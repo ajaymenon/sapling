@@ -26,6 +26,9 @@ use crate::BlobstoreKey;
 use crate::ClaimedBy;
 use crate::LongRunningRequestEntry;
 use crate::LongRunningRequestsQueue;
+use crate::QueueRepoFilter;
+use crate::QueueRequestTypeFilter;
+use crate::RecentBackfillEntry;
 use crate::RequestId;
 use crate::RequestStatus;
 use crate::RequestType;
@@ -49,6 +52,8 @@ mononoke_queries! {
         Option<ClaimedBy>,
         Option<u8>,
         Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
     ) {
         "SELECT id,
             request_type,
@@ -63,7 +68,9 @@ mononoke_queries! {
             status,
             claimed_by,
             num_retries,
-            failed_at
+            failed_at,
+            root_request_id,
+            created_by
         FROM long_running_request_queue
         WHERE id = {id}"
     }
@@ -83,6 +90,8 @@ mononoke_queries! {
         Option<ClaimedBy>,
         Option<u8>,
         Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
     ) {
         "SELECT id,
             request_type,
@@ -97,12 +106,14 @@ mononoke_queries! {
             status,
             claimed_by,
             num_retries,
-            failed_at
+            failed_at,
+            root_request_id,
+            created_by
         FROM long_running_request_queue
         WHERE id = {id} AND request_type = {request_type}"
     }
 
-    read GetOneNewRequestForGlobalQueue() -> (
+    read GetOneNewRequestForReposWithDeps(>list supported_repo_ids: RepositoryId) -> (
         RowId,
         RequestType,
         Option<RepositoryId>,
@@ -117,48 +128,73 @@ mononoke_queries! {
         Option<ClaimedBy>,
         Option<u8>,
         Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
     ) {
-        mysql("SELECT id,
-            request_type,
-            repo_id,
-            args_blobstore_key,
-            result_blobstore_key,
-            created_at,
-            started_processing_at,
-            inprogress_last_updated_at,
-            ready_at,
-            polled_at,
-            status,
-            claimed_by,
-            num_retries,
-            failed_at
-        FROM long_running_request_queue
-        WHERE status = 'new' AND repo_id IS NULL
-        ORDER BY created_at ASC
-        LIMIT 1
+        mysql("SELECT
+           q.id,
+           q.request_type,
+           q.repo_id,
+           q.args_blobstore_key,
+           q.result_blobstore_key,
+           q.created_at,
+           q.started_processing_at,
+           q.inprogress_last_updated_at,
+           q.ready_at,
+           q.polled_at,
+           q.status,
+           q.claimed_by,
+           q.num_retries,
+           q.failed_at,
+           q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND q.repo_id IN {supported_repo_ids}
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent
+               ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id
+               AND parent.status NOT IN ('ready', 'polled')
+            )
+          ORDER BY q.created_at ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
         ")
-        sqlite("SELECT id,
-            request_type,
-            repo_id,
-            args_blobstore_key,
-            result_blobstore_key,
-            created_at,
-            started_processing_at,
-            inprogress_last_updated_at,
-            ready_at,
-            polled_at,
-            status,
-            claimed_by,
-            num_retries,
-            failed_at
-        FROM long_running_request_queue
-        WHERE status = 'new' AND repo_id IS NULL
-        ORDER BY created_at ASC
-        LIMIT 1
+        sqlite("SELECT
+           q.id,
+           q.request_type,
+           q.repo_id,
+           q.args_blobstore_key,
+           q.result_blobstore_key,
+           q.created_at,
+           q.started_processing_at,
+           q.inprogress_last_updated_at,
+           q.ready_at,
+           q.polled_at,
+           q.status,
+           q.claimed_by,
+           q.num_retries,
+           q.failed_at,
+           q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND q.repo_id IN {supported_repo_ids}
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent
+               ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id
+               AND parent.status NOT IN ('ready', 'polled')
+            )
+          ORDER BY q.created_at ASC
+          LIMIT 1
         ")
     }
 
-    read GetOneNewRequestForRepos(>list supported_repo_ids: RepositoryId) -> (
+    read GetOneNewRequestExcludingReposWithDeps(>list excluded_repo_ids: RepositoryId) -> (
         RowId,
         RequestType,
         Option<RepositoryId>,
@@ -173,60 +209,319 @@ mononoke_queries! {
         Option<ClaimedBy>,
         Option<u8>,
         Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
     ) {
-        mysql("SELECT id,
-            request_type,
-            repo_id,
-            args_blobstore_key,
-            result_blobstore_key,
-            created_at,
-            started_processing_at,
-            inprogress_last_updated_at,
-            ready_at,
-            polled_at,
-            status,
-            claimed_by,
-            num_retries,
-            failed_at
-        FROM long_running_request_queue
-        WHERE status = 'new' AND repo_id IN {supported_repo_ids}
-        ORDER BY created_at ASC
-        LIMIT 1
+        mysql("SELECT
+           q.id,
+           q.request_type,
+           q.repo_id,
+           q.args_blobstore_key,
+           q.result_blobstore_key,
+           q.created_at,
+           q.started_processing_at,
+           q.inprogress_last_updated_at,
+           q.ready_at,
+           q.polled_at,
+           q.status,
+           q.claimed_by,
+           q.num_retries,
+           q.failed_at,
+           q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND (q.repo_id IS NULL OR q.repo_id NOT IN {excluded_repo_ids})
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent
+               ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id
+               AND parent.status NOT IN ('ready', 'polled')
+            )
+          ORDER BY q.created_at ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
         ")
-        sqlite("SELECT id,
-            request_type,
-            repo_id,
-            args_blobstore_key,
-            result_blobstore_key,
-            created_at,
-            started_processing_at,
-            inprogress_last_updated_at,
-            ready_at,
-            polled_at,
-            status,
-            claimed_by,
-            num_retries,
-            failed_at
-        FROM long_running_request_queue
-        WHERE status = 'new' AND repo_id IN {supported_repo_ids}
-        ORDER BY created_at ASC
-        LIMIT 1
+        sqlite("SELECT
+           q.id,
+           q.request_type,
+           q.repo_id,
+           q.args_blobstore_key,
+           q.result_blobstore_key,
+           q.created_at,
+           q.started_processing_at,
+           q.inprogress_last_updated_at,
+           q.ready_at,
+           q.polled_at,
+           q.status,
+           q.claimed_by,
+           q.num_retries,
+           q.failed_at,
+           q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND (q.repo_id IS NULL OR q.repo_id NOT IN {excluded_repo_ids})
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent
+               ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id
+               AND parent.status NOT IN ('ready', 'polled')
+            )
+          ORDER BY q.created_at ASC
+          LIMIT 1
         ")
     }
 
-    write AddRequestWithRepo(request_type: RequestType, repo_id: RepositoryId, args_blobstore_key: BlobstoreKey, created_at: Timestamp) {
+    read GetOneNewRequestWithDeps() -> (
+        RowId,
+        RequestType,
+        Option<RepositoryId>,
+        BlobstoreKey,
+        Option<BlobstoreKey>,
+        Timestamp,
+        Option<Timestamp>,
+        Option<Timestamp>,
+        Option<Timestamp>,
+        Option<Timestamp>,
+        RequestStatus,
+        Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
+    ) {
+        mysql("SELECT
+           q.id,
+           q.request_type,
+           q.repo_id,
+           q.args_blobstore_key,
+           q.result_blobstore_key,
+           q.created_at,
+           q.started_processing_at,
+           q.inprogress_last_updated_at,
+           q.ready_at,
+           q.polled_at,
+           q.status,
+           q.claimed_by,
+           q.num_retries,
+           q.failed_at,
+           q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent
+               ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id
+               AND parent.status NOT IN ('ready', 'polled')
+            )
+          ORDER BY q.created_at ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        ")
+        sqlite("SELECT
+           q.id,
+           q.request_type,
+           q.repo_id,
+           q.args_blobstore_key,
+           q.result_blobstore_key,
+           q.created_at,
+           q.started_processing_at,
+           q.inprogress_last_updated_at,
+           q.ready_at,
+           q.polled_at,
+           q.status,
+           q.claimed_by,
+           q.num_retries,
+           q.failed_at,
+           q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent
+               ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id
+               AND parent.status NOT IN ('ready', 'polled')
+            )
+          ORDER BY q.created_at ASC
+          LIMIT 1
+        ")
+    }
+
+    // Claim queries with both repo and request type filtering.
+    // The type filter is always resolved to an explicit IN-list by the caller
+    // (via QueueRequestTypeFilter::resolve_to_include_list), avoiding the need
+    // for separate IN/NOT IN query variants.
+    read GetOneNewRequestForReposFilteredTypes(>list supported_repo_ids: RepositoryId >list request_types: RequestType) -> (
+        RowId, RequestType, Option<RepositoryId>, BlobstoreKey, Option<BlobstoreKey>,
+        Timestamp, Option<Timestamp>, Option<Timestamp>, Option<Timestamp>, Option<Timestamp>,
+        RequestStatus, Option<ClaimedBy>, Option<u8>, Option<Timestamp>, Option<RowId>,
+        Option<String>,
+    ) {
+        mysql("SELECT q.id, q.request_type, q.repo_id, q.args_blobstore_key, q.result_blobstore_key,
+           q.created_at, q.started_processing_at, q.inprogress_last_updated_at, q.ready_at,
+           q.polled_at, q.status, q.claimed_by, q.num_retries, q.failed_at, q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND q.repo_id IN {supported_repo_ids}
+           AND q.request_type IN {request_types}
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id AND parent.status NOT IN ('ready', 'polled'))
+         ORDER BY q.created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED")
+        sqlite("SELECT q.id, q.request_type, q.repo_id, q.args_blobstore_key, q.result_blobstore_key,
+           q.created_at, q.started_processing_at, q.inprogress_last_updated_at, q.ready_at,
+           q.polled_at, q.status, q.claimed_by, q.num_retries, q.failed_at, q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND q.repo_id IN {supported_repo_ids}
+           AND q.request_type IN {request_types}
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id AND parent.status NOT IN ('ready', 'polled'))
+         ORDER BY q.created_at ASC LIMIT 1")
+    }
+
+    read GetOneNewRequestExcludingReposFilteredTypes(>list excluded_repo_ids: RepositoryId >list request_types: RequestType) -> (
+        RowId, RequestType, Option<RepositoryId>, BlobstoreKey, Option<BlobstoreKey>,
+        Timestamp, Option<Timestamp>, Option<Timestamp>, Option<Timestamp>, Option<Timestamp>,
+        RequestStatus, Option<ClaimedBy>, Option<u8>, Option<Timestamp>, Option<RowId>,
+        Option<String>,
+    ) {
+        mysql("SELECT q.id, q.request_type, q.repo_id, q.args_blobstore_key, q.result_blobstore_key,
+           q.created_at, q.started_processing_at, q.inprogress_last_updated_at, q.ready_at,
+           q.polled_at, q.status, q.claimed_by, q.num_retries, q.failed_at, q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND (q.repo_id IS NULL OR q.repo_id NOT IN {excluded_repo_ids})
+           AND q.request_type IN {request_types}
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id AND parent.status NOT IN ('ready', 'polled'))
+         ORDER BY q.created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED")
+        sqlite("SELECT q.id, q.request_type, q.repo_id, q.args_blobstore_key, q.result_blobstore_key,
+           q.created_at, q.started_processing_at, q.inprogress_last_updated_at, q.ready_at,
+           q.polled_at, q.status, q.claimed_by, q.num_retries, q.failed_at, q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND (q.repo_id IS NULL OR q.repo_id NOT IN {excluded_repo_ids})
+           AND q.request_type IN {request_types}
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id AND parent.status NOT IN ('ready', 'polled'))
+         ORDER BY q.created_at ASC LIMIT 1")
+    }
+
+    read GetOneNewRequestFilteredTypes(>list request_types: RequestType) -> (
+        RowId, RequestType, Option<RepositoryId>, BlobstoreKey, Option<BlobstoreKey>,
+        Timestamp, Option<Timestamp>, Option<Timestamp>, Option<Timestamp>, Option<Timestamp>,
+        RequestStatus, Option<ClaimedBy>, Option<u8>, Option<Timestamp>, Option<RowId>,
+        Option<String>,
+    ) {
+        mysql("SELECT q.id, q.request_type, q.repo_id, q.args_blobstore_key, q.result_blobstore_key,
+           q.created_at, q.started_processing_at, q.inprogress_last_updated_at, q.ready_at,
+           q.polled_at, q.status, q.claimed_by, q.num_retries, q.failed_at, q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND q.request_type IN {request_types}
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id AND parent.status NOT IN ('ready', 'polled'))
+         ORDER BY q.created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED")
+        sqlite("SELECT q.id, q.request_type, q.repo_id, q.args_blobstore_key, q.result_blobstore_key,
+           q.created_at, q.started_processing_at, q.inprogress_last_updated_at, q.ready_at,
+           q.polled_at, q.status, q.claimed_by, q.num_retries, q.failed_at, q.root_request_id,
+           q.created_by
+         FROM long_running_request_queue q
+         WHERE q.status = 'new'
+           AND q.request_type IN {request_types}
+           AND NOT EXISTS (
+             SELECT 1 FROM long_running_request_dependencies dep
+             JOIN long_running_request_queue parent ON dep.depends_on_request_id = parent.id
+             WHERE dep.request_id = q.id AND parent.status NOT IN ('ready', 'polled'))
+         ORDER BY q.created_at ASC LIMIT 1")
+    }
+
+    // Abandoned request queries with both repo and request type filtering.
+    read FindAbandonedRequestsForReposFilteredTypes(abandoned_timestamp: Timestamp, >list repo_ids: RepositoryId >list request_types: RequestType) -> (RowId, RequestType) {
+        "SELECT id, request_type FROM long_running_request_queue
+         WHERE status = 'inprogress' AND inprogress_last_updated_at <= {abandoned_timestamp}
+           AND repo_id IN {repo_ids} AND request_type IN {request_types}"
+    }
+
+    read FindAbandonedRequestsExcludingReposFilteredTypes(abandoned_timestamp: Timestamp, >list excluded_repo_ids: RepositoryId >list request_types: RequestType) -> (RowId, RequestType) {
+        "SELECT id, request_type FROM long_running_request_queue
+         WHERE status = 'inprogress' AND inprogress_last_updated_at <= {abandoned_timestamp}
+           AND (repo_id IS NULL OR repo_id NOT IN {excluded_repo_ids})
+           AND request_type IN {request_types}"
+    }
+
+    read FindAbandonedRequestsFilteredTypes(abandoned_timestamp: Timestamp, >list request_types: RequestType) -> (RowId, RequestType) {
+        "SELECT id, request_type FROM long_running_request_queue
+         WHERE status = 'inprogress' AND inprogress_last_updated_at <= {abandoned_timestamp}
+           AND request_type IN {request_types}"
+    }
+
+    write AddRequestWithRepo(request_type: RequestType, repo_id: RepositoryId, args_blobstore_key: BlobstoreKey, created_at: Timestamp, created_by: Option<String>) {
         none,
         "INSERT INTO long_running_request_queue
-         (request_type, repo_id, args_blobstore_key, status, created_at)
-         VALUES ({request_type}, {repo_id}, {args_blobstore_key}, 'new', {created_at})
+         (request_type, repo_id, args_blobstore_key, status, created_at, created_by)
+         VALUES ({request_type}, {repo_id}, {args_blobstore_key}, 'new', {created_at}, {created_by})
         "
     }
 
-    write AddRequest(request_type: RequestType, args_blobstore_key: BlobstoreKey, created_at: Timestamp) {
+    write AddRequest(request_type: RequestType, args_blobstore_key: BlobstoreKey, created_at: Timestamp, created_by: Option<String>) {
         none,
         "INSERT INTO long_running_request_queue
-         (request_type, args_blobstore_key, status, created_at)
-         VALUES ({request_type}, {args_blobstore_key}, 'new', {created_at})
+         (request_type, args_blobstore_key, status, created_at, created_by)
+         VALUES ({request_type}, {args_blobstore_key}, 'new', {created_at}, {created_by})
+        "
+    }
+
+    write AddRequestWithRepoAndRoot(request_type: RequestType, repo_id: RepositoryId, args_blobstore_key: BlobstoreKey, created_at: Timestamp, root_request_id: RowId, created_by: Option<String>) {
+        none,
+        "INSERT INTO long_running_request_queue
+         (request_type, repo_id, args_blobstore_key, status, created_at, root_request_id, created_by)
+         VALUES ({request_type}, {repo_id}, {args_blobstore_key}, 'new', {created_at}, {root_request_id}, {created_by})
+        "
+    }
+
+    read AddRequestWithRepoAndRootIfAbsent(request_type: RequestType, repo_id: RepositoryId, args_blobstore_key: BlobstoreKey, created_at: Timestamp, root_request_id: RowId, created_by: Option<String>) -> (RowId) {
+        mysql("INSERT INTO long_running_request_queue
+            (request_type, repo_id, args_blobstore_key, status, created_at, root_request_id, created_by)
+         VALUES ({request_type}, {repo_id}, {args_blobstore_key}, 'new', {created_at}, {root_request_id}, {created_by})
+         ON DUPLICATE KEY UPDATE id = id
+         RETURNING id
+        ")
+        sqlite("INSERT INTO long_running_request_queue
+            (request_type, repo_id, args_blobstore_key, status, created_at, root_request_id, created_by)
+         VALUES ({request_type}, {repo_id}, {args_blobstore_key}, 'new', {created_at}, {root_request_id}, {created_by})
+         ON CONFLICT(root_request_id, request_type, repo_id, args_blobstore_key) DO UPDATE SET id = id
+         RETURNING id
+        ")
+    }
+
+    write AddRequestWithRoot(request_type: RequestType, args_blobstore_key: BlobstoreKey, created_at: Timestamp, root_request_id: RowId, created_by: Option<String>) {
+        none,
+        "INSERT INTO long_running_request_queue
+         (request_type, args_blobstore_key, status, created_at, root_request_id, created_by)
+         VALUES ({request_type}, {args_blobstore_key}, 'new', {created_at}, {root_request_id}, {created_by})
         "
     }
 
@@ -246,6 +541,18 @@ mononoke_queries! {
         SELECT id, request_type
         FROM long_running_request_queue
         WHERE repo_id IN {repo_ids} AND status = 'inprogress' AND inprogress_last_updated_at <= {abandoned_timestamp}
+        "
+    }
+
+    read FindAbandonedRequestsExcludingRepos(
+        abandoned_timestamp: Timestamp,
+        >list excluded_repo_ids: RepositoryId
+    ) -> (RowId, RequestType) {
+        "
+        SELECT id, request_type
+        FROM long_running_request_queue
+        WHERE (repo_id IS NULL OR repo_id NOT IN {excluded_repo_ids})
+          AND status = 'inprogress' AND inprogress_last_updated_at <= {abandoned_timestamp}
         "
     }
 
@@ -355,6 +662,8 @@ mononoke_queries! {
         Option<ClaimedBy>,
         Option<u8>,
         Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
     ) {
        mysql( "SELECT id,
             request_type,
@@ -369,7 +678,9 @@ mononoke_queries! {
             status,
             claimed_by,
             num_retries,
-            failed_at
+            failed_at,
+            root_request_id,
+            created_by
         FROM long_running_request_queue
         FORCE INDEX (list_requests_any)
         WHERE (
@@ -389,7 +700,9 @@ mononoke_queries! {
             status,
             claimed_by,
             num_retries,
-            failed_at
+            failed_at,
+            root_request_id,
+            created_by
         FROM long_running_request_queue
         WHERE (
             inprogress_last_updated_at > {last_update_newer_than} OR
@@ -412,6 +725,8 @@ mononoke_queries! {
         Option<ClaimedBy>,
         Option<u8>,
         Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
     ) {
         mysql("SELECT id,
             request_type,
@@ -426,7 +741,9 @@ mononoke_queries! {
             status,
             claimed_by,
             num_retries,
-            failed_at
+            failed_at,
+            root_request_id,
+            created_by
         FROM long_running_request_queue
         FORCE INDEX (list_requests)
         WHERE repo_id IN {repo_ids} AND (
@@ -446,9 +763,74 @@ mononoke_queries! {
             status,
             claimed_by,
             num_retries,
-            failed_at
+            failed_at,
+            root_request_id,
+            created_by
         FROM long_running_request_queue
         WHERE repo_id IN {repo_ids} AND (
+            inprogress_last_updated_at > {last_update_newer_than} OR
+            (status = 'new' AND created_at > {last_update_newer_than})
+        )")
+    }
+
+    read ListRequestsExcludingRepos(last_update_newer_than: Timestamp, >list excluded_repo_ids: RepositoryId) -> (
+        RowId,
+        RequestType,
+        Option<RepositoryId>,
+        BlobstoreKey,
+        Option<BlobstoreKey>,
+        Timestamp,
+        Option<Timestamp>,
+        Option<Timestamp>,
+        Option<Timestamp>,
+        Option<Timestamp>,
+        RequestStatus,
+        Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
+    ) {
+        mysql("SELECT id,
+            request_type,
+            repo_id,
+            args_blobstore_key,
+            result_blobstore_key,
+            created_at,
+            started_processing_at,
+            inprogress_last_updated_at,
+            ready_at,
+            polled_at,
+            status,
+            claimed_by,
+            num_retries,
+            failed_at,
+            root_request_id,
+            created_by
+        FROM long_running_request_queue
+        FORCE INDEX (list_requests_any)
+        WHERE (repo_id IS NULL OR repo_id NOT IN {excluded_repo_ids}) AND (
+            inprogress_last_updated_at > {last_update_newer_than} OR
+            (status = 'new' AND created_at > {last_update_newer_than})
+        )")
+        sqlite("SELECT id,
+            request_type,
+            repo_id,
+            args_blobstore_key,
+            result_blobstore_key,
+            created_at,
+            started_processing_at,
+            inprogress_last_updated_at,
+            ready_at,
+            polled_at,
+            status,
+            claimed_by,
+            num_retries,
+            failed_at,
+            root_request_id,
+            created_by
+        FROM long_running_request_queue
+        WHERE (repo_id IS NULL OR repo_id NOT IN {excluded_repo_ids}) AND (
             inprogress_last_updated_at > {last_update_newer_than} OR
             (status = 'new' AND created_at > {last_update_newer_than})
         )")
@@ -517,6 +899,308 @@ mononoke_queries! {
         GROUP BY repo_id, status
         "
     }
+
+    // Variants excluding derived data backfill request types
+    read GetQueueLengthForReposExcludingBackfill(>list repo_ids: RepositoryId) -> (
+        RequestStatus, u64
+    ) {
+        "SELECT status, count(*) FROM long_running_request_queue
+        WHERE repo_id IN {repo_ids}
+        AND request_type NOT IN ('derive_boundaries', 'derive_slice', 'derive_backfill', 'derive_backfill_repo')
+        GROUP BY status"
+    }
+
+    read GetQueueLengthByRepoForReposExcludingBackfill(>list repo_ids: RepositoryId) -> (
+        Option<RepositoryId>, RequestStatus, u64
+    ) {
+        "SELECT repo_id, status, count(*) FROM long_running_request_queue
+        WHERE repo_id IN {repo_ids}
+        AND request_type NOT IN ('derive_boundaries', 'derive_slice', 'derive_backfill', 'derive_backfill_repo')
+        GROUP BY repo_id, status"
+    }
+
+    read GetQueueLengthForAllReposExcludingBackfill() -> (
+        RequestStatus, u64
+    ) {
+        "SELECT status, count(*) FROM long_running_request_queue
+        WHERE request_type NOT IN ('derive_boundaries', 'derive_slice', 'derive_backfill', 'derive_backfill_repo')
+        GROUP BY status"
+    }
+
+    read GetQueueLengthByRepoForAllReposExcludingBackfill() -> (
+        Option<RepositoryId>, RequestStatus, u64
+    ) {
+        "SELECT repo_id, status, count(*) FROM long_running_request_queue
+        WHERE request_type NOT IN ('derive_boundaries', 'derive_slice', 'derive_backfill', 'derive_backfill_repo')
+        GROUP BY repo_id, status"
+    }
+
+    read GetQueueAgeForReposExcludingBackfill(>list repo_ids: RepositoryId) -> (
+        RequestStatus, u64, Option<u64>, Option<u64>
+    ) {
+        "SELECT status, min(created_at), min(inprogress_last_updated_at), min(ready_at)
+        FROM long_running_request_queue
+        WHERE repo_id IN {repo_ids}
+        AND status NOT IN ('polled', 'failed')
+        AND request_type NOT IN ('derive_boundaries', 'derive_slice', 'derive_backfill', 'derive_backfill_repo')
+        GROUP BY status
+        "
+    }
+
+    read GetQueueAgeByRepoForReposExcludingBackfill(>list repo_ids: RepositoryId) -> (
+        Option<RepositoryId>, RequestStatus, u64, Option<u64>, Option<u64>
+    ) {
+        "SELECT repo_id, status, min(created_at), min(inprogress_last_updated_at), min(ready_at)
+        FROM long_running_request_queue
+        WHERE repo_id IN {repo_ids}
+        AND status NOT IN ('polled', 'failed')
+        AND request_type NOT IN ('derive_boundaries', 'derive_slice', 'derive_backfill', 'derive_backfill_repo')
+        GROUP BY repo_id, status
+        "
+    }
+
+    read GetQueueAgeForAllReposExcludingBackfill() -> (
+        RequestStatus, u64, Option<u64>, Option<u64>
+    ) {
+        "SELECT status, min(created_at), min(inprogress_last_updated_at), min(ready_at)
+        FROM long_running_request_queue
+        WHERE status NOT IN ('polled', 'failed')
+        AND request_type NOT IN ('derive_boundaries', 'derive_slice', 'derive_backfill', 'derive_backfill_repo')
+        GROUP BY status
+        "
+    }
+
+    read GetQueueAgeByRepoForAllReposExcludingBackfill() -> (
+        Option<RepositoryId>, RequestStatus, u64, Option<u64>, Option<u64>
+    ) {
+        "SELECT repo_id, status, min(created_at), min(inprogress_last_updated_at), min(ready_at)
+        FROM long_running_request_queue
+        WHERE status NOT IN ('polled', 'failed')
+        AND request_type NOT IN ('derive_boundaries', 'derive_slice', 'derive_backfill', 'derive_backfill_repo')
+        GROUP BY repo_id, status
+        "
+    }
+
+    write AddDependency(
+        request_id: RowId,
+        depends_on_request_id: RowId,
+    ) {
+        insert_or_ignore,
+        "{insert_or_ignore} INTO long_running_request_dependencies
+         (request_id, depends_on_request_id)
+         VALUES ({request_id}, {depends_on_request_id})
+        "
+    }
+
+    read GetDependencies(request_id: RowId) -> (RowId,) {
+        "SELECT depends_on_request_id
+         FROM long_running_request_dependencies
+         WHERE request_id = {request_id}
+        "
+    }
+
+    write FailRequestWithCascade(request_id: RowId, failed_at: Timestamp) {
+        none,
+        "WITH RECURSIVE to_fail(id) AS (
+             SELECT {request_id}
+             UNION
+             SELECT dep.request_id FROM long_running_request_dependencies dep
+             JOIN to_fail tf ON dep.depends_on_request_id = tf.id
+         )
+         UPDATE long_running_request_queue
+         SET status = 'failed', failed_at = {failed_at}
+         WHERE id IN (SELECT id FROM to_fail)
+           AND status IN ('new', 'inprogress')
+        "
+    }
+
+    read CountInProgressByTypes(>list request_types: RequestType) -> (i64,) {
+        mysql("
+            SELECT COUNT(*)
+            FROM long_running_request_queue
+            WHERE status = 'inprogress'
+              AND request_type IN {request_types}
+        ")
+        sqlite("
+            SELECT COUNT(*)
+            FROM long_running_request_queue
+            WHERE status = 'inprogress'
+              AND request_type IN {request_types}
+        ")
+    }
+
+    read GetRequestsByRootRequestId(root_request_id: RowId) -> (
+        RowId,
+        RequestType,
+        Option<RepositoryId>,
+        BlobstoreKey,
+        Option<BlobstoreKey>,
+        Timestamp,
+        Option<Timestamp>,
+        Option<Timestamp>,
+        Option<Timestamp>,
+        Option<Timestamp>,
+        RequestStatus,
+        Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
+    ) {
+        "SELECT id,
+            request_type,
+            repo_id,
+            args_blobstore_key,
+            result_blobstore_key,
+            created_at,
+            started_processing_at,
+            inprogress_last_updated_at,
+            ready_at,
+            polled_at,
+            status,
+            claimed_by,
+            num_retries,
+            failed_at,
+            root_request_id,
+            created_by
+        FROM long_running_request_queue
+        WHERE root_request_id = {root_request_id}"
+    }
+
+    write FailNewRequestsByRootId(root_request_id: RowId, failed_at: Timestamp) {
+        none,
+        "UPDATE long_running_request_queue
+         SET status = 'failed', failed_at = {failed_at}
+         WHERE root_request_id = {root_request_id} AND status = 'new'"
+    }
+
+    read GetBackfillStatsByStatus(root_request_id: RowId) -> (
+        RequestType,
+        RequestStatus,
+        i64,
+    ) {
+        "SELECT request_type, status, COUNT(*) as count
+         FROM long_running_request_queue
+         WHERE root_request_id = {root_request_id}
+         GROUP BY request_type, status"
+    }
+
+    read GetBackfillStatsByRepo(root_request_id: RowId) -> (
+        Option<RepositoryId>,
+        RequestStatus,
+        i64,
+    ) {
+        "SELECT repo_id, status, COUNT(*) as count
+         FROM long_running_request_queue
+         WHERE root_request_id = {root_request_id}
+           AND repo_id IS NOT NULL
+         GROUP BY repo_id, status"
+    }
+
+    read GetBackfillTimingStats(root_request_id: RowId) -> (
+        i64,
+        Option<f64>,
+        Option<Timestamp>,
+        Option<Timestamp>,
+    ) {
+        mysql("SELECT
+           COUNT(*) as total_completed,
+           AVG(TIMESTAMPDIFF(SECOND, COALESCE(started_processing_at, created_at), ready_at)) as avg_duration_seconds,
+           MIN(created_at) as min_created_at,
+           MAX(ready_at) as max_ready_at
+         FROM long_running_request_queue
+         WHERE root_request_id = {root_request_id}
+           AND status IN ('ready', 'polled')
+           AND ready_at IS NOT NULL")
+
+        sqlite("SELECT
+           COUNT(*) as total_completed,
+           AVG(ready_at - COALESCE(started_processing_at, created_at)) as avg_duration_seconds,
+           MIN(created_at) as min_created_at,
+           MAX(ready_at) as max_ready_at
+         FROM long_running_request_queue
+         WHERE root_request_id = {root_request_id}
+           AND status IN ('ready', 'polled')
+           AND ready_at IS NOT NULL")
+    }
+
+    read ListRecentBackfillsWithRepoCount(min_created_at: Timestamp) -> (
+        RowId,
+        Timestamp,
+        RequestStatus,
+        i64,
+        Option<String>,
+        BlobstoreKey,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) {
+        // SUM(CASE WHEN ...) returns DECIMAL in MySQL — CAST to SIGNED so the
+        // mysql_async driver decodes it as a long instead of bytes.
+        mysql("SELECT root.id,
+                root.created_at,
+                root.status,
+                COUNT(DISTINCT sub.repo_id) as repo_count,
+                root.created_by,
+                root.args_blobstore_key,
+                CAST(SUM(CASE WHEN sub.status = 'new' THEN 1 ELSE 0 END) AS SIGNED) as child_new_count,
+                CAST(SUM(CASE WHEN sub.status = 'inprogress' THEN 1 ELSE 0 END) AS SIGNED) as child_inprogress_count,
+                CAST(SUM(CASE WHEN sub.status IN ('ready', 'polled') THEN 1 ELSE 0 END) AS SIGNED) as child_ready_count,
+                CAST(SUM(CASE WHEN sub.status = 'failed' THEN 1 ELSE 0 END) AS SIGNED) as child_failed_count
+         FROM long_running_request_queue root
+         LEFT JOIN long_running_request_queue sub ON sub.root_request_id = root.id
+         WHERE CAST(root.request_type AS CHAR) = 'derive_backfill'
+           AND root.root_request_id IS NULL
+           AND root.created_at >= {min_created_at}
+         GROUP BY root.id, root.created_at, root.status, root.created_by, root.args_blobstore_key
+         ORDER BY root.created_at DESC")
+
+        sqlite("SELECT root.id,
+                root.created_at,
+                root.status,
+                COUNT(DISTINCT sub.repo_id) as repo_count,
+                root.created_by,
+                root.args_blobstore_key,
+                SUM(CASE WHEN sub.status = 'new' THEN 1 ELSE 0 END) as child_new_count,
+                SUM(CASE WHEN sub.status = 'inprogress' THEN 1 ELSE 0 END) as child_inprogress_count,
+                SUM(CASE WHEN sub.status IN ('ready', 'polled') THEN 1 ELSE 0 END) as child_ready_count,
+                SUM(CASE WHEN sub.status = 'failed' THEN 1 ELSE 0 END) as child_failed_count
+         FROM long_running_request_queue root
+         LEFT JOIN long_running_request_queue sub ON sub.root_request_id = root.id
+         WHERE CAST(root.request_type AS CHAR) = 'derive_backfill'
+           AND root.root_request_id IS NULL
+           AND root.created_at >= {min_created_at}
+         GROUP BY root.id, root.created_at, root.status, root.created_by, root.args_blobstore_key
+         ORDER BY root.created_at DESC")
+    }
+
+    read GetBackfillRepoStats(root_request_id: RowId, repo_id: RepositoryId) -> (
+        RequestType,
+        RequestStatus,
+        i64,
+    ) {
+        "SELECT request_type, status, COUNT(*) as count
+         FROM long_running_request_queue
+         WHERE root_request_id = {root_request_id}
+           AND repo_id = {repo_id}
+         GROUP BY request_type, status"
+    }
+
+    read GetBackfillRootEntry(id: RowId) -> (
+        RowId,
+        RequestType,
+        RequestStatus,
+        Timestamp,
+        BlobstoreKey,
+        Option<String>,
+    ) {
+        "SELECT id, request_type, status, created_at, args_blobstore_key, created_by
+         FROM long_running_request_queue
+         WHERE id = {id}
+           AND CAST(request_type AS CHAR) = 'derive_backfill'
+           AND root_request_id IS NULL"
+    }
 }
 
 fn row_to_entry(
@@ -535,6 +1219,8 @@ fn row_to_entry(
         Option<ClaimedBy>,
         Option<u8>,
         Option<Timestamp>,
+        Option<RowId>,
+        Option<String>,
     ),
 ) -> LongRunningRequestEntry {
     let (
@@ -552,6 +1238,8 @@ fn row_to_entry(
         claimed_by,
         num_retries,
         failed_at,
+        root_request_id,
+        created_by,
     ) = row;
     LongRunningRequestEntry {
         id,
@@ -568,6 +1256,8 @@ fn row_to_entry(
         claimed_by,
         num_retries,
         failed_at,
+        root_request_id,
+        created_by,
     }
 }
 
@@ -584,7 +1274,9 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
         request_type: &RequestType,
         repo_id: Option<&RepositoryId>,
         args_blobstore_key: &BlobstoreKey,
+        created_by: Option<&str>,
     ) -> Result<RowId> {
+        let created_by_owned = created_by.map(|s| s.to_string());
         let res = match &repo_id {
             Some(repo_id) => {
                 AddRequestWithRepo::query(
@@ -594,6 +1286,7 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
                     repo_id,
                     args_blobstore_key,
                     &Timestamp::now(),
+                    &created_by_owned,
                 )
                 .await?
             }
@@ -604,6 +1297,7 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
                     request_type,
                     args_blobstore_key,
                     &Timestamp::now(),
+                    &created_by_owned,
                 )
                 .await?
             }
@@ -611,7 +1305,7 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
 
         match res.last_insert_id() {
             Some(last_insert_id) if res.affected_rows() == 1 => Ok(RowId(last_insert_id)),
-            _ => bail!("Failed to insert a new request of type {}", request_type),
+            _ => bail!("Failed to insert a new request of type {request_type}"),
         }
     }
 
@@ -620,45 +1314,70 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
         &self,
         ctx: &CoreContext,
         claimed_by: &ClaimedBy,
-        supported_repos: Option<&[RepositoryId]>,
+        repo_filter: &QueueRepoFilter,
+        request_type_filter: &QueueRequestTypeFilter,
     ) -> Result<Option<LongRunningRequestEntry>> {
-        // Spin until we win the race or there's nothing to do.
-        loop {
-            let connection = &self.connections.read_master_connection; // reaching DB master improves our chances.
-            let rows = match supported_repos {
-                Some(repos) => {
-                    GetOneNewRequestForRepos::query(connection, ctx.sql_query_telemetry(), repos)
-                        .await
-                }
-                None => {
-                    GetOneNewRequestForGlobalQueue::query(connection, ctx.sql_query_telemetry())
-                        .await
-                }
-            }
-            .context("claiming new request")?;
-            let mut entry = match rows.into_iter().next() {
-                None => {
-                    return Ok(None);
-                }
-                Some(row) => row_to_entry(row),
-            };
-            if self
-                .mark_in_progress(
-                    ctx,
-                    &RequestId(entry.id, entry.request_type.clone()),
-                    claimed_by,
-                )
-                .await?
-            {
-                // Success, we won the race!
-                entry.status = RequestStatus::InProgress;
-                return Ok(Some(entry));
-            }
-            // Failure, let's try again.
+        let request_types = request_type_filter.resolve_to_include_list();
+        if request_types.is_empty() {
+            return Ok(None);
         }
+
+        // SELECT FOR UPDATE SKIP LOCKED ensures each worker gets a distinct
+        // row (or no row), eliminating the thundering-herd retry loop.
+        let txn = self
+            .connections
+            .write_connection
+            .start_transaction(ctx.sql_query_telemetry())
+            .await?;
+
+        let (txn, rows) = match repo_filter {
+            QueueRepoFilter::Only(repos) if repos.is_empty() => {
+                return Ok(None);
+            }
+            QueueRepoFilter::Only(repos) => {
+                GetOneNewRequestForReposFilteredTypes::query_with_transaction(
+                    txn,
+                    repos,
+                    &request_types,
+                )
+                .await
+            }
+            QueueRepoFilter::Except(repos) if repos.is_empty() => {
+                GetOneNewRequestFilteredTypes::query_with_transaction(txn, &request_types).await
+            }
+            QueueRepoFilter::Except(repos) => {
+                GetOneNewRequestExcludingReposFilteredTypes::query_with_transaction(
+                    txn,
+                    repos,
+                    &request_types,
+                )
+                .await
+            }
+        }
+        .context("claiming new request")?;
+        let mut entry = match rows.into_iter().next() {
+            None => {
+                txn.rollback().await?;
+                return Ok(None);
+            }
+            Some(row) => row_to_entry(row),
+        };
+
+        let now = Timestamp::now();
+        let (txn, _res) = MarkRequestInProgress::query_with_transaction(
+            txn,
+            &entry.id,
+            &entry.request_type,
+            &now,
+            claimed_by,
+        )
+        .await?;
+        txn.commit().await?;
+        entry.status = RequestStatus::InProgress;
+        Ok(Some(entry))
     }
 
-    async fn test_get_request_entry_by_id(
+    async fn get_request_entry_by_id(
         &self,
         ctx: &CoreContext,
         id: &RowId,
@@ -673,6 +1392,14 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
             None => Ok(None),
             Some(row) => Ok(Some(row_to_entry(row))),
         }
+    }
+
+    async fn test_get_request_entry_by_id(
+        &self,
+        ctx: &CoreContext,
+        id: &RowId,
+    ) -> Result<Option<LongRunningRequestEntry>> {
+        self.get_request_entry_by_id(ctx, id).await
     }
 
     async fn mark_in_progress(
@@ -712,29 +1439,52 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
     async fn find_abandoned_requests(
         &self,
         ctx: &CoreContext,
-        repo_ids: Option<&[RepositoryId]>,
+        repo_filter: &QueueRepoFilter,
+        request_type_filter: &QueueRequestTypeFilter,
         abandoned_timestamp: Timestamp,
     ) -> Result<Vec<RequestId>> {
-        let rows = match repo_ids {
-            Some(repos) => {
-                FindAbandonedRequestsForRepos::query(
-                    &self.connections.write_connection,
-                    ctx.sql_query_telemetry(),
+        let request_types = request_type_filter.resolve_to_include_list();
+        if request_types.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let conn = &self.connections.write_connection;
+        let tel = ctx.sql_query_telemetry();
+
+        let rows = match repo_filter {
+            QueueRepoFilter::Only(repos) if repos.is_empty() => {
+                return Ok(vec![]);
+            }
+            QueueRepoFilter::Only(repos) => {
+                FindAbandonedRequestsForReposFilteredTypes::query(
+                    conn,
+                    tel,
                     &abandoned_timestamp,
                     repos,
+                    &request_types,
                 )
                 .await
             }
-            None => {
-                FindAbandonedRequestsForAnyRepo::query(
-                    &self.connections.write_connection,
-                    ctx.sql_query_telemetry(),
+            QueueRepoFilter::Except(repos) if repos.is_empty() => {
+                FindAbandonedRequestsFilteredTypes::query(
+                    conn,
+                    tel,
                     &abandoned_timestamp,
+                    &request_types,
                 )
                 .await
             }
-        }
-        .context("finding abandoned requests")?;
+            QueueRepoFilter::Except(repos) => {
+                FindAbandonedRequestsExcludingReposFilteredTypes::query(
+                    conn,
+                    tel,
+                    &abandoned_timestamp,
+                    repos,
+                    &request_types,
+                )
+                .await
+            }
+        }?;
         Ok(rows.into_iter().map(|(id, ty)| RequestId(id, ty)).collect())
     }
 
@@ -816,7 +1566,7 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
 
         let (mut txn, rows) = GetRequest::query_with_transaction(txn, &req_id.0, &req_id.1).await?;
         let entry = match rows.into_iter().next() {
-            None => bail!("unknown request polled: {:?}", req_id),
+            None => bail!("unknown request polled: {req_id:?}"),
             Some(row) => {
                 let mut entry = row_to_entry(row);
 
@@ -855,11 +1605,14 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
     async fn list_requests(
         &self,
         ctx: &CoreContext,
-        repo_ids: Option<&[RepositoryId]>,
+        repo_filter: &QueueRepoFilter,
         last_update_newer_than: Option<&Timestamp>,
     ) -> Result<Vec<LongRunningRequestEntry>> {
-        let entries = match repo_ids {
-            Some(repos) => {
+        let entries = match repo_filter {
+            QueueRepoFilter::Only(repos) if repos.is_empty() => {
+                return Ok(vec![]);
+            }
+            QueueRepoFilter::Only(repos) => {
                 ListRequestsForRepos::query(
                     &self.connections.read_connection,
                     ctx.sql_query_telemetry(),
@@ -868,11 +1621,20 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
                 )
                 .await
             }
-            None => {
+            QueueRepoFilter::Except(repos) if repos.is_empty() => {
                 ListRequestsForAnyRepo::query(
                     &self.connections.read_connection,
                     ctx.sql_query_telemetry(),
                     last_update_newer_than.unwrap_or(&Timestamp::from_timestamp_nanos(0)),
+                )
+                .await
+            }
+            QueueRepoFilter::Except(repos) => {
+                ListRequestsExcludingRepos::query(
+                    &self.connections.read_connection,
+                    ctx.sql_query_telemetry(),
+                    last_update_newer_than.unwrap_or(&Timestamp::from_timestamp_nanos(0)),
+                    repos,
                 )
                 .await
             }
@@ -887,27 +1649,52 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
     async fn get_queue_stats(
         &self,
         ctx: &CoreContext,
-        repo_ids: Option<&[RepositoryId]>,
+        repo_filter: &QueueRepoFilter,
+        exclude_backfill: bool,
     ) -> Result<QueueStats> {
+        // Note: Except filtering is intentionally not implemented for stats
+        // queries. Stats are used for monitoring/observability, and returning
+        // stats across all repos is acceptable (and simpler than adding 8
+        // additional SQL query variants). Only `Only` filtering is exact here.
+        let repo_ids = match repo_filter {
+            QueueRepoFilter::Only(repos) if repos.is_empty() => {
+                return Ok(QueueStats {
+                    queue_length_by_status: vec![],
+                    queue_age_by_status: vec![],
+                    queue_length_by_repo_and_status: vec![],
+                    queue_age_by_repo_and_status: vec![],
+                });
+            }
+            QueueRepoFilter::Only(repos) => Some(repos.as_slice()),
+            QueueRepoFilter::Except(_) => None,
+        };
         Ok(QueueStats {
             queue_length_by_status: get_queue_length(
                 ctx,
                 &self.connections.read_connection,
                 repo_ids,
+                exclude_backfill,
             )
             .await?,
-            queue_age_by_status: get_queue_age(ctx, &self.connections.read_connection, repo_ids)
-                .await?,
+            queue_age_by_status: get_queue_age(
+                ctx,
+                &self.connections.read_connection,
+                repo_ids,
+                exclude_backfill,
+            )
+            .await?,
             queue_length_by_repo_and_status: get_queue_length_by_repo(
                 ctx,
                 &self.connections.read_connection,
                 repo_ids,
+                exclude_backfill,
             )
             .await?,
             queue_age_by_repo_and_status: get_queue_age_by_repo(
                 ctx,
                 &self.connections.read_connection,
                 repo_ids,
+                exclude_backfill,
             )
             .await?,
         })
@@ -927,17 +1714,16 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
 
         let (mut txn, rows) = GetRequest::query_with_transaction(txn, &req_id.0, &req_id.1).await?;
         let will_retry = match rows.into_iter().next() {
-            None => bail!("Failed to get request: {:?}", req_id),
+            None => bail!("Failed to get request: {req_id:?}"),
             Some(row) => {
                 let entry = row_to_entry(row);
                 match &entry.status {
                     RequestStatus::InProgress => {
                         let next_retry = entry.num_retries.unwrap_or(0) + 1;
                         if next_retry > max_retry_allowed {
-                            txn = MarkRequestFailed::query_with_transaction(
+                            txn = FailRequestWithCascade::query_with_transaction(
                                 txn,
                                 &req_id.0,
-                                &req_id.1,
                                 &Timestamp::now(),
                             )
                             .await?
@@ -955,10 +1741,7 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
                             Ok(true)
                         }
                     }
-                    _ => bail!(
-                        "Request {:?} is not in progress, it can't be retried",
-                        req_id
-                    ),
+                    _ => bail!("Request {req_id:?} is not in progress, it can't be retried"),
                 }
             }
         };
@@ -966,16 +1749,396 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
 
         will_retry
     }
+
+    async fn add_request_with_dependencies(
+        &self,
+        ctx: &CoreContext,
+        request_type: &RequestType,
+        repo_id: Option<&RepositoryId>,
+        args_blobstore_key: &BlobstoreKey,
+        depends_on: &[RowId],
+        created_by: Option<&str>,
+    ) -> Result<RowId> {
+        let txn = self
+            .connections
+            .write_connection
+            .start_transaction(ctx.sql_query_telemetry())
+            .await?;
+
+        let created_by_owned = created_by.map(|s| s.to_string());
+        let now = Timestamp::now();
+        let (mut txn, res) = match &repo_id {
+            Some(repo_id) => {
+                AddRequestWithRepo::query_with_transaction(
+                    txn,
+                    request_type,
+                    repo_id,
+                    args_blobstore_key,
+                    &now,
+                    &created_by_owned,
+                )
+                .await?
+            }
+            None => {
+                AddRequest::query_with_transaction(
+                    txn,
+                    request_type,
+                    args_blobstore_key,
+                    &now,
+                    &created_by_owned,
+                )
+                .await?
+            }
+        };
+
+        let row_id = match res.last_insert_id() {
+            Some(last_insert_id) if res.affected_rows() == 1 => RowId(last_insert_id),
+            _ => bail!("Failed to insert a new request of type {request_type}"),
+        };
+
+        for dep_id in depends_on {
+            txn = AddDependency::query_with_transaction(txn, &row_id, dep_id)
+                .await
+                .with_context(|| format!("adding dependency {dep_id:?} to request {row_id:?}"))?
+                .0;
+        }
+
+        txn.commit().await?;
+
+        Ok(row_id)
+    }
+
+    async fn get_dependencies(&self, ctx: &CoreContext, request_id: &RowId) -> Result<Vec<RowId>> {
+        let rows = GetDependencies::query(
+            &self.connections.read_connection,
+            ctx.sql_query_telemetry(),
+            request_id,
+        )
+        .await
+        .context("getting dependencies")?;
+
+        Ok(rows.into_iter().map(|(dep_id,)| dep_id).collect())
+    }
+
+    async fn mark_failed_with_cascade(&self, ctx: &CoreContext, req_id: &RowId) -> Result<bool> {
+        let now = Timestamp::now();
+        let res = FailRequestWithCascade::query(
+            &self.connections.write_connection,
+            ctx.sql_query_telemetry(),
+            req_id,
+            &now,
+        )
+        .await
+        .context("marking request and dependents as failed")?;
+        Ok(res.affected_rows() > 0)
+    }
+
+    async fn count_inprogress_by_types(
+        &self,
+        ctx: &CoreContext,
+        request_types: &[&str],
+    ) -> Result<i64> {
+        let types: Vec<RequestType> = request_types
+            .iter()
+            .map(|t| RequestType(t.to_string()))
+            .collect();
+        let rows = CountInProgressByTypes::query(
+            &self.connections.read_connection,
+            ctx.sql_query_telemetry(),
+            &types[..],
+        )
+        .await?;
+        Ok(rows.first().map(|(count,)| *count).unwrap_or(0))
+    }
+
+    async fn add_request_with_root(
+        &self,
+        ctx: &CoreContext,
+        request_type: &RequestType,
+        repo_id: Option<&RepositoryId>,
+        args_blobstore_key: &BlobstoreKey,
+        root_request_id: &RowId,
+        created_by: Option<&str>,
+    ) -> Result<RowId> {
+        let created_by_owned = created_by.map(|s| s.to_string());
+        let now = Timestamp::now();
+        match repo_id {
+            Some(repo_id) => {
+                let rows = AddRequestWithRepoAndRootIfAbsent::query(
+                    &self.connections.write_connection,
+                    ctx.sql_query_telemetry(),
+                    request_type,
+                    repo_id,
+                    args_blobstore_key,
+                    &now,
+                    root_request_id,
+                    &created_by_owned,
+                )
+                .await?;
+                rows.into_iter()
+                    .next()
+                    .map(|(row_id,)| row_id)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to find request of type {request_type}"))
+            }
+            None => {
+                let res = AddRequestWithRoot::query(
+                    &self.connections.write_connection,
+                    ctx.sql_query_telemetry(),
+                    request_type,
+                    args_blobstore_key,
+                    &now,
+                    root_request_id,
+                    &created_by_owned,
+                )
+                .await?;
+                match res.last_insert_id() {
+                    Some(last_insert_id) if res.affected_rows() == 1 => Ok(RowId(last_insert_id)),
+                    _ => bail!("Failed to insert a new request of type {request_type}"),
+                }
+            }
+        }
+    }
+
+    async fn add_request_with_dependencies_and_root(
+        &self,
+        ctx: &CoreContext,
+        request_type: &RequestType,
+        repo_id: Option<&RepositoryId>,
+        args_blobstore_key: &BlobstoreKey,
+        depends_on: &[RowId],
+        root_request_id: &RowId,
+        created_by: Option<&str>,
+    ) -> Result<RowId> {
+        let txn = self
+            .connections
+            .write_connection
+            .start_transaction(ctx.sql_query_telemetry())
+            .await?;
+
+        let created_by_owned = created_by.map(|s| s.to_string());
+        let now = Timestamp::now();
+        let (mut txn, row_id) = match repo_id {
+            Some(repo_id) => {
+                let (txn, rows) = AddRequestWithRepoAndRootIfAbsent::query_with_transaction(
+                    txn,
+                    request_type,
+                    repo_id,
+                    args_blobstore_key,
+                    &now,
+                    root_request_id,
+                    &created_by_owned,
+                )
+                .await?;
+                let row_id = rows
+                    .into_iter()
+                    .next()
+                    .map(|(row_id,)| row_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Failed to find request of type {request_type}")
+                    })?;
+                (txn, row_id)
+            }
+            None => {
+                let (txn, res) = AddRequestWithRoot::query_with_transaction(
+                    txn,
+                    request_type,
+                    args_blobstore_key,
+                    &now,
+                    root_request_id,
+                    &created_by_owned,
+                )
+                .await?;
+                let row_id = match res.last_insert_id() {
+                    Some(last_insert_id) if res.affected_rows() == 1 => RowId(last_insert_id),
+                    _ => bail!("Failed to insert a new request of type {request_type}"),
+                };
+                (txn, row_id)
+            }
+        };
+
+        for dep_id in depends_on {
+            txn = AddDependency::query_with_transaction(txn, &row_id, dep_id)
+                .await
+                .with_context(|| format!("adding dependency {dep_id:?} to request {row_id:?}"))?
+                .0;
+        }
+
+        txn.commit().await?;
+
+        Ok(row_id)
+    }
+
+    async fn get_requests_by_root_id(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+    ) -> Result<Vec<LongRunningRequestEntry>> {
+        let rows = GetRequestsByRootRequestId::query(
+            &self.connections.read_connection,
+            ctx.sql_query_telemetry(),
+            root_request_id,
+        )
+        .await?;
+        Ok(rows.into_iter().map(row_to_entry).collect())
+    }
+
+    async fn fail_new_requests_by_root_id(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+    ) -> Result<u64> {
+        let res = FailNewRequestsByRootId::query(
+            &self.connections.write_connection,
+            ctx.sql_query_telemetry(),
+            root_request_id,
+            &Timestamp::now(),
+        )
+        .await?;
+        Ok(res.affected_rows())
+    }
+
+    async fn get_backfill_stats(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+        repo_id: Option<&RepositoryId>,
+    ) -> Result<Vec<(RequestType, RequestStatus, i64)>> {
+        let rows = match repo_id {
+            Some(repo_id) => {
+                GetBackfillRepoStats::query(
+                    &self.connections.read_connection,
+                    ctx.sql_query_telemetry(),
+                    root_request_id,
+                    repo_id,
+                )
+                .await?
+            }
+            None => {
+                GetBackfillStatsByStatus::query(
+                    &self.connections.read_connection,
+                    ctx.sql_query_telemetry(),
+                    root_request_id,
+                )
+                .await?
+            }
+        };
+        Ok(rows)
+    }
+
+    async fn get_backfill_stats_by_repo(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+    ) -> Result<Vec<(Option<RepositoryId>, RequestStatus, i64)>> {
+        let rows = GetBackfillStatsByRepo::query(
+            &self.connections.read_connection,
+            ctx.sql_query_telemetry(),
+            root_request_id,
+        )
+        .await?;
+        Ok(rows)
+    }
+
+    async fn get_backfill_timing_stats(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+    ) -> Result<(i64, Option<f64>, Option<Timestamp>, Option<Timestamp>)> {
+        let rows = GetBackfillTimingStats::query(
+            &self.connections.read_connection,
+            ctx.sql_query_telemetry(),
+            root_request_id,
+        )
+        .await?;
+        rows.into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!("No timing stats found for root_request_id {root_request_id}")
+        })
+    }
+
+    async fn list_recent_backfills_with_repo_count(
+        &self,
+        ctx: &CoreContext,
+        min_created_at: &Timestamp,
+    ) -> Result<Vec<RecentBackfillEntry>> {
+        let rows = ListRecentBackfillsWithRepoCount::query(
+            &self.connections.read_connection,
+            ctx.sql_query_telemetry(),
+            min_created_at,
+        )
+        .await?;
+        let entries = rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    created_at,
+                    root_status,
+                    repo_count,
+                    created_by,
+                    args_blobstore_key,
+                    child_new_count,
+                    child_inprogress_count,
+                    child_ready_count,
+                    child_failed_count,
+                )| RecentBackfillEntry {
+                    id,
+                    created_at,
+                    root_status,
+                    repo_count,
+                    created_by,
+                    args_blobstore_key,
+                    child_new_count,
+                    child_inprogress_count,
+                    child_ready_count,
+                    child_failed_count,
+                },
+            )
+            .collect();
+        Ok(entries)
+    }
+
+    async fn get_backfill_root_entry(
+        &self,
+        ctx: &CoreContext,
+        id: &RowId,
+    ) -> Result<
+        Option<(
+            RowId,
+            RequestType,
+            RequestStatus,
+            Timestamp,
+            BlobstoreKey,
+            Option<String>,
+        )>,
+    > {
+        let rows = GetBackfillRootEntry::query(
+            &self.connections.read_connection,
+            ctx.sql_query_telemetry(),
+            id,
+        )
+        .await?;
+        Ok(rows.into_iter().next())
+    }
 }
 
 async fn get_queue_length(
     ctx: &CoreContext,
     conn: &Connection,
     repo_ids: Option<&[RepositoryId]>,
+    exclude_backfill: bool,
 ) -> Result<Vec<(RequestStatus, u64)>> {
-    Ok(match repo_ids {
-        Some(repos) => GetQueueLengthForRepos::query(conn, ctx.sql_query_telemetry(), repos).await,
-        None => GetQueueLengthForAllRepos::query(conn, ctx.sql_query_telemetry()).await,
+    Ok(match (repo_ids, exclude_backfill) {
+        (Some(repos), false) => {
+            GetQueueLengthForRepos::query(conn, ctx.sql_query_telemetry(), repos).await
+        }
+        (None, false) => GetQueueLengthForAllRepos::query(conn, ctx.sql_query_telemetry()).await,
+        (Some(repos), true) => {
+            GetQueueLengthForReposExcludingBackfill::query(conn, ctx.sql_query_telemetry(), repos)
+                .await
+        }
+        (None, true) => {
+            GetQueueLengthForAllReposExcludingBackfill::query(conn, ctx.sql_query_telemetry()).await
+        }
     }
     .context("fetching queue length stats")?
     .into_iter()
@@ -986,12 +2149,27 @@ async fn get_queue_length_by_repo(
     ctx: &CoreContext,
     conn: &Connection,
     repo_ids: Option<&[RepositoryId]>,
+    exclude_backfill: bool,
 ) -> Result<Vec<(QueueStatsEntry, u64)>> {
-    Ok(match repo_ids {
-        Some(repos) => {
+    Ok(match (repo_ids, exclude_backfill) {
+        (Some(repos), false) => {
             GetQueueLengthByRepoForRepos::query(conn, ctx.sql_query_telemetry(), repos).await
         }
-        None => GetQueueLengthByRepoForAllRepos::query(conn, ctx.sql_query_telemetry()).await,
+        (None, false) => {
+            GetQueueLengthByRepoForAllRepos::query(conn, ctx.sql_query_telemetry()).await
+        }
+        (Some(repos), true) => {
+            GetQueueLengthByRepoForReposExcludingBackfill::query(
+                conn,
+                ctx.sql_query_telemetry(),
+                repos,
+            )
+            .await
+        }
+        (None, true) => {
+            GetQueueLengthByRepoForAllReposExcludingBackfill::query(conn, ctx.sql_query_telemetry())
+                .await
+        }
     }
     .context("fetching queue length stats")?
     .into_iter()
@@ -1002,10 +2180,20 @@ async fn get_queue_age(
     ctx: &CoreContext,
     conn: &Connection,
     repo_ids: Option<&[RepositoryId]>,
+    exclude_backfill: bool,
 ) -> Result<Vec<(RequestStatus, Timestamp)>> {
-    Ok(match repo_ids {
-        Some(repos) => GetQueueAgeForRepos::query(conn, ctx.sql_query_telemetry(), repos).await,
-        None => GetQueueAgeForAllRepos::query(conn, ctx.sql_query_telemetry()).await,
+    Ok(match (repo_ids, exclude_backfill) {
+        (Some(repos), false) => {
+            GetQueueAgeForRepos::query(conn, ctx.sql_query_telemetry(), repos).await
+        }
+        (None, false) => GetQueueAgeForAllRepos::query(conn, ctx.sql_query_telemetry()).await,
+        (Some(repos), true) => {
+            GetQueueAgeForReposExcludingBackfill::query(conn, ctx.sql_query_telemetry(), repos)
+                .await
+        }
+        (None, true) => {
+            GetQueueAgeForAllReposExcludingBackfill::query(conn, ctx.sql_query_telemetry()).await
+        }
     }
     .context("fetching queue age stats")?
     .into_iter()
@@ -1027,12 +2215,25 @@ async fn get_queue_age_by_repo(
     ctx: &CoreContext,
     conn: &Connection,
     repo_ids: Option<&[RepositoryId]>,
+    exclude_backfill: bool,
 ) -> Result<Vec<(QueueStatsEntry, Timestamp)>> {
-    Ok(match repo_ids {
-        Some(repos) => {
+    Ok(match (repo_ids, exclude_backfill) {
+        (Some(repos), false) => {
             GetQueueAgeByRepoForRepos::query(conn, ctx.sql_query_telemetry(), repos).await
         }
-        None => GetQueueAgeByRepoForAllRepos::query(conn, ctx.sql_query_telemetry()).await,
+        (None, false) => GetQueueAgeByRepoForAllRepos::query(conn, ctx.sql_query_telemetry()).await,
+        (Some(repos), true) => {
+            GetQueueAgeByRepoForReposExcludingBackfill::query(
+                conn,
+                ctx.sql_query_telemetry(),
+                repos,
+            )
+            .await
+        }
+        (None, true) => {
+            GetQueueAgeByRepoForAllReposExcludingBackfill::query(conn, ctx.sql_query_telemetry())
+                .await
+        }
     }
     .context("fetching queue age stats")?
     .into_iter()
@@ -1060,8 +2261,10 @@ async fn get_queue_age_by_repo(
 impl SqlConstruct for SqlLongRunningRequestsQueue {
     const LABEL: &'static str = "long_running_requests_queue";
 
-    const CREATION_QUERY: &'static str =
-        include_str!("../schemas/sqlite-long_running_requests_queue.sql");
+    const CREATION_QUERY: &'static str = concat!(
+        include_str!("../schemas/sqlite-long_running_requests_queue.sql"),
+        include_str!("../schemas/sqlite-long_running_request_dependencies.sql"),
+    );
 
     fn from_sql_connections(connections: SqlConnections) -> Self {
         Self { connections }
@@ -1097,9 +2300,10 @@ mod test {
         let id = queue
             .add_request(
                 &ctx,
-                &RequestType("type".to_string()),
+                &RequestType("async_ping".to_string()),
                 None,
                 &BlobstoreKey("key".to_string()),
+                None,
             )
             .await?;
 
@@ -1109,7 +2313,12 @@ mod test {
         assert!(request.inprogress_last_updated_at.is_none());
 
         let result = queue
-            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), None)
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
             .await;
         assert!(result.is_ok());
         let result = result.unwrap();
@@ -1127,9 +2336,10 @@ mod test {
         let id = queue
             .add_request(
                 &ctx,
-                &RequestType("type".to_string()),
+                &RequestType("async_ping".to_string()),
                 Some(&RepositoryId::new(0)),
                 &BlobstoreKey("key".to_string()),
+                None,
             )
             .await?;
 
@@ -1138,36 +2348,13 @@ mod test {
         let request = request.unwrap();
         assert!(request.inprogress_last_updated_at.is_none());
 
-        // passing None does *not* match any repo id; it only matches global queue
-        let result = queue
-            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), None)
-            .await;
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_none());
-
-        // different repo id
+        // Dequeue picks up requests for any repo
         let result = queue
             .claim_and_get_new_request(
                 &ctx,
                 &ClaimedBy("me".to_string()),
-                Some(&[RepositoryId::new(1)]),
-            )
-            .await;
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_none());
-
-        // correct repo id
-        let result = queue
-            .claim_and_get_new_request(
-                &ctx,
-                &ClaimedBy("me".to_string()),
-                Some(&[
-                    RepositoryId::new(0),
-                    RepositoryId::new(1),
-                    RepositoryId::new(2),
-                ]),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
             )
             .await;
         assert!(result.is_ok());
@@ -1175,6 +2362,17 @@ mod test {
         assert!(result.is_some());
         let result = result.unwrap();
         assert!(result.id == id);
+
+        // Queue is now empty
+        let result = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(result.is_none());
 
         Ok(())
     }
@@ -1186,9 +2384,10 @@ mod test {
         let id = queue
             .add_request(
                 &ctx,
-                &RequestType("type".to_string()),
+                &RequestType("async_ping".to_string()),
                 None,
                 &BlobstoreKey("key".to_string()),
+                None,
             )
             .await?;
 
@@ -1198,7 +2397,12 @@ mod test {
         assert!(request.inprogress_last_updated_at.is_none());
 
         queue
-            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), None)
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
             .await?;
 
         let request = queue.test_get_request_entry_by_id(&ctx, &id).await?;
@@ -1229,15 +2433,21 @@ mod test {
         let id = queue
             .add_request(
                 &ctx,
-                &RequestType("type".to_string()),
+                &RequestType("async_ping".to_string()),
                 Some(&repo_id),
                 &BlobstoreKey("key".to_string()),
+                None,
             )
             .await?;
 
         // This claims new request from queue and makes it inprogress
         let req = queue
-            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), Some(&[repo_id]))
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
             .await?;
         assert!(req.is_some());
 
@@ -1247,31 +2457,24 @@ mod test {
         let abandoned_timestamp = Timestamp::from_timestamp_secs(now.timestamp_seconds() - 1);
         // Search in any repo
         let abandoned = queue
-            .find_abandoned_requests(&ctx, None, abandoned_timestamp)
+            .find_abandoned_requests(
+                &ctx,
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+                abandoned_timestamp,
+            )
             .await?;
         assert_eq!(abandoned.len(), 1);
         assert_eq!(abandoned[0].0, id);
 
-        // Search in the wrong repo
-        let now = Timestamp::now();
-        let abandoned_timestamp = Timestamp::from_timestamp_secs(now.timestamp_seconds() - 1);
-        let abandoned = queue
-            .find_abandoned_requests(&ctx, Some(&[RepositoryId::new(1)]), abandoned_timestamp)
-            .await?;
-        assert_eq!(abandoned.len(), 1);
-        assert_eq!(abandoned[0].0, id);
-
-        // Search in a set of repos
+        // Verify abandoned request is still found
         let now = Timestamp::now();
         let abandoned_timestamp = Timestamp::from_timestamp_secs(now.timestamp_seconds() - 1);
         let abandoned = queue
             .find_abandoned_requests(
                 &ctx,
-                Some(&[
-                    RepositoryId::new(1),
-                    RepositoryId::new(2),
-                    RepositoryId::new(5),
-                ]),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
                 abandoned_timestamp,
             )
             .await?;
@@ -1286,7 +2489,12 @@ mod test {
         assert!(updated);
         assert_eq!(
             queue
-                .find_abandoned_requests(&ctx, None, abandoned_timestamp)
+                .find_abandoned_requests(
+                    &ctx,
+                    &QueueRepoFilter::Except(vec![]),
+                    &QueueRequestTypeFilter::All,
+                    abandoned_timestamp,
+                )
                 .await?,
             vec![]
         );
@@ -1324,15 +2532,21 @@ mod test {
         let id = queue
             .add_request(
                 &ctx,
-                &RequestType("type".to_string()),
+                &RequestType("async_ping".to_string()),
                 Some(&repo_id),
                 &BlobstoreKey("key".to_string()),
+                None,
             )
             .await?;
 
         // This claims new request from queue and makes it inprogress
         let req = queue
-            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), Some(&[repo_id]))
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
             .await?;
         assert!(req.is_some());
 
@@ -1340,7 +2554,12 @@ mod test {
         let now = Timestamp::now();
         let abandoned_timestamp = Timestamp::from_timestamp_secs(now.timestamp_seconds() - 1);
         let abandoned = queue
-            .find_abandoned_requests(&ctx, Some(&[repo_id]), abandoned_timestamp)
+            .find_abandoned_requests(
+                &ctx,
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+                abandoned_timestamp,
+            )
             .await?;
         assert_eq!(abandoned.len(), 1);
         assert_eq!(abandoned[0].0, id);
@@ -1367,13 +2586,16 @@ mod test {
         let _ = queue
             .add_request(
                 &ctx,
-                &RequestType("type".to_string()),
+                &RequestType("async_ping".to_string()),
                 Some(&repo_id),
                 &BlobstoreKey("key".to_string()),
+                None,
             )
             .await?;
 
-        let stats = queue.get_queue_stats(&ctx, Some(&[repo_id])).await?;
+        let stats = queue
+            .get_queue_stats(&ctx, &QueueRepoFilter::Except(vec![]), false)
+            .await?;
         assert_eq!(stats.queue_length_by_status.len(), 1);
         let entry = &stats.queue_length_by_status[0];
         assert_eq!(entry.0, RequestStatus::New);
@@ -1387,13 +2609,20 @@ mod test {
         // This claims new request from queue and makes it inprogress
         let now = Timestamp::now();
         let req = queue
-            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), Some(&[repo_id]))
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
             .await?;
         assert!(req.is_some());
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        let stats = queue.get_queue_stats(&ctx, Some(&[repo_id])).await?;
+        let stats = queue
+            .get_queue_stats(&ctx, &QueueRepoFilter::Except(vec![]), false)
+            .await?;
         assert_eq!(stats.queue_length_by_status.len(), 1);
         let entry = &stats.queue_length_by_status[0];
         assert_eq!(entry.0, RequestStatus::InProgress);
@@ -1415,6 +2644,695 @@ mod test {
         assert_eq!(entry.0.repo_id.unwrap(), repo_id);
         assert_eq!(entry.0.status, RequestStatus::InProgress);
         assert!((entry.1.since_seconds() - now.since_seconds()) < 1);
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_root_request_enqueue_is_idempotent(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
+        let repo_id = RepositoryId::new(0);
+        let root_id = queue
+            .add_request(
+                &ctx,
+                &RequestType("derive_backfill".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("root-key".to_string()),
+                None,
+            )
+            .await?;
+        let request_type = RequestType("derive_boundaries".to_string());
+        let blobstore_key = BlobstoreKey("boundary-key".to_string());
+
+        let first_id = queue
+            .add_request_with_root(
+                &ctx,
+                &request_type,
+                Some(&repo_id),
+                &blobstore_key,
+                &root_id,
+                None,
+            )
+            .await?;
+        let second_id = queue
+            .add_request_with_root(
+                &ctx,
+                &request_type,
+                Some(&repo_id),
+                &blobstore_key,
+                &root_id,
+                None,
+            )
+            .await?;
+
+        assert_eq!(first_id, second_id);
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_root_request_dependencies_are_idempotent(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
+        let repo_id = RepositoryId::new(0);
+        let root_id = queue
+            .add_request(
+                &ctx,
+                &RequestType("derive_backfill".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("root-key".to_string()),
+                None,
+            )
+            .await?;
+        let dep_id = queue
+            .add_request(
+                &ctx,
+                &RequestType("derive_boundaries".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("boundary-key".to_string()),
+                None,
+            )
+            .await?;
+        let request_type = RequestType("derive_slice".to_string());
+        let blobstore_key = BlobstoreKey("slice-key".to_string());
+
+        let first_id = queue
+            .add_request_with_dependencies_and_root(
+                &ctx,
+                &request_type,
+                Some(&repo_id),
+                &blobstore_key,
+                &[dep_id],
+                &root_id,
+                None,
+            )
+            .await?;
+        let second_id = queue
+            .add_request_with_dependencies_and_root(
+                &ctx,
+                &request_type,
+                Some(&repo_id),
+                &blobstore_key,
+                &[dep_id],
+                &root_id,
+                None,
+            )
+            .await?;
+        let dependencies = queue.get_dependencies(&ctx, &first_id).await?;
+
+        assert_eq!(first_id, second_id);
+        assert_eq!(dependencies, vec![dep_id]);
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_dependency_blocks_dequeue(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
+        let repo_id = RepositoryId::new(0);
+
+        // Add a parent request (no dependencies)
+        let parent_id = queue
+            .add_request(
+                &ctx,
+                &RequestType("async_ping".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("parent_key".to_string()),
+                None,
+            )
+            .await?;
+
+        // Add a child request that depends on the parent
+        let child_id = queue
+            .add_request_with_dependencies(
+                &ctx,
+                &RequestType("derive_boundaries".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("child_key".to_string()),
+                &[parent_id],
+                None,
+            )
+            .await?;
+
+        // Both should be in 'new' status
+        let parent_entry = queue
+            .test_get_request_entry_by_id(&ctx, &parent_id)
+            .await?
+            .unwrap();
+        assert_eq!(parent_entry.status, RequestStatus::New);
+        let child_entry = queue
+            .test_get_request_entry_by_id(&ctx, &child_id)
+            .await?
+            .unwrap();
+        assert_eq!(child_entry.status, RequestStatus::New);
+
+        // Dequeue should return the parent (no unmet deps), not the child
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_some());
+        let claimed = claimed.unwrap();
+        assert_eq!(claimed.id, parent_id);
+
+        // Dequeue again — child should NOT be dequeued (parent is inprogress, not ready/polled)
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_none());
+
+        // Complete the parent (mark as ready)
+        let parent_req_id = RequestId(parent_id, RequestType("async_ping".to_string()));
+        queue
+            .mark_ready(&ctx, &parent_req_id, BlobstoreKey("result_key".to_string()))
+            .await?;
+
+        // Now dequeue should return the child
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_some());
+        let claimed = claimed.unwrap();
+        assert_eq!(claimed.id, child_id);
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_failure_cascades_to_dependents(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
+        let repo_id = RepositoryId::new(0);
+
+        // Create parent request
+        let parent_id = queue
+            .add_request(
+                &ctx,
+                &RequestType("async_ping".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("parent_key".to_string()),
+                None,
+            )
+            .await?;
+
+        // Create two children depending on parent
+        let child1_id = queue
+            .add_request_with_dependencies(
+                &ctx,
+                &RequestType("derive_boundaries".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("child1_key".to_string()),
+                &[parent_id],
+                None,
+            )
+            .await?;
+
+        let child2_id = queue
+            .add_request_with_dependencies(
+                &ctx,
+                &RequestType("derive_boundaries".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("child2_key".to_string()),
+                &[parent_id],
+                None,
+            )
+            .await?;
+
+        // Fail the parent with cascade
+        let failed = queue.mark_failed_with_cascade(&ctx, &parent_id).await?;
+        assert!(failed);
+
+        // Parent should be failed
+        let parent_entry = queue
+            .test_get_request_entry_by_id(&ctx, &parent_id)
+            .await?
+            .unwrap();
+        assert_eq!(parent_entry.status, RequestStatus::Failed);
+
+        // Both children should also be failed
+        let child1_entry = queue
+            .test_get_request_entry_by_id(&ctx, &child1_id)
+            .await?
+            .unwrap();
+        assert_eq!(child1_entry.status, RequestStatus::Failed);
+
+        let child2_entry = queue
+            .test_get_request_entry_by_id(&ctx, &child2_id)
+            .await?
+            .unwrap();
+        assert_eq!(child2_entry.status, RequestStatus::Failed);
+
+        // Nothing should be dequeueable
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_none());
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_serial_slice_chaining(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
+        let repo_id = RepositoryId::new(0);
+
+        // Create a chain: boundary -> slice1 -> slice2 -> slice3
+        let boundary_id = queue
+            .add_request(
+                &ctx,
+                &RequestType("derive_boundaries".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("boundary_key".to_string()),
+                None,
+            )
+            .await?;
+
+        let slice1_id = queue
+            .add_request_with_dependencies(
+                &ctx,
+                &RequestType("derive_slice".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("slice1_key".to_string()),
+                &[boundary_id],
+                None,
+            )
+            .await?;
+
+        let slice2_id = queue
+            .add_request_with_dependencies(
+                &ctx,
+                &RequestType("derive_slice".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("slice2_key".to_string()),
+                &[boundary_id, slice1_id],
+                None,
+            )
+            .await?;
+
+        let slice3_id = queue
+            .add_request_with_dependencies(
+                &ctx,
+                &RequestType("derive_slice".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("slice3_key".to_string()),
+                &[boundary_id, slice2_id],
+                None,
+            )
+            .await?;
+
+        // Verify dependencies were recorded correctly
+        let slice1_deps = queue.get_dependencies(&ctx, &slice1_id).await?;
+        assert_eq!(slice1_deps, vec![boundary_id]);
+
+        let slice2_deps = queue.get_dependencies(&ctx, &slice2_id).await?;
+        assert_eq!(slice2_deps.len(), 2);
+        assert!(slice2_deps.contains(&boundary_id));
+        assert!(slice2_deps.contains(&slice1_id));
+
+        let slice3_deps = queue.get_dependencies(&ctx, &slice3_id).await?;
+        assert_eq!(slice3_deps.len(), 2);
+        assert!(slice3_deps.contains(&boundary_id));
+        assert!(slice3_deps.contains(&slice2_id));
+
+        // Only boundary should be dequeueable initially
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_some());
+        assert_eq!(claimed.unwrap().id, boundary_id);
+
+        // No more dequeueable (boundary is inprogress, slices blocked)
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_none());
+
+        // Complete boundary
+        let boundary_req_id = RequestId(boundary_id, RequestType("derive_boundaries".to_string()));
+        queue
+            .mark_ready(
+                &ctx,
+                &boundary_req_id,
+                BlobstoreKey("boundary_result".to_string()),
+            )
+            .await?;
+
+        // Now slice1 should be dequeueable (boundary is ready)
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_some());
+        assert_eq!(claimed.unwrap().id, slice1_id);
+
+        // slice2 still blocked (slice1 is inprogress)
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_none());
+
+        // Complete slice1
+        let slice1_req_id = RequestId(slice1_id, RequestType("derive_slice".to_string()));
+        queue
+            .mark_ready(
+                &ctx,
+                &slice1_req_id,
+                BlobstoreKey("slice1_result".to_string()),
+            )
+            .await?;
+
+        // Now slice2 should be dequeueable
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_some());
+        assert_eq!(claimed.unwrap().id, slice2_id);
+
+        // Complete slice2
+        let slice2_req_id = RequestId(slice2_id, RequestType("derive_slice".to_string()));
+        queue
+            .mark_ready(
+                &ctx,
+                &slice2_req_id,
+                BlobstoreKey("slice2_result".to_string()),
+            )
+            .await?;
+
+        // Now slice3 should be dequeueable
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_some());
+        assert_eq!(claimed.unwrap().id, slice3_id);
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_failure_cascade_multi_level(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
+        let repo_id = RepositoryId::new(0);
+
+        // Create the chain from backfill_enqueue:
+        // Boundary (no deps)
+        // Slice1 → [Boundary]
+        // Slice2 → [Boundary, Slice1]
+        // Slice3 → [Boundary, Slice2]
+        let boundary_id = queue
+            .add_request(
+                &ctx,
+                &RequestType("derive_boundaries".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("boundary_key".to_string()),
+                None,
+            )
+            .await?;
+
+        let slice1_id = queue
+            .add_request_with_dependencies(
+                &ctx,
+                &RequestType("derive_slice".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("slice1_key".to_string()),
+                &[boundary_id],
+                None,
+            )
+            .await?;
+
+        let slice2_id = queue
+            .add_request_with_dependencies(
+                &ctx,
+                &RequestType("derive_slice".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("slice2_key".to_string()),
+                &[boundary_id, slice1_id],
+                None,
+            )
+            .await?;
+
+        let slice3_id = queue
+            .add_request_with_dependencies(
+                &ctx,
+                &RequestType("derive_slice".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("slice3_key".to_string()),
+                &[boundary_id, slice2_id],
+                None,
+            )
+            .await?;
+
+        // Complete boundary so slice1 can be dequeued
+        let boundary_req_id = RequestId(boundary_id, RequestType("derive_boundaries".to_string()));
+        // Claim boundary first so we can mark it ready (needs inprogress status)
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert_eq!(claimed.unwrap().id, boundary_id);
+        queue
+            .mark_ready(
+                &ctx,
+                &boundary_req_id,
+                BlobstoreKey("boundary_result".to_string()),
+            )
+            .await?;
+
+        // Claim slice1 and then fail it with cascade
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert_eq!(claimed.unwrap().id, slice1_id);
+
+        // Fail slice1 — should cascade to slice2 (direct dependent)
+        // AND slice3 (transitive dependent via slice2)
+        let failed = queue.mark_failed_with_cascade(&ctx, &slice1_id).await?;
+        assert!(failed);
+
+        // Slice1 should be failed
+        let entry = queue
+            .test_get_request_entry_by_id(&ctx, &slice1_id)
+            .await?
+            .unwrap();
+        assert_eq!(entry.status, RequestStatus::Failed);
+
+        // Slice2 should be failed (direct dependent of slice1)
+        let entry = queue
+            .test_get_request_entry_by_id(&ctx, &slice2_id)
+            .await?
+            .unwrap();
+        assert_eq!(entry.status, RequestStatus::Failed);
+
+        // Slice3 should ALSO be failed (transitive dependent via slice2)
+        let entry = queue
+            .test_get_request_entry_by_id(&ctx, &slice3_id)
+            .await?
+            .unwrap();
+        assert_eq!(entry.status, RequestStatus::Failed);
+
+        // Nothing should be dequeueable
+        let claimed = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("test".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(claimed.is_none());
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_claim_repo_filter(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
+
+        let repo_id = RepositoryId::new(0);
+        let id = queue
+            .add_request(
+                &ctx,
+                &RequestType("async_ping".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("key".to_string()),
+                None,
+            )
+            .await?;
+
+        // Only([wrong_repo]) should not match
+        let result = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Only(vec![RepositoryId::new(1)]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(result.is_none());
+
+        // Except([this_repo]) should not match
+        let result = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Except(vec![repo_id]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(result.is_none());
+
+        // Only([correct_repo]) should match
+        let result = queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Only(vec![repo_id]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, id);
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_find_abandoned_repo_filter(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
+
+        let repo_id = RepositoryId::new(5);
+        let id = queue
+            .add_request(
+                &ctx,
+                &RequestType("async_ping".to_string()),
+                Some(&repo_id),
+                &BlobstoreKey("key".to_string()),
+                None,
+            )
+            .await?;
+
+        // Claim the request to make it inprogress
+        queue
+            .claim_and_get_new_request(
+                &ctx,
+                &ClaimedBy("me".to_string()),
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+            )
+            .await?;
+
+        // Wait so the request becomes "abandoned"
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let now = Timestamp::now();
+        let abandoned_timestamp = Timestamp::from_timestamp_secs(now.timestamp_seconds() - 1);
+
+        // Except([this_repo]) should not find it
+        let abandoned = queue
+            .find_abandoned_requests(
+                &ctx,
+                &QueueRepoFilter::Except(vec![repo_id]),
+                &QueueRequestTypeFilter::All,
+                abandoned_timestamp,
+            )
+            .await?;
+        assert!(abandoned.is_empty());
+
+        // Only([wrong_repo]) should not find it
+        let abandoned = queue
+            .find_abandoned_requests(
+                &ctx,
+                &QueueRepoFilter::Only(vec![RepositoryId::new(99)]),
+                &QueueRequestTypeFilter::All,
+                abandoned_timestamp,
+            )
+            .await?;
+        assert!(abandoned.is_empty());
+
+        // Only([correct_repo]) should find it
+        let abandoned = queue
+            .find_abandoned_requests(
+                &ctx,
+                &QueueRepoFilter::Only(vec![repo_id]),
+                &QueueRequestTypeFilter::All,
+                abandoned_timestamp,
+            )
+            .await?;
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].0, id);
+
+        // Except([]) should also find it
+        let abandoned = queue
+            .find_abandoned_requests(
+                &ctx,
+                &QueueRepoFilter::Except(vec![]),
+                &QueueRequestTypeFilter::All,
+                abandoned_timestamp,
+            )
+            .await?;
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].0, id);
 
         Ok(())
     }

@@ -5,12 +5,14 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bonsai_git_mapping::BonsaiGitMappingArc;
 use bonsai_hg_mapping::BonsaiHgMappingArc;
 use borrowed::borrowed;
-use cloned::cloned;
+use chrono::Utc;
 use commit_cloud::CommitCloudRef;
 use commit_cloud::Phase;
 use commit_cloud::ctx::CommitCloudContext;
@@ -34,7 +36,6 @@ use commit_graph::CommitGraphRef;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
-use futures_util::future::try_join_all;
 use metaconfig_types::CommitIdentityScheme;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::ChangesetId;
@@ -116,6 +117,7 @@ impl<R: MononokeRepo> RepoContext<R> {
         workspace: &str,
         reponame: &str,
         flags: &[SmartlogFlag],
+        max_age_days: Option<i32>,
     ) -> Result<SmartlogData, MononokeError> {
         let mut cc_ctx = self.commit_cloud_context_with_scheme(workspace, reponame)?;
         let authz = self.authorization_context();
@@ -137,6 +139,7 @@ impl<R: MononokeRepo> RepoContext<R> {
                 raw_data.local_bookmarks,
                 raw_data.remote_bookmarks,
                 flags,
+                max_age_days,
             )
             .await?;
 
@@ -154,6 +157,7 @@ impl<R: MononokeRepo> RepoContext<R> {
         local_bookmarks: LocalBookmarksMap,
         remote_bookmarks: RemoteBookmarksMap,
         flags: &[SmartlogFlag],
+        max_age_days: Option<i32>,
     ) -> anyhow::Result<Vec<SmartlogNode>> {
         let ctx = self.ctx();
         let repo = self.repo();
@@ -166,6 +170,37 @@ impl<R: MononokeRepo> RepoContext<R> {
             c_ids,
         )
         .await?;
+
+        let cl_ids_mapping = if let Some(max_age_days) = max_age_days {
+            let cutoff = Utc::now().timestamp() - i64::from(max_age_days) * 86400;
+            let dated: Vec<_> = stream::iter(cl_ids_mapping)
+                .map(|(cloud_id, cs_id)| async move {
+                    let cs_ctx = self
+                        .changeset(ChangesetSpecifier::Bonsai(cs_id))
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("changeset not found for bonsai id {cs_id}")
+                        })?;
+                    let date = cs_ctx
+                        .changeset_info()
+                        .await?
+                        .author_date()
+                        .as_chrono()
+                        .timestamp();
+                    Ok::<_, anyhow::Error>((cloud_id, cs_id, date))
+                })
+                .buffer_unordered(100)
+                .try_collect()
+                .await?;
+
+            dated
+                .into_iter()
+                .filter(|(_, _, date)| *date >= cutoff)
+                .map(|(cloud_id, cs_id, _)| (cloud_id, cs_id))
+                .collect::<Vec<_>>()
+        } else {
+            cl_ids_mapping
+        };
 
         let cs_ids = cl_ids_mapping
             .iter()
@@ -199,12 +234,11 @@ impl<R: MononokeRepo> RepoContext<R> {
             .await?;
 
         let public_commits_ctx = if !flags.contains(&SmartlogFlag::SkipPublicCommitsMetadata) {
-            try_join_all(
-                public_frontier
-                    .into_iter()
-                    .map(|cs_id| self.changeset(ChangesetSpecifier::Bonsai(cs_id))),
-            )
-            .await?
+            stream::iter(public_frontier)
+                .map(|cs_id| self.changeset(ChangesetSpecifier::Bonsai(cs_id)))
+                .buffer_unordered(100)
+                .try_collect::<Vec<Option<ChangesetContext<R>>>>()
+                .await?
         } else {
             Vec::new()
         };
@@ -216,10 +250,14 @@ impl<R: MononokeRepo> RepoContext<R> {
             (Phase::Public, public_commits_ctx),
             (Phase::Draft, draft_commits_ctx),
         ] {
+            let changesets = changesets
+                .into_iter()
+                .flatten()
+                .collect::<Vec<ChangesetContext<R>>>();
+
             let ids = changesets
                 .iter()
-                .flatten()
-                .map(|cs| cs.id())
+                .map(ChangesetContext::id)
                 .collect::<Vec<ChangesetId>>();
 
             let cloud_ids = get_cloud_ids_from_bonsais(
@@ -230,30 +268,74 @@ impl<R: MononokeRepo> RepoContext<R> {
                 repo.bonsai_git_mapping_arc(),
             )
             .await?;
+            let cloud_ids = Arc::new(cloud_ids);
 
-            let changesets = stream::iter(changesets.into_iter().flatten())
+            let parents_by_changeset: Vec<(ChangesetId, Vec<ChangesetId>)> =
+                stream::iter(changesets.iter().cloned())
+                    .map(|changeset| async move {
+                        let id = changeset.id();
+                        let parent_ids = changeset.parents().await?;
+                        Ok::<_, MononokeError>((id, parent_ids))
+                    })
+                    .buffer_unordered(100)
+                    .try_collect()
+                    .await?;
+            let all_parent_ids: HashSet<ChangesetId> = parents_by_changeset
+                .iter()
+                .flat_map(|(_, parent_ids)| parent_ids.iter().copied())
+                .collect();
+            let parent_ids = all_parent_ids.into_iter().collect::<Vec<ChangesetId>>();
+
+            let parent_cloud_ids = get_cloud_ids_from_bonsais(
+                ctx,
+                &cc_ctx,
+                parent_ids,
+                repo.bonsai_hg_mapping_arc(),
+                repo.bonsai_git_mapping_arc(),
+            )
+            .await?;
+
+            let parents_by_changeset = parents_by_changeset
+                .into_iter()
+                .map(|(cs_id, parent_ids)| {
+                    let parent_cloud_ids = parent_ids
+                        .into_iter()
+                        .map(|parent_id| {
+                            parent_cloud_ids
+                                .get(&parent_id)
+                                .cloned()
+                                .ok_or(anyhow::anyhow!("no changeset id found for bonsai parent"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<(ChangesetId, Vec<CloudChangesetId>), anyhow::Error>((
+                        cs_id,
+                        parent_cloud_ids,
+                    ))
+                })
+                .collect::<Result<HashMap<ChangesetId, Vec<CloudChangesetId>>, _>>()?;
+            let parents_by_changeset = Arc::new(parents_by_changeset);
+
+            let changesets = stream::iter(changesets)
                 .map(|changeset| {
-                    cloned!(rbs, lbs, phase, cloud_ids, cc_ctx);
+                    let rbs = Arc::clone(&rbs);
+                    let lbs = Arc::clone(&lbs);
+                    let cloud_ids = Arc::clone(&cloud_ids);
+                    let parents_by_changeset = Arc::clone(&parents_by_changeset);
+                    let phase = phase.clone();
                     async move {
                         let cloud_id = cloud_ids
                             .get(&changeset.id())
                             .ok_or(anyhow::anyhow!("no changeset id found for bonsai"))?;
-
-                        let parents = changeset.parents().await?;
-                        let parents_c_ids = get_cloud_ids_from_bonsais(
-                            ctx,
-                            &cc_ctx,
-                            parents,
-                            repo.bonsai_hg_mapping_arc(),
-                            repo.bonsai_git_mapping_arc(),
-                        )
-                        .await?
-                        .into_values()
-                        .collect::<Vec<_>>();
+                        let parent_cloud_ids =
+                            parents_by_changeset
+                                .get(&changeset.id())
+                                .ok_or(anyhow::anyhow!(
+                                    "no parent changeset ids found for smartlog node"
+                                ))?;
 
                         self.repo().commit_cloud().make_smartlog_node(
                             cloud_id,
-                            &parents_c_ids,
+                            parent_cloud_ids,
                             &changeset.changeset_info().await?,
                             &lbs.get(cloud_id).cloned(),
                             &rbs.get(cloud_id).cloned(),
@@ -349,7 +431,7 @@ impl<R: MononokeRepo> RepoContext<R> {
         let hg_ids = history.collapse_into_vec(&rbs, &lbs, flags);
 
         let nodes = self
-            .form_smartlog_with_info(cc_ctx, hg_ids, lbs, rbs, flags)
+            .form_smartlog_with_info(cc_ctx, hg_ids, lbs, rbs, flags, None)
             .await?;
 
         Ok(SmartlogData {

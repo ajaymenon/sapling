@@ -33,14 +33,15 @@ use fsnodes::RootFsnodeId;
 use futures::future;
 use futures::stream::TryStreamExt;
 use futures_stats::TimedFutureExt;
+use history_manifest::RootHistoryManifestDirectoryId;
 use manifest::ManifestOps;
 use mercurial_derivation::MappedHgChangesetId;
 use mercurial_derivation::RootHgAugmentedManifestId;
 use mononoke_types::ChangesetId;
 use rand::Rng;
-use rand::distributions::Alphanumeric;
-use rand::distributions::Uniform;
-use rand::thread_rng;
+use rand::RngExt as _;
+use rand::distr::Alphanumeric;
+use rand::distr::Uniform;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedData;
@@ -92,8 +93,8 @@ async fn make_initial_large_directory(
     count: usize,
 ) -> Result<(ChangesetId, BTreeSet<String>)> {
     let mut filenames = BTreeSet::new();
-    let mut rng = thread_rng();
-    let len_distr = Uniform::new(5, 50);
+    let mut rng = rand::rng();
+    let len_distr = Uniform::new(5, 50).unwrap();
     while filenames.len() < count {
         let len = rng.sample(len_distr);
         let filename = gen_filename(&mut rng, len);
@@ -103,8 +104,8 @@ async fn make_initial_large_directory(
     let mut create = CreateCommitContext::new_root(ctx, repo);
     for filename in filenames.iter() {
         create = create.add_file(
-            format!("large_directory/{}", filename).as_str(),
-            format!("content of {}", filename),
+            format!("large_directory/{filename}").as_str(),
+            format!("content of {filename}"),
         );
     }
     let csid = create.commit().await?;
@@ -123,8 +124,8 @@ async fn modify_large_directory(
     delete_count: usize,
 ) -> Result<ChangesetId> {
     let mut create = CreateCommitContext::new(ctx, repo, vec![csid]);
-    let mut rng = thread_rng();
-    let len_distr = Uniform::new(5, 50);
+    let mut rng = rand::rng();
+    let len_distr = Uniform::new(5, 50).unwrap();
 
     let mut add_filenames = BTreeSet::new();
     while add_filenames.len() < add_count {
@@ -138,7 +139,7 @@ async fn modify_large_directory(
     let delete_count = delete_count.min(filenames.len());
     let modify_count = modify_count.min(filenames.len() - delete_count);
     let mut modify_filename_indexes = BTreeSet::new();
-    let index_distr = Uniform::new(0, filenames.len());
+    let index_distr = Uniform::new(0, filenames.len()).unwrap();
     while modify_filename_indexes.len() < modify_count {
         let index = rng.sample(index_distr);
         modify_filename_indexes.insert(index);
@@ -162,12 +163,12 @@ async fn modify_large_directory(
 
     for filename in add_filenames.iter().chain(modify_filenames) {
         create = create.add_file(
-            format!("large_directory/{}", filename).as_str(),
-            format!("content {} of {}", index, filename),
+            format!("large_directory/{filename}").as_str(),
+            format!("content {index} of {filename}"),
         );
     }
     for filename in delete_filenames.iter() {
-        create = create.delete_file(format!("large_directory/{}", filename).as_str());
+        create = create.delete_file(format!("large_directory/{filename}").as_str());
     }
 
     let csid = create.commit().await?;
@@ -232,7 +233,14 @@ async fn derive(ctx: &CoreContext, repo: &Repo, data: &str, csid: ChangesetId) -
             .unwrap()
             .into_content_manifest_id()
             .to_string(),
-        _ => panic!("invalid derived data type: {}", data),
+        RootHistoryManifestDirectoryId::NAME => repo
+            .repo_derived_data()
+            .derive::<RootHistoryManifestDirectoryId>(ctx, csid, DerivationPriority::LOW)
+            .await
+            .unwrap()
+            .into_history_manifest_directory_id()
+            .to_string(),
+        _ => panic!("invalid derived data type: {data}"),
     }
 }
 
@@ -324,7 +332,13 @@ async fn iterate(ctx: &CoreContext, repo: &Repo, data: &str, csid: ChangesetId) 
             .try_fold(0u64, |acc, _| future::ok(acc + 1))
             .await
             .unwrap(),
-        _ => panic!("invalid derived data type: {}", data),
+        RootHistoryManifestDirectoryId::NAME => {
+            // History manifest doesn't implement ManifestOps, so we skip
+            // iteration for now.
+            println!("  (iteration not supported for history_manifests)");
+            0
+        }
+        _ => panic!("invalid derived data type: {data}"),
     }
 }
 
@@ -335,15 +349,15 @@ async fn main(fb: FacebookInit) -> Result<()> {
     let mut args = std::env::args();
     let _ = args.next();
     let data = args.next().unwrap_or_else(|| String::from("fsnodes"));
-    println!("Deriving: {}", data);
+    println!("Deriving: {data}");
 
     let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
 
     let (mut csid, mut filenames) = make_initial_large_directory(&ctx, &repo, 100_000).await?;
 
-    println!("First commit: {}", csid);
+    println!("First commit: {csid}");
     let (stats, derived_id) = derive(&ctx, &repo, &data, csid).timed().await;
-    println!("Derived id: {}  stats: {:?}", derived_id, stats);
+    println!("Derived id: {derived_id}  stats: {stats:?}");
 
     let commit_count = 10;
 
@@ -352,12 +366,12 @@ async fn main(fb: FacebookInit) -> Result<()> {
             modify_large_directory(&ctx, &repo, &mut filenames, csid, commit, 25, 100, 25).await?;
     }
 
-    println!("Last commit: {}", csid);
+    println!("Last commit: {csid}");
     let (stats, derived_id) = derive(&ctx, &repo, &data, csid).timed().await;
-    println!("Derived id: {}  stats: {:?}", derived_id, stats);
+    println!("Derived id: {derived_id}  stats: {stats:?}");
 
     let (stats, count) = iterate(&ctx, &repo, &data, csid).timed().await;
-    println!("Iterated count: {}  stats: {:?}", count, stats);
+    println!("Iterated count: {count}  stats: {stats:?}");
 
     Ok(())
 }

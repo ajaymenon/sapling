@@ -12,75 +12,78 @@
 
 #include "eden/fs/privhelper/PrivHelperServer.h"
 
+#include <fcntl.h>
 #include <folly/Conv.h>
+#include <folly/File.h>
 #include <folly/FileUtil.h>
 #include <folly/String.h>
 #include <folly/logging/xlog.h>
+#include <sys/mount.h>
 #include <cerrno>
 #include <string>
 
 #include "eden/common/utils/ErrnoUtils.h"
 #include "eden/common/utils/FSDetect.h"
 #include "eden/common/utils/Throw.h"
+#include "eden/fs/utils/MountInfoTable.h"
 
-#ifdef __APPLE__
-#include <sys/mount.h>
-#else
+#ifdef __linux__
+
 #include <sys/statfs.h>
+
 #endif
 
 namespace facebook::eden {
 
 namespace {
 
-bool getSystemMountList(std::string& out) {
-#ifdef __APPLE__
+#ifdef __linux__
+#ifndef SYS_faccessat2
+#ifdef __NR_faccessat2
+#define SYS_faccessat2 __NR_faccessat2
+#elif defined(__x86_64__) || defined(__aarch64__)
+#define SYS_faccessat2 439
+#else
+#error "faccessat2 syscall number is required"
+#endif
+#endif
+#endif
+
+/**
+ * Determines whether the given mountPoint is contained in the mount table
+ * and looks like it was previously mounted by EdenFS.
+ */
+bool isOldEdenMount(const std::string& mountPoint) {
+#ifdef __linux__
+  MountInfoOptions options;
+  options.includeMountSource = true;
+  auto result = getMountInfoForPath(mountPoint.c_str(), options);
+  if (result.hasError()) {
+    XLOGF(
+        WARN,
+        "Failed to get mount info for {}: {}",
+        mountPoint,
+        folly::errnoStr(result.error()));
+    return false;
+  }
+  if (result.value().has_value() &&
+      is_edenfs_fs_type(result.value()->mountSource)) {
+    return true;
+  }
+#else
   struct statfs* buf;
   int count = getmntinfo(&buf, MNT_WAIT);
   if (count == 0) {
     XLOGF(ERR, "getmntinfo failed: {}", folly::errnoStr(errno));
-    return false;
-  }
-  for (int i = 0; i < count; i++) {
-    out += fmt::format(
-        "{} {} {}\n",
-        buf[i].f_mntfromname,
-        buf[i].f_mntonname,
-        buf[i].f_fstypename);
-  }
-  return true;
-#else
-  if (folly::readFile("/proc/mounts", out)) {
-    return true;
   } else {
-    XLOGF(ERR, "failed to read /proc/mounts: {}", folly::errnoStr(errno));
-    return false;
-  }
-#endif
-}
-
-/* Determines whether the given mountPoint is contained in the mount table
- * and looks like it was previously mounted by EdenFS.
- */
-bool isOldEdenMount(const std::string& mountPoint) {
-  std::string mounts;
-  if (getSystemMountList(mounts)) {
-    // TODO(T201411922): Update to std::string_view once our macOS build uses
-    // C++20.
-    // https://en.cppreference.com/w/cpp/string/basic_string_view/starts_with
-    std::vector<folly::StringPiece> lines;
-    folly::split('\n', mounts, lines);
-
-    for (const auto& line : lines) {
-      // We expect EdenFS mounts to look like the following:
-      // edenfs: {mountPoint} fuse ...
-      if (is_edenfs_fs_mount(line, mountPoint)) {
+    for (int i = 0; i < count; i++) {
+      if (std::string(buf[i].f_mntonname) == mountPoint &&
+          is_edenfs_fs_type(buf[i].f_fstypename)) {
         return true;
       }
     }
   }
-  // We couldn't verify that the mount is an old, disconnected EdenFS mount.
-  // We assume it isn't to be safe.
+#endif
   XLOGF(DBG4, "Could not verify that {} is an old EdenFS mount.", mountPoint);
   return false;
 }
@@ -106,10 +109,12 @@ bool isErrorSafeToIgnore(int err, bool isNFS, const std::string& mountPoint) {
  * This is copied from fusermount.c:
  * https://github.com/libfuse/libfuse/blob/master/util/fusermount.c#L990
  */
-void sanityCheckFs(const std::string& mountPoint) {
+void sanityCheckFs(const std::string& mountPoint, int mountPointFd = -1) {
 #ifndef __APPLE__
   struct statfs fsBuf;
-  if (statfs(mountPoint.c_str(), &fsBuf) < 0) {
+  const auto rc = mountPointFd >= 0 ? fstatfs(mountPointFd, &fsBuf)
+                                    : statfs(mountPoint.c_str(), &fsBuf);
+  if (rc < 0) {
     auto err = errno;
     throwf<std::domain_error>(
         "statfs failed for: {}: {}", mountPoint, folly::errnoStr(err));
@@ -161,9 +166,130 @@ void sanityCheckFs(const std::string& mountPoint) {
       "Cannot mount over filesystem type: {}", fsBuf.f_type);
 #else
   (void)mountPoint;
+  (void)mountPointFd;
 #endif
 }
+
+#ifdef __linux__
+folly::File openCheckedMountTarget(const std::string& mountPoint) {
+  const auto fd = open(mountPoint.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    auto err = errno;
+    throwf<std::domain_error>(
+        "User:{} cannot open {}: {}",
+        getuid(),
+        mountPoint,
+        folly::errnoStr(err));
+  }
+  return folly::File{fd, /*ownsFd=*/true};
+}
+
+void checkMountPointWriteAccess(
+    const std::string& mountPoint,
+    int mountPointFd) {
+  const auto rc = static_cast<int>(
+      syscall(SYS_faccessat2, mountPointFd, "", W_OK, AT_EMPTY_PATH));
+  if (rc == 0) {
+    return;
+  }
+
+  const auto err = errno;
+  throwf<std::domain_error>(
+      "User:{} doesn't have write access to {}: {}",
+      getuid(),
+      mountPoint,
+      folly::errnoStr(err));
+}
+#endif
+
+void sanityCheckOpenedMountPoint(
+    const std::string& mountPoint,
+    int mountPointFd,
+    uid_t uid) {
+  struct stat st{};
+  if (fstat(mountPointFd, &st) < 0) {
+    auto err = errno;
+    throwf<std::domain_error>(
+        "User:{} cannot stat {}: {}",
+        getuid(),
+        mountPoint,
+        folly::errnoStr(err));
+  }
+
+  if (!S_ISDIR(st.st_mode)) {
+    throwf<std::domain_error>("{} isn't a directory", mountPoint);
+  }
+
+  if (st.st_uid != uid) {
+    throwf<std::domain_error>(
+        "User:{} isn't the owner of: {}", uid, mountPoint);
+  }
+
+#ifdef __linux__
+  checkMountPointWriteAccess(mountPoint, mountPointFd);
+#endif
+  sanityCheckFs(mountPoint, mountPointFd);
+}
 } // namespace
+
+SanityCheckResult PrivHelperServer::cleanupStaleBindMounts(
+    const std::string& checkoutPath) {
+  SanityCheckResult result{};
+#ifdef __linux__
+  auto mountsResult = getMountsUnderPath(checkoutPath);
+  if (mountsResult.hasError()) {
+    XLOGF(
+        WARN,
+        "Failed to enumerate mounts under {}: {}; skipping redirection cleanup",
+        checkoutPath,
+        folly::errnoStr(mountsResult.error()));
+    return result;
+  }
+  auto& staleMounts = mountsResult.value();
+  if (staleMounts.empty()) {
+    return result;
+  }
+
+  result.staleRedirectionMountsFound =
+      static_cast<uint32_t>(staleMounts.size());
+
+  // Sort mount points in reverse order to handle nested mounts
+  std::sort(
+      staleMounts.begin(),
+      staleMounts.end(),
+      [](const MountTableEntry& a, const MountTableEntry& b) {
+        return a.mountPoint > b.mountPoint;
+      });
+
+  for (const auto& mount : staleMounts) {
+    XLOGF(
+        INFO,
+        "Found potential stale redirection mount under {}: {}",
+        checkoutPath,
+        mount.mountPoint);
+    // Use MNT_DETACH (lazy unmount) to avoid blocking if mount is busy
+    if (umount2(mount.mountPoint.c_str(), MNT_DETACH) == 0) {
+      XLOGF(
+          INFO,
+          "Successfully unmounted stale redirection mount: {}",
+          mount.mountPoint);
+      ++result.staleRedirectionMountsSucceeded;
+    } else {
+      auto err = errno;
+      XLOGF(
+          WARN,
+          "Failed to unmount stale redirection mount {}: {}",
+          mount.mountPoint,
+          folly::errnoStr(err));
+      ++result.staleRedirectionMountsFailed;
+    }
+  }
+#else
+  // Redirection mount cleanup is only needed on Linux
+  (void)checkoutPath;
+#endif
+  return result;
+}
 
 void PrivHelperServer::unmountStaleMount(const std::string& mountPoint) {
   // Attempt to unmount the stale mount.
@@ -175,10 +301,11 @@ void PrivHelperServer::unmountStaleMount(const std::string& mountPoint) {
   XLOGF(INFO, "Successfully unmounted stale mount {}", mountPoint);
 }
 
-void PrivHelperServer::detectAndUnmountStaleMount(
+bool PrivHelperServer::detectAndUnmountStaleMount(
     const std::string& mountPoint,
     bool isNFS,
     bool isHardMount) {
+  bool didUnmount = false;
   struct stat st;
   // Stat the mount point to determine its status. If the errno matches certain
   // values, then the mount is likely hanging. We'll try to unmount it before
@@ -206,6 +333,7 @@ void PrivHelperServer::detectAndUnmountStaleMount(
           mountPoint,
           folly::errnoStr(err));
       unmountStaleMount(mountPoint);
+      didUnmount = true;
       is_hanging = true;
     } else {
       throwf<std::domain_error>(
@@ -238,6 +366,7 @@ void PrivHelperServer::detectAndUnmountStaleMount(
             mountPoint,
             folly::errnoStr(err));
         unmountStaleMount(mountPoint);
+        didUnmount = true;
       }
     }
     XLOGF(DBG4, "Mount {} is not stale.", mountPoint);
@@ -256,25 +385,30 @@ void PrivHelperServer::detectAndUnmountStaleMount(
           mountPoint,
           folly::errnoStr(err));
       unmountStaleMount(mountPoint);
+      didUnmount = true;
     } else {
       throwf<std::domain_error>(
           "statfs failed for: {}: {}", mountPoint, folly::errnoStr(err));
     }
   }
 #endif
+  return didUnmount;
 }
 
-void PrivHelperServer::sanityCheckMountPoint(
+SanityCheckResult PrivHelperServer::sanityCheckMountPoint(
     const std::string& mountPoint,
     bool isNFS,
-    bool isHardMount) {
+    bool isHardMount,
+    bool performBindMountCleanup) {
   XLOGF(INFO, "Sanity checking mount {}", mountPoint);
   if (getuid() == 0) {
     XLOG(INFO, "Skipping sanity check for root user.");
-    return;
+    return SanityCheckResult{};
   }
 
-  detectAndUnmountStaleMount(mountPoint, isNFS, isHardMount);
+  SanityCheckResult result{};
+  result.staleCheckoutMountUnmounted =
+      detectAndUnmountStaleMount(mountPoint, isNFS, isHardMount);
 
   if (access(mountPoint.c_str(), W_OK) < 0) {
     auto err = errno;
@@ -285,29 +419,65 @@ void PrivHelperServer::sanityCheckMountPoint(
         folly::errnoStr(err));
   }
 
-  // At this point, any stat errors are not due to a stale mount.
-  struct stat st{};
-  auto fd = open(mountPoint.c_str(), O_RDONLY);
-  if (fd == -1 || fstat(fd, &st) < 0) {
-    auto err = errno;
+  folly::File file;
+  try {
+    file = folly::File(mountPoint.c_str(), O_RDONLY);
+  } catch (const std::system_error& e) {
     throwf<std::domain_error>(
-        "User:{} cannot stat {}: {}",
+        "User:{} cannot open {}: {}",
         getuid(),
         mountPoint,
-        folly::errnoStr(err));
+        folly::errnoStr(e.code().value()));
   }
-
-  if (!S_ISDIR(st.st_mode)) {
-    throwf<std::domain_error>("{} isn't a directory", mountPoint);
+  sanityCheckOpenedMountPoint(mountPoint, file.fd(), uid_);
+  if (performBindMountCleanup) {
+    // Only clean up mounts under a checkout after the checkout path itself has
+    // passed the ownership and access checks.
+    auto cleanupResult = cleanupStaleBindMounts(mountPoint);
+    result.staleRedirectionMountsFound =
+        cleanupResult.staleRedirectionMountsFound;
+    result.staleRedirectionMountsSucceeded =
+        cleanupResult.staleRedirectionMountsSucceeded;
+    result.staleRedirectionMountsFailed =
+        cleanupResult.staleRedirectionMountsFailed;
   }
-
-  if (st.st_uid != uid_) {
-    throwf<std::domain_error>(
-        "User:{} isn't the owner of: {}", uid_, mountPoint);
-  }
-
-  sanityCheckFs(mountPoint);
+  return result;
 }
+
+#ifndef __APPLE__
+PrivHelperServer::CheckedMountPoint
+PrivHelperServer::openAndSanityCheckMountPoint(
+    const std::string& mountPoint,
+    bool isNFS,
+    bool isHardMount,
+    bool performBindMountCleanup) {
+  XLOGF(INFO, "Sanity checking mount {}", mountPoint);
+  if (getuid() == 0) {
+    XLOG(INFO, "Skipping sanity check for root user.");
+    auto targetFd = openCheckedMountTarget(mountPoint);
+    return CheckedMountPoint{std::move(targetFd), SanityCheckResult{}};
+  }
+
+  SanityCheckResult result{};
+  result.staleCheckoutMountUnmounted =
+      detectAndUnmountStaleMount(mountPoint, isNFS, isHardMount);
+
+  auto targetFd = openCheckedMountTarget(mountPoint);
+  sanityCheckOpenedMountPoint(mountPoint, targetFd.fd(), uid_);
+  if (performBindMountCleanup) {
+    // Only clean up mounts under a checkout after the checkout path itself has
+    // passed the ownership and access checks.
+    auto cleanupResult = cleanupStaleBindMounts(mountPoint);
+    result.staleRedirectionMountsFound =
+        cleanupResult.staleRedirectionMountsFound;
+    result.staleRedirectionMountsSucceeded =
+        cleanupResult.staleRedirectionMountsSucceeded;
+    result.staleRedirectionMountsFailed =
+        cleanupResult.staleRedirectionMountsFailed;
+  }
+  return CheckedMountPoint{std::move(targetFd), result};
+}
+#endif
 } // namespace facebook::eden
 
 #endif

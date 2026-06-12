@@ -8,6 +8,7 @@
 #include "eden/fs/nfs/Nfsd3.h"
 
 #include <memory>
+#include <type_traits>
 
 #include <folly/String.h>
 #include <folly/Utility.h>
@@ -16,7 +17,6 @@
 #include <folly/portability/Stdlib.h>
 
 #include "eden/common/telemetry/RequestMetricsScope.h"
-#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/IDGen.h"
 #include "eden/common/utils/SystemError.h"
 #include "eden/common/utils/Throw.h"
@@ -25,6 +25,9 @@
 #include "eden/fs/nfs/NfsdRpc.h"
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/store/ObjectFetchContext.h"
+#include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/telemetry/FsEventLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/Clock.h"
@@ -36,25 +39,57 @@
 
 namespace facebook::eden {
 
+namespace detail {
+
+void logNfsError(
+    nfsstat3 error,
+    const folly::exception_wrapper& ex,
+    ErrorLogger& errorLogger,
+    uint64_t inode,
+    const AbsolutePath& mountPath) {
+  if (error == nfsstat3::NFS3ERR_SERVERFAULT) {
+    ex.with_exception([&](const std::exception& e) {
+      errorLogger.log(EdenErrorInfo::nfs(e, inode, mountPath.asString()));
+    });
+  }
+}
+
+} // namespace detail
+
 namespace {
 static_assert(CheckSize<NfsTraceEvent, 40>());
+
+void incrementNfsGcInvalidationCounter(
+    const EdenStatsPtr& stats,
+    std::optional<NfsInvalidationSource> source,
+    NfsStats::CounterPtr counter) {
+  if (source != NfsInvalidationSource::Gc) {
+    return;
+  }
+  stats->increment(counter);
+}
 
 class Nfsd3ServerProcessor final : public RpcServerProcessor {
  public:
   explicit Nfsd3ServerProcessor(
       std::unique_ptr<NfsDispatcher> dispatcher,
       const folly::Logger* straceLogger,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
+      ErrorLogger& errorLogger,
+      AbsolutePath mountPath,
       CaseSensitivity caseSensitive,
       uint32_t iosize,
       folly::Promise<FsStopDataPtr>& stopPromise,
       ProcessAccessLog& processAccessLog,
       std::atomic<size_t>& traceDetailedArguments,
       std::shared_ptr<TraceBus<NfsTraceEvent>>& traceBus,
-      std::chrono::nanoseconds longRunningFSRequestThreshold)
+      std::chrono::nanoseconds longRunningFSRequestThreshold,
+      bool fastPathRPCs)
       : dispatcher_(std::move(dispatcher)),
         straceLogger_(straceLogger),
-        structuredLogger_(structuredLogger),
+        edenFsEventsLogger_(edenFsEventsLogger),
+        errorLogger_(errorLogger),
+        mountPath_(std::move(mountPath)),
         caseSensitive_(caseSensitive),
         iosize_(iosize),
         stopPromise_{stopPromise},
@@ -62,7 +97,8 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
         traceDetailedArguments_(traceDetailedArguments),
         metadataSizeMismatchLogged_(false),
         traceBus_(traceBus),
-        longRunningFSRequestThreshold_(longRunningFSRequestThreshold) {}
+        longRunningFSRequestThreshold_(longRunningFSRequestThreshold),
+        fastPathRPCs_(fastPathRPCs) {}
 
   Nfsd3ServerProcessor(const Nfsd3ServerProcessor&) = delete;
   Nfsd3ServerProcessor(Nfsd3ServerProcessor&&) = delete;
@@ -79,6 +115,23 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
 
   void onShutdown(RpcStopData stopData) override;
   void clientConnected() override;
+  bool shouldFastPathRPCs() const override {
+    return fastPathRPCs_;
+  }
+  bool isUnimplementedProc(uint32_t proc) const override;
+
+  InlineRejectResult tryInlineReject() override;
+
+  void serializeInlineReject(
+      uint32_t proc,
+      uint32_t xid,
+      folly::io::QueueAppender& ser) override;
+
+  void onRequestComplete(const RpcRequestTimeline& timeline) override;
+
+  void setFsChannel(FsChannel* channel) {
+    fsChannel_ = channel;
+  }
 
   ImmediateFuture<folly::Unit> null(
       folly::io::Cursor deser,
@@ -176,7 +229,9 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
   // logger, the events are not logged anywhere outside of the machine this
   // EdenFS instance runs on.
   const folly::Logger* straceLogger_;
-  const std::shared_ptr<StructuredLogger> structuredLogger_;
+  const std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
+  ErrorLogger& errorLogger_;
+  AbsolutePath mountPath_;
   CaseSensitivity caseSensitive_;
   uint32_t iosize_;
   // This promise is owned by the nfs3d. The nfs3d owns an RPC server that owns
@@ -193,10 +248,16 @@ class Nfsd3ServerProcessor final : public RpcServerProcessor {
   std::shared_ptr<TraceBus<NfsTraceEvent>>& traceBus_;
   /**
    * The duration that must elapse before we consider a NFS request to be
-   * "long running" and therefore log it with StructuredLogger. This value
+   * "long running" and therefore log it with EdenFsEventsLogger. This value
    * is configured with EdenConfig::longRunningFSRequestThreshold.
    */
   std::chrono::nanoseconds longRunningFSRequestThreshold_;
+  bool fastPathRPCs_;
+  std::atomic<size_t> inflightRequests_{0};
+  // Used to check rate limiting. Set once in constructor via setFsChannel().
+  // Nulled in onShutdown() before Nfsd3 destruction. The backpressure check
+  // in dispatchRpc tests for nullptr before dereferencing.
+  FsChannel* fsChannel_{nullptr};
 };
 
 /**
@@ -331,13 +392,17 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::getattr(
 
   auto args = XdrTrait<GETATTR3args>::deserialize(deser);
 
-  return dispatcher_->getattr(args.object.ino, context.getObjectFetchContext())
-      .thenTry([ser = std::move(ser), stats = dispatcher_->getStats().copy()](
-                   const folly::Try<struct stat>& try_) mutable {
+  auto ino = args.object.ino;
+  return dispatcher_->getattr(ino, context.getObjectFetchContext())
+      .thenTry([this,
+                ser = std::move(ser),
+                stats = dispatcher_->getStats().copy(),
+                ino](const folly::Try<struct stat>& try_) mutable {
         if (try_.hasException()) {
-          GETATTR3res res{
-              {{exceptionToNfsError(try_.exception(), stats),
-                std::monostate{}}}};
+          auto error = exceptionToNfsError(try_.exception(), stats);
+          detail::logNfsError(
+              error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+          GETATTR3res res{{{error, std::monostate{}}}};
           XdrTrait<GETATTR3res>::serialize(ser, res);
         } else {
           const auto& stat = try_.value();
@@ -411,12 +476,16 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::setattr(
 
   return dispatcher_
       ->setattr(args.object.ino, desired, context.getObjectFetchContext())
-      .thenTry([ser = std::move(ser), stats = dispatcher_->getStats().copy()](
+      .thenTry([this,
+                ser = std::move(ser),
+                stats = dispatcher_->getStats().copy(),
+                ino = args.object.ino](
                    folly::Try<NfsDispatcher::SetattrRes>&& try_) mutable {
         if (try_.hasException()) {
-          SETATTR3res res{
-              {{exceptionToNfsError(try_.exception(), stats),
-                SETATTR3resfail{}}}};
+          auto error = exceptionToNfsError(try_.exception(), stats);
+          detail::logNfsError(
+              error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+          SETATTR3res res{{{error, SETATTR3resfail{}}}};
           XdrTrait<SETATTR3res>::serialize(ser, res);
         } else {
           const auto& setattrRes = try_.value();
@@ -443,8 +512,9 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::lookup(
   // be consumed in this function to avoid use-after-free. This future may also
   // need to be executed after the lookup call to conform to fill the "post-op"
   // attributes
+  auto dirIno = args.what.dir.ino;
   auto dirAttrFut =
-      dispatcher_->getattr(args.what.dir.ino, context.getObjectFetchContext());
+      dispatcher_->getattr(dirIno, context.getObjectFetchContext());
 
   if (args.what.name.length() > NAME_MAX) {
     // The filename is too long, let's try to get the attributes of the
@@ -498,27 +568,36 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::lookup(
                  });
            }
          })
-      .thenTry([ser = std::move(ser),
+      .thenTry([this,
+                ser = std::move(ser),
                 dirAttrFut = std::move(dirAttrFut),
-                stats = dispatcher_->getStats().copy()](
+                stats = dispatcher_->getStats().copy(),
+                ino = dirIno](
                    folly::Try<std::tuple<InodeNumber, struct stat>>&&
                        lookupTry) mutable {
         return std::move(dirAttrFut)
-            .thenTry([ser = std::move(ser),
+            .thenTry([this,
+                      ser = std::move(ser),
                       lookupTry = std::move(lookupTry),
-                      stats = std::move(stats)](
-                         const folly::Try<struct stat>& dirStat) mutable {
+                      stats = std::move(stats),
+                      ino](const folly::Try<struct stat>& dirStat) mutable {
               if (lookupTry.hasException()) {
+                auto error = exceptionToNfsError(lookupTry.exception(), stats);
+                detail::logNfsError(
+                    error,
+                    lookupTry.exception(),
+                    errorLogger_,
+                    ino.get(),
+                    mountPath_);
                 LOOKUP3res res{
-                    {{exceptionToNfsError(lookupTry.exception(), stats),
-                      LOOKUP3resfail{statToPostOpAttr(dirStat)}}}};
+                    {{error, LOOKUP3resfail{statToPostOpAttr(dirStat)}}}};
                 XdrTrait<LOOKUP3res>::serialize(ser, res);
               } else {
-                const auto& [ino, stat] = lookupTry.value();
+                const auto& [lookupIno, stat] = lookupTry.value();
                 LOOKUP3res res{
                     {{nfsstat3::NFS3_OK,
                       LOOKUP3resok{
-                          /*object*/ nfs_fh3{ino},
+                          /*object*/ nfs_fh3{lookupIno},
                           /*obj_attributes*/
                           post_op_attr{statToFattr3(stat)},
                           /*dir_attributes*/
@@ -540,14 +619,16 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::access(
   auto args = XdrTrait<ACCESS3args>::deserialize(deser);
 
   return dispatcher_->getattr(args.object.ino, context.getObjectFetchContext())
-      .thenTry([ser = std::move(ser),
+      .thenTry([this,
+                ser = std::move(ser),
                 desiredAccess = args.access,
-                stats = dispatcher_->getStats().copy()](
-                   folly::Try<struct stat>&& try_) mutable {
+                stats = dispatcher_->getStats().copy(),
+                ino = args.object.ino](folly::Try<struct stat>&& try_) mutable {
         if (try_.hasException()) {
-          ACCESS3res res{
-              {{exceptionToNfsError(try_.exception(), stats),
-                ACCESS3resfail{post_op_attr{}}}}};
+          auto error = exceptionToNfsError(try_.exception(), stats);
+          detail::logNfsError(
+              error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+          ACCESS3res res{{{error, ACCESS3resfail{post_op_attr{}}}}};
           XdrTrait<ACCESS3res>::serialize(ser, res);
         } else {
           const auto& stat = try_.value();
@@ -576,18 +657,27 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::readlink(
       dispatcher_->getattr(args.symlink.ino, context.getObjectFetchContext());
   return dispatcher_
       ->readlink(args.symlink.ino, context.getObjectFetchContext())
-      .thenTry([ser = std::move(ser),
+      .thenTry([this,
+                ser = std::move(ser),
                 getattr = std::move(getattr),
-                stats = dispatcher_->getStats().copy()](
+                stats = dispatcher_->getStats().copy(),
+                ino = args.symlink.ino](
                    folly::Try<std::string> tryReadlink) mutable {
         return std::move(getattr).thenTry(
-            [ser = std::move(ser),
+            [this,
+             ser = std::move(ser),
              tryReadlink = std::move(tryReadlink),
-             stats = std::move(stats)](
-                const folly::Try<struct stat>& tryAttr) mutable {
+             stats = std::move(stats),
+             ino](const folly::Try<struct stat>& tryAttr) mutable {
               if (tryReadlink.hasException()) {
                 auto error =
                     exceptionToNfsError(tryReadlink.exception(), stats);
+                detail::logNfsError(
+                    error,
+                    tryReadlink.exception(),
+                    errorLogger_,
+                    ino.get(),
+                    mountPath_);
                 READLINK3res res{
                     {{error, READLINK3resfail{statToPostOpAttr(tryAttr)}}}};
                 XdrTrait<READLINK3res>::serialize(ser, res);
@@ -636,6 +726,12 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::read(
                          const folly::Try<struct stat>& tryStat) mutable {
               if (tryRead.hasException()) {
                 auto error = exceptionToNfsError(tryRead.exception(), stats);
+                detail::logNfsError(
+                    error,
+                    tryRead.exception(),
+                    errorLogger_,
+                    ino.get(),
+                    mountPath_);
                 READ3res res{
                     {{error, READ3resfail{statToPostOpAttr(tryStat)}}}};
                 XdrTrait<READ3res>::serialize(ser, res);
@@ -656,7 +752,7 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::read(
                           length,
                           tryStat.value().st_size));
 
-                  this->structuredLogger_->logEvent(
+                  this->edenFsEventsLogger_->logEvent(
                       MetadataSizeMismatch{"NFS", "read"});
                 }
 
@@ -716,12 +812,16 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::write(
           std::move(data),
           args.offset,
           context.getObjectFetchContext())
-      .thenTry([ser = std::move(ser), stats = dispatcher_->getStats().copy()](
+      .thenTry([this,
+                ser = std::move(ser),
+                stats = dispatcher_->getStats().copy(),
+                ino = args.file.ino](
                    folly::Try<NfsDispatcher::WriteRes> writeTry) mutable {
         if (writeTry.hasException()) {
-          WRITE3res res{
-              {{exceptionToNfsError(writeTry.exception(), stats),
-                WRITE3resfail{}}}};
+          auto error = exceptionToNfsError(writeTry.exception(), stats);
+          detail::logNfsError(
+              error, writeTry.exception(), errorLogger_, ino.get(), mountPath_);
+          WRITE3res res{{{error, WRITE3resfail{}}}};
           XdrTrait<WRITE3res>::serialize(ser, res);
         } else {
           const auto& writeRes = writeTry.value();
@@ -802,9 +902,11 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::create(
         return dispatcher_->create(
             ino, std::move(name), mode, how, context.getObjectFetchContext());
       })
-      .thenTry([ser = std::move(ser),
+      .thenTry([this,
+                ser = std::move(ser),
                 createmode = args.how.tag,
-                stats = dispatcher_->getStats().copy()](
+                stats = dispatcher_->getStats().copy(),
+                ino = args.where.dir.ino](
                    folly::Try<NfsDispatcher::CreateRes> try_) mutable {
         if (try_.hasException()) {
           if (createmode == createmode3::UNCHECKED &&
@@ -828,9 +930,10 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::create(
                                }}}}};
             XdrTrait<CREATE3res>::serialize(ser, res);
           } else {
-            CREATE3res res{
-                {{exceptionToNfsError(try_.exception(), stats),
-                  CREATE3resfail{}}}};
+            auto error = exceptionToNfsError(try_.exception(), stats);
+            detail::logNfsError(
+                error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+            CREATE3res res{{{error, CREATE3resfail{}}}};
             XdrTrait<CREATE3res>::serialize(ser, res);
           }
         } else {
@@ -880,12 +983,16 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::mkdir(
         return dispatcher_->mkdir(
             ino, std::move(name), mode, context.getObjectFetchContext());
       })
-      .thenTry([ser = std::move(ser), stats = dispatcher_->getStats().copy()](
+      .thenTry([this,
+                ser = std::move(ser),
+                stats = dispatcher_->getStats().copy(),
+                ino = args.where.dir.ino](
                    folly::Try<NfsDispatcher::MkdirRes> try_) mutable {
         if (try_.hasException()) {
-          MKDIR3res res{
-              {{exceptionToNfsError(try_.exception(), stats),
-                MKDIR3resfail{}}}};
+          auto error = exceptionToNfsError(try_.exception(), stats);
+          detail::logNfsError(
+              error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+          MKDIR3res res{{{error, MKDIR3resfail{}}}};
           XdrTrait<MKDIR3res>::serialize(ser, res);
         } else {
           const auto& mkdirRes = try_.value();
@@ -932,12 +1039,16 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::symlink(
             std::move(symlink_data),
             context.getObjectFetchContext());
       })
-      .thenTry([ser = std::move(ser), stats = dispatcher_->getStats().copy()](
+      .thenTry([this,
+                ser = std::move(ser),
+                stats = dispatcher_->getStats().copy(),
+                ino = args.where.dir.ino](
                    folly::Try<NfsDispatcher::SymlinkRes> try_) mutable {
         if (try_.hasException()) {
-          SYMLINK3res res{
-              {{exceptionToNfsError(try_.exception(), stats),
-                SYMLINK3resfail{}}}};
+          auto error = exceptionToNfsError(try_.exception(), stats);
+          detail::logNfsError(
+              error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+          SYMLINK3res res{{{error, SYMLINK3resfail{}}}};
           XdrTrait<SYMLINK3res>::serialize(ser, res);
         } else {
           const auto& symlinkRes = try_.value();
@@ -1014,12 +1125,16 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::mknod(
         return dispatcher_->mknod(
             ino, std::move(name), mode, rdev, context.getObjectFetchContext());
       })
-      .thenTry([ser = std::move(ser), stats = dispatcher_->getStats().copy()](
+      .thenTry([this,
+                ser = std::move(ser),
+                stats = dispatcher_->getStats().copy(),
+                ino = args.where.dir.ino](
                    folly::Try<NfsDispatcher::MknodRes> try_) mutable {
         if (try_.hasException()) {
-          MKNOD3res res{
-              {{exceptionToNfsError(try_.exception(), stats),
-                MKNOD3resfail{}}}};
+          auto error = exceptionToNfsError(try_.exception(), stats);
+          detail::logNfsError(
+              error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+          MKNOD3res res{{{error, MKNOD3resfail{}}}};
           XdrTrait<MKNOD3res>::serialize(ser, res);
         } else {
           const auto& mknodRes = try_.value();
@@ -1064,12 +1179,16 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::remove(
             return dispatcher_->unlink(
                 ino, std::move(name), context.getObjectFetchContext());
           })
-      .thenTry([ser = std::move(ser), stats = dispatcher_->getStats().copy()](
+      .thenTry([this,
+                ser = std::move(ser),
+                stats = dispatcher_->getStats().copy(),
+                ino = args.object.dir.ino](
                    folly::Try<NfsDispatcher::UnlinkRes> try_) mutable {
         if (try_.hasException()) {
-          REMOVE3res res{
-              {{exceptionToNfsError(try_.exception(), stats),
-                REMOVE3resfail{}}}};
+          auto error = exceptionToNfsError(try_.exception(), stats);
+          detail::logNfsError(
+              error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+          REMOVE3res res{{{error, REMOVE3resfail{}}}};
           XdrTrait<REMOVE3res>::serialize(ser, res);
         } else {
           const auto& unlinkRes = try_.value();
@@ -1107,12 +1226,16 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::rmdir(
             return dispatcher_->rmdir(
                 ino, std::move(name), context.getObjectFetchContext());
           })
-      .thenTry([ser = std::move(ser), stats = dispatcher_->getStats().copy()](
+      .thenTry([this,
+                ser = std::move(ser),
+                stats = dispatcher_->getStats().copy(),
+                ino = args.object.dir.ino](
                    folly::Try<NfsDispatcher::RmdirRes> try_) mutable {
         if (try_.hasException()) {
-          RMDIR3res res{
-              {{exceptionToNfsError(try_.exception(), stats),
-                RMDIR3resfail{}}}};
+          auto error = exceptionToNfsError(try_.exception(), stats);
+          detail::logNfsError(
+              error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+          RMDIR3res res{{{error, RMDIR3resfail{}}}};
           XdrTrait<RMDIR3res>::serialize(ser, res);
         } else {
           const auto& rmdirRes = try_.value();
@@ -1169,12 +1292,16 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::rename(
             std::move(toName),
             context.getObjectFetchContext());
       })
-      .thenTry([ser = std::move(ser), stats = dispatcher_->getStats().copy()](
+      .thenTry([this,
+                ser = std::move(ser),
+                stats = dispatcher_->getStats().copy(),
+                ino = args.from.dir.ino](
                    folly::Try<NfsDispatcher::RenameRes> try_) mutable {
         if (try_.hasException()) {
-          RENAME3res res{
-              {{exceptionToNfsError(try_.exception(), stats),
-                RENAME3resfail{}}}};
+          auto error = exceptionToNfsError(try_.exception(), stats);
+          detail::logNfsError(
+              error, try_.exception(), errorLogger_, ino.get(), mountPath_);
+          RENAME3res res{{{error, RENAME3resfail{}}}};
           XdrTrait<RENAME3res>::serialize(ser, res);
         } else {
           const auto& renameRes = try_.value();
@@ -1264,14 +1391,21 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::readdir(
       .thenTry([this, ino = args.dir.ino, ser = std::move(ser), &context](
                    folly::Try<NfsDispatcher::ReaddirRes> try_) mutable {
         return dispatcher_->getattr(ino, context.getObjectFetchContext())
-            .thenTry([ser = std::move(ser),
+            .thenTry([this,
+                      ser = std::move(ser),
                       try_ = std::move(try_),
-                      stats = dispatcher_->getStats().copy()](
-                         const folly::Try<struct stat>& tryStat) mutable {
+                      stats = dispatcher_->getStats().copy(),
+                      ino](const folly::Try<struct stat>& tryStat) mutable {
               if (try_.hasException()) {
+                auto error = exceptionToNfsError(try_.exception(), stats);
+                detail::logNfsError(
+                    error,
+                    try_.exception(),
+                    errorLogger_,
+                    ino.get(),
+                    mountPath_);
                 READDIR3res res{
-                    {{exceptionToNfsError(try_.exception(), stats),
-                      READDIR3resfail{statToPostOpAttr(tryStat)}}}};
+                    {{error, READDIR3resfail{statToPostOpAttr(tryStat)}}}};
                 XdrTrait<READDIR3res>::serialize(ser, res);
               } else {
                 auto& readdirRes = try_.value();
@@ -1318,14 +1452,21 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::readdirplus(
       .thenTry([this, ino = args.dir.ino, ser = std::move(ser), &context](
                    folly::Try<NfsDispatcher::ReaddirRes> try_) mutable {
         return dispatcher_->getattr(ino, context.getObjectFetchContext())
-            .thenTry([ser = std::move(ser),
+            .thenTry([this,
+                      ser = std::move(ser),
                       try_ = std::move(try_),
-                      stats = dispatcher_->getStats().copy()](
-                         const folly::Try<struct stat>& tryStat) mutable {
+                      stats = dispatcher_->getStats().copy(),
+                      ino](const folly::Try<struct stat>& tryStat) mutable {
               if (try_.hasException()) {
+                auto error = exceptionToNfsError(try_.exception(), stats);
+                detail::logNfsError(
+                    error,
+                    try_.exception(),
+                    errorLogger_,
+                    ino.get(),
+                    mountPath_);
                 READDIRPLUS3res res{
-                    {{exceptionToNfsError(try_.exception(), stats),
-                      READDIRPLUS3resfail{statToPostOpAttr(tryStat)}}}};
+                    {{error, READDIRPLUS3resfail{statToPostOpAttr(tryStat)}}}};
                 XdrTrait<READDIRPLUS3res>::serialize(ser, res);
               } else {
                 auto& readdirRes = try_.value();
@@ -1368,14 +1509,21 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::fsstat(
       .thenTry([this, ser = std::move(ser), ino = args.fsroot.ino, &context](
                    folly::Try<struct statfs> statFsTry) mutable {
         return dispatcher_->getattr(ino, context.getObjectFetchContext())
-            .thenTry([ser = std::move(ser),
+            .thenTry([this,
+                      ser = std::move(ser),
                       statFsTry = std::move(statFsTry),
-                      stats = dispatcher_->getStats().copy()](
-                         const folly::Try<struct stat>& statTry) mutable {
+                      stats = dispatcher_->getStats().copy(),
+                      ino](const folly::Try<struct stat>& statTry) mutable {
               if (statFsTry.hasException()) {
+                auto error = exceptionToNfsError(statFsTry.exception(), stats);
+                detail::logNfsError(
+                    error,
+                    statFsTry.exception(),
+                    errorLogger_,
+                    ino.get(),
+                    mountPath_);
                 FSSTAT3res res{
-                    {{exceptionToNfsError(statFsTry.exception(), stats),
-                      FSSTAT3resfail{statToPostOpAttr(statTry)}}}};
+                    {{error, FSSTAT3resfail{statToPostOpAttr(statTry)}}}};
                 XdrTrait<FSSTAT3res>::serialize(ser, res);
               } else {
                 auto& statfs = statFsTry.value();
@@ -1980,6 +2128,65 @@ constexpr auto kNfs3dHandlers = [] {
   return handlers;
 }();
 
+bool Nfsd3ServerProcessor::isUnimplementedProc(uint32_t proc) const {
+  return proc == folly::to_underlying(nfsv3Procs::commit) ||
+      proc >= kNfs3dHandlers.size();
+}
+
+void Nfsd3ServerProcessor::onRequestComplete(const RpcRequestTimeline& t) {
+  auto stats = dispatcher_->getStats().copy();
+
+  if (t.requestReceived && t.dispatched) {
+    stats->addDuration(
+        &NfsStats::nfsPhaseAccept, *t.dispatched - *t.requestReceived);
+  }
+  if (t.dispatched && t.handlerStart) {
+    stats->addDuration(
+        &NfsStats::nfsPhaseQueueWait, *t.handlerStart - *t.dispatched);
+  }
+  if (t.handlerStart && t.handlerDone) {
+    stats->addDuration(
+        &NfsStats::nfsPhaseProcessing, *t.handlerDone - *t.handlerStart);
+  }
+  if (t.handlerDone && t.responseSent) {
+    stats->addDuration(
+        &NfsStats::nfsPhaseWriteWait, *t.responseSent - *t.handlerDone);
+  }
+
+  if (t.requestReceived && t.responseSent) {
+    auto total = *t.responseSent - *t.requestReceived;
+    stats->addDuration(&NfsStats::nfsPhaseTotal, total);
+
+    if (longRunningFSRequestThreshold_.count() > 0 &&
+        total > longRunningFSRequestThreshold_) {
+      using namespace std::chrono;
+      auto durationNs = [](auto d) {
+        return static_cast<double>(duration_cast<nanoseconds>(d).count());
+      };
+      auto procName = t.procNumber < kNfs3dHandlers.size()
+          ? kNfs3dHandlers[t.procNumber].name
+          : "unknown";
+      edenFsEventsLogger_->logEvent(
+          LongRunningFSRequest{
+              durationNs(total),
+              procName,
+              t.dispatched && t.requestReceived
+                  ? durationNs(*t.dispatched - *t.requestReceived)
+                  : 0.0,
+              t.handlerStart && t.dispatched
+                  ? durationNs(*t.handlerStart - *t.dispatched)
+                  : 0.0,
+              t.handlerDone && t.handlerStart
+                  ? durationNs(*t.handlerDone - *t.handlerStart)
+                  : 0.0,
+              t.responseSent && t.handlerDone
+                  ? durationNs(*t.responseSent - *t.handlerDone)
+                  : 0.0,
+          });
+    }
+  }
+}
+
 namespace {
 struct LiveRequest {
   LiveRequest(
@@ -2018,7 +2225,124 @@ SamplingGroup nfsProcSamplingGroup(uint32_t procNumber) {
       << "got invalid NFS procedure: " << procNumber;
   return kNfs3dHandlers[procNumber].samplingGroup;
 }
+
+/**
+ * Serialize a JUKEBOX error response for the given NFS procedure.
+ *
+ * Each NFS procedure has a different response type with its own fail fields
+ * (post_op_attr, wcc_data, etc.). We serialize the correct per-procedure
+ * response with default-constructed fail fields for RFC compliance.
+ */
+template <typename ResType>
+void serializeJukeboxResponse(folly::io::QueueAppender& ser, uint32_t xid) {
+  serializeReply(ser, accept_stat::SUCCESS, xid);
+  ResType res;
+  res.tag = nfsstat3::NFS3ERR_JUKEBOX;
+  if constexpr (!std::is_same_v<typename ResType::Default, std::monostate>) {
+    res.v = typename ResType::Default{};
+  }
+  XdrTrait<ResType>::serialize(ser, res);
+}
+
+void serializeJukeboxError(
+    folly::io::QueueAppender& ser,
+    uint32_t xid,
+    uint32_t procNumber) {
+  switch (procNumber) {
+    // null is fast-pathed as SUCCESS; commit and unknown procs are
+    // fast-pathed as PROC_UNAVAIL. Neither reaches this switch.
+    case folly::to_underlying(nfsv3Procs::getattr):
+      serializeJukeboxResponse<GETATTR3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::setattr):
+      serializeJukeboxResponse<SETATTR3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::lookup):
+      serializeJukeboxResponse<LOOKUP3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::access):
+      serializeJukeboxResponse<ACCESS3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::readlink):
+      serializeJukeboxResponse<READLINK3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::read):
+      serializeJukeboxResponse<READ3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::write):
+      serializeJukeboxResponse<WRITE3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::create):
+      serializeJukeboxResponse<CREATE3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::mkdir):
+      serializeJukeboxResponse<MKDIR3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::symlink):
+      serializeJukeboxResponse<SYMLINK3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::mknod):
+      serializeJukeboxResponse<MKNOD3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::remove):
+      serializeJukeboxResponse<REMOVE3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::rmdir):
+      serializeJukeboxResponse<RMDIR3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::rename):
+      serializeJukeboxResponse<RENAME3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::link):
+      serializeJukeboxResponse<LINK3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::readdir):
+      serializeJukeboxResponse<READDIR3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::readdirplus):
+      serializeJukeboxResponse<READDIRPLUS3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::fsstat):
+      serializeJukeboxResponse<FSSTAT3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::fsinfo):
+      serializeJukeboxResponse<FSINFO3res>(ser, xid);
+      break;
+    case folly::to_underlying(nfsv3Procs::pathconf):
+      serializeJukeboxResponse<PATHCONF3res>(ser, xid);
+      break;
+    default:
+      // null is fast-pathed as SUCCESS, commit and unknown procs are
+      // fast-pathed as PROC_UNAVAIL, so this default should never be
+      // reached for valid NFS procedures.
+      XDCHECK(false) << "Unexpected proc in serializeJukeboxError: "
+                     << procNumber;
+      serializeReply(ser, accept_stat::PROC_UNAVAIL, xid);
+      break;
+  }
+}
+
 } // namespace
+
+RpcServerProcessor::InlineRejectResult Nfsd3ServerProcessor::tryInlineReject() {
+  if (!fsChannel_ || !fsChannel_->isRateLimitingEnabled()) {
+    return {};
+  }
+
+  auto permit = fsChannel_->tryAcquireFsRequestPermit();
+  if (!permit) {
+    dispatcher_->getStats()->increment(&NfsStats::nfsBackpressureJukebox);
+    return {true, nullptr};
+  }
+  return {false, std::move(permit)};
+}
+
+void Nfsd3ServerProcessor::serializeInlineReject(
+    uint32_t proc,
+    uint32_t xid,
+    folly::io::QueueAppender& ser) {
+  serializeJukeboxError(ser, xid, proc);
+}
 
 ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
     folly::io::Cursor deser,
@@ -2045,6 +2369,10 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
     return folly::unit;
   }
 
+  auto depth = inflightRequests_.fetch_add(1, std::memory_order_relaxed);
+  dispatcher_->getStats()->increment(
+      &NfsStats::nfsInflightAtRequest, depth + 1);
+
   auto& handlerEntry = kNfs3dHandlers[procNumber];
   FB_LOGF(
       *straceLogger_,
@@ -2064,7 +2392,7 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
       xid,
       handlerEntry.name,
       processAccessLog_,
-      structuredLogger_,
+      edenFsEventsLogger_,
       longRunningFSRequestThreshold_);
   context->startRequest(
       dispatcher_->getStats().copy(), handlerEntry.duration, nullRequestWatch);
@@ -2079,8 +2407,10 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
       .thenValue([this, inodeNumber = std::move(inodeNumber)](auto&&) {
         if (inodeNumber.has_value()) {
           XLOGF(
-              DBG9, "Update last used time for inode: {}", inodeNumber.value());
-          return dispatcher_->updateLastUsedTime(inodeNumber.value());
+              DBG9,
+              "Update last fs request time for inode: {}",
+              inodeNumber.value());
+          return dispatcher_->updateLastFsRequestTime(inodeNumber.value());
         }
         return ImmediateFuture<folly::Unit>(folly::unit);
       })
@@ -2096,15 +2426,22 @@ ImmediateFuture<folly::Unit> Nfsd3ServerProcessor::dispatchRpc(
         } else if (dispatcher_->getStats() && handlerEntry.countSuccessful) {
           dispatcher_->getStats()->increment(handlerEntry.countSuccessful);
         }
-        return std::move(res);
+        return res;
       })
-      .ensure([liveRequest = std::move(liveRequest),
-               context = std::move(context)]() {});
+      .ensure([this,
+               liveRequest = std::move(liveRequest),
+               context = std::move(context)]() {
+        inflightRequests_.fetch_sub(1, std::memory_order_relaxed);
+      });
 }
 
 void Nfsd3ServerProcessor::onShutdown(RpcStopData data) {
+  // Clear fsChannel_ before triggering destruction. tryInlineReject checks
+  // for nullptr, so this prevents accessing a dangling FsChannel pointer
+  // during the shutdown window.
+  fsChannel_ = nullptr;
   // Note this triggers the Nfsd3 destruction which will also destroy
-  // Nfsd3ServerProcessor. Don't do anything will the Nfsd3ServerProcessor
+  // Nfsd3ServerProcessor. Don't do anything with the Nfsd3ServerProcessor
   // member variables after this!
   stopPromise_.setValue(std::make_unique<RpcStopData>(std::move(data)));
 }
@@ -2113,7 +2450,7 @@ void Nfsd3ServerProcessor::clientConnected() {
   auto numberOfClients =
       numberOfClients_.fetch_add(1, std::memory_order_acq_rel);
   if (numberOfClients > 1) {
-    structuredLogger_->logEvent(TooManyNfsClients{});
+    edenFsEventsLogger_->logEvent(TooManyNfsClients{});
   }
 }
 } // namespace
@@ -2127,7 +2464,8 @@ Nfsd3::Nfsd3(
     const folly::Logger* straceLogger,
     std::shared_ptr<ProcessInfoCache> processInfoCache,
     std::shared_ptr<FsEventLogger> fsEventLogger,
-    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
+    ErrorLogger& errorLogger,
     folly::Duration /*requestTimeout*/,
     std::shared_ptr<Notifier> /*notifier*/,
     CaseSensitivity caseSensitive,
@@ -2135,27 +2473,35 @@ Nfsd3::Nfsd3(
     size_t maximumInFlightRequests,
     std::chrono::nanoseconds highNfsRequestsLogInterval,
     std::chrono::nanoseconds longRunningFSRequestThreshold,
-    size_t traceBusCapacity)
+    size_t traceBusCapacity,
+    bool fastPathRPCs)
     : privHelper_{privHelper},
       mountPath_{std::move(mountPath)},
-      server_(
-          RpcServer::create(
-              std::make_shared<Nfsd3ServerProcessor>(
-                  std::move(dispatcher),
-                  straceLogger,
-                  structuredLogger,
-                  caseSensitive,
-                  iosize,
-                  stopPromise_,
-                  processAccessLog_,
-                  traceDetailedArguments_,
-                  traceBus_,
-                  longRunningFSRequestThreshold),
-              evb,
-              std::move(threadPool),
-              structuredLogger,
-              maximumInFlightRequests,
-              highNfsRequestsLogInterval)),
+      stats_{dispatcher->getStats().copy()},
+      server_([&]() {
+        auto proc = std::make_shared<Nfsd3ServerProcessor>(
+            std::move(dispatcher),
+            straceLogger,
+            edenFsEventsLogger,
+            errorLogger,
+            mountPath_,
+            caseSensitive,
+            iosize,
+            stopPromise_,
+            processAccessLog_,
+            traceDetailedArguments_,
+            traceBus_,
+            longRunningFSRequestThreshold,
+            fastPathRPCs);
+        proc->setFsChannel(this);
+        return RpcServer::create(
+            std::move(proc),
+            evb,
+            std::move(threadPool),
+            edenFsEventsLogger,
+            maximumInFlightRequests,
+            highNfsRequestsLogInterval);
+      }()),
       processAccessLog_(std::move(processInfoCache)),
       invalidationExecutor_{
           folly::SerialExecutor::create(folly::getGlobalCPUExecutor())},
@@ -2166,6 +2512,8 @@ Nfsd3::Nfsd3(
       "Creating Nfsd3: mountPath={}, caseSensitive={}",
       mountPath_,
       caseSensitive);
+
+  initializeInflightRequestsRateLimiter(maximumInFlightRequests);
 
   traceSubscriptionHandles_.push_back(traceBus_->subscribeFunction(
       "NFS request tracking",
@@ -2235,26 +2583,47 @@ folly::SemiFuture<folly::Unit> Nfsd3::unmount(UnmountOptions /* options */) {
 void Nfsd3::invalidate(
     AbsolutePath path,
     mode_t mode,
-    std::function<void()> onSuccess) {
+    folly::Function<void()> onSuccess,
+    std::optional<NfsInvalidationSource> source) {
+  auto stats = stats_.copy();
+  incrementNfsGcInvalidationCounter(
+      stats, source, &NfsStats::nfsInvalidationGcAttempt);
   invalidationExecutor_->add([path = std::move(path),
                               mode,
-                              onSuccess = std::move(onSuccess)]() {
+                              onSuccess = std::move(onSuccess),
+                              source,
+                              stats = std::move(stats)]() mutable {
     XLOGF(DBG9, "Invalidating: {} mode: {}", path.c_str(), mode);
-    if (chmod(path.c_str(), mode) == 0) {
+    const auto chmodResult = chmod(path.c_str(), mode);
+    const auto error = errno;
+    if (chmodResult == 0) {
+      incrementNfsGcInvalidationCounter(
+          stats, source, &NfsStats::nfsInvalidationGcSuccess);
       XLOGF(DBG9, "Finished invalidating: {}", path.c_str());
       if (onSuccess) {
         onSuccess();
       }
-    } else if (errno == ENOENT) {
+    } else if (error == ENOENT) {
+      incrementNfsGcInvalidationCounter(
+          stats, source, &NfsStats::nfsInvalidationGcEnoent);
       // ENOENT is expected after removing files.
       XLOGF(DBG9, "Finished invalidating (no longer exists): {}", path.c_str());
+    } else if (error == EACCES) {
+      incrementNfsGcInvalidationCounter(
+          stats, source, &NfsStats::nfsInvalidationGcFailure);
+      // Restricted directories can reject the synthetic chmod used to
+      // invalidate the NFS client cache.
+      XLOGF(
+          DBG9, "Finished invalidating (permission denied): {}", path.c_str());
     } else {
+      incrementNfsGcInvalidationCounter(
+          stats, source, &NfsStats::nfsInvalidationGcFailure);
       XLOGF(
           DFATAL,
           "Error invalidating path {} to mode {} using chmod: {}",
           path,
           mode,
-          folly::errnoStr(errno));
+          folly::errnoStr(error));
     }
   });
 }

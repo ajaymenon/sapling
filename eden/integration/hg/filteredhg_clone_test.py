@@ -3,10 +3,12 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
 
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -370,6 +372,40 @@ baz
             filter_paths=filter_paths,
         )
         await self.assert_fid_matches(path, self.initial_commit, filter_paths)
+
+    def test_reclone_after_filter_store_destroyed(self) -> None:
+        """Reproduces the 'Failed to get filter' error that occurs when the
+        backing repo's filter store is destroyed and recreated while EdenFS
+        holds a stale OBJECT_CACHE entry with old indexedlog handles."""
+        if sys.platform == "win32":
+            self.skipTest(
+                "On Windows, mmap'd indexedlog files in .hg/filters/ cannot be "
+                "fully unlinked while EdenFS holds active section objects, so "
+                "the stale-cache scenario cannot be reproduced."
+            )
+        clone_path = self.eden_clone_filteredhg_repo(
+            backing_store="filteredhg",
+            filter_paths=["filter_foo"],
+        )
+        self.assert_paths_filtered_unfiltered(clone_path, ["foo"], ["bar"])
+
+        self.eden.remove(str(clone_path))
+
+        # Destroy the filter store
+        filter_store_path = os.path.join(self.backing_repo.path, ".hg", "filters")
+        shutil.rmtree(filter_store_path)
+
+        # Make a new commit to get a new filter ID
+        self.backing_repo.write_file("new_file", "new_file")
+        self.backing_repo.commit("Second commit.")
+
+        # Re-clone: the stale OBJECT_CACHE entry has a FilterGenerator whose
+        # indexedlog handles point to the deleted .hg/filters/.
+        clone_path2 = self.eden_clone_filteredhg_repo(
+            backing_store="filteredhg",
+            filter_paths=["filter_foo"],
+        )
+        self.assert_paths_filtered_unfiltered(clone_path2, ["foo"], ["bar"])
 
 
 @hg_test

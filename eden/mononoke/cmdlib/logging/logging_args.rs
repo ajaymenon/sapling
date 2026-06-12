@@ -142,6 +142,13 @@ impl LoggingArgs {
             "edenapi::client=WARN".parse()?,
         ];
 
+        if self.tracing_test_format {
+            // Suppress startup info logs from mononoke_configs in test mode.
+            // These are useful in production but noise in integration tests
+            // where every foreground CLI command would emit them.
+            builtins.push("mononoke_configs=WARN".parse()?);
+        }
+
         let filter = match std::env::var("RUST_LOG") {
             Ok(env) if !env.is_empty() => {
                 // EnvFilter doesn't offer an API that lets us merge our own directives with the ones from
@@ -261,7 +268,7 @@ where
                 let ext = span.extensions();
                 if let Some(fields) = &ext.get::<FormattedFields<N>>() {
                     if !fields.is_empty() {
-                        write!(writer, "{{{}}}", fields)?;
+                        write!(writer, "{{{fields}}}")?;
                     }
                 }
 

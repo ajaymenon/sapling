@@ -74,22 +74,36 @@ class OverlayChecker {
       FsFileContentStore* fcs,
       std::optional<InodeNumber> nextInodeNumber,
       InodeCatalog::LookupCallback& lookupCallback,
-      uint64_t numErrorDiscoveryThreads);
+      uint64_t numErrorDiscoveryThreads,
+      CaseSensitivity caseSensitive = CaseSensitivity::Sensitive);
 
   ~OverlayChecker();
 
   /**
-   * Scan the overlay for problems.
+   * Scan the overlay for problems. Read-only: never mutates the overlay.
+   *
+   * On a WAL-enabled overlay, scan results are best-effort: WAL files are
+   * left on disk, and inodes referenced only by pending WAL entries may
+   * surface as false-positive errors. The repair path (repairErrors())
+   * merges those WALs before scanning, so its results are authoritative.
+   *
+   * Safe to call multiple times; each call clears any prior scan state.
    */
-  void scanForErrors(const ProgressCallback& progressCallback = [](auto) {});
+  void scanForErrors(
+      const ProgressCallback& progressCallback = [](auto) {},
+      bool includeWalChildren = false);
 
   /**
-   * Attempt to repair the errors that were found by scanForErrors().
+   * Merge any pending WALs, scan for problems, and repair them.
    *
-   * Returns std::nullopt if repairErrors() is called when there are no errors
-   * to repair, otherwise returns a RepairResult.
+   * Self-contained: callers do not need to (and should not) call
+   * scanForErrors() first -- doing so just wastes work, since this method
+   * scans internally after merging WALs.
+   *
+   * Returns std::nullopt if no errors were found, otherwise a RepairResult.
    */
-  std::optional<RepairResult> repairErrors();
+  std::optional<RepairResult> repairErrors(
+      const ProgressCallback& progressCallback = [](auto) {});
 
   /**
    * Log the errors that were found by scanForErrors(), without fixing them.
@@ -185,6 +199,8 @@ class OverlayChecker {
   PathInfo cachedPathComputation(InodeNumber number, Fn&& fn);
 
   using ShardID = uint32_t;
+  void scanForWalChildren();
+  bool recoverWalFiles();
   void readInodes(const ProgressCallback& progressCallback = [](auto) {});
   void readInodeSubdir(const AbsolutePath& path, ShardID shardID);
   // loadInodeSharded and loadInodeInfoFromFileContentStore are called from a

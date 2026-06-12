@@ -11,8 +11,10 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Display;
 use std::future::Future;
+use std::ops::Bound;
 use std::sync::Arc;
 
+use acl_regions::AclRegionsRef;
 use anyhow::anyhow;
 use basename_suffix_skeleton_manifest_v3::RootBssmV3DirectoryId;
 use blobstore::Loadable;
@@ -30,12 +32,18 @@ use commit_graph::AncestorsStreamBuilder;
 use commit_graph::CommitGraphArc;
 use commit_graph::CommitGraphRef;
 use commit_graph::LinearAncestorsStreamBuilder;
+use commit_rate_limit::CommitRateLimitCheckResult;
+use commit_rate_limit::check_all_commit_rate_limits;
+use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use deleted_manifest::DeletedManifestOps;
 use deleted_manifest::RootDeletedManifestIdCommon;
 use deleted_manifest::RootDeletedManifestV2Id;
 use derivation_queue_thrift::DerivationPriority;
 use derived_data_manager::BonsaiDerivable;
+use derived_data_manager::DerivableType;
+use directory_branch_cluster_manifest::RootDirectoryBranchClusterManifestId;
+use ephemeral_blobstore::RepoEphemeralStoreRef;
 use fsnodes::RootFsnodeId;
 use futures::future::try_join;
 use futures::stream;
@@ -50,6 +58,7 @@ use git_types::MappedGitCommitId;
 use hooks::CrossRepoPushSource;
 use hooks::HookOutcome;
 use hooks::PushAuthoredBy;
+use itertools::Itertools;
 use manifest::Diff as ManifestDiff;
 use manifest::Entry as ManifestEntry;
 use manifest::ManifestOps;
@@ -65,12 +74,19 @@ use mononoke_types::NonRootMPath;
 use mononoke_types::SkeletonManifestId;
 use mononoke_types::SubtreeChange;
 use mononoke_types::Svnrev;
+use mononoke_types::content_manifest::compat;
+use mononoke_types::directory_branch_cluster_manifest::DirectoryBranchClusterManifest;
 use mononoke_types::path::MPath;
 use mononoke_types::skeleton_manifest_v2::SkeletonManifestV2;
+use mutable_renames::MutableRenamesArc;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataArc;
 use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentityRef;
+use repo_permission_checker::RepoPermissionCheckerRef;
+use restricted_paths::RestrictedPathsArc;
+use restricted_paths::check_path_restriction_infos;
 use skeleton_manifest::RootSkeletonManifestId;
 use skeleton_manifest_v2::RootSkeletonManifestV2Id;
 use smallvec::SmallVec;
@@ -84,14 +100,34 @@ use crate::MononokeRepo;
 use crate::changeset_path::ChangesetPathContentContext;
 use crate::changeset_path::ChangesetPathContext;
 use crate::changeset_path::ChangesetPathHistoryContext;
+use crate::changeset_path::ChangesetPathRestrictionContext;
 use crate::changeset_path_diff::ChangesetPathDiffContext;
 use crate::errors::MononokeError;
 use crate::repo::RepoContext;
+use crate::repo::RepoWithBubble;
+use crate::restricted_paths::PathAccessInfo;
+use crate::restricted_paths::RestrictedChangeGroup;
+use crate::restricted_paths::RestrictedPathsChangesInfo;
 use crate::specifiers::ChangesetId;
 use crate::specifiers::GitSha1;
 use crate::specifiers::HgChangesetId;
 
 mod find_files;
+
+const ENABLE_BONSAI_ONLY_LFS_DIFFS: &str = "scm/mononoke:changeset_diff_enable_bonsai_only_lfs";
+
+/// Algorithm version for changeset content fingerprinting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FingerprintVersion {
+    /// V1: root FsnodeId blake2 hash. Universally available — every production
+    /// repo derives Fsnodes — but not the long-term recommendation.
+    V1,
+    /// V2: root ContentManifestId blake2 hash. Recommended long-term default.
+    /// Requires `scm/mononoke:derived_data_use_content_manifests` enabled for
+    /// the repo; otherwise the request fails with InvalidRequest (no
+    /// auto-fallback, to keep the fingerprint bytes stable for consumers).
+    V2,
+}
 
 #[derive(Clone, Debug)]
 enum PathMutableHistory {
@@ -141,6 +177,54 @@ impl From<metaconfig_types::DirectoryBranchClusterFixedCluster> for DirectoryBra
     }
 }
 
+/// Recursively traverse the directory branch cluster manifest to collect all clusters.
+/// A cluster is found when a directory has non-empty secondaries (it is a primary).
+//
+// Note: We expect the number of clusters to be relatively small (O(1000)),
+// and the manifest only contains directories that are part of clusters, not
+// all directories in the repo, so traversing the whole manifest should be fine.
+async fn collect_manifest_clusters(
+    ctx: &CoreContext,
+    blobstore: &repo_blobstore::RepoBlobstore,
+    manifest: DirectoryBranchClusterManifest,
+    current_path: MPath,
+) -> Result<Vec<DirectoryBranchCluster>, MononokeError> {
+    use mononoke_types::directory_branch_cluster_manifest::DirectoryBranchClusterManifestEntry;
+
+    let mut clusters = Vec::new();
+
+    // Check if this directory is a cluster primary (has secondaries)
+    if let Some(secondaries) = manifest.get_secondaries() {
+        if !secondaries.is_empty() {
+            clusters.push(DirectoryBranchCluster {
+                cluster_primary: current_path.clone(),
+                secondaries: secondaries.to_vec(),
+            });
+        }
+    }
+
+    // Recursively traverse child directories (skip file entries)
+    let mut subentries = manifest.into_subentries(ctx, blobstore);
+    while let Some(result) = subentries.next().await {
+        let (name, entry) = result.map_err(MononokeError::from)?;
+        // Only recurse into directories, skip file entries
+        if let DirectoryBranchClusterManifestEntry::Directory(child_manifest) = entry {
+            let child_path = current_path.join_element(Some(&name));
+            let child_clusters = Box::pin(collect_manifest_clusters(
+                ctx,
+                blobstore,
+                child_manifest,
+                child_path,
+            ))
+            .await?;
+            clusters.extend(child_clusters);
+        }
+    }
+
+    Ok(clusters)
+}
+
+/// A context object representing a query to a particular commit in a repo.
 #[derive(Clone)]
 pub struct ChangesetContext<R> {
     repo_ctx: RepoContext<R>,
@@ -148,11 +232,13 @@ pub struct ChangesetContext<R> {
     bonsai_changeset: LazyShared<Result<BonsaiChangeset, MononokeError>>,
     changeset_info: LazyShared<Result<ChangesetInfo, MononokeError>>,
     root_unode_manifest_id: LazyShared<Result<RootUnodeManifestId, MononokeError>>,
-    root_fsnode_id: LazyShared<Result<RootFsnodeId, MononokeError>>,
+    root_content_manifest_id: LazyShared<Result<compat::ContentManifestId, MononokeError>>,
     root_skeleton_manifest_id: LazyShared<Result<RootSkeletonManifestId, MononokeError>>,
     root_skeleton_manifest_v2_id: LazyShared<Result<RootSkeletonManifestV2Id, MononokeError>>,
     root_deleted_manifest_v2_id: LazyShared<Result<RootDeletedManifestV2Id, MononokeError>>,
     root_bssm_v3_directory_id: LazyShared<Result<RootBssmV3DirectoryId, MononokeError>>,
+    root_directory_branch_cluster_manifest_id:
+        LazyShared<Result<RootDirectoryBranchClusterManifestId, MononokeError>>,
     /// None if no mutable history, else map from supplied paths to data fetched
     mutable_history: Option<HashMap<MPath, PathMutableHistory>>,
 }
@@ -184,7 +270,7 @@ pub enum ChangesetDiffItem {
     FILES,
 }
 
-impl<R: MononokeRepo> fmt::Debug for ChangesetContext<R> {
+impl<R: RepoIdentityRef> fmt::Debug for ChangesetContext<R> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -199,30 +285,31 @@ fn to_vec1<X>(maybe_vec: Option<Vec<X>>) -> Option<Vec1<X>> {
     maybe_vec.and_then(|v| Vec1::try_from_vec(v).ok())
 }
 
-/// A context object representing a query to a particular commit in a repo.
-impl<R: MononokeRepo> ChangesetContext<R> {
+impl<R> ChangesetContext<R> {
     /// Construct a new `MononokeChangeset`.  The changeset must exist
     /// in the repo.
     pub(crate) fn new(repo_ctx: RepoContext<R>, id: ChangesetId) -> Self {
         let bonsai_changeset = LazyShared::new_empty();
         let changeset_info = LazyShared::new_empty();
         let root_unode_manifest_id = LazyShared::new_empty();
-        let root_fsnode_id = LazyShared::new_empty();
+        let root_content_manifest_id = LazyShared::new_empty();
         let root_skeleton_manifest_id = LazyShared::new_empty();
         let root_skeleton_manifest_v2_id = LazyShared::new_empty();
         let root_deleted_manifest_v2_id = LazyShared::new_empty();
         let root_bssm_v3_directory_id = LazyShared::new_empty();
+        let root_directory_branch_cluster_manifest_id = LazyShared::new_empty();
         Self {
             repo_ctx,
             id,
             changeset_info,
             bonsai_changeset,
             root_unode_manifest_id,
-            root_fsnode_id,
+            root_content_manifest_id,
             root_skeleton_manifest_id,
             root_skeleton_manifest_v2_id,
             root_deleted_manifest_v2_id,
             root_bssm_v3_directory_id,
+            root_directory_branch_cluster_manifest_id,
             mutable_history: None,
         }
     }
@@ -232,6 +319,40 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         self.repo_ctx.ctx()
     }
 
+    /// The `RepoContext` for this query.
+    pub fn repo_ctx(&self) -> &RepoContext<R> {
+        &self.repo_ctx
+    }
+
+    /// The canonical bonsai changeset ID for the changeset.
+    pub fn id(&self) -> ChangesetId {
+        self.id
+    }
+
+    /// Deconstruct the changeset into RepoContext and ChangesetId.
+    pub fn into_repo_ctx_and_id(self) -> (RepoContext<R>, ChangesetId) {
+        let Self { repo_ctx, id, .. } = self;
+        (repo_ctx, id)
+    }
+
+    /// The IDs of mutable parents of the changeset, if any.
+    ///
+    /// The value can be `None` to indicate that we were given a path
+    /// to check, but it had no mutable parents of its own.
+    ///
+    /// Only returns a non-empty set if add_mutable_renames has been called
+    pub fn mutable_parents(&self) -> HashSet<Option<ChangesetId>> {
+        self.mutable_history
+            .as_ref()
+            .map_or(HashSet::new(), |info| {
+                info.values()
+                    .map(PathMutableHistory::get_parent_cs_id)
+                    .collect()
+            })
+    }
+}
+
+impl<R: MutableRenamesArc> ChangesetContext<R> {
     /// Adds copy information from mutable renames as an override to replace
     /// the Bonsai copy information
     pub async fn add_mutable_renames(
@@ -261,38 +382,9 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         self.mutable_history = Some(copy_info);
         Ok(())
     }
+}
 
-    /// The `RepoContext` for this query.
-    pub fn repo_ctx(&self) -> &RepoContext<R> {
-        &self.repo_ctx
-    }
-
-    /// The canonical bonsai changeset ID for the changeset.
-    pub fn id(&self) -> ChangesetId {
-        self.id
-    }
-
-    /// Deconstruct the changeset into RepoContext and ChangesetId.
-    pub fn into_repo_ctx_and_id(self) -> (RepoContext<R>, ChangesetId) {
-        let Self { repo_ctx, id, .. } = self;
-        (repo_ctx, id)
-    }
-
-    /// The Mercurial ID for the changeset.
-    pub async fn hg_id(&self) -> Result<Option<HgChangesetId>, MononokeError> {
-        let maybe_hg_id = self
-            .repo_ctx()
-            .repo()
-            .bonsai_hg_mapping()
-            .get_hg_from_bonsai(self.ctx(), self.id)
-            .await?;
-        if maybe_hg_id.is_none() && self.repo_ctx().derive_hgchangesets_enabled() {
-            let mapped_hg_id = self.derive::<MappedHgChangesetId>().await?;
-            return Ok(Some(mapped_hg_id.hg_changeset_id()));
-        }
-        Ok(maybe_hg_id)
-    }
-
+impl<R: BonsaiGlobalrevMappingRef> ChangesetContext<R> {
     /// The Globalrev for the changeset.
     pub async fn globalrev(&self) -> Result<Option<Globalrev>, MononokeError> {
         let mapping = self
@@ -303,7 +395,9 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .await?;
         Ok(mapping.into_iter().next())
     }
+}
 
+impl<R: BonsaiSvnrevMappingRef> ChangesetContext<R> {
     /// The SVN revision number for the changeset.
     pub async fn svnrev(&self) -> Result<Option<Svnrev>, MononokeError> {
         let mapping = self
@@ -314,22 +408,9 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .await?;
         Ok(mapping)
     }
+}
 
-    /// The git Sha1 for the changeset (if available).
-    pub async fn git_sha1(&self) -> Result<Option<GitSha1>, MononokeError> {
-        let maybe_git_sha1 = self
-            .repo_ctx()
-            .repo()
-            .bonsai_git_mapping()
-            .get_git_sha1_from_bonsai(self.ctx(), self.id)
-            .await?;
-        if maybe_git_sha1.is_none() && self.repo_ctx().derive_gitcommit_enabled() {
-            let mapped_git_commit_id = self.derive::<MappedGitCommitId>().await?;
-            return Ok(Some(*mapped_git_commit_id.oid()));
-        }
-        Ok(maybe_git_sha1)
-    }
-
+impl<R: RepoDerivedDataArc> ChangesetContext<R> {
     /// Derive a derivable data type for this changeset.
     // Desugared async syntax so we can return a future with static lifetime.
     fn derive<Derivable: BonsaiDerivable>(
@@ -347,17 +428,42 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         }
     }
 
+    /// Returns a content-based fingerprint for this changeset.
+    ///
+    /// The fingerprint depends only on the file tree contents (paths, content
+    /// ids, file types, sizes), not on metadata (author, date, message).
+    /// Two changesets with identical file trees produce the same fingerprint
+    /// regardless of how they got there.
+    pub async fn content_fingerprint(
+        &self,
+        version: FingerprintVersion,
+    ) -> Result<Vec<u8>, MononokeError> {
+        match version {
+            FingerprintVersion::V1 => {
+                let root_id = self.derive::<RootFsnodeId>().await?;
+                Ok(root_id.into_fsnode_id().blake2().as_ref().to_vec())
+            }
+            FingerprintVersion::V2 => {
+                // No auto-fallback to fsnode if ContentManifest is not enrolled:
+                // the deterministic-fingerprint guarantee requires V2 bytes to
+                // be derivable only from RootContentManifestId. The
+                // derive::<RootContentManifestId>() call returns InvalidRequest
+                // when the type is not enabled for the repo.
+                let root_id = self.derive::<RootContentManifestId>().await?;
+                Ok(root_id
+                    .into_content_manifest_id()
+                    .blake2()
+                    .as_ref()
+                    .to_vec())
+            }
+        }
+    }
+
     pub(crate) async fn root_unode_manifest_id(
         &self,
     ) -> Result<RootUnodeManifestId, MononokeError> {
         self.root_unode_manifest_id
             .get_or_init(|| self.derive::<RootUnodeManifestId>())
-            .await
-    }
-
-    pub(crate) async fn root_fsnode_id(&self) -> Result<RootFsnodeId, MononokeError> {
-        self.root_fsnode_id
-            .get_or_init(|| self.derive::<RootFsnodeId>())
             .await
     }
 
@@ -393,6 +499,487 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .await
     }
 
+    pub(crate) async fn root_directory_branch_cluster_manifest_id(
+        &self,
+    ) -> Result<RootDirectoryBranchClusterManifestId, MononokeError> {
+        self.root_directory_branch_cluster_manifest_id
+            .get_or_init(|| self.derive::<RootDirectoryBranchClusterManifestId>())
+            .await
+    }
+}
+
+impl<R: RepoDerivedDataArc + RepoIdentityRef> ChangesetContext<R> {
+    pub(crate) async fn root_content_manifest_id(
+        &self,
+    ) -> Result<compat::ContentManifestId, MononokeError> {
+        self.root_content_manifest_id
+            .get_or_init(|| {
+                let repo_name = self.repo_ctx().name().to_string();
+                let use_content_manifests = justknobs::eval(
+                    "scm/mononoke:derived_data_use_content_manifests",
+                    None,
+                    Some(&repo_name),
+                );
+                if use_content_manifests {
+                    let fut = self.derive::<RootContentManifestId>();
+                    either::Either::Left(async move {
+                        let id = fut.await?;
+                        Ok(id.into_content_manifest_id().into())
+                    })
+                } else {
+                    let fut = self.derive::<RootFsnodeId>();
+                    either::Either::Right(async move {
+                        let id = fut.await?;
+                        Ok(id.into_fsnode_id().into())
+                    })
+                }
+            })
+            .await
+    }
+}
+
+impl<R: RepoBlobstoreArc> ChangesetContext<R> {
+    /// Get the `BonsaiChangeset` information for this changeset.
+    pub async fn bonsai_changeset(&self) -> Result<BonsaiChangeset, MononokeError> {
+        self.bonsai_changeset
+            .get_or_init(|| {
+                let ctx = self.ctx().clone();
+                let blobstore = self.repo_ctx.repo().repo_blobstore_arc();
+                let id = self.id;
+                async move { id.load(&ctx, &blobstore).await.map_err(MononokeError::from) }
+            })
+            .await
+    }
+}
+
+impl<R: CommitGraphRef + Clone> ChangesetContext<R> {
+    /// The generation number of the given changeset
+    pub async fn generation(&self) -> Result<Generation, MononokeError> {
+        self.repo_ctx
+            .commit_graph()
+            .changeset_generation(self.ctx(), self.id)
+            .await
+            .map_err(|_| {
+                MononokeError::NotAvailable(format!("Generation number missing for {:?}", &self.id))
+            })
+    }
+
+    /// The linear depth of the given changeset
+    pub async fn linear_depth(&self) -> Result<u64, MononokeError> {
+        self.repo_ctx
+            .commit_graph()
+            .changeset_linear_depth(self.ctx(), self.id)
+            .await
+            .map_err(|_| {
+                MononokeError::NotAvailable(format!("Linear depth missing for {:?}", &self.id))
+            })
+    }
+
+    /// Returns `true` if this commit is an ancestor of `other_commit`.  A commit is considered its
+    /// own ancestor for the purpose of this call.
+    pub async fn is_ancestor_of(&self, other_commit: ChangesetId) -> Result<bool, MononokeError> {
+        Ok(self
+            .repo_ctx()
+            .repo()
+            .commit_graph()
+            .is_ancestor(self.ctx(), self.id, other_commit)
+            .await?)
+    }
+
+    /// Returns the lowest common ancestor of two commits.
+    ///
+    /// In case of ambiguity (can happen with multiple merges of the same branches) returns the
+    /// common ancestor with lowest id out of those with highest generation number.
+    pub async fn common_base_with(
+        &self,
+        other_commit: ChangesetId,
+    ) -> Result<Option<ChangesetContext<R>>, MononokeError> {
+        let lca = self
+            .repo_ctx()
+            .repo()
+            .commit_graph()
+            .common_base(self.ctx(), self.id, other_commit)
+            .watched()
+            .await?;
+        Ok(lca.first().map(|id| Self::new(self.repo_ctx.clone(), *id)))
+    }
+
+    /// Returns the lowest common ancestor of two commits in the p1 linear graph, ignoring merge parents.
+    pub async fn linear_common_base_with(
+        &self,
+        other_commit: ChangesetId,
+    ) -> Result<Option<ChangesetContext<R>>, MononokeError> {
+        let lca = self
+            .repo_ctx()
+            .repo()
+            .commit_graph()
+            .p1_linear_graph()
+            .skip_tree_lowest_common_ancestor(self.ctx(), self.id, other_commit)
+            .watched()
+            .await?;
+        Ok(lca.map(|node| Self::new(self.repo_ctx.clone(), node.cs_id)))
+    }
+}
+
+impl<R: BonsaiHgMappingRef + RepoDerivedDataRef + RepoDerivedDataArc> ChangesetContext<R> {
+    /// The Mercurial ID for the changeset.
+    pub async fn hg_id(&self) -> Result<Option<HgChangesetId>, MononokeError> {
+        let maybe_hg_id = self
+            .repo_ctx()
+            .repo()
+            .bonsai_hg_mapping()
+            .get_hg_from_bonsai(self.ctx(), self.id)
+            .await?;
+        if maybe_hg_id.is_none() && self.repo_ctx().derive_hgchangesets_enabled() {
+            let mapped_hg_id = self.derive::<MappedHgChangesetId>().await?;
+            return Ok(Some(mapped_hg_id.hg_changeset_id()));
+        }
+        Ok(maybe_hg_id)
+    }
+}
+
+impl<R: BonsaiGitMappingRef + RepoDerivedDataRef + RepoDerivedDataArc> ChangesetContext<R> {
+    /// The git Sha1 for the changeset (if available).
+    pub async fn git_sha1(&self) -> Result<Option<GitSha1>, MononokeError> {
+        let maybe_git_sha1 = self
+            .repo_ctx()
+            .repo()
+            .bonsai_git_mapping()
+            .get_git_sha1_from_bonsai(self.ctx(), self.id)
+            .await?;
+        if maybe_git_sha1.is_none() && self.repo_ctx().derive_gitcommit_enabled() {
+            let mapped_git_commit_id = self.derive::<MappedGitCommitId>().await?;
+            return Ok(Some(*mapped_git_commit_id.oid()));
+        }
+        Ok(maybe_git_sha1)
+    }
+}
+
+impl<R: RepoDerivedDataRef + RepoDerivedDataArc + RepoBlobstoreArc> ChangesetContext<R> {
+    /// Get the `ChangesetInfo` for this changeset.
+    pub async fn changeset_info(&self) -> Result<ChangesetInfo, MononokeError> {
+        if self.repo_ctx.derive_changeset_info_enabled() {
+            self.changeset_info
+                .get_or_init(|| self.derive::<ChangesetInfo>())
+                .await
+        } else {
+            let bonsai = self.bonsai_changeset().await?;
+            Ok(ChangesetInfo::new(self.id(), bonsai))
+        }
+    }
+
+    /// The IDs of the parents of the changeset.
+    pub async fn parents(&self) -> Result<Vec<ChangesetId>, MononokeError> {
+        Ok(self.changeset_info().await?.parents().collect())
+    }
+
+    /// The author of the changeset.
+    pub async fn author(&self) -> Result<String, MononokeError> {
+        Ok(self.changeset_info().await?.author().to_string())
+    }
+
+    /// The date the changeset was authored.
+    pub async fn author_date(&self) -> Result<DateTime<FixedOffset>, MononokeError> {
+        Ok(self
+            .changeset_info()
+            .await?
+            .author_date()
+            .as_chrono()
+            .clone())
+    }
+
+    /// The committer of the changeset.  May be `None` if the committer
+    /// is not tracked.
+    pub async fn committer(&self) -> Result<Option<String>, MononokeError> {
+        Ok(self
+            .changeset_info()
+            .await?
+            .committer()
+            .map(|s| s.to_string()))
+    }
+
+    /// The date the changeset was committed.  May be `None` if the
+    /// committer is not tracked.
+    pub async fn committer_date(&self) -> Result<Option<DateTime<FixedOffset>>, MononokeError> {
+        Ok(self
+            .changeset_info()
+            .await?
+            .committer_date()
+            .map(|d| d.as_chrono().clone()))
+    }
+
+    /// The commit message.
+    pub async fn message(&self) -> Result<String, MononokeError> {
+        Ok(self.changeset_info().await?.message().to_string())
+    }
+
+    /// All mercurial commit extras as (name, value) pairs.
+    pub async fn hg_extras(&self) -> Result<Vec<(String, Vec<u8>)>, MononokeError> {
+        Ok(self
+            .changeset_info()
+            .await?
+            .hg_extra()
+            .map(|(name, value)| (name.to_string(), Vec::from(value)))
+            .collect())
+    }
+
+    pub async fn git_extra_headers(
+        &self,
+    ) -> Result<Option<Vec<(SmallVec<[u8; 24]>, Bytes)>>, MononokeError> {
+        Ok(self
+            .changeset_info()
+            .await?
+            .git_extra_headers()
+            .map(|headers| {
+                headers
+                    .map(|(key, value)| (SmallVec::from(key), Bytes::copy_from_slice(value)))
+                    .collect()
+            }))
+    }
+
+    pub async fn subtree_change_count(&self) -> Result<usize, MononokeError> {
+        Ok(self.changeset_info().await?.subtree_change_count())
+    }
+}
+
+impl<R: RepoBlobstoreArc> ChangesetContext<R> {
+    /// File changes associated with the commit.
+    pub async fn file_changes(
+        &self,
+    ) -> Result<SortedVectorMap<NonRootMPath, FileChange>, MononokeError> {
+        let bonsai = self.bonsai_changeset().await?;
+        let bonsai = bonsai.into_mut();
+        Ok(bonsai.file_changes)
+    }
+
+    pub async fn subtree_changes(
+        &self,
+    ) -> Result<SortedVectorMap<MPath, SubtreeChange>, MononokeError> {
+        let bonsai = self.bonsai_changeset().await?;
+        let bonsai = bonsai.into_mut();
+        Ok(bonsai.subtree_changes)
+    }
+}
+
+impl<R: RepoDerivedDataArc + RepoBlobstoreRef> ChangesetContext<R> {
+    async fn find_entries(
+        &self,
+        prefixes: Option<Vec1<MPath>>,
+        ordering: ChangesetFileOrdering,
+    ) -> Result<
+        impl Stream<Item = Result<(MPath, ManifestEntry<SkeletonManifestId, ()>), anyhow::Error>>
+        + use<R>,
+        MononokeError,
+    > {
+        let root = self.root_skeleton_manifest_id().await?;
+        let prefixes = match prefixes {
+            Some(prefixes) => prefixes.into_iter().map(PathOrPrefix::Prefix).collect(),
+            None => vec![PathOrPrefix::Prefix(MPath::ROOT)],
+        };
+        let entries = match ordering {
+            ChangesetFileOrdering::Unordered => root
+                .skeleton_manifest_id()
+                .find_entries(
+                    self.ctx().clone(),
+                    self.repo_ctx().repo().repo_blobstore().clone(),
+                    prefixes,
+                )
+                .left_stream(),
+            ChangesetFileOrdering::Ordered { after } => root
+                .skeleton_manifest_id()
+                .find_entries_ordered(
+                    self.ctx().clone(),
+                    self.repo_ctx().repo().repo_blobstore().clone(),
+                    prefixes,
+                    after,
+                )
+                .right_stream(),
+        };
+        Ok(entries)
+    }
+
+    async fn find_entries_v2(
+        &self,
+        prefixes: Option<Vec1<MPath>>,
+        ordering: ChangesetFileOrdering,
+    ) -> Result<
+        impl Stream<Item = Result<(MPath, ManifestEntry<SkeletonManifestV2, ()>), anyhow::Error>>
+        + use<R>,
+        MononokeError,
+    > {
+        let root = self.root_skeleton_manifest_v2_id().await?;
+        let manifest = root
+            .inner_id()
+            .load(self.ctx(), self.repo_ctx().repo().repo_blobstore())
+            .await?;
+        let prefixes = match prefixes {
+            Some(prefixes) => prefixes.into_iter().map(PathOrPrefix::Prefix).collect(),
+            None => vec![PathOrPrefix::Prefix(MPath::ROOT)],
+        };
+        let entries = match ordering {
+            ChangesetFileOrdering::Unordered => manifest
+                .find_entries(
+                    self.ctx().clone(),
+                    self.repo_ctx().repo().repo_blobstore().clone(),
+                    prefixes,
+                )
+                .left_stream(),
+            ChangesetFileOrdering::Ordered { after } => manifest
+                .find_entries_ordered(
+                    self.ctx().clone(),
+                    self.repo_ctx().repo().repo_blobstore().clone(),
+                    prefixes,
+                    after,
+                )
+                .right_stream(),
+        };
+        Ok(entries)
+    }
+}
+
+impl<R: CommitGraphRef + RepoDerivedDataRef + RepoBlobstoreRef + Clone + Send + Sync + 'static>
+    ChangesetContext<R>
+{
+    /// Returns a stream of `ChangesetContext` for the history of the repository from this commit.
+    pub async fn history(
+        &self,
+        opts: ChangesetHistoryOptions,
+    ) -> Result<BoxStream<'_, Result<ChangesetContext<R>, MononokeError>>, MononokeError> {
+        let mut ancestors_stream_builder = AncestorsStreamBuilder::new(
+            Arc::new(self.repo_ctx().repo().commit_graph().parents_graph()),
+            self.ctx().clone(),
+            vec![self.id()],
+        );
+
+        if opts.until_timestamp.is_some() || opts.until_committer_timestamp.is_some() {
+            ancestors_stream_builder = ancestors_stream_builder.with({
+                let ctx = self.ctx().clone();
+                let repo_ctx = self.repo_ctx().clone();
+                let cs_info_enabled = repo_ctx.derive_changeset_info_enabled();
+                move |cs_id| {
+                    cloned!(ctx, repo_ctx, cs_info_enabled);
+                    async move {
+                        let info = if cs_info_enabled {
+                            repo_ctx
+                                .repo()
+                                .repo_derived_data()
+                                .derive::<ChangesetInfo>(&ctx, cs_id, DerivationPriority::LOW)
+                                .await?
+                        } else {
+                            let bonsai = cs_id.load(&ctx, repo_ctx.repo().repo_blobstore()).await?;
+                            ChangesetInfo::new(cs_id, bonsai)
+                        };
+
+                        if let Some(until_timestamp) = opts.until_timestamp {
+                            let date = info.author_date().as_chrono().clone();
+                            if date.timestamp() < until_timestamp {
+                                return Ok(false);
+                            }
+                        }
+                        if let Some(until_committer_timestamp) = opts.until_committer_timestamp {
+                            // Get committer_date if available, otherwise fall back to author_date
+                            let date = match info.committer_date() {
+                                Some(committer_date) => committer_date.as_chrono().clone(),
+                                None => info.author_date().as_chrono().clone(),
+                            };
+                            if date.timestamp() < until_committer_timestamp {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                }
+            });
+        }
+
+        if let Some(descendants_of) = opts.descendants_of {
+            ancestors_stream_builder = ancestors_stream_builder.descendants_of(descendants_of);
+        }
+
+        if let Some(exclude_changeset_and_ancestors) = opts.exclude_changeset_and_ancestors {
+            ancestors_stream_builder = ancestors_stream_builder
+                .exclude_ancestors_of(vec![exclude_changeset_and_ancestors]);
+        }
+
+        let cs_ids_stream = ancestors_stream_builder.build().await?;
+
+        Ok(cs_ids_stream
+            .map_err(MononokeError::from)
+            .and_then(move |cs_id| async move {
+                Ok::<_, MononokeError>(ChangesetContext::new(self.repo_ctx().clone(), cs_id))
+            })
+            .boxed())
+    }
+}
+
+impl<R: CommitGraphArc + Clone + Send + Sync + 'static> ChangesetContext<R> {
+    pub async fn linear_history(
+        &self,
+        opts: ChangesetLinearHistoryOptions,
+    ) -> Result<BoxStream<'_, Result<ChangesetContext<R>, MononokeError>>, MononokeError> {
+        let mut linear_ancestors_stream_builder = LinearAncestorsStreamBuilder::new(
+            self.repo_ctx().repo().commit_graph_arc(),
+            self.ctx().clone(),
+            self.id(),
+        )
+        .await?;
+
+        if let Some(exclude_changeset_and_ancestors) = opts.exclude_changeset_and_ancestors {
+            linear_ancestors_stream_builder = linear_ancestors_stream_builder
+                .exclude_ancestors_of(exclude_changeset_and_ancestors)
+                .await?;
+        }
+
+        if let Some(descendants_of) = opts.descendants_of {
+            linear_ancestors_stream_builder = linear_ancestors_stream_builder
+                .descendants_of(descendants_of)
+                .await?;
+        }
+
+        linear_ancestors_stream_builder = linear_ancestors_stream_builder.skip(opts.skip);
+
+        let cs_ids_stream = linear_ancestors_stream_builder.build().await?;
+
+        Ok(cs_ids_stream
+            .map_err(MononokeError::from)
+            .and_then(move |cs_id| async move {
+                Ok::<_, MononokeError>(ChangesetContext::new(self.repo_ctx().clone(), cs_id))
+            })
+            .boxed())
+    }
+}
+
+/// Merge a sorted `supplement` of `ChangesetPathDiffContext` entries into a
+/// `manifest_vec`. The two inputs are disjoint by construction in the
+/// LFS-renormalize use case (manifest emits only when content_id or
+/// file_type differs; the supplement requires they match), so no tie-break
+/// is needed.
+///
+/// Ordered: classic two-iterator sort-merge by `.path()`. Both inputs must
+/// already be sorted ascending by path.
+///
+/// Unordered: append `supplement` to `manifest_vec` (no ordering guarantee
+/// across the join).
+pub(crate) fn insert_sorted_results<R>(
+    manifest_vec: &mut Vec<ChangesetPathDiffContext<R>>,
+    supplement: Vec<ChangesetPathDiffContext<R>>,
+    is_ordered: bool,
+) {
+    if supplement.is_empty() {
+        return;
+    }
+    if !is_ordered {
+        manifest_vec.extend(supplement);
+        return;
+    }
+
+    *manifest_vec = std::mem::take(manifest_vec)
+        .into_iter()
+        .merge_by(supplement, |m, s| m.path() <= s.path())
+        .collect();
+}
+
+impl<R: MononokeRepo> ChangesetContext<R> {
     /// Query the root directory in the repository at this changeset revision.
     pub async fn root(&self) -> Result<ChangesetPathContentContext<R>, MononokeError> {
         ChangesetPathContentContext::new(self.clone(), None).await
@@ -505,10 +1092,9 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         impl Stream<Item = Result<ChangesetPathContentContext<R>, MononokeError>> + use<R, T>,
         MononokeError,
     > {
-        Ok(self
-            .root_fsnode_id()
-            .await?
-            .fsnode_id()
+        let root_id = self.root_content_manifest_id().await?;
+
+        Ok(root_id
             .find_entries(
                 self.ctx().clone(),
                 self.repo_ctx().repo().repo_blobstore().clone(),
@@ -520,10 +1106,10 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                 move |(mpath, entry)| {
                     cloned!(changeset);
                     async move {
-                        ChangesetPathContentContext::new_with_fsnode_entry(
+                        ChangesetPathContentContext::new_with_manifest_entry(
                             changeset.clone(),
                             mpath,
-                            entry,
+                            entry.map_leaf(Into::into),
                         )
                         .await
                     }
@@ -546,7 +1132,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             "scm/mononoke:changeset_path_context_use_skeleton_manifest_v2",
             None,
             Some(self.repo_ctx().name()),
-        )? {
+        ) {
             Ok(self
                 .root_skeleton_manifest_v2_id()
                 .await?
@@ -627,204 +1213,33 @@ impl<R: MononokeRepo> ChangesetContext<R> {
     > {
         Ok(self.deleted_paths_impl(self.root_deleted_manifest_v2_id().await?, paths))
     }
+}
 
-    /// Get the `BonsaiChangeset` information for this changeset.
-    pub async fn bonsai_changeset(&self) -> Result<BonsaiChangeset, MononokeError> {
-        self.bonsai_changeset
-            .get_or_init(|| {
-                let ctx = self.ctx().clone();
-                let blobstore = self.repo_ctx.repo().repo_blobstore_arc();
-                let id = self.id;
-                async move { id.load(&ctx, &blobstore).await.map_err(MononokeError::from) }
-            })
-            .await
-    }
-
-    /// Get the `ChangesetInfo` for this changeset.
-    pub async fn changeset_info(&self) -> Result<ChangesetInfo, MononokeError> {
-        if self.repo_ctx.derive_changeset_info_enabled() {
-            self.changeset_info
-                .get_or_init(|| self.derive::<ChangesetInfo>())
-                .await
-        } else {
-            let bonsai = self.bonsai_changeset().await?;
-            Ok(ChangesetInfo::new(self.id(), bonsai))
-        }
-    }
-
-    /// The IDs of the parents of the changeset.
-    pub async fn parents(&self) -> Result<Vec<ChangesetId>, MononokeError> {
-        Ok(self.changeset_info().await?.parents().collect())
-    }
-
-    /// The IDs of mutable parents of the changeset, if any.
-    ///
-    /// The value can be `None` to indicate that we were given a path
-    /// to check, but it had no mutable parents of its own.
-    ///
-    /// Only returns a non-empty set if add_mutable_renames has been called
-    pub fn mutable_parents(&self) -> HashSet<Option<ChangesetId>> {
-        self.mutable_history
-            .as_ref()
-            .map_or(HashSet::new(), |info| {
-                info.values()
-                    .map(PathMutableHistory::get_parent_cs_id)
-                    .collect()
-            })
-    }
-
-    /// The author of the changeset.
-    pub async fn author(&self) -> Result<String, MononokeError> {
-        Ok(self.changeset_info().await?.author().to_string())
-    }
-
-    /// The date the changeset was authored.
-    pub async fn author_date(&self) -> Result<DateTime<FixedOffset>, MononokeError> {
-        Ok(self
-            .changeset_info()
-            .await?
-            .author_date()
-            .as_chrono()
-            .clone())
-    }
-
-    /// The committer of the changeset.  May be `None` if the committer
-    /// is not tracked.
-    pub async fn committer(&self) -> Result<Option<String>, MononokeError> {
-        Ok(self
-            .changeset_info()
-            .await?
-            .committer()
-            .map(|s| s.to_string()))
-    }
-
-    /// The date the changeset was committed.  May be `None` if the
-    /// committer is not tracked.
-    pub async fn committer_date(&self) -> Result<Option<DateTime<FixedOffset>>, MononokeError> {
-        Ok(self
-            .changeset_info()
-            .await?
-            .committer_date()
-            .map(|d| d.as_chrono().clone()))
-    }
-
-    /// The commit message.
-    pub async fn message(&self) -> Result<String, MononokeError> {
-        Ok(self.changeset_info().await?.message().to_string())
-    }
-
-    /// The generation number of the given changeset
-    pub async fn generation(&self) -> Result<Generation, MononokeError> {
-        self.repo_ctx
-            .commit_graph()
-            .changeset_generation(self.ctx(), self.id)
-            .await
-            .map_err(|_| {
-                MononokeError::NotAvailable(format!("Generation number missing for {:?}", &self.id))
-            })
-    }
-
-    /// The linear depth of the given changeset
-    pub async fn linear_depth(&self) -> Result<u64, MononokeError> {
-        self.repo_ctx
-            .commit_graph()
-            .changeset_linear_depth(self.ctx(), self.id)
-            .await
-            .map_err(|_| {
-                MononokeError::NotAvailable(format!("Linear depth missing for {:?}", &self.id))
-            })
-    }
-
-    /// All mercurial commit extras as (name, value) pairs.
-    pub async fn hg_extras(&self) -> Result<Vec<(String, Vec<u8>)>, MononokeError> {
-        Ok(self
-            .changeset_info()
-            .await?
-            .hg_extra()
-            .map(|(name, value)| (name.to_string(), Vec::from(value)))
-            .collect())
-    }
-
-    pub async fn git_extra_headers(
-        &self,
-    ) -> Result<Option<Vec<(SmallVec<[u8; 24]>, Bytes)>>, MononokeError> {
-        Ok(self
-            .changeset_info()
-            .await?
-            .git_extra_headers()
-            .map(|headers| {
-                headers
-                    .map(|(key, value)| (SmallVec::from(key), Bytes::copy_from_slice(value)))
-                    .collect()
-            }))
-    }
-
-    /// File changes associated with the commit.
-    pub async fn file_changes(
-        &self,
-    ) -> Result<SortedVectorMap<NonRootMPath, FileChange>, MononokeError> {
-        let bonsai = self.bonsai_changeset().await?;
-        let bonsai = bonsai.into_mut();
-        Ok(bonsai.file_changes)
-    }
-
-    pub async fn subtree_change_count(&self) -> Result<usize, MononokeError> {
-        Ok(self.changeset_info().await?.subtree_change_count())
-    }
-
-    pub async fn subtree_changes(
-        &self,
-    ) -> Result<SortedVectorMap<MPath, SubtreeChange>, MononokeError> {
-        let bonsai = self.bonsai_changeset().await?;
-        let bonsai = bonsai.into_mut();
-        Ok(bonsai.subtree_changes)
-    }
-
-    /// Returns `true` if this commit is an ancestor of `other_commit`.  A commit is considered its
-    /// own ancestor for the purpose of this call.
-    pub async fn is_ancestor_of(&self, other_commit: ChangesetId) -> Result<bool, MononokeError> {
-        Ok(self
-            .repo_ctx()
-            .repo()
-            .commit_graph()
-            .is_ancestor(self.ctx(), self.id, other_commit)
-            .await?)
-    }
-
-    /// Returns the lowest common ancestor of two commits.
-    ///
-    /// In case of ambiguity (can happen with multiple merges of the same branches) returns the
-    /// common ancestor with lowest id out of those with highest generation number.
-    pub async fn common_base_with(
-        &self,
-        other_commit: ChangesetId,
-    ) -> Result<Option<ChangesetContext<R>>, MononokeError> {
-        let lca = self
-            .repo_ctx()
-            .repo()
-            .commit_graph()
-            .common_base(self.ctx(), self.id, other_commit)
-            .watched()
-            .await?;
-        Ok(lca.first().map(|id| Self::new(self.repo_ctx.clone(), *id)))
-    }
-
-    /// Returns the lowest common ancestor of two commits in the p1 linear graph, ignoring merge parents.
-    pub async fn linear_common_base_with(
-        &self,
-        other_commit: ChangesetId,
-    ) -> Result<Option<ChangesetContext<R>>, MononokeError> {
-        let lca = self
-            .repo_ctx()
-            .repo()
-            .commit_graph()
-            .p1_linear_graph()
-            .skip_tree_lowest_common_ancestor(self.ctx(), self.id, other_commit)
-            .watched()
-            .await?;
-        Ok(lca.map(|node| Self::new(self.repo_ctx.clone(), node.cs_id)))
-    }
-
+impl<R> ChangesetContext<R>
+where
+    R: RepoPermissionCheckerRef
+        + AclRegionsRef
+        + RepoIdentityRef
+        + RepoConfigRef
+        + RestrictedPathsArc
+        + RepoBlobstoreRef
+        + RepoBlobstoreArc
+        + RepoDerivedDataRef
+        + RepoDerivedDataArc
+        + RepoEphemeralStoreRef
+        + RepoWithBubble
+        + CommitGraphRef
+        + CommitGraphArc
+        + BonsaiHgMappingRef
+        + BonsaiGitMappingRef
+        + BonsaiGlobalrevMappingRef
+        + BonsaiSvnrevMappingRef
+        + MutableRenamesArc
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
     pub async fn diff_unordered(
         &self,
         other: &ChangesetContext<R>,
@@ -844,6 +1259,136 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         )
         .watched()
         .await
+    }
+
+    /// Find paths whose only change between `self` and `other` is a
+    /// Git-LFS discriminator flip (raw blob ↔ canonical pointer, same
+    /// resolved content). The manifest walk in `diff()` misses these
+    /// because manifest leaves carry no `git_lfs` field.
+    ///
+    /// Candidates are `FileChange::Change` entries in `self`'s bonsai
+    /// that the manifest walk did not emit; by construction, such a
+    /// candidate matches `other` on `(content_id, file_type)`, so the
+    /// only field that can differ is `git_lfs`. We do not inspect
+    /// `other`'s bonsai — the orphan-pointer cleanup workflow inherits
+    /// the LFS state from an ancestor, so neither side records it.
+    ///
+    /// Pass `excluded_paths` as the set already emitted by the manifest
+    /// walk; this keeps the returned set disjoint from it without
+    /// re-deriving manifests.
+    ///
+    /// Assumes producers only emit `FileChange::Change` for real changes
+    /// (`emits_re_recorded_state` locks the no-op-Change case: we
+    /// surface, never mask) and that candidates have `copy_from = None`
+    /// (gitimport hardcodes this; if a future producer changes it,
+    /// filter `tracked.copy_from().is_some()` here).
+    ///
+    /// Callers must pass `self`'s first parent for `other` and a repo
+    /// with `git_lfs_interpret_pointers`, or this returns empty. Returns
+    /// `ChangesetPathDiffContext` entries sorted ascending by path,
+    /// lazy-loaded so path-only consumers pay only per-path ACL cost.
+    pub(crate) async fn get_potential_lfs_changes(
+        &self,
+        other: &ChangesetContext<R>,
+        path_restrictions: &Option<Vec<MPath>>,
+        subtree_copy_sources: &manifest::PathTree<Option<(ChangesetContext<R>, MPath)>>,
+        excluded_paths: &HashSet<MPath>,
+        after: Option<&MPath>,
+        before_or_at: Option<&MPath>,
+        max_entries: usize,
+    ) -> Result<Vec<ChangesetPathDiffContext<R>>, MononokeError> {
+        // Per-path `ChangesetPathContentContext::new` calls do an ACL check
+        // and a restricted-paths check. Bound the parallel fan-out per the
+        // project guidance for path-context construction.
+        const LFS_PATH_CONTEXT_CONCURRENCY: usize = 50;
+
+        if max_entries == 0
+            || !self
+                .repo_ctx()
+                .repo()
+                .repo_config()
+                .git_configs
+                .git_lfs_interpret_pointers
+        {
+            return Ok(Vec::new());
+        }
+
+        if before_or_at.is_some_and(|b| b.is_root() || after.is_some_and(|a| b <= a)) {
+            return Ok(Vec::new());
+        }
+
+        fn within_restrictions(path: &MPath, path_restrictions: &Option<Vec<MPath>>) -> bool {
+            path_restrictions.as_ref().is_none_or(|i| {
+                i.iter()
+                    .any(|path_restriction| path.is_related_to(path_restriction))
+            })
+        }
+
+        let self_changes = self.file_changes().await?;
+
+        let start_bound = after
+            .cloned()
+            .and_then(MPath::into_optional_non_root_path)
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let end_bound = before_or_at
+            .cloned()
+            .and_then(MPath::into_optional_non_root_path)
+            .map_or(Bound::Unbounded, Bound::Included);
+
+        let candidates: Vec<MPath> = self_changes
+            .range::<NonRootMPath, _>((start_bound, end_bound))
+            .filter_map(|(non_root_path, file_change)| {
+                let FileChange::Change(_) = file_change else {
+                    return None;
+                };
+
+                let path: MPath = non_root_path.clone().into();
+                if !within_restrictions(&path, path_restrictions) {
+                    return None;
+                }
+
+                // Skip paths inside a subtree-copy region: for those, the
+                // correct comparison side is the copy source, not `other`,
+                // and the main manifest walk handles them via its own
+                // subtree-copy logic.
+                if subtree_copy_sources
+                    .get_nearest_parent(&path, Option::is_some)
+                    .is_some()
+                {
+                    return None;
+                }
+
+                // Already emitted by the manifest walk -- the manifests
+                // differed on content_id or file_type, so it isn't an
+                // LFS-only flip.
+                if excluded_paths.contains(&path) {
+                    return None;
+                }
+
+                Some(path)
+            })
+            .collect();
+
+        stream::iter(candidates)
+            .map(|path| async move {
+                let (new_content, old_content) = try_join(
+                    ChangesetPathContentContext::new(self.clone(), path.clone()),
+                    ChangesetPathContentContext::new(other.clone(), path.clone()),
+                )
+                .await?;
+                ChangesetPathDiffContext::new_file(
+                    self.clone(),
+                    path,
+                    Some(new_content),
+                    Some(old_content),
+                    CopyInfo::None,
+                    None,
+                )
+            })
+            .buffered(LFS_PATH_CONTEXT_CONCURRENCY)
+            .take(max_entries)
+            .try_collect()
+            .await
     }
 
     /// If the given path is part of a subtree copy, get the subtree copy source, as well as the replacement path
@@ -885,7 +1430,10 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         diff_items: BTreeSet<ChangesetDiffItem>,
         ordering: ChangesetFileOrdering,
         limit: Option<usize>,
-    ) -> Result<Vec<ChangesetPathDiffContext<R>>, MononokeError> {
+    ) -> Result<Vec<ChangesetPathDiffContext<R>>, MononokeError>
+    where
+        R: RepoConfigRef,
+    {
         // Helper to that checks if a path is within the given path restrictions
         fn within_restrictions(path: &MPath, path_restrictions: &Option<Vec<MPath>>) -> bool {
             path_restrictions.as_ref().is_none_or(|i| {
@@ -901,8 +1449,14 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         let mut inv_copy_path_map = HashMap::new();
         let mut manifest_replacements = HashMap::new();
         let mut subtree_copy_sources = manifest::PathTree::default();
+        let parents = self.parents().await?;
         // We can only consider copies or subtree copies when comparing with a parent
-        let comparing_against_parent = self.parents().await?.contains(&other.id);
+        let comparing_against_parent = parents.contains(&other.id);
+        // The bonsai-only LFS supplement is only valid when `other` is `self`'s
+        // first parent; this matches the common-case `commit_compare` usage and
+        // avoids emitting spurious entries for merge changesets compared
+        // against a non-leftmost parent.
+        let first_parent_is_other = parents.first() == Some(&other.id);
         if comparing_against_parent && include_copies_renames {
             let file_changes = self.file_changes().await?;
             let mut to_paths = HashSet::new();
@@ -954,28 +1508,27 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                 }
             }
 
-            let other_root_fsnode_id = other.root_fsnode_id().await?;
+            let other_root_manifest_id = other.root_content_manifest_id().await?;
 
-            // Prefetch fsnode entries for all "from paths" so that we don't need
-            // to refetch them later.  Use other's blobstore since we're accessing
-            // other's manifest data.
-            let from_path_to_mf_entry = other_root_fsnode_id
-                .fsnode_id()
+            // Prefetch manifest entries for all "from paths" so that we don't
+            // need to refetch them later.  Use other's blobstore since we're
+            // accessing other's manifest data.
+            let from_path_to_mf_entry = other_root_manifest_id
                 .find_entries(
                     self.ctx().clone(),
                     other.repo_ctx().repo().repo_blobstore().clone(),
                     copy_path_map.keys().cloned(),
                 )
+                .map_ok(|(path, entry)| (path, entry.map_leaf(Into::into)))
                 .try_collect::<HashMap<_, _>>();
 
             // At the same time, find out whether the destinations of copies
             // already existed in the parent.
-            let to_path_exists_in_parent = other_root_fsnode_id
-                .fsnode_id()
+            let to_path_exists_in_parent = other_root_manifest_id
                 .find_entries(
                     self.ctx().clone(),
                     other.repo_ctx().repo().repo_blobstore().clone(),
-                    to_paths.into_iter(),
+                    to_paths,
                 )
                 .map_ok(|(path, _)| path)
                 .try_collect::<HashSet<_>>();
@@ -998,8 +1551,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             for (from_path, to_paths) in copy_path_map.iter() {
                 let mf_entry = from_path_to_mf_entry.get(from_path).ok_or_else(|| {
                     MononokeError::from(anyhow!(
-                        "internal error: cannot find {:?} in parent commit",
-                        from_path
+                        "internal error: cannot find {from_path:?} in parent commit"
                     ))
                 })?;
                 for to_path in to_paths {
@@ -1009,10 +1561,21 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         }
         if comparing_against_parent && include_subtree_copies {
             let subtree_changes = self.subtree_changes().await?;
-            for (path, change) in subtree_changes {
-                if let Some((from_cs_id, from_path)) = change.copy_or_deep_copy_source() {
+            let repo_ctx = self.repo_ctx().clone();
+            let ctx = self.ctx().clone();
+            let blobstore = self.repo_ctx().repo().repo_blobstore().clone();
+            let results: Vec<_> = stream::iter(subtree_changes.into_iter().filter_map(
+                |(path, change)| {
+                    change
+                        .copy_or_deep_copy_source()
+                        .map(|(from_cs_id, from_path)| (path, from_cs_id, from_path.clone()))
+                },
+            ))
+            .map(|(path, from_cs_id, from_path)| {
+                cloned!(repo_ctx, ctx, blobstore);
+                async move {
                     let from_cs =
-                        self.repo_ctx()
+                        repo_ctx
                             .changeset(from_cs_id)
                             .await?
                             .ok_or_else(|| {
@@ -1021,12 +1584,11 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                 ))
                             })?;
                     let entry = from_cs
-                        .root_fsnode_id()
+                        .root_content_manifest_id()
                         .await?
-                        .into_fsnode_id()
                         .find_entry(
-                            self.ctx().clone(),
-                            from_cs.repo_ctx().repo().repo_blobstore().clone(),
+                            ctx,
+                            blobstore,
                             from_path.clone(),
                         )
                         .await?
@@ -1035,9 +1597,15 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                 "Invalid subtree copy source: {from_cs_id} does not contain {from_path}"
                             ))
                         })?;
-                    subtree_copy_sources.insert(path.clone(), Some((from_cs, from_path.clone())));
-                    manifest_replacements.insert(path, entry);
+                    Ok::<_, MononokeError>((path, from_cs, from_path, entry))
                 }
+            })
+            .buffer_unordered(10)
+            .try_collect()
+            .await?;
+            for (path, from_cs, from_path, entry) in results {
+                subtree_copy_sources.insert(path.clone(), Some((from_cs, from_path.clone())));
+                manifest_replacements.insert(path, entry);
             }
         }
 
@@ -1046,9 +1614,8 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         // If self does contain a path, then we consider it to be a copy, otherwise
         // it's a move to the first location it was copied to.
         let copied_paths = self
-            .root_fsnode_id()
+            .root_content_manifest_id()
             .await?
-            .fsnode_id()
             .find_entries(
                 self.ctx().clone(),
                 self.repo_ctx().repo().repo_blobstore().clone(),
@@ -1058,11 +1625,14 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .try_collect::<HashSet<_>>()
             .await?;
 
-        let (self_manifest_root, other_manifest_root) =
-            try_join(self.root_fsnode_id(), other.root_fsnode_id()).await?;
-
         let diff_files = diff_items.contains(&ChangesetDiffItem::FILES);
         let diff_trees = diff_items.contains(&ChangesetDiffItem::TREES);
+
+        let (self_root, other_root) = try_join(
+            self.root_content_manifest_id(),
+            other.root_content_manifest_id(),
+        )
+        .await?;
 
         let recurse_pruner = {
             cloned!(path_restrictions);
@@ -1073,17 +1643,22 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             }
         };
 
+        let is_ordered = matches!(ordering, ChangesetFileOrdering::Ordered { .. });
+        let supplement_after: Option<MPath> = match &ordering {
+            ChangesetFileOrdering::Ordered { after } => after.clone(),
+            ChangesetFileOrdering::Unordered => None,
+        };
+
         let diff = match ordering {
             ChangesetFileOrdering::Unordered => {
                 // We start from "other" as manifest.diff() is backwards.
-                // Use other's blobstore for other_manifest_root data,
-                // and self's blobstore for self_manifest_root data.
-                other_manifest_root
-                    .fsnode_id()
+                // Use other's blobstore for other_root data,
+                // and self's blobstore for self_root data.
+                other_root
                     .filtered_diff(
                         self.ctx().clone(),
                         other.repo_ctx().repo().repo_blobstore().clone(),
-                        self_manifest_root.fsnode_id().clone(),
+                        self_root,
                         self.repo_ctx().repo().repo_blobstore().clone(),
                         Some,
                         recurse_pruner,
@@ -1093,20 +1668,29 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             }
             ChangesetFileOrdering::Ordered { after } => {
                 // We must find the weights of manifest replacements.
-                let manifest_replacements = stream::iter(manifest_replacements)
+                let weighted_replacements = stream::iter(manifest_replacements)
                     .map(|(path, entry)| {
                         Ok(async move {
                             match entry {
-                                ManifestEntry::Tree(fsnode_id) => {
-                                    let fsnode = fsnode_id
+                                ManifestEntry::Tree(manifest_id) => {
+                                    let manifest = manifest_id
                                         .load(self.ctx(), self.repo_ctx().repo().repo_blobstore())
                                         .await?;
-                                    let summary = fsnode.summary();
-                                    let weight =
-                                        summary.descendant_files_count + summary.child_dirs_count;
+                                    let weight = match &manifest {
+                                        either::Either::Left(cm) => {
+                                            let counts =
+                                                &cm.subentries.rollup_data().descendant_counts;
+                                            counts.files_count + counts.dirs_count
+                                        }
+                                        either::Either::Right(fsnode) => {
+                                            let summary = fsnode.summary();
+                                            summary.descendant_files_count
+                                                + summary.child_dirs_count
+                                        }
+                                    };
                                     anyhow::Ok((
                                         path,
-                                        ManifestEntry::Tree((weight as usize, fsnode_id)),
+                                        ManifestEntry::Tree((weight as usize, manifest_id)),
                                     ))
                                 }
                                 ManifestEntry::Leaf(leaf) => Ok((path, ManifestEntry::Leaf(leaf))),
@@ -1116,26 +1700,37 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                     .try_buffered(10)
                     .try_collect()
                     .await?;
+
                 // We start from "other" as manifest.diff() is backwards.
-                // Use other's blobstore for other_manifest_root data,
-                // and self's blobstore for self_manifest_root data.
-                other_manifest_root
-                    .fsnode_id()
+                // Use other's blobstore for other_root data,
+                // and self's blobstore for self_root data.
+                other_root
                     .filtered_diff_ordered(
                         self.ctx().clone(),
                         other.repo_ctx().repo().repo_blobstore().clone(),
-                        self_manifest_root.fsnode_id().clone(),
+                        self_root,
                         self.repo_ctx().repo().repo_blobstore().clone(),
                         after,
                         Some,
                         recurse_pruner,
-                        manifest_replacements,
+                        weighted_replacements,
                     )
                     .right_stream()
             }
         };
 
-        let change_contexts = diff
+        let convert_entry = |e: ManifestEntry<compat::ContentManifestId, _>| e.map_leaf(Into::into);
+
+        let mut change_contexts: Vec<ChangesetPathDiffContext<R>> = diff
+            .map_ok(|diff_entry| match diff_entry {
+                ManifestDiff::Added(path, entry) => ManifestDiff::Added(path, convert_entry(entry)),
+                ManifestDiff::Removed(path, entry) => {
+                    ManifestDiff::Removed(path, convert_entry(entry))
+                }
+                ManifestDiff::Changed(path, from, to) => {
+                    ManifestDiff::Changed(path, convert_entry(from), convert_entry(to))
+                }
+            })
             .try_filter_map(|diff_entry| {
                 async {
                     let entry = match diff_entry {
@@ -1148,7 +1743,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                 // There's copy information that we can use.
                                 let copy_info = if copied_paths.contains(from_path)
                                     || copy_path_map
-                                        .get(*from_path)
+                                        .get(from_path)
                                         .and_then(|to_paths| to_paths.first())
                                         != Some(&path)
                                 {
@@ -1162,17 +1757,17 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                     CopyInfo::Move
                                 };
 
-                                let from = ChangesetPathContentContext::new_with_fsnode_entry(
+                                let from = ChangesetPathContentContext::new_with_manifest_entry(
                                     other.clone(),
-                                    (**from_path).clone(),
-                                    *from_entry,
+                                    (*from_path).clone(),
+                                    from_entry.clone(),
                                 )
                                 .await?;
                                 Some(ChangesetPathDiffContext::new_file(
                                     self.clone(),
                                     path.clone(),
                                     Some(
-                                        ChangesetPathContentContext::new_with_fsnode_entry(
+                                        ChangesetPathContentContext::new_with_manifest_entry(
                                             self.clone(),
                                             path,
                                             entry,
@@ -1188,7 +1783,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                     self.clone(),
                                     path.clone(),
                                     Some(
-                                        ChangesetPathContentContext::new_with_fsnode_entry(
+                                        ChangesetPathContentContext::new_with_manifest_entry(
                                             self.clone(),
                                             path,
                                             entry,
@@ -1221,7 +1816,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                     path.clone(),
                                     None,
                                     Some(
-                                        ChangesetPathContentContext::new_with_fsnode_entry(
+                                        ChangesetPathContentContext::new_with_manifest_entry(
                                             source,
                                             source_path,
                                             entry,
@@ -1251,7 +1846,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                     self.clone(),
                                     path.clone(),
                                     Some(
-                                        ChangesetPathContentContext::new_with_fsnode_entry(
+                                        ChangesetPathContentContext::new_with_manifest_entry(
                                             self.clone(),
                                             path.clone(),
                                             to_entry,
@@ -1259,7 +1854,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                         .await?,
                                     ),
                                     Some(
-                                        ChangesetPathContentContext::new_with_fsnode_entry(
+                                        ChangesetPathContentContext::new_with_manifest_entry(
                                             source,
                                             source_path,
                                             from_entry,
@@ -1279,7 +1874,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                     self.clone(),
                                     path.clone(),
                                     Some(
-                                        ChangesetPathContentContext::new_with_fsnode_entry(
+                                        ChangesetPathContentContext::new_with_manifest_entry(
                                             self.clone(),
                                             path,
                                             entry,
@@ -1306,7 +1901,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                     path.clone(),
                                     None,
                                     Some(
-                                        ChangesetPathContentContext::new_with_fsnode_entry(
+                                        ChangesetPathContentContext::new_with_manifest_entry(
                                             source,
                                             source_path,
                                             entry,
@@ -1335,7 +1930,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                     self.clone(),
                                     path.clone(),
                                     Some(
-                                        ChangesetPathContentContext::new_with_fsnode_entry(
+                                        ChangesetPathContentContext::new_with_manifest_entry(
                                             self.clone(),
                                             path.clone(),
                                             to_entry,
@@ -1343,7 +1938,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                                         .await?,
                                     ),
                                     Some(
-                                        ChangesetPathContentContext::new_with_fsnode_entry(
+                                        ChangesetPathContentContext::new_with_manifest_entry(
                                             source,
                                             source_path,
                                             from_entry,
@@ -1364,187 +1959,59 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .take(limit.unwrap_or(usize::MAX))
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(change_contexts)
-    }
 
-    async fn find_entries(
-        &self,
-        prefixes: Option<Vec1<MPath>>,
-        ordering: ChangesetFileOrdering,
-    ) -> Result<
-        impl Stream<Item = Result<(MPath, ManifestEntry<SkeletonManifestId, ()>), anyhow::Error>>
-        + use<R>,
-        MononokeError,
-    > {
-        let root = self.root_skeleton_manifest_id().await?;
-        let prefixes = match prefixes {
-            Some(prefixes) => prefixes.into_iter().map(PathOrPrefix::Prefix).collect(),
-            None => vec![PathOrPrefix::Prefix(MPath::ROOT)],
-        };
-        let entries = match ordering {
-            ChangesetFileOrdering::Unordered => root
-                .skeleton_manifest_id()
-                .find_entries(
-                    self.ctx().clone(),
-                    self.repo_ctx().repo().repo_blobstore().clone(),
-                    prefixes,
-                )
-                .left_stream(),
-            ChangesetFileOrdering::Ordered { after } => root
-                .skeleton_manifest_id()
-                .find_entries_ordered(
-                    self.ctx().clone(),
-                    self.repo_ctx().repo().repo_blobstore().clone(),
-                    prefixes,
-                    after,
-                )
-                .right_stream(),
-        };
-        Ok(entries)
-    }
+        let supplement_enabled = first_parent_is_other
+            && diff_files
+            && self
+                .repo_ctx()
+                .repo()
+                .repo_config()
+                .git_configs
+                .git_lfs_interpret_pointers
+            && justknobs::eval(
+                ENABLE_BONSAI_ONLY_LFS_DIFFS,
+                None,
+                Some(self.repo_ctx().name()),
+            );
+        if supplement_enabled {
+            // Ordered mode only needs supplement paths up to the final manifest
+            // entry in this page: anything after it cannot affect the first
+            // `limit` entries of the sorted union. If the manifest page is
+            // short, scan to the end so supplement-only tail entries can fill
+            // it.
+            let supplement_before_or_at =
+                if is_ordered && limit.is_some_and(|l| change_contexts.len() == l) {
+                    change_contexts.last().map(|d| d.path().clone())
+                } else {
+                    None
+                };
+            let supplement_max = if is_ordered {
+                limit.unwrap_or(usize::MAX)
+            } else {
+                limit.map_or(usize::MAX, |l| l.saturating_sub(change_contexts.len()))
+            };
 
-    async fn find_entries_v2(
-        &self,
-        prefixes: Option<Vec1<MPath>>,
-        ordering: ChangesetFileOrdering,
-    ) -> Result<
-        impl Stream<Item = Result<(MPath, ManifestEntry<SkeletonManifestV2, ()>), anyhow::Error>>
-        + use<R>,
-        MononokeError,
-    > {
-        let root = self.root_skeleton_manifest_v2_id().await?;
-        let manifest = root
-            .inner_id()
-            .load(self.ctx(), self.repo_ctx().repo().repo_blobstore())
-            .await?;
-        let prefixes = match prefixes {
-            Some(prefixes) => prefixes.into_iter().map(PathOrPrefix::Prefix).collect(),
-            None => vec![PathOrPrefix::Prefix(MPath::ROOT)],
-        };
-        let entries = match ordering {
-            ChangesetFileOrdering::Unordered => manifest
-                .find_entries(
-                    self.ctx().clone(),
-                    self.repo_ctx().repo().repo_blobstore().clone(),
-                    prefixes,
-                )
-                .left_stream(),
-            ChangesetFileOrdering::Ordered { after } => manifest
-                .find_entries_ordered(
-                    self.ctx().clone(),
-                    self.repo_ctx().repo().repo_blobstore().clone(),
-                    prefixes,
-                    after,
-                )
-                .right_stream(),
-        };
-        Ok(entries)
-    }
-
-    /// Returns a stream of `ChangesetContext` for the history of the repository from this commit.
-    pub async fn history(
-        &self,
-        opts: ChangesetHistoryOptions,
-    ) -> Result<BoxStream<'_, Result<ChangesetContext<R>, MononokeError>>, MononokeError> {
-        let mut ancestors_stream_builder = AncestorsStreamBuilder::new(
-            Arc::new(self.repo_ctx().repo().commit_graph().parents_graph()),
-            self.ctx().clone(),
-            vec![self.id()],
-        );
-
-        if opts.until_timestamp.is_some() || opts.until_committer_timestamp.is_some() {
-            ancestors_stream_builder = ancestors_stream_builder.with({
-                let ctx = self.ctx().clone();
-                let repo_ctx = self.repo_ctx().clone();
-                let cs_info_enabled = repo_ctx.derive_changeset_info_enabled();
-                move |cs_id| {
-                    cloned!(ctx, repo_ctx, cs_info_enabled);
-                    async move {
-                        let info = if cs_info_enabled {
-                            repo_ctx
-                                .repo()
-                                .repo_derived_data()
-                                .derive::<ChangesetInfo>(&ctx, cs_id, DerivationPriority::LOW)
-                                .await?
-                        } else {
-                            let bonsai = cs_id.load(&ctx, repo_ctx.repo().repo_blobstore()).await?;
-                            ChangesetInfo::new(cs_id, bonsai)
-                        };
-
-                        if let Some(until_timestamp) = opts.until_timestamp {
-                            let date = info.author_date().as_chrono().clone();
-                            if date.timestamp() < until_timestamp {
-                                return Ok(false);
-                            }
-                        }
-                        if let Some(until_committer_timestamp) = opts.until_committer_timestamp {
-                            // Get committer_date if available, otherwise fall back to author_date
-                            let date = match info.committer_date() {
-                                Some(committer_date) => committer_date.as_chrono().clone(),
-                                None => info.author_date().as_chrono().clone(),
-                            };
-                            if date.timestamp() < until_committer_timestamp {
-                                return Ok(false);
-                            }
-                        }
-                        Ok(true)
-                    }
+            if supplement_max > 0 {
+                let excluded_paths: HashSet<MPath> =
+                    change_contexts.iter().map(|c| c.path().clone()).collect();
+                let supplement = self
+                    .get_potential_lfs_changes(
+                        other,
+                        &path_restrictions,
+                        &subtree_copy_sources,
+                        &excluded_paths,
+                        supplement_after.as_ref(),
+                        supplement_before_or_at.as_ref(),
+                        supplement_max,
+                    )
+                    .await?;
+                insert_sorted_results(&mut change_contexts, supplement, is_ordered);
+                if let Some(l) = limit {
+                    change_contexts.truncate(l);
                 }
-            });
+            }
         }
-
-        if let Some(descendants_of) = opts.descendants_of {
-            ancestors_stream_builder = ancestors_stream_builder.descendants_of(descendants_of);
-        }
-
-        if let Some(exclude_changeset_and_ancestors) = opts.exclude_changeset_and_ancestors {
-            ancestors_stream_builder = ancestors_stream_builder
-                .exclude_ancestors_of(vec![exclude_changeset_and_ancestors]);
-        }
-
-        let cs_ids_stream = ancestors_stream_builder.build().await?;
-
-        Ok(cs_ids_stream
-            .map_err(MononokeError::from)
-            .and_then(move |cs_id| async move {
-                Ok::<_, MononokeError>(ChangesetContext::new(self.repo_ctx().clone(), cs_id))
-            })
-            .boxed())
-    }
-
-    pub async fn linear_history(
-        &self,
-        opts: ChangesetLinearHistoryOptions,
-    ) -> Result<BoxStream<'_, Result<ChangesetContext<R>, MononokeError>>, MononokeError> {
-        let mut linear_ancestors_stream_builder = LinearAncestorsStreamBuilder::new(
-            self.repo_ctx().repo().commit_graph_arc(),
-            self.ctx().clone(),
-            self.id(),
-        )
-        .await?;
-
-        if let Some(exclude_changeset_and_ancestors) = opts.exclude_changeset_and_ancestors {
-            linear_ancestors_stream_builder = linear_ancestors_stream_builder
-                .exclude_ancestors_of(exclude_changeset_and_ancestors)
-                .await?;
-        }
-
-        if let Some(descendants_of) = opts.descendants_of {
-            linear_ancestors_stream_builder = linear_ancestors_stream_builder
-                .descendants_of(descendants_of)
-                .await?;
-        }
-
-        linear_ancestors_stream_builder = linear_ancestors_stream_builder.skip(opts.skip);
-
-        let cs_ids_stream = linear_ancestors_stream_builder.build().await?;
-
-        Ok(cs_ids_stream
-            .map_err(MononokeError::from)
-            .and_then(move |cs_id| async move {
-                Ok::<_, MononokeError>(ChangesetContext::new(self.repo_ctx().clone(), cs_id))
-            })
-            .boxed())
+        Ok(change_contexts)
     }
 
     pub async fn diff_root_unordered(
@@ -1617,7 +2084,9 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .watched()
             .await
     }
+}
 
+impl<R: MononokeRepo> ChangesetContext<R> {
     pub async fn run_hooks(
         &self,
         bookmark: impl AsRef<str>,
@@ -1637,93 +2106,315 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .await?)
     }
 
+    /// Check commit rate limits for a changeset against a bookmark.
+    pub async fn commit_rate_limit_check(
+        &self,
+        bookmark: &BookmarkKey,
+    ) -> Result<CommitRateLimitCheckResult, MononokeError> {
+        let bonsai = self.bonsai_changeset().await?;
+        let result = check_all_commit_rate_limits(
+            self.ctx(),
+            self.repo_ctx().repo(),
+            &bonsai,
+            self.id(),
+            bookmark,
+        )
+        .await
+        .map_err(MononokeError::from)?;
+        Ok(result)
+    }
+
     pub async fn directory_branch_clusters(
         &self,
         filter_path_prefixes: Option<Vec<MPath>>,
         after: Option<MPath>,
     ) -> Result<impl Iterator<Item = DirectoryBranchCluster>, MononokeError> {
-        let Some(fixed_config) = self
+        // Cluster information is stored in the directory branch cluster
+        // manifest, which can also be amended or overridden by configuration.
+        let fixed_config = self
             .repo_ctx()
             .repo()
             .repo_config()
             .directory_branch_cluster_config
             .as_ref()
-            .map(|config| &config.fixed_config)
-        else {
-            return Ok(vec![].into_iter());
-        };
+            .map(|config| &config.fixed_config);
 
-        let root_manifest_id = self
+        let root_skeleton_manifest_id = self
             .root_skeleton_manifest_id()
             .await?
             .into_skeleton_manifest_id();
 
-        // Find which paths in the cluster config exist in this commit.  We will
-        // filter out any primary or secondary paths that don't exist.
-        let cluster_paths: HashSet<MPath> = fixed_config
-            .clusters
-            .iter()
-            .flat_map(|cluster| {
-                std::iter::once(&cluster.cluster_primary).chain(cluster.secondaries.iter())
-            })
-            .cloned()
-            .map(MPath::from)
-            .collect();
-        let existing_paths = root_manifest_id
-            .find_entries(
-                self.ctx().clone(),
-                self.repo_ctx().repo().repo_blobstore().clone(),
-                cluster_paths.into_iter().map(PathOrPrefix::Path),
-            )
-            .map_ok(|(path, _entry)| path)
-            .try_collect::<HashSet<_>>()
-            .await?;
+        let dbcm_enabled = self
+            .repo_ctx()
+            .repo()
+            .repo_derived_data()
+            .config()
+            .is_enabled(DerivableType::DirectoryBranchClusterManifest);
+        let read_dbcm = dbcm_enabled
+            && justknobs::eval(
+                "scm/mononoke:dbcm_read_from_manifest",
+                None,
+                Some(self.repo_ctx().name()),
+            );
 
-        let mut clusters = vec![];
-        for cluster in fixed_config.clusters.iter() {
-            // Apply fixed cluster config to the requested commit.   We need to filter out
-            // the parts of the cluster config that don't apply to this commit by removing
-            // any paths that don't exist in the commit.
+        let mut clusters_by_primary: HashMap<MPath, DirectoryBranchCluster> = if read_dbcm {
+            let root_dbcm = self
+                .root_directory_branch_cluster_manifest_id()
+                .await?
+                .into_directory_branch_cluster_manifest_id()
+                .load(self.ctx(), self.repo_ctx().repo().repo_blobstore())
+                .await
+                .map_err(MononokeError::from)?;
 
-            let mut cluster = DirectoryBranchCluster::from(cluster.clone());
+            let blobstore = self.repo_ctx().repo().repo_blobstore().clone();
+            let ctx = self.ctx().clone();
+            let manifest_clusters =
+                collect_manifest_clusters(&ctx, &blobstore, root_dbcm, MPath::ROOT).await?;
 
-            // Filter out any secondary paths that don't exist.
-            cluster
-                .secondaries
-                .retain(|path| existing_paths.contains(path));
+            // Build a map of primary path -> cluster from manifest
+            manifest_clusters
+                .into_iter()
+                .map(|c| (c.cluster_primary.clone(), c))
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
-            if !existing_paths.contains(&cluster.cluster_primary) && !cluster.secondaries.is_empty()
-            {
-                // If the primary path doesn't exist, promote the first secondary (if any) to be the primary.
-                cluster.cluster_primary = cluster.secondaries.remove(0);
-            }
-            // If the cluster no longer has any secondary paths, skip it.
-            if cluster.secondaries.is_empty() {
-                continue;
-            }
-            // Now that we know what the (possibly promoted) primary is at this commit, if the
-            // cluster primary is before the `after` parameter, skip it.
-            if let Some(after) = after.as_ref()
-                && &cluster.cluster_primary <= after
-            {
-                continue;
-            }
-            // If there are path prefix filters, and none of the paths in the cluster match, skip it.
-            if let Some(filter_path_prefixes) = &filter_path_prefixes
-                && !filter_path_prefixes.iter().any(|prefix| {
-                    prefix.is_prefix_of(&cluster.cluster_primary)
-                        || cluster.secondaries.iter().any(|s| prefix.is_prefix_of(s))
+        if let Some(fixed_config) = fixed_config {
+            // Find which paths in the cluster config exist in this commit
+            let config_paths: HashSet<MPath> = fixed_config
+                .clusters
+                .iter()
+                .flat_map(|cluster| {
+                    std::iter::once(&cluster.cluster_primary).chain(cluster.secondaries.iter())
                 })
-            {
-                continue;
-            }
+                .cloned()
+                .map(MPath::from)
+                .collect();
+            let existing_paths = root_skeleton_manifest_id
+                .find_entries(
+                    self.ctx().clone(),
+                    self.repo_ctx().repo().repo_blobstore().clone(),
+                    config_paths.into_iter().map(PathOrPrefix::Path),
+                )
+                .map_ok(|(path, _entry)| path)
+                .try_collect::<HashSet<_>>()
+                .await?;
 
-            clusters.push(cluster);
+            let config_clusters: Vec<DirectoryBranchCluster> = fixed_config
+                .clusters
+                .iter()
+                .cloned()
+                .map(|mut cluster| {
+                    cluster
+                        .secondaries
+                        .retain(|path| existing_paths.contains(<&MPath>::from(path)));
+                    if !existing_paths.contains(<&MPath>::from(&cluster.cluster_primary))
+                        && !cluster.secondaries.is_empty()
+                    {
+                        // If the primary path doesn't exist, promote the first secondary
+                        cluster.cluster_primary = cluster.secondaries.remove(0);
+                    }
+                    cluster.into()
+                })
+                .filter(|cluster: &DirectoryBranchCluster| !cluster.secondaries.is_empty())
+                .collect();
+
+            // Merge config clusters with the manifest clusters.
+            // If a cluster with the same primary exists in both config and
+            // manifest, we take the union of the secondaries.
+            // Note that we're assuming that if the config is attempting to
+            // modify an existing cluster, it will have the same primary as
+            // the manifest cluster - there's no attempt here to find 'overlapping'
+            // clusters between the manifest and config that don't have the same
+            // primary.
+            for config_cluster in config_clusters.into_iter() {
+                if let Some(manifest_cluster) =
+                    clusters_by_primary.get_mut(&config_cluster.cluster_primary)
+                {
+                    // Union the secondaries from both sources
+                    for secondary in config_cluster.secondaries {
+                        if !manifest_cluster.secondaries.contains(&secondary) {
+                            manifest_cluster.secondaries.push(secondary);
+                        }
+                    }
+                } else {
+                    clusters_by_primary
+                        .insert(config_cluster.cluster_primary.clone(), config_cluster);
+                }
+            }
         }
 
-        // Sort the clusters by primary path.
+        // Convert to a sorted vector, applying filters
+        let mut clusters: Vec<_> = clusters_by_primary
+            .into_values()
+            .filter(|cluster| {
+                // Apply after filter
+                if let Some(after) = after.as_ref() {
+                    if &cluster.cluster_primary <= after {
+                        return false;
+                    }
+                }
+                // Apply path prefix filter
+                if let Some(filter_path_prefixes) = &filter_path_prefixes {
+                    if !filter_path_prefixes.iter().any(|prefix| {
+                        prefix.is_prefix_of(&cluster.cluster_primary)
+                            || cluster.secondaries.iter().any(|s| prefix.is_prefix_of(s))
+                    }) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        // Sort the clusters by primary path
         clusters.sort_by(|a, b| a.cluster_primary.cmp(&b.cluster_primary));
 
         Ok(clusters.into_iter())
+    }
+
+    /// Create a restriction context for querying restriction metadata about a path.
+    ///
+    /// Unlike `path()`, `path_with_content()`, and `path_with_history()`, this
+    /// method does NOT perform Path ACLs access checks, since restriction queries are
+    /// meta-queries about access policy. Repo read access is still required.
+    pub async fn path_restriction(
+        &self,
+        path: impl Into<MPath>,
+    ) -> Result<ChangesetPathRestrictionContext<R>, MononokeError> {
+        ChangesetPathRestrictionContext::new(self.clone(), path.into()).await
+    }
+
+    /// Check restriction info for a batch of paths.
+    ///
+    /// For each path, returns the path and its restriction infos (empty if not restricted).
+    /// A path under multiple nested roots will have multiple infos.
+    /// Checks are performed concurrently.
+    ///
+    /// When `check_permissions` is true, each `PathAccessInfo` will have
+    /// its `has_access` field populated with the result of an ACL check.
+    /// When false, `has_access` will be `None`.
+    pub async fn paths_restriction_info(
+        &self,
+        paths: Vec<NonRootMPath>,
+        check_permissions: bool,
+    ) -> Result<Vec<(NonRootMPath, Vec<PathAccessInfo>)>, MononokeError> {
+        stream::iter(paths)
+            .map(|path| async move {
+                let restriction_ctx = self.path_restriction(path.clone()).await?;
+                let infos = restriction_ctx.restriction_info(check_permissions).await?;
+                Ok::<_, MononokeError>((path, infos))
+            })
+            .buffer_unordered(100)
+            .try_collect()
+            .await
+    }
+
+    /// Find restricted descendants under a set of root paths.
+    ///
+    /// Returns PathAccessInfo for all restriction roots
+    /// that are descendants of any of the given root paths.
+    /// Results are deduplicated by restriction_root.
+    ///
+    /// When `check_permissions` is true, each `PathAccessInfo` will have
+    /// its `has_access` field populated with the result of an ACL check.
+    /// When false, `has_access` will be `None`.
+    pub async fn find_restricted_descendants(
+        &self,
+        roots: Vec<MPath>,
+        check_permissions: bool,
+    ) -> Result<Vec<PathAccessInfo>, MononokeError> {
+        let restricted_paths = self.repo_ctx().repo().restricted_paths_arc();
+        let cs_id = self.id();
+
+        let restriction_infos = restricted_paths
+            .find_restricted_descendants(self.ctx(), Some(cs_id), roots)
+            .await?;
+
+        if check_permissions {
+            let restriction_checks =
+                check_path_restriction_infos(self.ctx(), &restricted_paths, restriction_infos)
+                    .await?;
+            return Ok(restriction_checks
+                .into_iter()
+                .map(|restriction_check| PathAccessInfo {
+                    has_access: Some(restriction_check.has_authorization()),
+                    restriction: restriction_check.into_restriction_info(),
+                })
+                .collect());
+        }
+
+        Ok(restriction_infos
+            .into_iter()
+            .map(|restriction| PathAccessInfo {
+                restriction,
+                has_access: None,
+            })
+            .collect())
+    }
+
+    /// Determine which changed files in this changeset touch restricted paths.
+    ///
+    /// Returns restriction info grouped by restriction root, with the list of
+    /// changed paths under each root.
+    // TODO(T248660146): update this primitive to use AclManifest instead of access logging config.
+    // For draft commit safety (T255927050), the long-term implementation should
+    // resolve ACLs using the closest public ancestor's ACL manifest.
+    /// When `check_permissions` is true, each `PathAccessInfo` will have
+    /// its `has_access` field populated with the result of an ACL check.
+    /// When false, `has_access` will be `None`.
+    pub async fn restricted_paths_changes(
+        &self,
+        check_permissions: bool,
+    ) -> Result<RestrictedPathsChangesInfo, MononokeError> {
+        let file_changes = self.file_changes().await?;
+        let changed_paths: Vec<NonRootMPath> = file_changes.keys().cloned().collect();
+
+        let restriction_results = self
+            .paths_restriction_info(changed_paths, check_permissions)
+            .await?;
+
+        // A path under multiple nested roots will appear in multiple groups.
+        // Expand each (path, infos) into individual (path, info) pairs, then group by root.
+        let groups =
+            restriction_results
+                .into_iter()
+                .flat_map(|(path, infos)| infos.into_iter().map(move |info| (path.clone(), info)))
+                .fold(
+                    std::collections::BTreeMap::<
+                        NonRootMPath,
+                        (PathAccessInfo, Vec<NonRootMPath>),
+                    >::new(),
+                    |mut acc, (path, info)| {
+                        let root = info.restriction_root().clone();
+                        acc.entry(root)
+                            .or_insert_with(|| (info, Vec::new()))
+                            .1
+                            .push(path);
+                        acc
+                    },
+                );
+
+        let restricted_changes = groups
+            .into_values()
+            .map(|(restriction_info, mut changed_paths)| {
+                changed_paths.sort();
+                RestrictedChangeGroup {
+                    restriction_info,
+                    changed_paths,
+                }
+            })
+            .collect();
+
+        Ok(RestrictedPathsChangesInfo { restricted_changes })
+    }
+
+    /// Check if the repository may have restricted paths.
+    pub fn may_have_restricted_paths(&self) -> bool {
+        self.repo_ctx()
+            .repo()
+            .restricted_paths_arc()
+            .may_have_restricted_paths()
     }
 }

@@ -13,36 +13,36 @@ license = "MIT"
 name = "http_client"
 
 [dependencies]
-anyhow = "1.0.98"
-async-compression = { version = "0.4.9", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
-auto_impl = "1.2.1"
-curl = { version = "0.4.41", features = ["http2", "static-ssl"] }
-curl-sys = "0.4.80"
+anyhow = "1.0.102"
+async-compression = { version = "0.4.42", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
+auto_impl = "1.3.0"
+curl = { version = "0.4.49", features = ["http2", "static-ssl"] }
+curl-sys = "0.4.87"
 flume = "0.11.1"
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
-http = "0.2"
+http = "=1.4.0"
 lru-cache = "0.1.2"
 maplit = "1.0"
-once_cell = "1.21"
-openssl = "0.10.72"
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
+once_cell = "1.21.4"
+openssl = "0.10.80"
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 paste = "1.0.14"
-pin-project = "1.1.10"
-regex = "1.12.2"
+pin-project = "1.1.13"
+regex = "1.12.3"
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
 sapling-clientinfo = { version = "0.1.0", path = "../clientinfo" }
 sapling-minibytes = { version = "0.1.0", path = "../minibytes" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_cbor = "0.11"
+serde_cbor = "0.11.2"
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 thiserror = "2.0.18"
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
-tokio-util = { version = "0.7.15", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
+tokio-util = { version = "0.7.18", features = ["full"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-url = "2.5.4"
+url = "2.5.8"
 
 [dev-dependencies]
 assert_matches = "1.5"
 crossbeam = "0.8"
-mockito = "1.4.0"
-zstd = { version = "0.13", features = ["experimental", "zstdmt"] }
+mockito = "1.7.2"
+zstd = { version = "0.13.3", features = ["experimental", "zstdmt"] }

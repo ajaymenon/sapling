@@ -119,7 +119,7 @@ impl GitStore {
                 // PERF: Ideally this is "tree:0" but the tree diff is currently sequential...
                 None => "blob:none",
             };
-            format!("--filter={}", config)
+            format!("--filter={config}")
         };
 
         struct UnsafeForceSync<T: ?Sized>(T);
@@ -166,7 +166,7 @@ impl GitStore {
             return Err(git2::Error::new(
                 git2::ErrorCode::NotFound,
                 git2::ErrorClass::Object,
-                format!("{} {} not found", kind, oid),
+                format!("{kind} {oid} not found"),
             )
             .into());
         }
@@ -209,7 +209,7 @@ impl GitStore {
             return Err(git2::Error::new(
                 git2::ErrorCode::NotFound,
                 git2::ErrorClass::Object,
-                format!("{} {} not found", kind, oid),
+                format!("{kind} {oid} not found"),
             )
             .into());
         }
@@ -229,6 +229,9 @@ impl GitStore {
     /// Report `git fetch` errors as `NetworkError`.
     pub fn fetch_objs(&self, ids: &[HgId]) -> Result<()> {
         let mut missing_ids = ids.iter().filter(|id| {
+            if id.is_null() {
+                return false;
+            }
             let id = hgid_to_git_oid(**id);
             // For performance, disable refresh here.
             !self.odb.exists_ext(id, git2::OdbLookupFlags::NO_REFRESH)

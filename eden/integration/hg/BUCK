@@ -1,4 +1,5 @@
 load("@fbcode//eden:defs.bzl", "get_integration_test_env_and_deps")
+load("@fbcode_macros//build_defs:python_integration_test.bzl", "python_integration_test")
 load("@fbcode_macros//build_defs:python_unittest.bzl", "python_unittest")
 
 oncall("scm_client_infra")
@@ -16,7 +17,7 @@ python_unittest(
     ],
 )
 
-python_unittest(
+python_integration_test(
     name = "add",
     srcs = ["add_test.py"],
     env = artifacts["env"],
@@ -119,7 +120,7 @@ python_unittest(
     ],
 )
 
-python_unittest(
+python_integration_test(
     name = "filteredhg",
     srcs = ["filteredhg_test.py"],
     env = artifacts["env"],
@@ -274,6 +275,27 @@ python_unittest(
     ],
 )
 
+python_integration_test(
+    name = "restricted_tree",
+    srcs = ["restricted_tree_test.py"],
+    compatible_with = [
+        "ovr_config//os:linux",
+        "ovr_config//os:macos",
+    ],
+    env = artifacts["env"],
+    # This test relies on the host-installed edenfs_privhelper, which must be
+    # root-owned and setuid, so the test action cannot [easily] run on RE workers today. Discussion here:
+    # https://fb.workplace.com/groups/1042353022615812/posts/3259731087544650/?comment_id=3259741330876959
+    remote_execution = "disabled",
+    supports_static_listing = False,
+    deps = [
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/hg/lib:testutil",
+        "//eden/integration/lib:lib",
+        "//thrift/lib/python:types",
+    ],
+)
+
 python_unittest(
     name = "revert",
     srcs = ["revert_test.py"],
@@ -351,7 +373,7 @@ python_unittest(
     ],
 )
 
-python_unittest(
+python_integration_test(
     name = "status",
     srcs = ["status_test.py"],
     env = artifacts["env"],
@@ -360,7 +382,6 @@ python_unittest(
         "//eden/fs/cli:lib",
         "//eden/integration/hg/lib:testutil",
         "//eden/integration/lib:lib",
-        "//thrift/lib/py:server_base",
         "//thrift/lib/python:types",
     ] + select({
         "DEFAULT": [],
@@ -368,7 +389,7 @@ python_unittest(
     }),
 )
 
-python_unittest(
+python_integration_test(
     name = "symlink",
     srcs = ["symlink_test.py"],
     env = artifacts["env"],
@@ -390,13 +411,14 @@ python_unittest(
     ],
 )
 
-python_unittest(
+python_integration_test(
     name = "update",
     srcs = ["update_test.py"],
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
+        "//eden/fs/cli:mp",
         "//eden/integration/hg/lib:testutil",
         "//eden/integration/lib:lib",
     ],

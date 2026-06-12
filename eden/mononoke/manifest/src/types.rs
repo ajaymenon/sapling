@@ -19,16 +19,21 @@ use mononoke_types::MPathElement;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
 
+pub(crate) use self::acl_manifests::convert_acl_manifest;
 pub(crate) use self::bssm::bssm_v3_to_mf_entry;
 pub(crate) use self::ccsm::ccsm_to_mf_entry;
 pub(crate) use self::content_manifests::convert_content_manifest;
+pub(crate) use self::dbcm::dbcm_to_mf_entry;
 pub(crate) use self::skeleton_manifests::skeleton_manifest_v2_to_mf_entry;
 pub(crate) use self::test_manifests::convert_test_sharded_manifest;
 
+mod acl_manifests;
 mod bssm;
 mod ccsm;
 mod content_manifests;
+mod dbcm;
 mod fsnodes;
+mod history_manifests;
 mod skeleton_manifests;
 mod test_manifests;
 mod unodes;

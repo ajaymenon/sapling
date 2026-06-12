@@ -11,9 +11,9 @@
 
   $ . "$TESTDIR/library.sh"
 
-  $ hg init client1
+  $ sl init client1
   $ cd client1
-  $ cat >> .hg/hgrc << 'EOF'
+  $ cat >> .sl/config << 'EOF'
   > [remotefilelog]
   > reponame=master
   > cachepath=$CACHEDIR
@@ -22,8 +22,8 @@
   $ echo a > a
   $ mkdir dir
   $ echo b > dir/b
-  $ hg commit -Aqm 'initial commit'
+  $ sl commit -Aqm 'initial commit'
 
-  $ hg init ../client2
+  $ sl init ../client2
   $ cd ../client2
-  $ hg pull -q ../client1
+  $ sl pull -q ../client1

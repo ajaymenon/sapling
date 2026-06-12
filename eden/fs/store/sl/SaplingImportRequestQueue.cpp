@@ -38,10 +38,23 @@ ImmediateFuture<TreePtr> SaplingImportRequestQueue::enqueueTree(
   return enqueue<Tree, SaplingImportRequest::TreeImport>(std::move(request));
 }
 
+folly::coro::now_task<TreePtr> SaplingImportRequestQueue::co_enqueueTree(
+    std::shared_ptr<SaplingImportRequest> request) {
+  co_return co_await co_enqueue<Tree, SaplingImportRequest::TreeImport>(
+      std::move(request));
+}
+
 ImmediateFuture<BlobAuxDataPtr> SaplingImportRequestQueue::enqueueBlobAux(
     std::shared_ptr<SaplingImportRequest> request) {
   return enqueue<BlobAuxData, SaplingImportRequest::BlobAuxImport>(
       std::move(request));
+}
+
+folly::coro::Task<BlobAuxDataPtr> SaplingImportRequestQueue::co_enqueueBlobAux(
+    std::shared_ptr<SaplingImportRequest> request) {
+  co_return co_await co_enqueue<
+      BlobAuxData,
+      SaplingImportRequest::BlobAuxImport>(std::move(request));
 }
 
 ImmediateFuture<TreeAuxDataPtr> SaplingImportRequestQueue::enqueueTreeAux(
@@ -138,6 +151,7 @@ SaplingImportRequestQueue::co_enqueue(
             return (*lhs) < (*rhs);
           });
     }
+    state.unlock();
     co_return co_await std::move(future);
   }
 
@@ -156,7 +170,9 @@ SaplingImportRequestQueue::co_enqueue(
 
   queueCV_.notify_one();
 
-  co_return co_await promise->getSemiFuture();
+  auto sf = promise->getSemiFuture();
+  state.unlock();
+  co_return co_await std::move(sf);
 }
 
 std::vector<std::shared_ptr<SaplingImportRequest>>

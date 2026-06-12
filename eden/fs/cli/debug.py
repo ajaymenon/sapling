@@ -11,6 +11,7 @@ import argparse
 import binascii
 import collections
 import datetime
+import inspect
 import json
 import os
 import re
@@ -31,26 +32,19 @@ from typing import (
     List,
     Optional,
     Pattern,
+    Sequence,
     Tuple,
     Type,
     Union,
 )
 
 import eden.dirstate
-import facebook.eden.ttypes as eden_ttypes
-import thrift.util.inspect
+import eden.fs.service.eden.thrift_types as eden_thrift_types
 from eden.fs.cli.cmd_util import get_eden_instance
-from eden.thrift.legacy import EdenClient
-from facebook.eden import EdenService
-from facebook.eden.constants import (
-    DIS_COMPUTE_ACCURATE_MODE,
-    DIS_COMPUTE_BLOB_SIZES,
-    DIS_NOT_RECURSIVE,
-    DIS_REQUIRE_LOADED,
-    DIS_REQUIRE_MATERIALIZED,
-)
-from facebook.eden.ttypes import (
-    AttributesRequestScope,
+from eden.fs.service.eden.thrift_clients import EdenService as ModernEdenService
+from eden.fs.service.eden.thrift_enums import AttributesRequestScope
+from eden.fs.service.eden.thrift_types import (
+    AclInfoOrError,
     Blake3OrError,
     BlobMetadataOrError,
     BlobMetadataWithOrigin,
@@ -63,6 +57,11 @@ from facebook.eden.ttypes import (
     DebugJournalDelta,
     DigestHashOrError,
     DigestSizeOrError,
+    DIS_COMPUTE_ACCURATE_MODE,
+    DIS_COMPUTE_BLOB_SIZES,
+    DIS_NOT_RECURSIVE,
+    DIS_REQUIRE_LOADED,
+    DIS_REQUIRE_MATERIALIZED,
     EdenError,
     FileAttributeDataOrErrorV2,
     FileAttributeDataV2,
@@ -84,11 +83,11 @@ from facebook.eden.ttypes import (
     SyncBehavior,
     TimeSpec,
     TreeInodeDebugInfo,
+    UnderAclOrError,
 )
-from fb303_core import BaseService
-from thrift.protocol.TSimpleJSONProtocol import TSimpleJSONProtocolFactory
-from thrift.Thrift import TApplicationException
-from thrift.util import Serializer
+from thrift.python.exceptions import ApplicationError, ApplicationErrorType
+from thrift.python.serializer import Protocol, serialize as thrift_serialize
+from thrift.python.types import Struct as ThriftStruct
 
 try:
     from tqdm import tqdm
@@ -165,6 +164,7 @@ class BooleanOptionalAction(argparse.Action):
     # pyre-fixme[2]: Parameter must be annotated.
     def __call__(self, parser, namespace, values, option_string=None):
         if option_string in self.option_strings:
+            # pyrefly: ignore [missing-attribute]
             setattr(namespace, self.dest, not option_string.startswith("--no-"))
 
     # pyre-fixme[3]: Return type must be annotated.
@@ -277,21 +277,21 @@ class TreeCmd(Subcmd):
         parser.add_argument("mount", help="The EdenFS mount point path.")
         parser.add_argument("id", help="The tree ID")
 
-    def print_all_trees(self, trees: List[ScmTreeWithOrigin]) -> None:
+    def print_all_trees(self, trees: Sequence[ScmTreeWithOrigin]) -> None:
         print_all_objects(
             trees,
             "tree",
-            lambda tree: tree.scmTreeData.getType() != ScmTreeOrError.TREEENTRIES,
-            lambda trees: trees[0].scmTreeData.get_treeEntries()
-            == trees[1].scmTreeData.get_treeEntries(),
-            lambda tree: print_tree(tree.scmTreeData.get_treeEntries()),
+            lambda tree: tree.scmTreeData.type is not ScmTreeOrError.Type.treeEntries,
+            lambda trees: trees[0].scmTreeData.treeEntries
+            == trees[1].scmTreeData.treeEntries,
+            lambda tree: print_tree(tree.scmTreeData.treeEntries),
         )
 
     def print_tree_or_error(self, treeOrError: ScmTreeOrError) -> None:
-        if treeOrError.getType() == ScmTreeOrError.TREEENTRIES:
-            print_tree(treeOrError.get_treeEntries())
+        if treeOrError.type is ScmTreeOrError.Type.treeEntries:
+            print_tree(treeOrError.treeEntries)
         else:
-            error = treeOrError.get_error()
+            error = treeOrError.error
             sys.stdout.buffer.write(f"ERROR fetching data: {error}\n".encode())
 
     def run(self, args: argparse.Namespace) -> int:
@@ -300,7 +300,7 @@ class TreeCmd(Subcmd):
 
         origin_flags = get_origin_flags(args)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             resp = client.debugGetTree(
                 DebugGetScmTreeRequest(
                     mountId=MountId(mountPoint=bytes(checkout.path)),
@@ -373,7 +373,7 @@ class ProcessFetchCmd(Subcmd):
         rows = []
 
         eden = cmd_util.get_eden_instance(args)
-        with eden.get_thrift_client_legacy() as client:
+        with eden.get_thrift_client() as client:
             # Get the data in the past args.time_window seconds. All data is collected only within
             # this period except that fetchCountsByPid is from the beginning of start
             counts = client.getAccessCounts(args.time_window)
@@ -408,6 +408,7 @@ class ProcessFetchCmd(Subcmd):
                 cmd = process.cmd
                 if args.short_cmdline:
                     cmd = cmd.split()[0]
+                # pyrefly: ignore [unsupported-operation]
                 row["PID"] = pid
                 row["FETCH COUNT"] = process.fetch_count
                 row["CMD"] = cmd
@@ -497,7 +498,7 @@ def print_blob(blob: bytes) -> None:
     sys.stdout.buffer.write(blob)
 
 
-def print_tree(treeEntries: List[ScmTreeEntry]) -> None:
+def print_tree(treeEntries: Sequence[ScmTreeEntry]) -> None:
     max_object_id_len = max(
         (len(object_id_str(entry.id)) for entry in treeEntries), default=0
     )
@@ -521,9 +522,7 @@ def print_blob_metadata(id: str, metadata: ScmBlobMetadata) -> None:
 
 
 def print_all_objects(
-    # pyre-fixme[24]: Generic type `list` expects 1 type parameter, use
-    #  `typing.List[<element type>]` to avoid runtime subscripting errors.
-    objects: List,
+    objects: Sequence[Any],
     object_type: str,
     # pyre-fixme[24]: Generic type `Callable` expects 2 type parameters.
     is_error: Callable,
@@ -582,19 +581,19 @@ class BlobCmd(Subcmd):
         parser.add_argument("id", help="The blob ID")
 
     def print_blob_or_error(self, blobOrError: ScmBlobOrError) -> None:
-        if blobOrError.getType() == ScmBlobOrError.BLOB:
-            print_blob(blobOrError.get_blob())
+        if blobOrError.type is ScmBlobOrError.Type.blob:
+            print_blob(blobOrError.blob)
         else:
-            error = blobOrError.get_error()
+            error = blobOrError.error
             sys.stdout.buffer.write(f"ERROR fetching data: {error}\n".encode())
 
-    def print_all_blobs(self, blobs: List[ScmBlobWithOrigin]) -> None:
+    def print_all_blobs(self, blobs: Sequence[ScmBlobWithOrigin]) -> None:
         print_all_objects(
             blobs,
             "blob",
-            lambda blob: blob.blob.getType() != ScmBlobOrError.BLOB,
-            lambda blobs: blobs[0].blob.get_blob() == blobs[1].blob.get_blob(),
-            lambda blob: print_blob(blob.blob.get_blob()),
+            lambda blob: blob.blob.type is not ScmBlobOrError.Type.blob,
+            lambda blobs: blobs[0].blob.blob == blobs[1].blob.blob,
+            lambda blob: print_blob(blob.blob.blob),
         )
 
     def run(self, args: argparse.Namespace) -> int:
@@ -603,7 +602,7 @@ class BlobCmd(Subcmd):
 
         origin_flags = get_origin_flags(args)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             data = client.debugGetBlob(
                 DebugGetScmBlobRequest(
                     mountId=MountId(mountPoint=bytes(checkout.path)),
@@ -629,23 +628,23 @@ class BlobMetaCmd(Subcmd):
     def print_blob_metadata_or_error(
         self, id: str, metadataOrError: BlobMetadataOrError
     ) -> None:
-        if metadataOrError.getType() == BlobMetadataOrError.METADATA:
-            print_blob_metadata(id, metadataOrError.get_metadata())
+        if metadataOrError.type is BlobMetadataOrError.Type.metadata:
+            print_blob_metadata(id, metadataOrError.metadata)
         else:
-            error = metadataOrError.get_error()
+            error = metadataOrError.error
             sys.stdout.buffer.write(f"ERROR fetching data: {error}\n".encode())
 
     def print_all_blob_metadatas(
-        self, id: str, blob_metadatas: List[BlobMetadataWithOrigin]
+        self, id: str, blob_metadatas: Sequence[BlobMetadataWithOrigin]
     ) -> None:
         print_all_objects(
             blob_metadatas,
             "blob metadata",
-            lambda metadata: metadata.metadata.getType()
-            != BlobMetadataOrError.METADATA,
-            lambda metadatas: metadatas[0].metadata.get_metadata()
-            == metadatas[1].metadata.get_metadata(),
-            lambda metadata: print_blob_metadata(id, metadata.metadata.get_metadata()),
+            lambda metadata: metadata.metadata.type
+            is not BlobMetadataOrError.Type.metadata,
+            lambda metadatas: metadatas[0].metadata.metadata
+            == metadatas[1].metadata.metadata,
+            lambda metadata: print_blob_metadata(id, metadata.metadata.metadata),
         )
 
     def run(self, args: argparse.Namespace) -> int:
@@ -654,7 +653,7 @@ class BlobMetaCmd(Subcmd):
 
         origin_flags = get_origin_flags(args)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             info = client.debugGetBlobMetadata(
                 DebugGetBlobMetadataRequest(
                     mountId=MountId(mountPoint=bytes(checkout.path)),
@@ -681,7 +680,7 @@ class MismatchedBlobSize:
 
 
 def check_blob_and_size_match(
-    client: EdenClient, checkout: Path, identifying_hash: bytes
+    client: ModernEdenService.Sync, checkout: Path, identifying_hash: bytes
 ) -> Optional[MismatchedBlobSize]:
     try:
         response = client.debugGetBlob(
@@ -694,7 +693,7 @@ def check_blob_and_size_match(
         blob = None
         for blobFromACertainPlace in response.blobs:
             try:
-                blob = blobFromACertainPlace.blob.get_blob()
+                blob = blobFromACertainPlace.blob.blob
             except AssertionError:
                 # only care to check blobs that exist
                 pass
@@ -710,7 +709,7 @@ def check_blob_and_size_match(
                     )
                 )
                 .metadatas[0]
-                .metadata.get_metadata()
+                .metadata.metadata
             )
         except AssertionError:
             # only care to check blobs that exist
@@ -727,10 +726,10 @@ def check_blob_and_size_match(
         # We don't care if debugGetScmBlobMetadata returns an EdenError because
         # we only care about cached data being incorrect.
         return None
-    except TApplicationException as ex:
+    except ApplicationError as ex:
         # we don't care about older versions of eden being incompatible, we will
         # just run the check when we can.
-        if ex.type == TApplicationException.UNKNOWN_METHOD:
+        if ex.type == ApplicationErrorType.UNKNOWN_METHOD:
             return None
 
 
@@ -769,6 +768,26 @@ def do_buildinfo(instance: EdenInstance, out: Optional[IO[bytes]] = None) -> Non
         out.write(b"%s: %s\n" % (key.encode(), value.encode()))
 
 
+@debug_cmd("systemd", "Print the systemd unit name for this EdenFS instance")
+class SystemdCmd(Subcmd):
+    def run(self, args: argparse.Namespace) -> int:
+        if sys.platform != "linux":
+            print(
+                "error: eden debug systemd is only supported on Linux", file=sys.stderr
+            )
+            return 1
+        instance = cmd_util.get_eden_instance(args)
+        from . import daemon
+
+        try:
+            unit = daemon._get_systemd_unit(instance)
+            print(unit)
+            return 0
+        except (RuntimeError, OSError) as e:
+            print(f"error: failed to get systemd unit name: {e}", file=sys.stderr)
+            return 1
+
+
 @debug_cmd(
     "gc_process_fetch", "clear and start a new recording of process fetch counts"
 )
@@ -783,7 +802,7 @@ class GcProcessFetchCmd(Subcmd):
 
     def run(self, args: argparse.Namespace) -> int:
         eden = cmd_util.get_eden_instance(args)
-        with eden.get_thrift_client_legacy() as client:
+        with eden.get_thrift_client() as client:
             if args.mount:
                 instance, checkout, _rel_path = cmd_util.require_checkout(
                     args, args.mount
@@ -797,14 +816,18 @@ class GcProcessFetchCmd(Subcmd):
 @debug_cmd("clear_local_caches", "Clears local caches of objects stored in RocksDB")
 class ClearLocalCachesCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
-        # noop
+        instance = cmd_util.get_eden_instance(args)
+        with instance.get_thrift_client() as client:
+            client.debugClearLocalStoreCaches()
         return 0
 
 
 @debug_cmd("compact_local_storage", "Asks RocksDB to compact its storage")
 class CompactLocalStorageCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
-        # noop
+        instance = cmd_util.get_eden_instance(args)
+        with instance.get_thrift_client() as client:
+            client.debugCompactLocalStorage()
         return 0
 
 
@@ -950,7 +973,7 @@ class InodeCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         out = sys.stdout.buffer
         instance, checkout, rel_path = cmd_util.require_checkout(args, args.path)
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             flags = DIS_REQUIRE_LOADED | DIS_COMPUTE_BLOB_SIZES
             if not args.recursive:
                 flags |= DIS_NOT_RECURSIVE
@@ -989,7 +1012,7 @@ class MaterializedCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance, checkout, rel_path = cmd_util.require_checkout(args, args.path)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             results = client.debugInodeStatus(
                 bytes(checkout.path),
                 bytes(rel_path),
@@ -1083,7 +1106,7 @@ class FileStatsCMD(Subcmd):
         request_root = args.path
         instance, checkout, rel_path = cmd_util.require_checkout(args, request_root)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             inode_results = client.debugInodeStatus(
                 bytes(checkout.path), bytes(rel_path), flags=0, sync=SyncBehavior()
             )
@@ -1112,7 +1135,7 @@ class FuseCallsCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         out = sys.stdout.buffer
         instance, checkout, _rel_path = cmd_util.require_checkout(args, args.path)
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             outstanding_call = client.debugOutstandingFuseCalls(bytes(checkout.path))
 
         out.write(b"Outstanding FUSE calls: %d\n" % len(outstanding_call))
@@ -1141,7 +1164,7 @@ class StartRecordingCmd(Subcmd):
 
     def run(self, args: argparse.Namespace) -> int:
         instance, checkout, _rel_path = cmd_util.require_checkout(args, os.getcwd())
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             result = client.debugStartRecordingActivity(
                 bytes(checkout.path), args.output_dir.encode()
             )
@@ -1167,7 +1190,7 @@ class StopRecordingCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance, checkout, _rel_path = cmd_util.require_checkout(args, os.getcwd())
         output_path: Optional[bytes] = None
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             result = client.debugStopRecordingActivity(
                 bytes(checkout.path), args.unique
             )
@@ -1186,7 +1209,7 @@ class StopRecordingCmd(Subcmd):
 class ListRecordingsCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance, checkout, _rel_path = cmd_util.require_checkout(args, os.getcwd())
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             result = client.debugListActivityRecordings(bytes(checkout.path))
             if not result.recordings:
                 print("There is no active activity recording sessions.")
@@ -1252,7 +1275,7 @@ class GetPathCmd(Subcmd):
         path = args.path or os.getcwd()
         instance, checkout, _rel_path = cmd_util.require_checkout(args, path)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             inodePathInfo = client.debugGetInodePath(bytes(checkout.path), args.number)
 
         state = "loaded" if inodePathInfo.loaded else "unloaded"
@@ -1285,11 +1308,11 @@ class UnloadInodesCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance, checkout, rel_path = cmd_util.require_checkout(args, args.path)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             # set the age in nanoSeconds
-            age = TimeSpec()
-            age.seconds = int(args.age)
-            age.nanoSeconds = int((args.age - age.seconds) * 10**9)
+            seconds = int(args.age)
+            nanoSeconds = int((args.age - seconds) * 10**9)
+            age = TimeSpec(seconds=seconds, nanoSeconds=nanoSeconds)
             count = client.unloadInodeForPath(
                 bytes(checkout.path), bytes(rel_path), age
             )
@@ -1310,7 +1333,7 @@ class FlushCacheCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance, checkout, rel_path = cmd_util.require_checkout(args, args.path)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             client.invalidateKernelInodeCache(bytes(checkout.path), bytes(rel_path))
 
         return 0
@@ -1361,8 +1384,7 @@ class LogCmd(Subcmd):
     def upload_logs(
         self, args: argparse.Namespace, instance: EdenInstance, eden_log_path: Path
     ) -> int:
-        # For ease of use, just use the same rage reporter
-        rage_processor = instance.get_config_value("rage.reporter", default="")
+        rage_processor = rage_mod.get_rage_reporter(instance)
 
         # pyre-fixme[24]: Generic type `subprocess.Popen` expects 1 type parameter.
         proc: Optional[subprocess.Popen] = None
@@ -1459,7 +1481,7 @@ class LoggingCmd(Subcmd):
                 "WARN:default,eden=DBG2; default=stream:stream=stderr,async=true"
             )
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             if args.config is not None:
                 if args.reset:
                     print(f"Resetting logging configuration to {args.config!r}")
@@ -1538,7 +1560,7 @@ class DebugJournalSetMemoryLimitCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance, checkout, _rel_path = cmd_util.require_checkout(args, args.path)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             try:
                 client.setJournalMemoryLimit(bytes(checkout.path), args.limit)
             except EdenError as err:
@@ -1559,7 +1581,7 @@ class DebugJournalGetMemoryLimitCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance, checkout, _rel_path = cmd_util.require_checkout(args, args.path)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             try:
                 mem = client.getJournalMemoryLimit(bytes(checkout.path))
             except EdenError as err:
@@ -1584,7 +1606,7 @@ class DebugFlushJournalCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance, checkout, _rel_path = cmd_util.require_checkout(args, args.path)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             try:
                 client.flushJournal(bytes(checkout.path))
             except EdenError as err:
@@ -1644,7 +1666,7 @@ class DebugJournalCmd(Subcmd):
         # pyre-fixme[3]: Return type must be annotated.
         # pyre-fixme[2]: Parameter must be annotated.
         def refresh(params):
-            with instance.get_thrift_client_legacy() as client:
+            with instance.get_thrift_client() as client:
                 journal = client.debugGetRawJournal(params)
 
             deltas = journal.allDeltas
@@ -1736,9 +1758,6 @@ def _print_journal_entry(delta: DebugJournalDelta, entries: List[str]) -> None:
 
 @debug_cmd("thrift", "Invoke a thrift function")
 class DebugThriftCmd(Subcmd):
-    args_suffix = "_args"
-    result_suffix = "_result"
-
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "-l",
@@ -1780,69 +1799,41 @@ class DebugThriftCmd(Subcmd):
             return 1
 
         # Look up the function information
-        try:
-            fn_info = thrift.util.inspect.get_function_info(
-                EdenService, args.function_name
-            )
-        except thrift.util.inspect.NoSuchFunctionError:
+        if not hasattr(ModernEdenService.Sync, args.function_name):
             print(f"Error: unknown function {args.function_name!r}", file=sys.stderr)
             print(
                 'Run "eden debug thrift --list" to see a list of available functions',
                 file=sys.stderr,
             )
             return 1
+        fn = getattr(ModernEdenService.Sync, args.function_name)
+        fn_sig = inspect.signature(fn)
+        fn_params = [
+            p
+            for p in fn_sig.parameters.values()
+            if p.name not in ("self", "rpc_options")
+        ]
 
-        if len(args.args) != len(fn_info.arg_specs):
+        if len(args.args) != len(fn_params):
             print(
-                f"Error: {args.function_name} requires {len(fn_info.arg_specs)} "
+                f"Error: {args.function_name} requires {len(fn_params)} "
                 f"arguments, but {len(args.args)} were supplied>",
                 file=sys.stderr,
             )
             return 1
 
         python_args = self._eval_args(
-            args.args, fn_info, eval_strings=args.eval_all_args
+            args.args, fn_params, eval_strings=args.eval_all_args
         )
 
-        # pyre-fixme[3]: Return type must be annotated.
-        # pyre-fixme[2]: Parameter must be annotated.
-        def lookup_module_member(modules, name):
-            for module in modules:
-                try:
-                    return getattr(module, name)
-                except AttributeError:
-                    continue
-            raise AttributeError(f"Failed to find {name} in {modules}")
-
         instance = cmd_util.get_eden_instance(args)
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             fn = getattr(client, args.function_name)
             result = fn(**python_args)
             if args.json:
-                # The following back-and-forth is required to reliably
-                # convert a Python Thrift client result into its JSON
-                # form. The Python Thrift client returns native Python
-                # lists and dicts for lists and maps, but they cannot
-                # be passed directly to TSimpleJSONProtocol. Instead,
-                # map the result back into a Thrift message, and then
-                # serialize that as JSON. Finally, strip the message
-                # container.
-                #
-                # NOTE: Stripping the root object means the output may
-                # not have a root dict or array, which is required by
-                # most JSON specs. But Python's json module and jq are
-                # both fine with this deviation.
-                result_type = lookup_module_member(
-                    [EdenService, BaseService], args.function_name + "_result"
-                )
-                json_data = Serializer.serialize(
-                    TSimpleJSONProtocolFactory(), result_type(result)
-                )
+                json_result = self._thrift_result_to_json(result)
                 json.dump(
-                    # If the method returns void, json_data will not
-                    # have a "success" field. Print `null` in that
-                    # case.
-                    json.loads(json_data).get("success"),
+                    json_result,
                     sys.stdout,
                     sort_keys=True,
                     indent=2,
@@ -1853,50 +1844,80 @@ class DebugThriftCmd(Subcmd):
 
         return 0
 
-    def _eval_args(
-        self, args: List[str], fn_info: thrift.util.inspect.Function, eval_strings: bool
-    ) -> Dict[str, Any]:
-        from thrift.Thrift import TType
+    @staticmethod
+    def _thrift_result_to_json(result: Any) -> Any:
+        """Convert a thrift result to a JSON-serializable value."""
+        if result is None:
+            return None
+        elif isinstance(result, ThriftStruct):
+            return json.loads(thrift_serialize(result, protocol=Protocol.JSON))
+        elif isinstance(result, (list, tuple)):
+            return [DebugThriftCmd._thrift_result_to_json(item) for item in result]
+        elif isinstance(result, collections.abc.Mapping):
+            return {
+                str(k): DebugThriftCmd._thrift_result_to_json(v)
+                for k, v in result.items()
+            }
+        elif isinstance(result, bytes):
+            return result.decode("utf-8", errors="replace")
+        else:
+            return result
 
-        code_globals = {key: getattr(eden_ttypes, key) for key in dir(eden_ttypes)}
+    def _eval_args(
+        self,
+        args: List[str],
+        fn_params: List[inspect.Parameter],
+        eval_strings: bool,
+    ) -> Dict[str, Any]:
+        code_globals = {
+            key: getattr(eden_thrift_types, key) for key in dir(eden_thrift_types)
+        }
         parsed_args = {}
-        for arg, arg_spec in zip(args, fn_info.arg_specs):
-            (
-                _field_id,
-                thrift_type,
-                arg_name,
-                _extra_spec,
-                _default,
-                _required,
-            ) = arg_spec
+        for arg, param in zip(args, fn_params):
             # If the argument is a string type, don't pass it through eval.
             # This is purely to make it easier for humans to input strings.
-            if not eval_strings and thrift_type == TType.STRING:
+            if not eval_strings and param.annotation in (str, bytes):
                 parsed_arg = arg
             else:
-                # pyre-fixme[6]: For 5th argument expected `bool` but got `int`.
-                code = compile(arg, "<command_line>", "eval", 0, 1)
+                code = compile(arg, "<command_line>", "eval", 0, True)
                 parsed_arg = eval(code, code_globals.copy())
-            parsed_args[arg_name] = parsed_arg
+            parsed_args[param.name] = parsed_arg
 
         return parsed_args
 
     def _list_functions(self) -> None:
-        # Report functions by module, from parent service downwards
-        modules = thrift.util.inspect.get_service_module_hierarchy(EdenService)
-        for module in reversed(modules):
-            module_functions = thrift.util.inspect.list_service_functions(module)
-            print(f"From {module.__name__}:")
-
-            for _fn_name, fn_info in sorted(module_functions.items()):
-                print(f"  {fn_info}")
+        for name in sorted(dir(ModernEdenService.Sync)):
+            if name.startswith("_"):
+                continue
+            method = getattr(ModernEdenService.Sync, name, None)
+            if method is None or not callable(method):
+                continue
+            try:
+                sig = inspect.signature(method)
+            except (ValueError, TypeError):
+                continue
+            params = [
+                p
+                for p in sig.parameters.values()
+                if p.name not in ("self", "rpc_options")
+            ]
+            param_strs = []
+            for p in params:
+                ann = p.annotation
+                if ann is inspect.Parameter.empty:
+                    param_strs.append(p.name)
+                elif hasattr(ann, "__name__"):
+                    param_strs.append(f"{p.name}: {ann.__name__}")
+                else:
+                    param_strs.append(f"{p.name}: {ann}")
+            print(f"  {name}({', '.join(param_strs)})")
 
 
 @debug_cmd("drop-fetch-requests", "Drop all pending source control object fetches")
 class DropRequestsCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance = cmd_util.get_eden_instance(args)
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             num_dropped = client.debugDropAllPendingRequests()
             print(f"Dropped {num_dropped} source control fetch requests")
             return 0
@@ -1939,7 +1960,7 @@ class GCInodesCmd(Subcmd):
             seconds = 0
         if int(args.age) > 0:
             seconds = int(args.age)
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             try:
                 result = client.debugInvalidateNonMaterialized(
                     DebugInvalidateRequest(
@@ -2031,6 +2052,18 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
             action="store_true",
             help="Include file mode attribute",
         )
+        attr_group.add_argument(
+            "--under-acl",
+            action="store_true",
+            default=False,
+            help="Return whether any ACL applies to this path",
+        )
+        attr_group.add_argument(
+            "--acls",
+            action="store_true",
+            default=False,
+            help="Return rich ACL metadata for this path",
+        )
 
         # Scope options - mutually exclusive
         scope_group = parser.add_argument_group(
@@ -2073,11 +2106,11 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
         if object_id is None:
             print("  Object ID:             None")
             return
-        obj_enum = object_id.getType()
-        if obj_enum == object_id.OBJECTID:
-            print(f"  Object ID:             {object_id_str(object_id.get_objectId())}")
-        elif obj_enum == object_id.ERROR:
-            print(f"  Object ID:             {object_id.get_error().message}")
+        obj_type = object_id.type
+        if obj_type is ObjectIdOrError.Type.objectId:
+            print(f"  Object ID:             {object_id_str(object_id.objectId)}")
+        elif obj_type is ObjectIdOrError.Type.error:
+            print(f"  Object ID:             {object_id.error.message}")
         else:
             print("  Object ID:             Empty")
 
@@ -2086,13 +2119,11 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
         if size is None:
             print("  File Size:             None")
             return
-        size_enum = size.getType()
-        if size_enum == size.SIZE:
-            print(
-                f"  File Size:             {stats_print.format_size(size.get_size())}"
-            )
-        elif size_enum == size.ERROR:
-            print(f"  File Size:             {size.get_error().message}")
+        size_type = size.type
+        if size_type is SizeOrError.Type.size:
+            print(f"  File Size:             {stats_print.format_size(size.size)}")
+        elif size_type is SizeOrError.Type.error:
+            print(f"  File Size:             {size.error.message}")
         else:
             print("  File Size:             Empty")
 
@@ -2101,11 +2132,11 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
         if mode is None:
             print("  File Mode:             None")
             return
-        mode_enum = mode.getType()
-        if mode_enum == mode.MODE:
-            print(f"  File Mode:             {mode.get_mode():04o}")
-        elif mode_enum == mode.ERROR:
-            print(f"  File Mode:             {mode.get_error().message}")
+        mode_type = mode.type
+        if mode_type is ModeOrError.Type.mode:
+            print(f"  File Mode:             {mode.mode:04o}")
+        elif mode_type is ModeOrError.Type.error:
+            print(f"  File Mode:             {mode.error.message}")
         else:
             print("  File Mode:             Empty")
 
@@ -2116,15 +2147,15 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
         if scm_type is None:
             print("  Source Control Type:   None")
             return
-        scm_type_enum = scm_type.getType()
+        scm_type_type = scm_type.type
 
-        if scm_type_enum == scm_type.SOURCECONTROLTYPE:
+        if scm_type_type is SourceControlTypeOrError.Type.sourceControlType:
             scm_type_str = self._source_control_type_to_string(
-                scm_type.get_sourceControlType()
+                scm_type.sourceControlType
             )
             print(f"  Source Control Type:   {scm_type_str}")
-        elif scm_type_enum == scm_type.ERROR:
-            print(f"  Source Control Type:   {scm_type.get_error().message}")
+        elif scm_type_type is SourceControlTypeOrError.Type.error:
+            print(f"  Source Control Type:   {scm_type.error.message}")
         else:
             print("  Source Control Type:   Empty")
 
@@ -2134,11 +2165,11 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
             print("  SHA1 Hash:            None")
             return
 
-        sha1_enum = sha1.getType()
-        if sha1_enum == sha1.SHA1:
-            print(f"  SHA1 Hash:            {hash_str(sha1.get_sha1())}")
-        elif sha1_enum == sha1.ERROR:
-            print(f"  SHA1 Hash:            {sha1.get_error().message}")
+        sha1_type = sha1.type
+        if sha1_type is Sha1OrError.Type.sha1:
+            print(f"  SHA1 Hash:            {hash_str(sha1.sha1)}")
+        elif sha1_type is Sha1OrError.Type.error:
+            print(f"  SHA1 Hash:            {sha1.error.message}")
         else:
             print("  SHA1 Hash:            Empty")
 
@@ -2148,11 +2179,11 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
             print("  BLAKE3 Hash:          None")
             return
 
-        blake3_enum = blake3.getType()
-        if blake3_enum == blake3.BLAKE3:
-            print(f"  BLAKE3 Hash:          {hash_str(blake3.get_blake3())}")
-        elif blake3_enum == blake3.ERROR:
-            print(f"  BLAKE3 Hash:          {blake3.get_error().message}")
+        blake3_type = blake3.type
+        if blake3_type is Blake3OrError.Type.blake3:
+            print(f"  BLAKE3 Hash:          {hash_str(blake3.blake3)}")
+        elif blake3_type is Blake3OrError.Type.error:
+            print(f"  BLAKE3 Hash:          {blake3.error.message}")
         else:
             print("  BLAKE3 Hash:          Empty")
 
@@ -2162,13 +2193,13 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
             print("  Digest Size:          None")
             return
 
-        digest_size_enum = digest_size.getType()
-        if digest_size_enum == digest_size.DIGESTSIZE:
+        digest_size_type = digest_size.type
+        if digest_size_type is DigestSizeOrError.Type.digestSize:
             print(
-                f"  Digest Size:          {stats_print.format_size(digest_size.get_digestSize())}"
+                f"  Digest Size:          {stats_print.format_size(digest_size.digestSize)}"
             )
-        elif digest_size_enum == digest_size.ERROR:
-            print(f"  Digest Size:          {digest_size.get_error().message}")
+        elif digest_size_type is DigestSizeOrError.Type.error:
+            print(f"  Digest Size:          {digest_size.error.message}")
         else:
             print("  Digest Size:          Empty")
 
@@ -2178,11 +2209,11 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
             print("  Digest Hash:          None")
             return
 
-        digest_hash_enum = digest_hash.getType()
-        if digest_hash_enum == digest_hash.DIGESTHASH:
-            print(f"  Digest Hash:          {hash_str(digest_hash.get_digestHash())}")
-        elif digest_hash_enum == digest_hash.ERROR:
-            print(f"  Digest Hash:          {digest_hash.get_error().message}")
+        digest_hash_type = digest_hash.type
+        if digest_hash_type is DigestHashOrError.Type.digestHash:
+            print(f"  Digest Hash:          {hash_str(digest_hash.digestHash)}")
+        elif digest_hash_type is DigestHashOrError.Type.error:
+            print(f"  Digest Hash:          {digest_hash.error.message}")
         else:
             print("  Digest Hash:          Empty")
 
@@ -2192,18 +2223,54 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
             print("  Modification Time:    None")
             return
 
-        mtime_enum = mtime.getType()
-        if mtime_enum == mtime.MTIME:
-            mtime_val = mtime.get_mtime()
+        mtime_type = mtime.type
+        if mtime_type is MtimeOrError.Type.mtime:
+            mtime_val = mtime.mtime
             timestamp = mtime_val.seconds + mtime_val.nanoSeconds / 1e9
             datetime_str = datetime.datetime.fromtimestamp(timestamp).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
             print(f"  Modification Time:    {datetime_str}")
-        elif mtime_enum == mtime.ERROR:
-            print(f"  Modification Time:    {mtime.get_error().message}")
+        elif mtime_type is MtimeOrError.Type.error:
+            print(f"  Modification Time:    {mtime.error.message}")
         else:
             print("  Modification Time:    Empty")
+
+    def _print_under_acl(self, under_acl: Optional[UnderAclOrError]) -> None:
+        """Print under_acl attribute."""
+        if under_acl is None:
+            print("  Under ACL:            None")
+            return
+
+        under_acl_type = under_acl.type
+        if under_acl_type is UnderAclOrError.Type.underAcl:
+            print(f"  Under ACL:            {under_acl.underAcl}")
+        elif under_acl_type is UnderAclOrError.Type.error:
+            print(f"  Under ACL:            {under_acl.error.message}")
+        else:
+            print("  Under ACL:            Empty")
+
+    def _print_acl_info(self, acl_info: Optional[AclInfoOrError]) -> None:
+        """Print ACL info attribute."""
+        if acl_info is None:
+            print("  ACL Info:             None")
+            return
+
+        acl_info_type = acl_info.type
+        if acl_info_type is AclInfoOrError.Type.error:
+            print(f"  ACL Info:             {acl_info.error.message}")
+        elif acl_info_type is AclInfoOrError.Type.aclInfo:
+            info = acl_info.aclInfo
+            print("  ACL Info:")
+            print(f"    Under ACL:          {info.underAcl}")
+            print("    ACL Entries:")
+            for entry in info.acls:
+                request = entry.requestAcl if entry.requestAcl else "N/A"
+                print(
+                    f"      - Root: {entry.restrictionRoot}, Region: {entry.repoRegionAcl}, Request: {request}"
+                )
+        else:
+            print("  ACL Info:             Empty")
 
     def _print_file_attributes(
         self, attr_data: FileAttributeDataV2, requested_attributes: int
@@ -2227,6 +2294,10 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
             self._print_digest_hash(attr_data.digestHash)
         if requested_attributes & FileAttributes.MTIME:
             self._print_mtime(attr_data.mtime)
+        if requested_attributes & FileAttributes.UNDER_ACL:
+            self._print_under_acl(attr_data.underAcl)
+        if requested_attributes & FileAttributes.ACLs:
+            self._print_acl_info(attr_data.aclInfo)
 
     def _print_path_result(
         self,
@@ -2238,12 +2309,12 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
         print(f"\nPath: {path}")
         print("=" * (len(path) + 6))
 
-        attr_result_enum = attr_result.getType()
-        if attr_result_enum == attr_result.FILEATTRIBUTEDATA:
-            attr_data = attr_result.get_fileAttributeData()
+        attr_result_type = attr_result.type
+        if attr_result_type is FileAttributeDataOrErrorV2.Type.fileAttributeData:
+            attr_data = attr_result.fileAttributeData
             self._print_file_attributes(attr_data, requested_attributes)
-        elif attr_result_enum == attr_result.ERROR:
-            error = attr_result.get_error()
+        elif attr_result_type is FileAttributeDataOrErrorV2.Type.error:
+            error = attr_result.error
             print(f"  ERROR: {error.message}")
         else:
             print("  Empty attribute result")
@@ -2262,6 +2333,8 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
                 | FileAttributes.DIGEST_SIZE
                 | FileAttributes.DIGEST_HASH
                 | FileAttributes.MTIME
+                | FileAttributes.UNDER_ACL
+                | FileAttributes.ACLs
             )
 
         # Check if any specific attributes were requested
@@ -2284,6 +2357,10 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
             requested_attrs |= FileAttributes.DIGEST_HASH
         if args.mtime:
             requested_attrs |= FileAttributes.MTIME
+        if args.under_acl:
+            requested_attrs |= FileAttributes.UNDER_ACL
+        if args.acls:
+            requested_attrs |= FileAttributes.ACLs
 
         # If no attributes were explicitly requested, use defaults
         if requested_attrs == 0:
@@ -2319,9 +2396,8 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
         scope = self._get_scope(args)
 
         # Get the sync behavior based on command line arguments
-        sync_behavior = SyncBehavior()
-        if args.sync_timeout is not None:
-            sync_behavior.syncTimeoutSeconds = args.sync_timeout
+        sync_timeout = args.sync_timeout if args.sync_timeout is not None else None
+        sync_behavior = SyncBehavior(syncTimeoutSeconds=sync_timeout)
 
         # Create the request params
         params = GetAttributesFromFilesParams(
@@ -2329,14 +2405,11 @@ class GetAttributesFromFilesV2Cmd(Subcmd):
             paths=paths,
             requestedAttributes=requested_attributes,
             sync=sync_behavior,
+            scope=scope,
         )
 
-        # Add scope if specified
-        if scope is not None:
-            params.scope = scope
-
         try:
-            with instance.get_thrift_client_legacy() as client:
+            with instance.get_thrift_client() as client:
                 result = client.getAttributesFromFilesV2(params)
                 for i, path in enumerate(args.paths):
                     attr_result = result.res[i]

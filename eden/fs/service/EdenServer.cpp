@@ -32,6 +32,8 @@
 #include <folly/Subprocess.h> // @manual
 #endif
 #include <folly/chrono/Conv.h>
+#include <folly/coro/Invoke.h>
+#include <folly/coro/Task.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/io/async/AsyncSignalHandler.h>
@@ -53,6 +55,7 @@
 #include "eden/common/telemetry/RequestMetricsScope.h"
 #include "eden/common/telemetry/SessionInfo.h"
 #include "eden/common/telemetry/StructuredLoggerFactory.h"
+#include "eden/common/telemetry/SubprocessScribeLogger.h"
 #include "eden/common/utils/EnumValue.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/FileUtils.h"
@@ -87,10 +90,18 @@
 #include "eden/fs/store/TreeCache.h"
 #include "eden/fs/store/sl/SaplingBackingStore.h"
 #include "eden/fs/takeover/TakeoverData.h"
+#include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/EdenStructuredLogger.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/telemetry/IScribeLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
+#ifdef EDEN_HAVE_LOGGER
+#include "eden/fs/telemetry/facebook/XplatLogger.h" // @manual
+#include "eden/fs/telemetry/facebook/XplatTransforms.h" // @manual
+#endif
+#include "eden/fs/telemetry/XplatKeys.h"
 #include "eden/fs/utils/Clock.h"
 #include "eden/fs/utils/EdenError.h"
 #include "eden/fs/utils/EdenTaskQueue.h"
@@ -165,7 +176,7 @@ using namespace facebook::eden;
 
 std::shared_ptr<Notifier> getPlatformNotifier(
     std::shared_ptr<ReloadableConfig> config,
-    std::shared_ptr<StructuredLogger> logger,
+    std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
     std::string version) {
 #if defined(_WIN32)
   /*
@@ -182,19 +193,22 @@ std::shared_ptr<Notifier> getPlatformNotifier(
      */
     try {
       auto notifier = std::make_shared<WindowsNotifier>(
-          config, logger, version, std::chrono::steady_clock::now());
+          config,
+          edenFsEventsLogger,
+          version,
+          std::chrono::steady_clock::now());
       notifier->initialize();
       return notifier;
     } catch (const std::exception& ex) {
       auto reason = folly::exceptionStr(ex);
       XLOGF(WARN, "Couldn't start E-Menu: {}", reason);
-      logger->logEvent(EMenuStartupFailure{reason.toStdString()});
+      edenFsEventsLogger->logEvent(EMenuStartupFailure{reason.toStdString()});
     }
   }
   return std::make_shared<NullNotifier>(config);
 #else
   (void)version;
-  (void)logger;
+  (void)edenFsEventsLogger;
   return std::make_shared<CommandNotifier>(config);
 #endif // _WIN32
 }
@@ -325,6 +339,37 @@ std::shared_ptr<folly::Executor> makePrefetchFilesV2Threads(
   }
   return nullptr;
 }
+
+std::shared_ptr<ErrorLogger> makeErrorLogger(
+    const EdenConfig& edenConfig,
+    SessionInfo sessionInfo,
+    std::shared_ptr<ReloadableConfig> config,
+    EdenStatsPtr edenStats) {
+  auto scribeBinary = edenConfig.scribeLogger.getValue();
+  auto errorCategory = edenConfig.errorScribeCategory.getValue();
+  std::shared_ptr<ScribeLogger> scribeLogger;
+  if (!scribeBinary.empty() && !errorCategory.empty()) {
+    try {
+      scribeLogger = std::make_shared<SubprocessScribeLogger>(
+          scribeBinary.c_str(), errorCategory);
+    } catch (const std::exception& ex) {
+      edenStats->increment(&TelemetryStats::subprocessLoggerFailure, 1);
+      XLOGF(
+          ERR,
+          "Failed to create scribe logger for ErrorLogger: {}. Error logging is disabled.",
+          folly::exceptionStr(ex));
+    }
+  }
+  return std::make_shared<ErrorLogger>(
+      std::move(scribeLogger), std::move(sessionInfo), std::move(config));
+}
+
+#ifndef _WIN32
+bool shouldRunPeriodicInodeUnload(const EdenConfig& config) {
+  return !config.enablePressureBasedGc.getValue() &&
+      config.periodicUnloadIntervalMinutes.getValue() > 0;
+}
+#endif
 
 } // namespace
 
@@ -525,8 +570,23 @@ EdenServer::EdenServer(
               edenConfig->notificationsScribeCategory.getValue(),
               sessionInfo,
               edenStats.copy())},
-      heartbeatManager_{
-          std::make_shared<HeartbeatManager>(edenDir_, structuredLogger_)},
+      errorLogger_{
+          makeErrorLogger(*edenConfig, sessionInfo, config_, edenStats.copy())},
+#ifdef EDEN_HAVE_LOGGER
+      xplatLogger_{std::make_unique<XplatLogger>(
+          EdenTelemetryIdentity::fromSessionInfo(sessionInfo),
+          edenStats.copy(),
+          config_)},
+#endif
+      edenFsEventsLogger_{std::make_shared<EdenFsEventsLogger>(
+          structuredLogger_,
+#ifdef EDEN_HAVE_LOGGER
+          xplatLogger_.get(),
+#else
+          nullptr,
+#endif
+          config_,
+          edenStats.copy())},
       serverState_{make_shared<ServerState>(
           std::move(userInfo),
           std::move(edenStats),
@@ -541,12 +601,26 @@ EdenServer::EdenServer(
           std::make_shared<ProcessInfoCache>(),
           structuredLogger_,
           notificationsStructuredLogger_,
+          errorLogger_,
           std::move(scribeLogger),
           config_,
           *edenConfig,
           mainEventBase_,
-          getPlatformNotifier(config_, structuredLogger_, version),
-          FLAGS_enable_fault_injection)},
+          getPlatformNotifier(config_, edenFsEventsLogger_, version),
+          FLAGS_enable_fault_injection,
+          nullptr, // inodeAccessLogger — use default
+#ifdef EDEN_HAVE_LOGGER
+          [this]() {
+            registerXplatTransforms();
+            return xplatLogger_.get();
+          }()
+#else
+          nullptr
+#endif
+              )},
+      heartbeatManager_{std::make_shared<HeartbeatManager>(
+          edenDir_,
+          serverState_->getEdenFsEventsLogger())},
       blobCache_{BlobCache::create(
           serverState_->getReloadableConfig(),
           serverState_->getStats().copy())},
@@ -568,7 +642,8 @@ EdenServer::EdenServer(
           makePrefetchFilesV2Threads(thriftUsePrefetchExecutor_, edenConfig)},
       progressManager_{
           std::make_unique<folly::Synchronized<EdenServer::ProgressManager>>()},
-      startupStatusChannel_{std::move(startupStatusChannel)} {
+      startupStatusChannel_{std::move(startupStatusChannel)},
+      lastPressureBasedGcTimes_{kPathMapDefaultCaseSensitive} {
   auto counters = fb303::ServiceData::get()->getDynamicCounters();
 
   registerInodePopulationReportsCallback();
@@ -689,6 +764,25 @@ EdenServer::EdenServer(
 #endif
 }
 
+#ifdef EDEN_HAVE_LOGGER
+void EdenServer::registerXplatTransforms() {
+  if (!xplatLogger_) {
+    return;
+  }
+  // Register XplatLogger transforms for all EdenFS Scuba tables.
+  // This must happen before any logging call sites fire.
+  // Add new registerTransform() calls here as new tables are onboarded.
+  xplatLogger_->registerTransform(
+      std::string{xplat_keys::kFileAccessCategory},
+      "GeneratedEdenfsFileAccessesLoggerConfig",
+      fileAccessTransform);
+  xplatLogger_->registerTransform(
+      std::string{xplat_keys::kEventsCategory},
+      "GeneratedEdenfsEventsLoggerConfig",
+      edenfsEventsTransform);
+}
+#endif
+
 EdenServer::~EdenServer() {
   auto counters = fb303::ServiceData::get()->getDynamicCounters();
 
@@ -802,7 +896,7 @@ void EdenServer::ProgressManager::markFailed(size_t progressIndex) {
 }
 
 void EdenServer::ProgressManager::printProgresses(
-    std::shared_ptr<StartupLogger> logger,
+    const std::shared_ptr<StartupLogger>& logger,
     std::optional<std::string_view> errorMessage) {
   std::string prepare;
   std::string content;
@@ -856,7 +950,7 @@ void EdenServer::ProgressManager::printProgresses(
 }
 
 void EdenServer::ProgressManager::manageProgress(
-    std::shared_ptr<StartupLogger> logger,
+    const std::shared_ptr<StartupLogger>& logger,
     size_t progressIndex,
     uint16_t percent) {
   updateProgressState(progressIndex, percent);
@@ -913,6 +1007,7 @@ folly::SemiFuture<Unit> EdenServer::unmountAll() {
 Future<TakeoverData> EdenServer::stopMountsForTakeover(
     folly::Promise<std::optional<TakeoverData>>&& takeoverPromise) {
   std::vector<Future<optional<TakeoverData::MountInfo>>> futures;
+  std::vector<AbsolutePath> mountPaths;
   {
     const auto mountPoints = mountPoints_->wlock();
     for (auto& [mountPath, info] : *mountPoints) {
@@ -966,9 +1061,17 @@ Future<TakeoverData> EdenServer::stopMountsForTakeover(
         auto ew = folly::exception_wrapper{std::current_exception()};
         XLOGF(
             ERR, "Error while stopping \"{}\" for takeover: {}", mountPath, ew);
+        ew.with_exception([&](const std::exception& ex) {
+          serverState_->getErrorLogger().log(
+              EdenErrorInfo::takeover(ex)
+                  .withMountPoint(std::string(mountPath.view()))
+                  .withMountStatus(
+                      fmt::format("{}", info.edenMount->getState())));
+        });
         futures.push_back(
             makeFuture<optional<TakeoverData::MountInfo>>(std::move(ew)));
       }
+      mountPaths.emplace_back(mountPath);
     }
   }
   // Use collectAll() rather than collect() to wait for all of the unmounts
@@ -977,23 +1080,30 @@ Future<TakeoverData> EdenServer::stopMountsForTakeover(
   // unsafe and deadlock prone. See eden/fs/docs/Futures.md for more details.
   return folly::collectAll(futures)
       .via(&folly::InlineExecutor::instance())
-      .thenValue([takeoverPromise = std::move(takeoverPromise)](
+      .thenValue([takeoverPromise = std::move(takeoverPromise),
+                  mountPaths = std::move(mountPaths),
+                  serverState = serverState_](
                      std::vector<folly::Try<optional<TakeoverData::MountInfo>>>
                          results) mutable {
         TakeoverData data;
         data.takeoverComplete = std::move(takeoverPromise);
         data.mountPoints.reserve(results.size());
-        for (auto& result : results) {
+        for (size_t i = 0; i < results.size(); ++i) {
+          auto& result = results[i];
+          const auto& path = mountPaths[i];
           // If something went wrong shutting down a mount point,
           // log the error but continue trying to perform graceful takeover
           // of the other mount points.
           if (!result.hasValue()) {
-            // TODO: Log this type of error either in the new process or the old
-            // process.
             XLOGF(
                 ERR,
-                "error stopping mount during takeover shutdown: {}",
+                "error stopping \"{}\" during takeover shutdown: {}",
+                path,
                 result.exception().what());
+            result.exception().with_exception([&](const std::exception& ex) {
+              serverState->getErrorLogger().log(
+                  EdenErrorInfo::takeover(ex).withMountPoint(path.asString()));
+            });
             continue;
           }
 
@@ -1002,9 +1112,7 @@ Future<TakeoverData> EdenServer::stopMountsForTakeover(
           // in the middle of stopping it for takeover.  Just skip this mount
           // in this case.
           if (!result.value().has_value()) {
-            // TODO: Log this type of error either in the new process or the old
-            // process.
-            XLOG(WARN, "mount point was unmounted during takeover shutdown");
+            XLOGF(WARN, "\"{}\" was unmounted during takeover shutdown", path);
             continue;
           }
 
@@ -1042,7 +1150,7 @@ void EdenServer::startPeriodicTasks() {
   // so using unloadChildrenNow just to validate the behaviour. We will have to
   // modify current unloadChildrenNow function to unload inodes based on the
   // last access time.
-  if (config->periodicUnloadIntervalMinutes.getValue() > 0) {
+  if (shouldRunPeriodicInodeUnload(*config)) {
     scheduleInodeUnload(std::chrono::minutes(FLAGS_start_delay_minutes));
   }
 #endif
@@ -1070,14 +1178,20 @@ void EdenServer::updatePeriodicTaskIntervals(const EdenConfig& config) {
       std::chrono::duration_cast<std::chrono::milliseconds>(
           config.overlayMaintenanceInterval.getValue()));
 
-  /**
-   * For now, periodic GC only makes sense on Windows and macOS, with unknown
-   * behavior on Linux.
-   */
+  // Pressure-based GC ticks frequently so it can react quickly to sudden inode
+  // growth. Each tick uses the pressure policy to decide which mounts are due.
   if (config.enableGc.getValue()) {
-    gcTask_.updateInterval(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            config.gcPeriod.getValue()));
+    if (config.enablePressureBasedGc.getValue()) {
+      gcTask_.updateInterval(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              config.pressureBasedGcTickPeriod.getValue()));
+    } else {
+      gcTask_.updateInterval(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              config.gcPeriod.getValue()));
+    }
+  } else {
+    gcTask_.updateInterval(0s);
   }
 
   if (config.enableNfsServer.getValue() &&
@@ -1165,6 +1279,18 @@ size_t EdenServer::enumerateInProgressCheckouts() {
 
 #ifndef _WIN32
 void EdenServer::unloadInodes() {
+  auto config = serverState_->getReloadableConfig()->getEdenConfig();
+  if (!shouldRunPeriodicInodeUnload(*config)) {
+    XLOG(
+        DBG4,
+        "Skipping periodic inode unload because it is disabled or pressure-based GC is enabled");
+    auto interval = config->periodicUnloadIntervalMinutes.getValue();
+    if (interval > 0) {
+      scheduleInodeUnload(std::chrono::minutes(interval));
+    }
+    return;
+  }
+
   auto mounts = getMountPoints();
 
   if (!mounts.empty()) {
@@ -1186,9 +1312,7 @@ void EdenServer::unloadInodes() {
     }
   }
   scheduleInodeUnload(
-      std::chrono::minutes(serverState_->getReloadableConfig()
-                               ->getEdenConfig()
-                               ->periodicUnloadIntervalMinutes.getValue()));
+      std::chrono::minutes(config->periodicUnloadIntervalMinutes.getValue()));
 }
 
 void EdenServer::scheduleInodeUnload(std::chrono::milliseconds timeout) {
@@ -1227,6 +1351,12 @@ ImmediateFuture<Unit> EdenServer::recoverImpl(TakeoverData&& takeoverData) {
     oldDaemonPid_ = oldDaemonPid.value();
   }
   server_->useExistingSocket(takeoverData.thriftSocket.release());
+
+  if (auto nfsServer = serverState_->getNfsServer();
+      nfsServer && takeoverData.mountdAcceptsPaused) {
+    XLOG(DBG7, "Resuming mountd accepts after takeover recovery");
+    nfsServer->resumeMountdAccepting();
+  }
 
   // Remount our mounts from our prepared takeoverData
   std::vector<ImmediateFuture<Unit>> mountFutures;
@@ -1299,6 +1429,16 @@ std::chrono::seconds getTakeoverTimeoutSeconds(const EdenConfig& config) {
   return std::chrono::duration_cast<std::chrono::seconds>(
       config.takeoverReceiveTimeout.getValue());
 }
+
+#ifndef _WIN32
+Future<TakeoverData> recoverPreparedTakeoverFromError(
+    folly::exception_wrapper ew,
+    TakeoverData&& takeover) {
+  auto takeoverPromise = std::move(takeover.takeoverComplete);
+  takeoverPromise.setValue(std::move(takeover));
+  return makeFuture<TakeoverData>(std::move(ew));
+}
+#endif
 } // namespace
 
 Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
@@ -1325,6 +1465,7 @@ Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
   }
   auto thriftRunningFuture = createThriftServer();
   // Start the PrivHelper client, using our main event base to drive its I/O
+  serverState_->getPrivHelper()->setEdenFsEventsLogger(edenFsEventsLogger_);
   serverState_->getPrivHelper()->attachEventBase(mainEventBase_);
 
   startPeriodicTasks();
@@ -1341,11 +1482,17 @@ Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
     logger->log(
         "Requesting existing edenfs process to gracefully "
         "transfer its mount points...");
+    folly::stop_watch<std::chrono::microseconds> takeoverReceiveWatch;
+    SCOPE_EXIT {
+      serverState_->getStats()->addDuration(
+          &TakeoverStats::receive, takeoverReceiveWatch.elapsed());
+    };
     auto edenConfig = serverState_->getEdenConfig();
     takeoverData = takeoverMounts(
         takeoverPath,
         getTakeoverTimeoutSeconds(*edenConfig),
         shouldThrowDuringTakeover(*edenConfig));
+    serverState_->getStats()->increment(&TakeoverStats::receiveSuccess);
     logger->log(
         "Received takeover information for ",
         takeoverData.mountPoints.size(),
@@ -1404,6 +1551,15 @@ Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
        takeoverData = std::move(takeoverData),
 #endif
        thriftRunningFuture = std::move(thriftRunningFuture)]() mutable {
+        // Create fsck concurrency semaphore before either mount path.
+        // A value of 0 means unlimited concurrency (no semaphore).
+        auto maxConcurrentFsck = serverState_->getReloadableConfig()
+                                     ->getEdenConfig()
+                                     ->fsckMaxConcurrentMounts.getValue();
+        if (maxConcurrentFsck > 0) {
+          fsckSemaphore_ = std::make_unique<folly::LifoSem>(maxConcurrentFsck);
+        }
+
         std::vector<ImmediateFuture<Unit>> mountFutures;
         if (doingTakeover) {
 #ifndef _WIN32
@@ -1426,7 +1582,11 @@ Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
 std::shared_ptr<cpptoml::table> EdenServer::parseConfig() {
   auto configPath = edenDir_.getPath() + RelativePathPiece{kStateConfig};
 
+#ifdef _WIN32
+  std::ifstream inputFile(configPath.wide());
+#else
   std::ifstream inputFile(configPath.c_str());
+#endif
   if (!inputFile.is_open()) {
     if (errno != ENOENT) {
       folly::throwSystemErrorExplicit(
@@ -1579,7 +1739,7 @@ bool EdenServer::performCleanup() {
   SCOPE_EXIT {
     auto shutdownTimeInSeconds =
         std::chrono::duration<double>{shutdown.elapsed()}.count();
-    serverState_->getStructuredLogger()->logEvent(
+    serverState_->getEdenFsEventsLogger()->logEvent(
         DaemonStop{shutdownTimeInSeconds, takeover, shutdownSuccess});
   };
 
@@ -1832,7 +1992,7 @@ Future<Unit> EdenServer::performTakeoverStart(
     [[maybe_unused]] std::shared_ptr<EdenMount> edenMount,
     [[maybe_unused]] TakeoverData::MountInfo&& info) {
 #ifndef _WIN32
-  auto mountPath = info.mountPath;
+  auto mountPath = std::move(info.mountPath);
 
   auto future = completeTakeoverStart(edenMount, std::move(info));
   return std::move(future).thenValue(
@@ -1855,8 +2015,7 @@ Future<Unit> EdenServer::completeTakeoverStart(
     [[maybe_unused]] TakeoverData::MountInfo&& info) {
   if (auto channelData = std::get_if<FuseChannelData>(&info.channelInfo)) {
     // Start up the fuse workers.
-    return folly::makeFutureWith(
-        [&] { edenMount->takeoverFuse(std::move(*channelData)); });
+    return edenMount->takeoverFuse(std::move(*channelData));
   } else if (
       auto nfsMountInfo = std::get_if<NfsChannelData>(&info.channelInfo)) {
     return edenMount->takeoverNfs(std::move(*nfsMountInfo));
@@ -1887,9 +2046,8 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
       treeCache_,
       getStats().copy(),
       serverState_->getProcessInfoCache(),
-      serverState_->getStructuredLogger(),
+      serverState_->getEdenFsEventsLogger(),
       serverState_->getReloadableConfig(),
-      initialConfig->getEnableWindowsSymlinks(),
       initialConfig->getCaseSensitive());
   auto journal = std::make_unique<Journal>(getStats().copy());
 
@@ -1902,6 +2060,10 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
       std::move(journal),
       getStats().copy());
   addToMountPoints(edenMount);
+
+  if (fsckSemaphore_) {
+    edenMount->getOverlay()->setFsckSemaphore(fsckSemaphore_.get());
+  }
 
   registerStats(edenMount);
 
@@ -1979,7 +2141,13 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
               auto* fsChannel = edenMount->getFsChannel();
               auto inodeCatalogType =
                   edenMount->getCheckoutConfig()->getInodeCatalogType();
-              serverState_->getStructuredLogger()->logEvent(
+              std::optional<std::string> fsTransportName;
+#ifdef __linux__
+              if (auto* fuseChannel = dynamic_cast<FuseChannel*>(fsChannel)) {
+                fsTransportName = fuseChannel->getTransportName();
+              }
+#endif
+              serverState_->getEdenFsEventsLogger()->logEvent(
                   FinishedMount{
                       std::string{toBackingStoreString(
                           edenMount->getCheckoutConfig()
@@ -1988,6 +2156,7 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
                       std::string{basename(
                           edenMount->getCheckoutConfig()->getRepoSource())},
                       fsChannel ? fsChannel->getName() : "unknown",
+                      std::move(fsTransportName),
                       doTakeover,
                       std::chrono::duration<double>{mountStopWatch.elapsed()}
                           .count(),
@@ -1995,9 +2164,7 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
                       edenMount->getOverlay()->hadCleanStartup(),
                       inodeCatalogType.has_value()
                           ? static_cast<int64_t>(inodeCatalogType.value())
-                          : 0,
-                      edenMount->getCheckoutConfig()
-                          ->getEnableWindowsSymlinks()});
+                          : 0});
               return makeFuture(std::move(t));
             });
       });
@@ -2148,6 +2315,79 @@ EdenMountHandle EdenServer::getMount(AbsolutePathPiece mountPath) const {
   return {mount, mount->getRootInodeUnchecked()};
 }
 
+namespace {
+
+CheckoutResult finishCheckoutPostProcessing(
+    EdenServer* server,
+    CheckoutResult&& result,
+    CheckoutMode checkoutMode,
+    bool isNfs,
+    AbsolutePath mountPath) {
+  server->getServerState()->getNotifier()->signalCheckout(
+      server->enumerateInProgressCheckouts());
+  if (checkoutMode == CheckoutMode::DRY_RUN) {
+    return std::move(result);
+  }
+
+  // In NFSv3 the kernel never tells us when its safe to unload
+  // inodes ("safe" meaning all file handles to the inode have been
+  // closed).
+  //
+  // To avoid unbounded memory and disk use we need to periodically
+  // clean them up. Checkout will likely create a lot of stale innodes
+  // so we run a delayed cleanup after checkout.
+  if (isNfs &&
+      server->getServerState()
+          ->getReloadableConfig()
+          ->getEdenConfig()
+          ->unloadUnlinkedInodes.getValue()) {
+    // During whole Eden Process shutdown, this function can only be
+    // run before the mount is destroyed. This is because the function
+    // is either run before the server event base is destroyed or it
+    // is not run at all, and the server event base is destroyed
+    // before the mountPoints. Since the function must be run before
+    // the eventbase is destroyed and the eventbase is destroyed
+    // before the mountPoints, this function can only be called before
+    // the mount points are destroyed during normal destruction.
+    // However, the mount point might have been unmounted before this
+    // function is run outside of shutdown.
+    auto delay = server->getServerState()
+                     ->getReloadableConfig()
+                     ->getEdenConfig()
+                     ->postCheckoutDelayToUnloadInodes.getValue();
+    XLOGF(
+        DBG9,
+        "Scheduling unlinked inode cleanup for mount {} in {} seconds.",
+        mountPath,
+        durationStr(delay));
+    server->scheduleCallbackOnMainEventBase(
+        std::chrono::duration_cast<std::chrono::milliseconds>(delay),
+        [server, mountPath = std::move(mountPath)]() {
+          try {
+            // TODO: This might be a pretty expensive operation to run
+            // on an EventBase. Maybe we should debounce onto a
+            // different executor.
+            auto mountHandle = server->getMount(mountPath);
+            mountHandle.getEdenMount().forgetStaleInodes();
+          } catch (EdenError& err) {
+            // This is an expected error if the mount has been
+            // unmounted before this callback ran.
+            if (err.errorCode() == ENOENT) {
+              XLOGF(
+                  DBG3,
+                  "Callback to clear inodes: Mount cannot be found. {}",
+                  *err.message());
+            } else {
+              throw;
+            }
+          }
+        });
+  }
+  return std::move(result);
+}
+
+} // namespace
+
 ImmediateFuture<CheckoutResult> EdenServer::checkOutRevision(
     AbsolutePathPiece mountPath,
     std::string& rootId,
@@ -2210,65 +2450,8 @@ ImmediateFuture<CheckoutResult> EdenServer::checkOutRevision(
           })
           .thenValue([this, checkoutMode, isNfs, mountPath = mountPath.copy()](
                          CheckoutResult&& result) {
-            getServerState()->getNotifier()->signalCheckout(
-                enumerateInProgressCheckouts());
-            if (checkoutMode == CheckoutMode::DRY_RUN) {
-              return std::move(result);
-            }
-
-            // In NFSv3 the kernel never tells us when its safe to unload
-            // inodes ("safe" meaning all file handles to the inode have been
-            // closed).
-            //
-            // To avoid unbounded memory and disk use we need to periodically
-            // clean them up. Checkout will likely create a lot of stale innodes
-            // so we run a delayed cleanup after checkout.
-            if (isNfs &&
-                serverState_->getReloadableConfig()
-                    ->getEdenConfig()
-                    ->unloadUnlinkedInodes.getValue()) {
-              // During whole Eden Process shutdown, this function can only be
-              // run before the mount is destroyed. This is because the function
-              // is either run before the server event base is destroyed or it
-              // is not run at all, and the server event base is destroyed
-              // before the mountPoints. Since the function must be run before
-              // the eventbase is destroyed and the eventbase is destroyed
-              // before the mountPoints, this function can only be called before
-              // the mount points are destroyed during normal destruction.
-              // However, the mount point might have been unmounted before this
-              // function is run outside of shutdown.
-              auto delay = serverState_->getReloadableConfig()
-                               ->getEdenConfig()
-                               ->postCheckoutDelayToUnloadInodes.getValue();
-              XLOGF(
-                  DBG9,
-                  "Scheduling unlinked inode cleanup for mount {} in {} seconds.",
-                  mountPath,
-                  durationStr(delay));
-              this->scheduleCallbackOnMainEventBase(
-                  std::chrono::duration_cast<std::chrono::milliseconds>(delay),
-                  [this, mountPath = mountPath.copy()]() {
-                    try {
-                      // TODO: This might be a pretty expensive operation to run
-                      // on an EventBase. Maybe we should debounce onto a
-                      // different executor.
-                      auto mountHandle = this->getMount(mountPath);
-                      mountHandle.getEdenMount().forgetStaleInodes();
-                    } catch (EdenError& err) {
-                      // This is an expected error if the mount has been
-                      // unmounted before this callback ran.
-                      if (err.errorCode() == ENOENT) {
-                        XLOGF(
-                            DBG3,
-                            "Callback to clear inodes: Mount cannot be found. {}",
-                            *err.message());
-                      } else {
-                        throw;
-                      }
-                    }
-                  });
-            }
-            return std::move(result);
+            return finishCheckoutPostProcessing(
+                this, std::move(result), checkoutMode, isNfs, mountPath);
           });
 
   if (thriftUseCheckoutExecutor_) {
@@ -2292,6 +2475,74 @@ ImmediateFuture<CheckoutResult> EdenServer::checkOutRevision(
   }
 
   return std::move(checkoutFuture).ensure([mountHandle] {});
+}
+
+folly::coro::now_task<CheckoutResult> EdenServer::co_checkOutRevision(
+    AbsolutePathPiece mountPath,
+    std::string& rootId,
+    std::optional<folly::StringPiece> rootHgManifest,
+    const ObjectFetchContextPtr& fetchContext,
+    StringPiece callerName,
+    CheckoutMode checkoutMode) {
+  auto mountHandle = getMount(mountPath);
+  auto& edenMount = mountHandle.getEdenMount();
+  auto root = edenMount.getObjectStore()->parseRootId(rootId);
+  if (rootHgManifest.has_value()) {
+    // The hg client has told us what the root manifest is.
+    //
+    // This is useful when a commit has just been created.  We won't be able to
+    // ask the import helper to map the commit to its root manifest because it
+    // won't know about the new commit until it reopens the repo.  Instead,
+    // import the manifest for this commit directly.
+    auto rootManifest = hash20FromThrift(rootHgManifest.value());
+    co_await edenMount.getObjectStore()
+        ->getBackingStore()
+        ->importManifestForRoot(root, rootManifest, fetchContext)
+        .semi();
+  }
+
+  bool isNfs = edenMount.isNfsdChannel();
+
+  // the +1 is so we count the current checkout that hasn't quite started yet
+  getServerState()->getNotifier()->signalCheckout(
+      enumerateInProgressCheckouts() + 1);
+
+  // Helper that runs the checkout body. Extracted into a Task so it can
+  // either be scheduled on the dedicated checkout executor (when
+  // `thriftUseCheckoutExecutor_=true`) or run inline on the current
+  // executor.
+  //
+  // Captures are explicit (no [&]) so the lambda owns mountHandle and
+  // doesn't alias stack locals if the Task is later detached.
+  auto checkoutBody =
+      [mountHandle,
+       root,
+       fetchContext = fetchContext.copy(),
+       callerName = callerName.str(),
+       checkoutMode]() mutable -> folly::coro::Task<CheckoutResult> {
+    co_return co_await mountHandle.getEdenMount()
+        .checkout(
+            mountHandle.getRootInode(),
+            root,
+            fetchContext,
+            callerName,
+            checkoutMode)
+        .semi();
+  };
+
+  CheckoutResult result;
+  if (thriftUseCheckoutExecutor_) {
+    fetchContext->setDetachedExecutor(checkoutRevisionExecutor_.get());
+    // Pin the checkout body to the dedicated executor to isolate long
+    // checkouts from thrift worker thread starvation.
+    result = co_await folly::coro::co_withExecutor(
+        checkoutRevisionExecutor_.get(), checkoutBody());
+  } else {
+    result = co_await checkoutBody();
+  }
+
+  co_return finishCheckoutPostProcessing(
+      this, std::move(result), checkoutMode, isNfs, AbsolutePath{mountPath});
 }
 
 shared_ptr<BackingStore> EdenServer::getBackingStore(
@@ -2408,7 +2659,7 @@ folly::SemiFuture<Unit> EdenServer::createThriftServer() {
           edenConfig->thriftQueueTimeout.getValue()));
   server_->setAllowCheckUnimplementedExtraInterfaces(false);
 
-  // Setting this allows us to to only do stopListening() on the stop() call
+  // Setting this allows us to only do stopListening() on the stop() call
   // and delay thread-pool join (stop cpu workers + stop workers) until
   // server object destruction. This specifically matters in the takeover
   // shutdown code path.
@@ -2516,6 +2767,9 @@ void EdenServer::stop() {
 
 folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
 #ifndef _WIN32
+  // Track how long the takeover send takes and whether it succeeds.
+  folly::stop_watch<std::chrono::microseconds> takeoverSendWatch;
+
   // Make sure we aren't already shutting down, then update our state
   // to indicate that we should perform mount point takeover shutdown
   // once runServer() returns.
@@ -2526,6 +2780,7 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
     if (state->state != RunState::RUNNING) {
       // We are either still in the process of starting,
       // or already shutting down.
+      serverState_->getStats()->increment(&TakeoverStats::sendFailure);
       return makeFuture<TakeoverData>(std::runtime_error(
           folly::to<string>(
               "can only perform graceful restart when running normally; "
@@ -2538,6 +2793,7 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
       for (const auto& entry : *mountPoints) {
         const auto& mount = entry.second.edenMount;
         if (!mount->isSafeForInodeAccess()) {
+          serverState_->getStats()->increment(&TakeoverStats::sendFailure);
           return makeFuture<TakeoverData>(std::runtime_error(
               "can only perform graceful restart when all mount points are initialized"));
           // TODO(xavierd): There is still a potential race after this check if
@@ -2557,6 +2813,7 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
             /*maxRetries=*/3, /*retryInterval=*/std::chrono::seconds(1))) {
       // We are still waiting for the GC to finish. This is unexpected and
       // should not happen. We should not proceed with the graceful restart.
+      serverState_->getStats()->increment(&TakeoverStats::sendFailure);
       return makeFuture<TakeoverData>(std::runtime_error(
           "cannot run graceful restart while garbage collection is running"));
     }
@@ -2605,37 +2862,71 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
         }
         return stopMountsForTakeover(std::move(takeoverPromise));
       })
-      .thenValue([this, socket = std::move(thriftSocket)](
-                     TakeoverData&& takeover) mutable {
-        takeover.lockFile = edenDir_.extractLock();
+      .thenTry(
+          [this, socket = std::move(thriftSocket)](
+              folly::Try<TakeoverData>&& result) mutable
+              -> folly::Future<TakeoverData> {
+            if (result.hasException()) {
+              return makeFuture<TakeoverData>(result.exception());
+            }
 
-        takeover.thriftSocket = std::move(socket);
-        return via(getMainEventBase())
-            .thenValue(
-                [this](
-                    auto&&) -> folly::SemiFuture<std::optional<folly::File>> {
-                  if (auto& takeoverServer =
-                          this->getServerState()->getNfsServer()) {
-                    return takeoverServer->takeoverStop().deferValue(
-                        [](folly::File file) {
-                          return std::make_optional<folly::File>(
-                              std::move(file));
-                        });
-                  } else {
-                    return std::nullopt;
-                  }
-                })
-            .thenValue([takeover = std::move(takeover)](
-                           std::optional<folly::File>&& mountdSocket) mutable {
-              if (mountdSocket.has_value()) {
-                XLOGF(
-                    DBG7,
-                    "Got mountd Socket for takeover {}",
-                    mountdSocket.value().fd());
-              }
-              takeover.mountdServerSocket = std::move(mountdSocket);
-              return std::move(takeover);
-            });
+            auto takeover = std::move(result).value();
+            takeover.lockFile = edenDir_.extractLock();
+            takeover.thriftSocket = std::move(socket);
+            return via(getMainEventBase())
+                .thenValue(
+                    [this](auto&&)
+                        -> folly::SemiFuture<std::optional<folly::File>> {
+                      if (auto& takeoverServer =
+                              this->getServerState()->getNfsServer()) {
+                        return takeoverServer->takeoverStop().deferValue(
+                            [](folly::File file) {
+                              return std::make_optional<folly::File>(
+                                  std::move(file));
+                            });
+                      } else {
+                        return std::nullopt;
+                      }
+                    })
+                .thenTry(
+                    [this, takeover = std::move(takeover)](
+                        folly::Try<std::optional<folly::File>>&&
+                            mountdSocket) mutable
+                        -> folly::Future<TakeoverData> {
+                      takeover.mountdAcceptsPaused =
+                          this->getServerState()->getNfsServer() != nullptr;
+                      if (mountdSocket.hasException()) {
+                        return recoverPreparedTakeoverFromError(
+                            mountdSocket.exception(), std::move(takeover));
+                      }
+
+                      if (mountdSocket->has_value()) {
+                        XLOGF(
+                            DBG7,
+                            "Got mountd Socket for takeover {}",
+                            mountdSocket->value().fd());
+                      }
+                      takeover.mountdServerSocket =
+                          std::move(mountdSocket).value();
+
+                      auto postPrepareResult =
+                          serverState_->getFaultInjector().checkTry(
+                              "takeover", "post_prepare_data");
+                      if (postPrepareResult.hasException()) {
+                        return recoverPreparedTakeoverFromError(
+                            postPrepareResult.exception(), std::move(takeover));
+                      }
+                      return makeFuture<TakeoverData>(std::move(takeover));
+                    });
+          })
+      .thenTry([this,
+                takeoverSendWatch](folly::Try<TakeoverData>&& result) mutable {
+        auto& stats = serverState_->getStats();
+        stats->addDuration(&TakeoverStats::send, takeoverSendWatch.elapsed());
+        if (result.hasException()) {
+          stats->increment(&TakeoverStats::sendFailure);
+        }
+        return result;
       });
 #else
   NOT_IMPLEMENTED();
@@ -2703,7 +2994,8 @@ ImmediateFuture<uint64_t> EdenServer::garbageCollectWorkingCopy(
     EdenMount& mount,
     TreeInodePtr inode,
     std::chrono::system_clock::time_point cutoff,
-    const ObjectFetchContextPtr& context) {
+    const ObjectFetchContextPtr& context,
+    bool pressureBased) {
   folly::stop_watch<> workingCopyRuntime;
 
   auto lease = mount.tryStartWorkingCopyGC(inode);
@@ -2720,27 +3012,42 @@ ImmediateFuture<uint64_t> EdenServer::garbageCollectWorkingCopy(
   auto totalNumberOfInodesBeforeGC = inodeCountsBeforeGC.fileCount +
       inodeCountsBeforeGC.treeCount + inodeCountsBeforeGC.unloadedInodeCount;
   XLOGF(
-      DBG1,
-      "Starting GC for: {} total number of inodes {}",
+      DBG4,
+      "Starting {} GC for: {} total number of inodes {}",
+      pressureBased ? "pressure-based" : "config-based",
       mountPath,
       totalNumberOfInodesBeforeGC);
   // Use the member cancellation source for this operation
 
+  auto gcToken = gcCancelSource_.rlock()->getToken();
   return inode
       // First step of garbage collection varies by platform (e.g., Linux,
       // macOS, Windows)
-      ->handleChildrenNotAccessedRecently(
-          cutoff, context, gcCancelSource_.getToken())
+      ->handleChildrenNotAccessedRecently(cutoff, context, gcToken)
+      // Wait for queued filesystem invalidations to drain before the unload
+      // sweep. On FUSE, invalidation-triggered FORGETs may arrive too late for
+      // this GC cycle if we start unloading immediately.
+      .thenTry(
+          [&mount](folly::Try<uint64_t>&& invalidatedTry)
+              -> ImmediateFuture<uint64_t> {
+            if (invalidatedTry.hasException()) {
+              return makeFuture<uint64_t>(invalidatedTry.exception());
+            }
+            return mount.flushInvalidations().thenValue(
+                [numInvalidated = invalidatedTry.value()](folly::Unit) {
+                  return numInvalidated;
+                });
+          })
       // Second step of garbage collection deletes all the unreferenced inodes
       .ensure([inode, lease = std::move(lease)] {
         inode->unloadChildrenUnreferencedByFs();
       })
       .thenTry([workingCopyRuntime,
-                structuredLogger = structuredLogger_,
+                edenFsEventsLogger = serverState_->getEdenFsEventsLogger(),
                 mountPath,
                 inodeMap = mount.getInodeMap(),
-                totalNumberOfInodesBeforeGC](
-                   folly::Try<uint64_t> invalidatedTry) {
+                totalNumberOfInodesBeforeGC,
+                pressureBased](folly::Try<uint64_t> invalidatedTry) {
         auto runtime =
             std::chrono::duration<double>{workingCopyRuntime.elapsed()};
 
@@ -2751,21 +3058,30 @@ ImmediateFuture<uint64_t> EdenServer::garbageCollectWorkingCopy(
         auto totalNumberOfInodesAfterGC = inodeCountsAfterGC.fileCount +
             inodeCountsAfterGC.treeCount +
             inodeCountsAfterGC.unloadedInodeCount;
+        auto inodeDelta = folly::to_signed(totalNumberOfInodesBeforeGC) -
+            folly::to_signed(totalNumberOfInodesAfterGC);
 
-        structuredLogger->logEvent(
+        edenFsEventsLogger->logEvent(
             WorkingCopyGc{
-                runtime.count(),
-                numInvalidated,
-                success,
-                static_cast<int64_t>(
-                    (totalNumberOfInodesBeforeGC -
-                     totalNumberOfInodesAfterGC))});
-        XLOGF(
-            DBG1,
-            "GC for: {}, completed in: {} seconds, total number of inodes after GC: {}",
-            mountPath,
-            runtime.count(),
-            totalNumberOfInodesAfterGC);
+                runtime.count(), numInvalidated, success, inodeDelta});
+        auto shouldLogAtDbg2 = runtime > std::chrono::seconds{5} ||
+            numInvalidated > 10'000 || inodeDelta > 10'000;
+        auto logMessage = [&] {
+          return fmt::format(
+              "{} GC for: {}, completed in: {} seconds, "
+              "invalidated: {}, inodes before: {}, inodes after: {}",
+              pressureBased ? "Pressure-based" : "Config-based",
+              mountPath,
+              runtime.count(),
+              numInvalidated,
+              totalNumberOfInodesBeforeGC,
+              totalNumberOfInodesAfterGC);
+        };
+        if (shouldLogAtDbg2) {
+          XLOG(DBG2) << logMessage();
+        } else {
+          XLOG(DBG4) << logMessage();
+        }
 
         return invalidatedTry.value();
       });
@@ -2779,28 +3095,86 @@ void EdenServer::garbageCollectAllMounts() {
   auto shorterCutoffConfig =
       std::chrono::duration_cast<std::chrono::system_clock::duration>(
           config->aggressiveGcCutoff.getValue());
+  auto pressureBasedGc = config->enablePressureBasedGc.getValue();
+  auto steadyNow = std::chrono::steady_clock::now();
   std::chrono::system_clock::time_point cutoff;
 
   auto mountPoints = getMountPoints();
+  if (pressureBasedGc) {
+    PathMap<std::chrono::steady_clock::time_point, AbsolutePath>
+        activePressureBasedGcTimes{kPathMapDefaultCaseSensitive};
+    for (auto& mountHandle : mountPoints) {
+      auto& mount = mountHandle.getEdenMount();
+      auto lastGcTime = lastPressureBasedGcTimes_.find(mount.getPath());
+      if (lastGcTime != lastPressureBasedGcTimes_.end()) {
+        activePressureBasedGcTimes.emplace(mount.getPath(), lastGcTime->second);
+      }
+    }
+    lastPressureBasedGcTimes_ = std::move(activePressureBasedGcTimes);
+  } else {
+    lastPressureBasedGcTimes_.clear();
+  }
   for (auto& mountHandle : mountPoints) {
-    auto inodeCountsBeforeGc =
-        mountHandle.getEdenMount().getInodeMap()->getInodeCounts();
-    auto totalNumberOfInodesBeforeGc = inodeCountsBeforeGc.fileCount +
-        inodeCountsBeforeGc.treeCount + inodeCountsBeforeGc.unloadedInodeCount;
-    auto aggressiveGcThreshold = config->aggressiveGcThreshold.getValue();
-    // If aggressiveGcThreshold is set to 0, we will not run GC with shorter
-    // cutoff.
-    if (aggressiveGcThreshold > 0 &&
-        totalNumberOfInodesBeforeGc > aggressiveGcThreshold) {
-      // If the number of inodes is above the threshold, we want to run
-      // GC with shorter cutoff.
-      cutoff = std::chrono::system_clock::now() - shorterCutoffConfig;
+    if (pressureBasedGc) {
+      // Use the pressure-based policy to compute a dynamic cutoff based on
+      // the current inode count for this mount.
+      auto& mount = mountHandle.getEdenMount();
+      auto policy = mount.getInodePressurePolicy();
+      auto inodeCount = mount.getInodeMap()->getTotalInodeCountFast();
+      auto gcPeriod = policy->getGcPeriod(inodeCount);
+      auto lastGcTime = lastPressureBasedGcTimes_.find(mount.getPath());
+      if (lastGcTime != lastPressureBasedGcTimes_.end() &&
+          steadyNow - lastGcTime->second < gcPeriod) {
+        XLOGF(
+            DBG6,
+            "Skipping pressure-based GC for: {}, next run in {} seconds",
+            mount.getPath(),
+            std::chrono::duration_cast<std::chrono::seconds>(
+                gcPeriod - (steadyNow - lastGcTime->second))
+                .count());
+        continue;
+      }
+      if (mount.isWorkingCopyGCRunning()) {
+        XLOGF(
+            DBG6,
+            "Skipping pressure-based GC for: {}, another GC is already in progress",
+            mount.getPath());
+        continue;
+      }
+      lastPressureBasedGcTimes_[mount.getPath()] = steadyNow;
+
+      auto gcCutoffDuration = policy->getGcCutoff(inodeCount);
+
+      if constexpr (folly::kIsWindows) {
+        // On Windows, PrjFS GC uses on-disk atime which is only updated
+        // ~hourly. A cutoff shorter than 1 hour would incorrectly treat
+        // recently-used files as stale.
+        gcCutoffDuration =
+            std::max(gcCutoffDuration, std::chrono::seconds{3600});
+      }
+
+      cutoff = std::chrono::system_clock::now() - gcCutoffDuration;
     } else {
-      cutoff = std::chrono::system_clock::now() - cutoffConfig;
+      auto inodeCountsBeforeGc =
+          mountHandle.getEdenMount().getInodeMap()->getInodeCounts();
+      auto totalNumberOfInodesBeforeGc = inodeCountsBeforeGc.fileCount +
+          inodeCountsBeforeGc.treeCount +
+          inodeCountsBeforeGc.unloadedInodeCount;
+      auto aggressiveGcThreshold = config->aggressiveGcThreshold.getValue();
+      // If aggressiveGcThreshold is set to 0, we will not run GC with shorter
+      // cutoff.
+      if (aggressiveGcThreshold > 0 &&
+          totalNumberOfInodesBeforeGc > aggressiveGcThreshold) {
+        // If the number of inodes is above the threshold, we want to run
+        // GC with shorter cutoff.
+        cutoff = std::chrono::system_clock::now() - shorterCutoffConfig;
+      } else {
+        cutoff = std::chrono::system_clock::now() - cutoffConfig;
+      }
     }
     folly::via(
         getServerState()->getThreadPool().get(),
-        [this, mountHandle, cutoff]() mutable {
+        [this, mountHandle, cutoff, pressureBasedGc]() mutable {
           static auto context =
               ObjectFetchContext::getNullContextWithCauseDetail(
                   "EdenServer::garbageCollectAllMounts");
@@ -2808,7 +3182,8 @@ void EdenServer::garbageCollectAllMounts() {
                      mountHandle.getEdenMount(),
                      mountHandle.getRootInode(),
                      cutoff,
-                     context)
+                     context,
+                     pressureBasedGc)
               .semi();
         })
         .ensure([mountHandle] {});
@@ -2827,7 +3202,7 @@ bool EdenServer::stopAllGarbageCollections(
   // to forcibly stop a running task. We can cancel any running GC and wait
   // for them to stop. This is not guaranteed to work if the GC is stuck in
   // some operation, but it should work in most cases.
-  gcCancelSource_.requestCancellation();
+  gcCancelSource_.wlock()->requestCancellation();
   XLOGF(DBG1, "Cancel request sent to all ongoing garbage collections");
 
   bool isGCRunning = isWorkingCopyGCRunningForAnyMount();
@@ -2839,7 +3214,9 @@ bool EdenServer::stopAllGarbageCollections(
     currentAttempts++;
   }
 
-  return !isGCRunning;
+  const auto gcStopped = !isGCRunning;
+  *gcCancelSource_.wlock() = folly::CancellationSource{};
+  return gcStopped;
 }
 
 bool EdenServer::isWorkingCopyGCRunningForAnyMount() const {
@@ -2911,18 +3288,18 @@ void EdenServer::accidentalUnmountRecovery() {
           getServerState()->getThreadPool().get(),
           [this,
            initialConfig = std::move(initialConfig),
-           structuredLogger = structuredLogger_,
+           edenFsEventsLogger = serverState_->getEdenFsEventsLogger(),
            mountPath,
            repoName = client.second.asString()]() mutable {
             return mount(std::move(initialConfig), /*readOnly=*/false)
                 .thenTry([mountPath,
-                          structuredLogger,
+                          edenFsEventsLogger,
                           repoName = std::move(repoName)](
                              folly::Try<std::shared_ptr<EdenMount>>&& result) {
                   bool success = result.hasValue();
                   std::string exceptionMessage =
                       success ? "" : result.exception().what().toStdString();
-                  structuredLogger->logEvent(
+                  edenFsEventsLogger->logEvent(
                       AccidentalUnmountRecovery{
                           exceptionMessage, success, repoName});
                   if (success) {
@@ -3063,7 +3440,7 @@ void EdenServer::detectNfsCrawl() {
                     "NFS crawl detection found process with open files in mount point: {}\n  {}",
                     mount.getPath(),
                     output);
-                serverState->getStructuredLogger()->logEvent(
+                serverState->getEdenFsEventsLogger()->logEvent(
                     NfsCrawlDetected{
                         readCount,
                         readThreshold,
@@ -3090,6 +3467,11 @@ void EdenServer::reloadConfig() {
       [this, config = std::move(config)] {
         updatePeriodicTaskIntervals(*config);
       });
+
+  // Rebuild cached InodePressurePolicy for each mount.
+  for (auto& handle : getMountPoints()) {
+    handle.getEdenMount().updateInodePressurePolicy();
+  }
 }
 
 void EdenServer::checkLockValidity() {

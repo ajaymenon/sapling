@@ -96,6 +96,39 @@ ImmediateFuture<BackingStore::GetRootTreeResult> FakeBackingStore::getRootTree(
       .semi();
 }
 
+folly::coro::now_task<BackingStore::GetRootTreeResult>
+FakeBackingStore::co_getRootTree(
+    const RootId& commitID,
+    const ObjectFetchContextPtr& /*context*/) {
+  StoredId* storedTreeId;
+  {
+    auto data = data_.wlock();
+    ++data->commitAccessCounts[commitID];
+    auto commitIter = data->commits.find(commitID);
+    if (commitIter == data->commits.end()) {
+      throw std::domain_error(fmt::format("commit {} not found", commitID));
+    }
+    storedTreeId = commitIter->second.get();
+  }
+
+  auto id = co_await storedTreeId->getFuture().semi();
+
+  folly::SemiFuture<TreePtr> treeFuture =
+      folly::SemiFuture<TreePtr>::makeEmpty();
+  {
+    auto data = data_.rlock();
+    auto treeIter = data->trees.find(*id);
+    if (treeIter == data->trees.end()) {
+      throw std::domain_error(
+          fmt::format("tree {} for commit {} not found", *id, commitID));
+    }
+    treeFuture = std::move(treeIter->second->getFuture()).semi();
+  }
+  auto tree = co_await std::move(treeFuture);
+
+  co_return GetRootTreeResult{tree, storedTreeId->get()};
+}
+
 SemiFuture<BackingStore::GetTreeResult> FakeBackingStore::getTree(
     const ObjectId& id,
     const ObjectFetchContextPtr& /*context*/) {
@@ -127,6 +160,14 @@ SemiFuture<BackingStore::GetTreeAuxResult> FakeBackingStore::getTreeAuxData(
       std::domain_error("GetTreeAuxData not implemented for FakeBackingStore"));
 }
 
+folly::coro::now_task<BackingStore::GetTreeAuxResult>
+FakeBackingStore::co_getTreeAuxData(
+    const ObjectId& /*id*/,
+    const ObjectFetchContextPtr& /*context*/) {
+  co_yield folly::coro::co_error(
+      std::domain_error("GetTreeAuxData not implemented for FakeBackingStore"));
+}
+
 SemiFuture<BackingStore::GetBlobResult> FakeBackingStore::getBlob(
     const ObjectId& id,
     const ObjectFetchContextPtr& /*context*/) {
@@ -146,17 +187,38 @@ SemiFuture<BackingStore::GetBlobResult> FakeBackingStore::getBlob(
       .semi();
 }
 
+folly::coro::now_task<BackingStore::GetTreeResult> FakeBackingStore::co_getTree(
+    const ObjectId& id,
+    const ObjectFetchContextPtr& /*context*/) {
+  folly::SemiFuture<TreePtr> future = folly::SemiFuture<TreePtr>::makeEmpty();
+  {
+    auto data = data_.wlock();
+    ++data->accessCounts[id];
+    auto it = data->trees.find(id);
+    if (it == data->trees.end()) {
+      throw std::domain_error(fmt::format("tree {} not found", id));
+    }
+    future = std::move(it->second->getFuture()).semi();
+  }
+  auto tree = co_await std::move(future);
+  co_return BackingStore::GetTreeResult{
+      std::move(tree), ObjectFetchContext::Origin::FromNetworkFetch};
+}
+
 folly::coro::Task<BackingStore::GetBlobResult> FakeBackingStore::co_getBlob(
     const ObjectId& id,
     const ObjectFetchContextPtr& /*context*/) {
-  auto data = data_.wlock();
-  ++data->accessCounts[id];
-  auto it = data->blobs.find(id);
-  if (it == data->blobs.end()) {
-    // Throw immediately, for the same reasons mentioned in getTree()
-    throw std::domain_error(fmt::format("blob {} not found", id));
+  folly::SemiFuture<BlobPtr> future = folly::SemiFuture<BlobPtr>::makeEmpty();
+  {
+    auto data = data_.wlock();
+    ++data->accessCounts[id];
+    auto it = data->blobs.find(id);
+    if (it == data->blobs.end()) {
+      throw std::domain_error(fmt::format("blob {} not found", id));
+    }
+    future = std::move(it->second->getFuture()).semi();
   }
-  auto blob = co_await std::move(it->second->getFuture()).semi();
+  auto blob = co_await std::move(future);
   co_return BackingStore::GetBlobResult{
       std::move(blob), ObjectFetchContext::Origin::FromNetworkFetch};
 }
@@ -194,6 +256,33 @@ FakeBackingStore::getBlobAuxData(
       .semi();
 }
 
+folly::coro::now_task<BackingStore::GetBlobAuxResult>
+FakeBackingStore::co_getBlobAuxData(
+    const ObjectId& id,
+    const ObjectFetchContextPtr& context) {
+  {
+    auto data = data_.wlock();
+    data->auxDataLookups.push_back(id);
+  }
+
+  if (serverState_) {
+    co_await serverState_->getFaultInjector().co_checkAsync(
+        "getBlobAuxData", id);
+  }
+
+  auto blobResult = co_await co_getBlob(id, context);
+  co_return BackingStore::GetBlobAuxResult{
+      std::make_shared<BlobAuxDataPtr::element_type>(
+          Hash20::sha1(blobResult.blob->getContents()),
+          blake3Key_ ? Hash32::keyedBlake3(
+                           folly::ByteRange{folly::StringPiece{
+                               blake3Key_->data(), blake3Key_->size()}},
+                           blobResult.blob->getContents())
+                     : Hash32::blake3(blobResult.blob->getContents()),
+          blobResult.blob->getSize()),
+      blobResult.origin};
+}
+
 ImmediateFuture<BackingStore::GetGlobFilesResult>
 FakeBackingStore::getGlobFiles(
     const RootId& id,
@@ -205,6 +294,18 @@ FakeBackingStore::getGlobFiles(
   auto glob = getStoredGlob(suffixQuery)->get();
   return ImmediateFuture<GetGlobFilesResult>{
       GetGlobFilesResult{std::move(glob), id}};
+}
+
+folly::coro::now_task<BackingStore::GetGlobFilesResult>
+FakeBackingStore::co_getGlobFiles(
+    const RootId& id,
+    const std::vector<std::string>& globs,
+    const std::vector<std::string>& /*prefixes*/) {
+  // Since unordered map can't take a vec for testing purposes only use the
+  // first entry in the query
+  auto suffixQuery = std::pair<RootId, std::string>(id, globs[0]);
+  auto glob = getStoredGlob(suffixQuery)->get();
+  co_return GetGlobFilesResult{std::move(glob), id};
 }
 
 Blob FakeBackingStore::makeBlob(folly::StringPiece contents) {
@@ -311,6 +412,22 @@ StoredTree* FakeBackingStore::putTree(ObjectId id, Tree::container entries) {
   return putTreeImpl(id, std::move(entries));
 }
 
+StoredTree* FakeBackingStore::putRestrictedTree(
+    const std::initializer_list<TreeEntryData>& entryArgs) {
+  auto entries = buildTreeEntries(entryArgs);
+  auto id = computeTreeId(entries);
+  return putTreeImpl(
+      std::move(id), std::move(entries), /* isRestricted */ true);
+}
+
+StoredTree* FakeBackingStore::putRestrictedTree(
+    ObjectId id,
+    const std::initializer_list<TreeEntryData>& entryArgs) {
+  auto entries = buildTreeEntries(entryArgs);
+  return putTreeImpl(
+      std::move(id), std::move(entries), /* isRestricted */ true);
+}
+
 std::pair<StoredTree*, bool> FakeBackingStore::maybePutTree(
     const std::initializer_list<TreeEntryData>& entryArgs) {
   return maybePutTree(buildTreeEntries(entryArgs));
@@ -357,8 +474,9 @@ ObjectId FakeBackingStore::computeTreeId(const Tree::container& sortedEntries) {
 
 StoredTree* FakeBackingStore::putTreeImpl(
     ObjectId id,
-    Tree::container&& sortedEntries) {
-  auto ret = maybePutTreeImpl(id, std::move(sortedEntries));
+    Tree::container&& sortedEntries,
+    bool isRestricted) {
+  auto ret = maybePutTreeImpl(id, std::move(sortedEntries), isRestricted);
   if (!ret.second) {
     throw std::domain_error(fmt::format("tree with id {} already exists", id));
   }
@@ -367,8 +485,12 @@ StoredTree* FakeBackingStore::putTreeImpl(
 
 std::pair<StoredTree*, bool> FakeBackingStore::maybePutTreeImpl(
     ObjectId id,
-    Tree::container&& sortedEntries) {
-  auto storedTree = make_unique<StoredTree>(Tree{std::move(sortedEntries), id});
+    Tree::container&& sortedEntries,
+    bool isRestricted) {
+  auto tree = isRestricted
+      ? Tree{Tree::Restricted{}, std::move(sortedEntries), id}
+      : Tree{std::move(sortedEntries), id};
+  auto storedTree = make_unique<StoredTree>(std::move(tree));
 
   {
     auto data = data_.wlock();
@@ -481,5 +603,29 @@ void FakeBackingStore::discardOutstandingRequests() {
 
 size_t FakeBackingStore::getAccessCount(const ObjectId& id) const {
   return folly::get_default(data_.rlock()->accessCounts, id, 0);
+}
+
+void FakeBackingStore::setCheckPermissionResult(
+    const ObjectId& id,
+    bool allowed) {
+  auto data = data_.wlock();
+  data->permissionResults[id] = allowed;
+}
+
+size_t FakeBackingStore::getCheckPermissionCount(const ObjectId& id) const {
+  auto data = data_.rlock();
+  auto it = data->permissionCheckCounts.find(id);
+  return it != data->permissionCheckCounts.end() ? it->second : 0;
+}
+
+ImmediateFuture<bool> FakeBackingStore::checkPermission(
+    const ObjectId& manifestId) {
+  auto data = data_.wlock();
+  data->permissionCheckCounts[manifestId]++;
+  auto it = data->permissionResults.find(manifestId);
+  if (it != data->permissionResults.end()) {
+    return it->second;
+  }
+  return true; // default: fail-open
 }
 } // namespace facebook::eden

@@ -10,7 +10,6 @@
 
 # Verify ancestry data is readable by mergedrivers by looking at mergestate:
 
-  $ setconfig devel.segmented-changelog-rev-compat=true
   $ eagerepo
   $ newrepo
   $ enable rebase
@@ -30,8 +29,8 @@
   > EOF
 
   $ setconfig 'experimental.mergedriver=python:driver/'
-  $ hg commit -Aqm driver
-  $ hg debugdrawdag << 'EOS'
+  $ sl commit -Aqm driver
+  $ sl debugdrawdag << 'EOS'
   > E    # E/file = 1\n2\n3\n4\n5
   > |
   > D
@@ -42,7 +41,7 @@
   > |
   > A   # A/file = 1\n2\n3\n4
   > EOS
-  $ hg rebase -s A -d 0
+  $ sl rebase -s A -d 'desc(driver)'
   rebasing 19c6d3b0d8fb "A" (A)
   rebasing 5a83467e1fc3 "B" (B)
   rebasing 09810f6b52c0 "F" (F)
@@ -65,8 +64,8 @@
   │ o  520a9f665f6e b
   │
   @  2563cf1728bf driver
-  $ hg rebase -r 25a05a650d8b -d 17085bf4ec19
+  $ sl rebase -r 25a05a650d8b -d 17085bf4ec19
   rebasing 25a05a650d8b "F" (F)
   ancestor nodes = ['0b21084cb21221e8ac6138fc5e92460d37525d21']
-  ancestor revs = [9]
+  ancestor revs = [*] (glob)
   merging file

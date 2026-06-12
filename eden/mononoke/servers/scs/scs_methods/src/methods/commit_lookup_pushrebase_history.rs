@@ -99,14 +99,13 @@ impl RepoChangesetsPushrebaseHistory {
         let is_public = repo
             .repo()
             .phases()
-            .get_public(&self.ctx, vec![*bcs_id], true /* ephemeral_derive */)
+            .get_cached_public(&self.ctx, vec![*bcs_id])
             .await
             .map_err(scs_errors::internal_error)?
             .contains(bcs_id);
         if !is_public {
             return Err(scs_errors::invalid_request(format!(
-                "changeset {} is not public, and only public commits could be pushrebased",
-                bcs_id,
+                "changeset {bcs_id} is not public, and only public commits could be pushrebased",
             ))
             .into());
         }
@@ -138,8 +137,7 @@ impl RepoChangesetsPushrebaseHistory {
                 }
             }
             (Some(_), Some(_)) => Err(scs_errors::internal_error(format!(
-                "pushrebase mapping is ambiguous in repo {} for {}: {:?} (expected only one)",
-                repo_name, bcs_id, bcs_ids,
+                "pushrebase mapping is ambiguous in repo {repo_name} for {bcs_id}: {bcs_ids:?} (expected only one)",
             ))
             .into()),
         }

@@ -5,8 +5,10 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::num::NonZeroU64;
 use std::str::FromStr;
 
 use anyhow::Context;
@@ -14,6 +16,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use bookmarks_types::BookmarkKey;
+use metaconfig_types::AclManifestMode;
 use metaconfig_types::Address;
 use metaconfig_types::BlameVersion;
 use metaconfig_types::BookmarkOrRegex;
@@ -22,13 +25,21 @@ use metaconfig_types::CacheWarmupParams;
 use metaconfig_types::CommitCloudConfig;
 use metaconfig_types::CommitGraphConfig;
 use metaconfig_types::CommitIdentityScheme;
+use metaconfig_types::CommitRateLimitCacheConfig;
+use metaconfig_types::CommitRateLimitConfig;
+use metaconfig_types::CommitRateLimitEligibilityCheck;
+use metaconfig_types::CommitRateLimitRuleConfig;
+use metaconfig_types::CommitRateLimitWindow;
 use metaconfig_types::ComparableRegex;
 use metaconfig_types::CrossRepoCommitValidation;
+use metaconfig_types::DerivationPipelineConfig;
+use metaconfig_types::DerivationPipelineStageConfig;
 use metaconfig_types::DerivedDataConfig;
 use metaconfig_types::DerivedDataTypesConfig;
 use metaconfig_types::DirectoryBranchClusterConfig;
 use metaconfig_types::DirectoryBranchClusterFixedCluster;
 use metaconfig_types::DirectoryBranchClusterFixedConfig;
+use metaconfig_types::EnforcementConditionSet;
 use metaconfig_types::GitBundleURIConfig;
 use metaconfig_types::GitConcurrencyParams;
 use metaconfig_types::GitConfigs;
@@ -45,6 +56,7 @@ use metaconfig_types::InfinitepushNamespace;
 use metaconfig_types::InfinitepushParams;
 use metaconfig_types::LfsParams;
 use metaconfig_types::LoggingDestination;
+use metaconfig_types::MergeResolutionOverride;
 use metaconfig_types::MetadataCacheConfig;
 use metaconfig_types::MetadataCacheUpdateMode;
 use metaconfig_types::MetadataLoggerConfig;
@@ -57,7 +69,6 @@ use metaconfig_types::PushrebaseParams;
 use metaconfig_types::PushrebaseRemoteMode;
 use metaconfig_types::RemoteDerivationConfig;
 use metaconfig_types::RemoteDiffConfig;
-use metaconfig_types::RepoClientKnobs;
 use metaconfig_types::RestrictedPathsConfig;
 use metaconfig_types::ServiceWriteRestrictions;
 use metaconfig_types::ShardedService;
@@ -89,7 +100,10 @@ use repos::RawCasSyncConfig;
 use repos::RawCommitCloudConfig;
 use repos::RawCommitGraphConfig;
 use repos::RawCommitIdentityScheme;
+use repos::RawCommitRateLimitConfig;
 use repos::RawCrossRepoCommitValidationConfig;
+use repos::RawDerivationPipelineConfig;
+use repos::RawDerivationPipelineStageConfig;
 use repos::RawDerivedDataBlockedChangesetDerivation;
 use repos::RawDerivedDataBlockedDerivation;
 use repos::RawDerivedDataConfig;
@@ -97,6 +111,7 @@ use repos::RawDerivedDataTypesConfig;
 use repos::RawDirectoryBranchClusterConfig;
 use repos::RawDirectoryBranchClusterFixedCluster;
 use repos::RawDirectoryBranchClusterFixedConfig;
+use repos::RawEligibilityCheck;
 use repos::RawGitBundleURIConfig;
 use repos::RawGitConcurrencyParams;
 use repos::RawGitConfigs;
@@ -119,7 +134,6 @@ use repos::RawPushrebaseRemoteMode;
 use repos::RawPushrebaseRemoteModeRemote;
 use repos::RawRemoteDerivationConfig;
 use repos::RawRemoteDiffConfig;
-use repos::RawRepoClientKnobs;
 use repos::RawRestrictedPathsConfig;
 use repos::RawServiceWriteRestrictions;
 use repos::RawShardedService;
@@ -185,6 +199,8 @@ impl Convert for RawHookConfig {
             })
             .transpose()?;
 
+        let permission_group = self.bypass_permission_group;
+
         let bypass = match (bypass_commit_message, bypass_pushvar) {
             (Some(msg), None) => Some(HookBypass::new_with_commit_msg(msg)),
             (None, Some((name, value))) => Some(HookBypass::new_with_pushvar(name, value)),
@@ -193,6 +209,7 @@ impl Convert for RawHookConfig {
             )),
             (None, None) => None,
         };
+        let bypass = bypass.map(|b| b.with_permission_group(permission_group));
 
         let config = HookConfig {
             bypass,
@@ -224,8 +241,7 @@ impl Convert for RawBookmarkConfig {
                 Ok(comparable_regex) => BookmarkOrRegex::Regex(comparable_regex),
                 Err(err) => {
                     return Err(ConfigurationError::InvalidConfig(format!(
-                        "invalid bookmark regex: {}",
-                        err
+                        "invalid bookmark regex: {err}"
                     ))
                     .into());
                 }
@@ -234,8 +250,7 @@ impl Convert for RawBookmarkConfig {
                 Ok(comparable_regex) => BookmarkOrRegex::InverseRegex(comparable_regex),
                 Err(err) => {
                     return Err(ConfigurationError::InvalidConfig(format!(
-                        "invalid bookmark inverse regex: {}",
-                        err
+                        "invalid bookmark inverse regex: {err}"
                     ))
                     .into());
                 }
@@ -302,7 +317,7 @@ impl Convert for RawCommitIdentityScheme {
             RawCommitIdentityScheme::GIT => CommitIdentityScheme::GIT,
             RawCommitIdentityScheme::BONSAI => CommitIdentityScheme::BONSAI,
             RawCommitIdentityScheme::UNKNOWN => CommitIdentityScheme::UNKNOWN,
-            v => return Err(anyhow!("Invalid value {} for enum CommitIdentityScheme", v)),
+            v => return Err(anyhow!("Invalid value {v} for enum CommitIdentityScheme")),
         };
         Ok(converted)
     }
@@ -315,7 +330,7 @@ impl Convert for RawPushrebaseRemoteModeRemote {
         match self {
             Self::tier(t) => Ok(Address::Tier(t)),
             Self::host_port(host) => Ok(Address::HostPort(host)),
-            Self::UnknownField(e) => anyhow::bail!("Unknown field: {}", e),
+            Self::UnknownField(e) => anyhow::bail!("Unknown field: {e}"),
         }
     }
 }
@@ -332,7 +347,7 @@ impl Convert for RawPushrebaseRemoteMode {
             Self::remote_land_service_local_fallback(addr) => Ok(
                 PushrebaseRemoteMode::RemoteLandServiceWithLocalFallback(addr.convert()?),
             ),
-            Self::UnknownField(e) => anyhow::bail!("Unknown field: {}", e),
+            Self::UnknownField(e) => anyhow::bail!("Unknown field: {e}"),
         }
     }
 }
@@ -367,6 +382,22 @@ impl Convert for RawPushrebaseParams {
                     .unwrap_or_default(),
                 not_generated_filenodes_limit: 500,
                 monitoring_bookmark: self.monitoring_bookmark,
+                merge_resolution_excluded_path_prefixes: self
+                    .merge_resolution_excluded_path_prefixes
+                    .map(|raw| {
+                        raw.into_iter()
+                            .map(|path| NonRootMPath::new_opt(path.as_bytes()).map(MPath::from))
+                            .collect::<Result<PrefixTrie>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+                pessimistic_locking_bookmarks: self
+                    .pessimistic_locking_bookmarks
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(BookmarkKey::new)
+                    .collect::<Result<Vec<_>>>()?,
+                merge_resolution_override: MergeResolutionOverride::UseJk, // request-scoped, not loaded from config
             },
             block_merges: self.block_merges.unwrap_or(default.block_merges),
             emit_obsmarkers: self.emit_obsmarkers.unwrap_or(default.emit_obsmarkers),
@@ -417,7 +448,6 @@ impl Convert for RawInfinitepushParams {
                     .ok()
                     .map(InfinitepushNamespace::new)
             }),
-            hydrate_getbundle_response: self.hydrate_getbundle_response.unwrap_or(false),
         })
     }
 }
@@ -452,6 +482,7 @@ impl Convert for RawServiceWriteRestrictions {
             permitted_path_prefixes,
             permitted_bookmarks,
             permitted_bookmark_regex,
+            permit_create_commit_check_bypass,
             ..
         } = self;
 
@@ -480,11 +511,15 @@ impl Convert for RawServiceWriteRestrictions {
             .transpose()
             .context("invalid service write permitted bookmark regex")?;
 
+        let permit_create_commit_check_bypass =
+            permit_create_commit_check_bypass.unwrap_or_default();
+
         Ok(ServiceWriteRestrictions {
             permitted_methods,
             permitted_path_prefixes,
             permitted_bookmarks,
             permitted_bookmark_regex,
+            permit_create_commit_check_bypass,
         })
     }
 }
@@ -528,20 +563,21 @@ impl Convert for RawDerivedDataTypesConfig {
             None => UnodeVersion::default(),
             Some(1) => return Err(anyhow!("unode version 1 has been deprecated")),
             Some(2) => UnodeVersion::V2,
-            Some(version) => return Err(anyhow!("unknown unode version {}", version)),
+            Some(version) => return Err(anyhow!("unknown unode version {version}")),
         };
         let blame_filesize_limit = self.blame_filesize_limit.map(|limit| limit as u64);
         let blame_version = match self.blame_version {
             None => BlameVersion::default(),
             Some(1) => return Err(anyhow!("blame version 1 has been deprecated")),
             Some(2) => BlameVersion::V2,
-            Some(version) => return Err(anyhow!("unknown blame version {}", version)),
+            Some(3) => BlameVersion::V3,
+            Some(version) => return Err(anyhow!("unknown blame version {version}")),
         };
         let git_delta_manifest_version = match self.git_delta_manifest_version {
             None => GitDeltaManifestVersion::default(),
             Some(2) => GitDeltaManifestVersion::V2,
             Some(3) => GitDeltaManifestVersion::V3,
-            Some(version) => return Err(anyhow!("unknown git delta manifest version {}", version)),
+            Some(version) => return Err(anyhow!("unknown git delta manifest version {version}")),
         };
         let git_delta_manifest_v2_config = self
             .git_delta_manifest_v2_config
@@ -564,6 +600,17 @@ impl Convert for RawDerivedDataTypesConfig {
             .map(|raw| raw.convert())
             .transpose()?;
 
+        let xdb_mapping_shard_ids: HashMap<DerivableType, usize> = self
+            .xdb_mapping_shard_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| {
+                let dt = DerivableType::from_name(&k)?;
+                let shard_id: usize = v.try_into()?;
+                Ok((dt, shard_id))
+            })
+            .collect::<Result<_>>()?;
+
         Ok(DerivedDataTypesConfig {
             types,
             ephemeral_bubbles_disabled_types,
@@ -577,6 +624,7 @@ impl Convert for RawDerivedDataTypesConfig {
             git_delta_manifest_v3_config,
             derivation_batch_sizes,
             inferred_copy_from_config,
+            xdb_mapping_shard_ids,
         })
     }
 }
@@ -643,6 +691,20 @@ impl Convert for RawDerivedDataConfig {
                 .map(|blocked_derivation| blocked_derivation.convert())
                 .transpose()?
                 .unwrap_or_default(),
+            extra_types_available_for_read: self
+                .extra_types_available_for_read
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| DerivableType::from_name(&s))
+                .collect::<Result<_, _>>()?,
+            // Reads thrift field `pipeline_config_v2` (renamed from
+            // `pipeline_config` so old binaries' JSON deserializer skips
+            // the new shape instead of crashing on it). The in-memory
+            // Rust field stays named `pipeline_config`.
+            pipeline_config: self
+                .pipeline_config_v2
+                .map(|raw| raw.convert())
+                .transpose()?,
         })
     }
 }
@@ -690,7 +752,7 @@ impl Convert for RawRemoteDerivationConfig {
                 Ok(RemoteDerivationConfig::HostPort(host_port))
             }
             RawRemoteDerivationConfig::UnknownField(e) => {
-                anyhow::bail!("Unknown variant of RawRemoteDerivationConfig: {}", e)
+                anyhow::bail!("Unknown variant of RawRemoteDerivationConfig: {e}")
             }
         }
     }
@@ -707,19 +769,136 @@ impl Convert for RawRemoteDiffConfig {
             RawRemoteDiffConfig::smc_tier(smc_tier) => Ok(RemoteDiffConfig::SmcTier(smc_tier)),
             RawRemoteDiffConfig::host_port(host_port) => Ok(RemoteDiffConfig::HostPort(host_port)),
             RawRemoteDiffConfig::UnknownField(e) => {
-                anyhow::bail!("Unknown variant of RawRemoteDiffConfig: {}", e)
+                anyhow::bail!("Unknown variant of RawRemoteDiffConfig: {e}")
             }
         }
     }
 }
 
-impl Convert for RawRepoClientKnobs {
-    type Output = RepoClientKnobs;
+impl Convert for RawCommitRateLimitConfig {
+    type Output = CommitRateLimitConfig;
 
     fn convert(self) -> Result<Self::Output> {
-        Ok(RepoClientKnobs {
-            allow_short_getpack_history: self.allow_short_getpack_history,
+        let cache_config = self
+            .cache_config
+            .map(|cc| -> Result<CommitRateLimitCacheConfig> {
+                Ok(CommitRateLimitCacheConfig {
+                    max_entries: cc
+                        .max_entries
+                        .try_into()
+                        .context("cache max_entries must be non-negative")?,
+                    ttl_secs: cc
+                        .ttl_secs
+                        .try_into()
+                        .context("cache ttl_secs must be non-negative")?,
+                })
+            })
+            .transpose()?;
+        let rules = self
+            .rules
+            .into_iter()
+            .map(|rule| {
+                let eligibility_checks = rule
+                    .eligibility_checks
+                    .into_iter()
+                    .map(|check| match check {
+                        RawEligibilityCheck::commit_message_tag(tag) => {
+                            Ok(CommitRateLimitEligibilityCheck::CommitMessageTag(tag))
+                        }
+                        RawEligibilityCheck::hg_extra_key(key) => {
+                            Ok(CommitRateLimitEligibilityCheck::HgExtra(key))
+                        }
+                        RawEligibilityCheck::always_pass(_) => {
+                            Ok(CommitRateLimitEligibilityCheck::AlwaysPass)
+                        }
+                        RawEligibilityCheck::UnknownField(id) => {
+                            bail!("Unknown variant of RawEligibilityCheck: {id}")
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let limits = rule
+                    .limits
+                    .into_iter()
+                    .map(|limit| -> Result<CommitRateLimitWindow> {
+                        Ok(CommitRateLimitWindow {
+                            window_secs: limit
+                                .window_secs
+                                .try_into()
+                                .context("window_secs must be non-negative")?,
+                            max_commits: limit
+                                .max_commits
+                                .try_into()
+                                .context("max_commits must be non-negative")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(CommitRateLimitRuleConfig {
+                    name: rule.name,
+                    eligibility_checks,
+                    limits,
+                    directories: rule.directories,
+                    per_user: rule.per_user,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CommitRateLimitConfig {
+            rules,
+            cache_config,
         })
+    }
+}
+
+impl Convert for RawDerivationPipelineStageConfig {
+    type Output = DerivationPipelineStageConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        let dependencies = self
+            .dependencies
+            .into_iter()
+            .map(|p| MPath::new(p.as_bytes()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DerivationPipelineStageConfig { dependencies })
+    }
+}
+
+impl Convert for RawDerivationPipelineConfig {
+    type Output = DerivationPipelineConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        let types = self
+            .types
+            .into_iter()
+            .map(|name| DerivableType::from_name(&name))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let bookmarks = self
+            .bookmarks
+            .into_iter()
+            .map(BookmarkKey::new)
+            .collect::<Result<Vec<_>>>()?;
+        let stages = self
+            .stages
+            .into_iter()
+            .map(|(path, raw_config)| Ok((MPath::new(path.as_bytes())?, raw_config.convert()?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        let batch_size = u64::try_from(self.batch_size)
+            .ok()
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| {
+                anyhow!(
+                    "pipeline_config.batch_size must be a positive integer, got {}",
+                    self.batch_size,
+                )
+            })?;
+        let config = DerivationPipelineConfig {
+            types,
+            bookmarks,
+            stages,
+            batch_size,
+        };
+        config
+            .validate()
+            .context("Invalid derivation pipeline config")?;
+        Ok(config)
     }
 }
 
@@ -745,7 +924,7 @@ impl Convert for RawWalkerJobType {
             RawWalkerJobType::SHALLOW_HG_SCRUB => WalkerJobType::ShallowHgScrub,
             RawWalkerJobType::VALIDATE_ALL => WalkerJobType::ValidateAll,
             RawWalkerJobType::UNKNOWN => WalkerJobType::Unknown,
-            v => return Err(anyhow!("Invalid value {} for enum WalkerJobType", v)),
+            v => return Err(anyhow!("Invalid value {v} for enum WalkerJobType")),
         };
         Ok(job_type)
     }
@@ -862,7 +1041,7 @@ impl Convert for RawLoggingDestination {
                 LoggingDestination::Scribe { scribe_category }
             }
             Self::UnknownField(f) => {
-                return Err(anyhow!("Unknown variant {} of RawLoggingDestination", f));
+                return Err(anyhow!("Unknown variant {f} of RawLoggingDestination"));
             }
         };
         Ok(dest)
@@ -920,7 +1099,7 @@ impl Convert for RawZelosConfig {
                 port: port.try_into()?,
             }),
             Self::zelos_tier(tier) => Ok(ZelosConfig::Remote { tier }),
-            Self::UnknownField(f) => Err(anyhow!("Unknown variant {} of RawZelosConfig", f)),
+            Self::UnknownField(f) => Err(anyhow!("Unknown variant {f} of RawZelosConfig")),
         }
     }
 }
@@ -949,7 +1128,7 @@ impl Convert for RawGitBundleURIConfig {
                 trusted_only: self.trusted_only,
             }),
             RawUriGeneratorType::UnknownField(f) => {
-                Err(anyhow!("Unknown variant {} of RawGitBundleURIConfig", f))
+                Err(anyhow!("Unknown variant {f} of RawGitBundleURIConfig"))
             }
         }
     }
@@ -976,7 +1155,10 @@ impl Convert for RawShardedService {
             RawShardedService::REPO_METADATA_LOGGER => ShardedService::RepoMetadataLogger,
             RawShardedService::BOOKMARK_SERVICE => ShardedService::BookmarkService,
             RawShardedService::DIFF_SERVICE => ShardedService::DiffService,
-            v => return Err(anyhow!("Invalid value {} for enum ShardedService", v)),
+            RawShardedService::DERIVATION_PIPELINE_TAILER => {
+                ShardedService::DerivationPipelineTailer
+            }
+            v => return Err(anyhow!("Invalid value {v} for enum ShardedService")),
         };
         Ok(service)
     }
@@ -1080,7 +1262,7 @@ impl Convert for RawMetadataCacheUpdateMode {
             },
             RawMetadataCacheUpdateMode::polling(_) => MetadataCacheUpdateMode::Polling,
             RawMetadataCacheUpdateMode::UnknownField(f) => {
-                bail!("Unsupported MetadataCacheUpdateMode {}", f)
+                bail!("Unsupported MetadataCacheUpdateMode {f}")
             }
         };
         Ok(cache_update_mode)
@@ -1169,6 +1351,18 @@ impl Convert for RawSoftRestrictedPathConfig {
     }
 }
 
+fn parse_acl_manifest_mode(s: Option<&str>) -> Result<AclManifestMode> {
+    match s {
+        None | Some("Disabled") => Ok(AclManifestMode::Disabled),
+        Some("Shadow") => Ok(AclManifestMode::Shadow),
+        Some("Both") => Ok(AclManifestMode::Both),
+        Some("Authoritative") => Ok(AclManifestMode::Authoritative),
+        Some(other) => Err(anyhow!(
+            "invalid acl_manifest_mode value '{other}': expected one of Disabled, Shadow, Both, Authoritative"
+        )),
+    }
+}
+
 impl Convert for RawRestrictedPathsConfig {
     type Output = RestrictedPathsConfig;
 
@@ -1177,9 +1371,8 @@ impl Convert for RawRestrictedPathsConfig {
             .path_acls
             .into_iter()
             .map(|(path, acl)| {
-                let non_root_path = NonRootMPath::new(path.as_bytes()).with_context(|| {
-                    format!("Invalid path for restricted path config: {}", path)
-                })?;
+                let non_root_path = NonRootMPath::new(path.as_bytes())
+                    .with_context(|| format!("Invalid path for restricted path config: {path}"))?;
                 Ok((
                     non_root_path,
                     MononokeIdentity::from_str(&acl)
@@ -1202,26 +1395,155 @@ impl Convert for RawRestrictedPathsConfig {
             .map(|raw| raw.convert())
             .collect::<Result<Vec<_>>>()?;
 
-        let conditional_enforcement_acls = self
-            .conditional_enforcement_acls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|id| {
-                MononokeIdentity::from_str(&id)
-                    .with_context(|| format!("Failed to parse identity: {}", id))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         // tooling_allowlist_group is used directly as a group name for membership checking
         let tooling_allowlist_group = self.tooling_allowlist_acl;
+
+        // rollout_allowlist_group is used for tooling allowed during rollout
+        let rollout_allowlist_group = self.rollout_allowlist_acl;
+
+        // admin_bypass_group is an optional group identity used for membership
+        // checking when bypassing Path ACL enforcement.
+        let admin_bypass_group = self
+            .admin_bypass_group
+            .map(|group| {
+                MononokeIdentity::from_str(&group)
+                    .with_context(|| format!("Failed to parse admin_bypass_group `{group}`"))
+            })
+            .transpose()?;
+
+        let enforcement_condition_sets = self
+            .enforcement_condition_sets
+            .unwrap_or_default()
+            .into_iter()
+            .map(|raw| {
+                Ok::<_, anyhow::Error>(EnforcementConditionSet {
+                    always_enabled: raw.always_enabled.unwrap_or(false),
+                    entry_points: raw.entry_points.unwrap_or_default(),
+                    require_client_request_flag: raw.require_client_request_flag.unwrap_or(false),
+                    restriction_acls: raw
+                        .restriction_acls
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|s| {
+                            MononokeIdentity::from_str(&s)
+                                .with_context(|| format!("parsing restriction_acl `{s}`"))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    machine_tiers: raw.machine_tiers.unwrap_or_default(),
+                    build_rules: raw.build_rules.unwrap_or_default(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(RestrictedPathsConfig {
             path_acls,
             use_manifest_id_cache,
             cache_update_interval_ms,
             soft_path_acls,
-            conditional_enforcement_acls,
             tooling_allowlist_group,
+            rollout_allowlist_group,
+            admin_bypass_group,
+            acl_file_name: self
+                .acl_file_name
+                .unwrap_or(RestrictedPathsConfig::default().acl_file_name.to_string()),
+            enforcement_condition_sets,
+            enforcement_enabled: self.enforcement_enabled.unwrap_or(false),
+            acl_manifest_mode: parse_acl_manifest_mode(self.acl_manifest_mode.as_deref())?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mononoke_macros::mononoke;
+    use repos::RawDerivationPipelineConfig;
+    use repos::RawEnforcementConditionSet;
+
+    use super::*;
+
+    fn raw_pipeline_config_with_batch_size(batch_size: i64) -> RawDerivationPipelineConfig {
+        RawDerivationPipelineConfig {
+            types: Default::default(),
+            bookmarks: Default::default(),
+            stages: Default::default(),
+            batch_size,
+        }
+    }
+
+    #[mononoke::test]
+    fn test_parse_pipeline_config_rejects_zero_batch_size() {
+        let raw = raw_pipeline_config_with_batch_size(0);
+        let err = raw.convert().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("batch_size must be a positive integer") && msg.contains("got 0"),
+            "expected positive-batch-size error, got: {msg}",
+        );
+    }
+
+    #[mononoke::test]
+    fn test_parse_pipeline_config_rejects_negative_batch_size() {
+        let raw = raw_pipeline_config_with_batch_size(-5);
+        let err = raw.convert().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("batch_size must be a positive integer") && msg.contains("got -5"),
+            "expected positive-batch-size error, got: {msg}",
+        );
+    }
+
+    fn empty_raw_restricted_paths_config() -> RawRestrictedPathsConfig {
+        RawRestrictedPathsConfig {
+            path_acls: Default::default(),
+            ..Default::default()
+        }
+    }
+
+    #[mononoke::test]
+    fn test_parse_acl_manifest_mode_absent_defaults_to_disabled() {
+        assert_eq!(
+            parse_acl_manifest_mode(None).unwrap(),
+            AclManifestMode::Disabled
+        );
+    }
+
+    #[mononoke::test]
+    fn test_parse_enforcement_enabled_absent_defaults_to_false() {
+        let cfg: RestrictedPathsConfig = empty_raw_restricted_paths_config().convert().unwrap();
+        assert!(!cfg.enforcement_enabled);
+    }
+
+    #[mononoke::test]
+    fn test_parse_restriction_acls_passthrough() {
+        let raw_set = RawEnforcementConditionSet {
+            restriction_acls: Some(vec![
+                "USER:test_user".to_string(),
+                "GROUP:test_group".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.enforcement_condition_sets = Some(vec![raw_set]);
+        let cfg: RestrictedPathsConfig = raw.convert().unwrap();
+        assert_eq!(cfg.enforcement_condition_sets.len(), 1);
+        assert_eq!(cfg.enforcement_condition_sets[0].restriction_acls.len(), 2);
+    }
+
+    #[mononoke::test]
+    fn test_parse_restriction_acls_invalid_value_errors_with_value_in_message() {
+        let raw_set = RawEnforcementConditionSet {
+            restriction_acls: Some(vec!["bogus".to_string()]),
+            ..Default::default()
+        };
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.enforcement_condition_sets = Some(vec![raw_set]);
+
+        let result: Result<RestrictedPathsConfig> = raw.convert();
+        let err = result.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("restriction_acl `bogus`"),
+            "error should contain offending value: {msg}"
+        );
     }
 }

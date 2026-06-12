@@ -30,6 +30,7 @@ use futures_ext::FbStreamExt;
 use futures_watchdog::WatchdogExt;
 use manifest::Entry;
 use manifest::Manifest;
+use manifest::TrieMapOps;
 use mononoke_types::Blob;
 use mononoke_types::BlobstoreKey;
 use mononoke_types::BlobstoreValue;
@@ -43,6 +44,8 @@ use mononoke_types::sharded_map_v2::LoadableShardedMapV2Node;
 use mononoke_types::sharded_map_v2::Rollup;
 use mononoke_types::sharded_map_v2::ShardedMapV2Node;
 use mononoke_types::sharded_map_v2::ShardedMapV2Value;
+use mononoke_types::typed_hash::AclManifestId;
+use smallvec::SmallVec;
 
 use crate::FileType;
 use crate::HgAugmentedManifestId;
@@ -72,6 +75,7 @@ pub struct HgAugmentedDirectoryNode {
     pub treenode: HgNodeHash,
     pub augmented_manifest_id: Blake3,
     pub augmented_manifest_size: u64,
+    pub acl_manifest_directory_id: Option<AclManifestId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -94,6 +98,7 @@ pub struct ShardedHgAugmentedManifest {
     pub p2: Option<HgNodeHash>,
     pub computed_node_id: HgNodeHash,
     pub subentries: ShardedMapV2Node<HgAugmentedManifestEntry>,
+    pub acl_manifest_directory_id: Option<AclManifestId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,6 +440,10 @@ impl ThriftConvert for HgAugmentedDirectoryNode {
             treenode: HgNodeHash::from_thrift(t.treenode)?,
             augmented_manifest_id: Blake3::from_thrift(t.augmented_manifest_id)?,
             augmented_manifest_size: t.augmented_manifest_size as u64,
+            acl_manifest_directory_id: t
+                .acl_manifest_directory_id
+                .map(AclManifestId::from_thrift)
+                .transpose()?,
         })
     }
 
@@ -443,6 +452,9 @@ impl ThriftConvert for HgAugmentedDirectoryNode {
             treenode: self.treenode.into_thrift(),
             augmented_manifest_id: self.augmented_manifest_id.into_thrift(),
             augmented_manifest_size: self.augmented_manifest_size as i64,
+            acl_manifest_directory_id: self
+                .acl_manifest_directory_id
+                .map(AclManifestId::into_thrift),
         }
     }
 }
@@ -480,6 +492,10 @@ impl ThriftConvert for ShardedHgAugmentedManifest {
             p2: HgNodeHash::from_thrift_opt(t.p2)?,
             computed_node_id: HgNodeHash::from_thrift(t.computed_node_id)?,
             subentries: ShardedMapV2Node::from_thrift(t.subentries)?,
+            acl_manifest_directory_id: t
+                .acl_manifest_directory_id
+                .map(AclManifestId::from_thrift)
+                .transpose()?,
         })
     }
 
@@ -490,6 +506,9 @@ impl ThriftConvert for ShardedHgAugmentedManifest {
             p2: self.p2.map(HgNodeHash::into_thrift),
             computed_node_id: self.computed_node_id.into_thrift(),
             subentries: self.subentries.into_thrift(),
+            acl_manifest_directory_id: self
+                .acl_manifest_directory_id
+                .map(AclManifestId::into_thrift),
         }
     }
 }
@@ -598,8 +617,7 @@ impl HgAugmentedManifestEnvelope {
         .with_max_poll(blobstore::BLOBSTORE_MAX_POLL_TIME_MS)
         .await
         .context(format!(
-            "Failed to load manifest {} from blobstore",
-            manifestid
+            "Failed to load manifest {manifestid} from blobstore"
         ))
     }
 
@@ -713,7 +731,7 @@ impl<Store: KeyedBlobstore> Manifest<Store> for HgAugmentedManifestEnvelope {
 
     type Leaf = HgAugmentedFileLeafNode;
 
-    type TrieMapType = LoadableShardedMapV2Node<HgAugmentedManifestEntry>;
+    type TrieMapType = HgAugmentedManifestTrieMapNode;
 
     async fn list(
         &self,
@@ -797,9 +815,60 @@ impl<Store: KeyedBlobstore> Manifest<Store> for HgAugmentedManifestEnvelope {
         _ctx: &CoreContext,
         _blobstore: &Store,
     ) -> Result<Self::TrieMapType> {
-        Ok(LoadableShardedMapV2Node::Inlined(
-            self.augmented_manifest.subentries,
+        Ok(HgAugmentedManifestTrieMapNode(
+            LoadableShardedMapV2Node::Inlined(self.augmented_manifest.subentries),
         ))
+    }
+}
+
+/// Newtype wrapper around `LoadableShardedMapV2Node<HgAugmentedManifestEntry>`
+/// to satisfy orphan rules when implementing `TrieMapOps` (a trait from the
+/// `manifest` crate) for a type parameterized with types from `mercurial_types`.
+pub struct HgAugmentedManifestTrieMapNode(LoadableShardedMapV2Node<HgAugmentedManifestEntry>);
+
+#[async_trait]
+impl<Store: KeyedBlobstore> TrieMapOps<Store, Entry<HgAugmentedManifestId, HgAugmentedFileLeafNode>>
+    for HgAugmentedManifestTrieMapNode
+{
+    async fn expand(
+        self,
+        ctx: &CoreContext,
+        blobstore: &Store,
+    ) -> Result<(
+        Option<Entry<HgAugmentedManifestId, HgAugmentedFileLeafNode>>,
+        Vec<(u8, Self)>,
+    )> {
+        let (entry, children) = self.0.expand(ctx, blobstore).await?;
+        Ok((
+            entry.map(convert_hg_augmented_manifest_entry),
+            children.into_iter().map(|(k, v)| (k, Self(v))).collect(),
+        ))
+    }
+
+    async fn into_stream(
+        self,
+        ctx: &CoreContext,
+        blobstore: &Store,
+    ) -> Result<
+        BoxStream<
+            'async_trait,
+            Result<(
+                SmallVec<[u8; 24]>,
+                Entry<HgAugmentedManifestId, HgAugmentedFileLeafNode>,
+            )>,
+        >,
+    > {
+        Ok(self
+            .0
+            .load(ctx, blobstore)
+            .await?
+            .into_entries(ctx, blobstore)
+            .map_ok(|(k, v)| (k, convert_hg_augmented_manifest_entry(v)))
+            .boxed())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.size() == 0
     }
 }
 
@@ -925,6 +994,7 @@ mod sharded_augmented_manifest_tests {
                     treenode: hash_threes(),
                     augmented_manifest_id: blake3_threes(),
                     augmented_manifest_size: 10,
+                    acl_manifest_directory_id: None,
                 }),
             ),
             (
@@ -933,6 +1003,7 @@ mod sharded_augmented_manifest_tests {
                     treenode: hash_ones(),
                     augmented_manifest_id: blake3_ones(),
                     augmented_manifest_size: 10000,
+                    acl_manifest_directory_id: None,
                 }),
             ),
         ];
@@ -943,6 +1014,7 @@ mod sharded_augmented_manifest_tests {
             p2: Some(hash_threes()),
             computed_node_id: hash_ones(),
             subentries: ShardedMapV2Node::from_entries(&ctx, &blobstore, subentries).await?,
+            acl_manifest_directory_id: None,
         };
 
         let bytes = augmented_manifest

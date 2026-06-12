@@ -7,10 +7,8 @@
 
 import react from '@vitejs/plugin-react';
 import {defineConfig} from 'vite';
-// @ts-expect-error vite-plugin-stylex import expects module format
-import styleX from 'vite-plugin-stylex';
 import viteTsconfigPaths from 'vite-tsconfig-paths';
 
 export default defineConfig({
-  plugins: [react(), styleX(), viteTsconfigPaths()],
+  plugins: [react(), viteTsconfigPaths()],
 });

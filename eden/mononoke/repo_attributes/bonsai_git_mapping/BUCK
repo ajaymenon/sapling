@@ -1,7 +1,7 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "bonsai_git_mapping",
@@ -9,23 +9,26 @@ rust_library(
         "src/**/*.rs",
         "schemas/**/*.sql",
     ]),
-    named_deps = {
-        "bincode": "fbsource//third-party/rust:bincode-2",
+    autocargo = {
+        "cargo_toml_config": {
+            "dependencies_override": {"dependencies": {"gix-hash": {"features": ["sha1"]}}},
+        }
     },
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:ascii",
         "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:bytes",
         "fbsource//third-party/rust:gix-hash",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tracing",
         "//common/rust/shed/facet:facet",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//common/rust/shed/memcache_stub:memcache",
         "//common/rust/shed/stats:stats",
         "//eden/mononoke/common/rendezvous:rendezvous",
         "//eden/mononoke/common/rust/caching_ext:caching_ext",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",
         "//eden/mononoke/common/sql_construct:sql_construct",
         "//eden/mononoke/metaconfig:metaconfig_types",
@@ -55,6 +58,7 @@ rust_library(
         "//eden/mononoke/repo_attributes/bonsai_git_mapping:bonsai_git_mapping",
         "//eden/mononoke/repo_attributes/bonsai_hg_mapping:bonsai_hg_mapping",
         "//eden/mononoke/repo_attributes/bookmarks:bookmarks",
+        "//eden/mononoke/repo_attributes/bookmarks/dbbookmarks:dbbookmarks",
         "//eden/mononoke/repo_attributes/commit_graph/commit_graph:commit_graph",
         "//eden/mononoke/repo_attributes/filestore:filestore",
         "//eden/mononoke/repo_attributes/repo_blobstore:repo_blobstore",

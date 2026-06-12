@@ -38,6 +38,7 @@ use mononoke_types::ContentChunk;
 use mononoke_types::ContentMetadataV2;
 use mononoke_types::FileContents;
 use mononoke_types::ThriftConvert;
+use mononoke_types::acl_manifest::AclManifest;
 use mononoke_types::basename_suffix_skeleton_manifest_v3::BssmV3Directory;
 use mononoke_types::basename_suffix_skeleton_manifest_v3::BssmV3Entry;
 use mononoke_types::blame_v2::BlameV2;
@@ -88,6 +89,7 @@ pub struct BlobstoreFetchArgs {
 pub enum DecodeAs {
     Hex,
     Auto,
+    AclManifest,
     Changeset,
     Content,
     ContentChunk,
@@ -186,6 +188,7 @@ impl DecodeAs {
                 ("contentmf.", DecodeAs::ContentManifest),
                 ("icf.map2node.", DecodeAs::InferredCopyFromMapNode),
                 ("icf.", DecodeAs::InferredCopyFrom),
+                ("aclmf.", DecodeAs::AclManifest),
             ] {
                 if key[index..].starts_with(prefix) {
                     return Some(auto_decode_as);
@@ -213,7 +216,7 @@ impl Decoded {
 
     fn try_debug<T: std::fmt::Debug, E: std::fmt::Display>(data: Result<T, E>) -> Decoded {
         match data {
-            Ok(data) => Decoded::Display(format!("{:#?}", data)),
+            Ok(data) => Decoded::Display(format!("{data:#?}")),
             Err(err) => Decoded::Fail(err.to_string()),
         }
     }
@@ -243,7 +246,7 @@ async fn decode(
         DecodeAs::Changeset => Decoded::try_debug(BonsaiChangeset::from_bytes(data.as_raw_bytes())),
         DecodeAs::Content => match FileContents::from_encoded_bytes(data.into_raw_bytes()) {
             Ok(FileContents::Bytes(data)) => Decoded::Hexdump(data),
-            Ok(FileContents::Chunked(chunked)) => Decoded::Display(format!("{:#?}", chunked)),
+            Ok(FileContents::Chunked(chunked)) => Decoded::Display(format!("{chunked:#?}")),
             Err(err) => Decoded::Fail(err.to_string()),
         },
         DecodeAs::ContentChunk => match ContentChunk::from_encoded_bytes(data.into_raw_bytes()) {
@@ -364,6 +367,9 @@ async fn decode(
         DecodeAs::PreloadedCommitGraph => Decoded::try_debug(
             preloaded_commit_graph_storage::deserialize_preloaded_edges(data.into_raw_bytes()),
         ),
+        DecodeAs::AclManifest => {
+            Decoded::try_debug(AclManifest::from_bytes(&data.into_raw_bytes()))
+        }
     }
 }
 
@@ -415,13 +421,13 @@ pub async fn fetch(
                 let bytes = value.as_raw_bytes().clone();
                 match decode(ctx, blobstore, &fetch_args.key, value, fetch_args.decode_as).await {
                     Decoded::Display(decoded) => {
-                        writeln!(std::io::stdout(), "{}", decoded)?;
+                        writeln!(std::io::stdout(), "{decoded}")?;
                     }
                     Decoded::Hexdump(data) => {
                         hexdump(std::io::stdout(), data)?;
                     }
                     Decoded::Fail(err) => {
-                        writeln!(std::io::stderr(), "Failed to decode: {}", err)?;
+                        writeln!(std::io::stderr(), "Failed to decode: {err}")?;
                         // Fall back to dumping as raw hex
                         hexdump(std::io::stdout(), bytes)?;
                     }

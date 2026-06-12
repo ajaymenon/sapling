@@ -43,6 +43,7 @@
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/store/TreeCache.h"
 #include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/telemetry/IScribeLogger.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeClock.h"
@@ -124,6 +125,7 @@ TestMount::TestMount(bool enableActivityBuffer, CaseSensitivity caseSensitivity)
       make_shared<ProcessInfoCache>(),
       make_shared<NullStructuredLogger>(),
       make_shared<NullStructuredLogger>(),
+      make_shared<ErrorLogger>(nullptr, SessionInfo{}, nullptr),
       make_shared<NullScribeLogger>(),
       reloadableConfig,
       *edenConfig_,
@@ -267,9 +269,8 @@ void TestMount::createMount(
       treeCache_,
       stats_.copy(),
       std::make_shared<ProcessInfoCache>(),
-      std::make_shared<NullStructuredLogger>(),
-      std::make_shared<ReloadableConfig>(edenConfig_),
-      config_->getEnableWindowsSymlinks(),
+      serverState_->getEdenFsEventsLogger(),
+      serverState_->getReloadableConfig(),
       config_->getCaseSensitive());
   auto journal = std::make_unique<Journal>(stats_.copy());
   edenMount_ = EdenMount::create(
@@ -378,9 +379,8 @@ void TestMount::remount() {
       treeCache_,
       stats_.copy(),
       std::make_shared<ProcessInfoCache>(),
-      std::make_shared<NullStructuredLogger>(),
+      serverState_->getEdenFsEventsLogger(),
       std::make_shared<ReloadableConfig>(edenConfig_),
-      config->getEnableWindowsSymlinks(),
       config->getCaseSensitive());
 
   auto journal = std::make_unique<Journal>(stats_.copy());
@@ -420,9 +420,8 @@ void TestMount::remountGracefully() {
       treeCache_,
       stats_.copy(),
       std::make_shared<ProcessInfoCache>(),
-      std::make_shared<NullStructuredLogger>(),
+      serverState_->getEdenFsEventsLogger(),
       std::make_shared<ReloadableConfig>(edenConfig_),
-      config->getEnableWindowsSymlinks(),
       config->getCaseSensitive());
 
   auto journal = std::make_unique<Journal>(stats_.copy());
@@ -786,14 +785,7 @@ ImmediateFuture<Unit> TestMount::loadAllInodesFuture(
   // (If necessary we could make a more efficient version of this that starts
   // all the child loads while holding the lock.  However, we don't really care
   // about efficiency for test code, and this is much simpler.)
-  std::vector<PathComponent> childNames;
-  {
-    auto contents = treeInode->getContents().rlock();
-    childNames.reserve(contents->entries.size());
-    for (const auto& entry : contents->entries) {
-      childNames.emplace_back(entry.first);
-    }
-  }
+  std::vector<PathComponent> childNames = treeInode->getChildNames();
 
   // Now start all the loads.
   std::vector<ImmediateFuture<Unit>> childFutures;

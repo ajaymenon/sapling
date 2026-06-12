@@ -70,6 +70,15 @@ pub(crate) async fn loop_forever<R: CrossRepo>(
         // Before initiating every iteration, check if cancellation has been requested.
         if cancellation_requested.load(Ordering::Relaxed) {
             info!("bookmark validation stopping due to cancellation request");
+            // Report a healthy value before stopping so that the metric doesn't
+            // drop to zero during shard reassignment while the new task starts up.
+            // If bookmarks are truly inconsistent, the new task will detect it
+            // within seconds and report 0.
+            STATS::result_counter.set_value(
+                ctx.fb,
+                1,
+                (large_repo_name.to_string(), small_repo_name.to_string()),
+            );
             return Ok(());
         }
 
@@ -113,7 +122,7 @@ pub(crate) async fn loop_forever<R: CrossRepo>(
         tokio::time::sleep(Duration::from_millis(justknobs::get_as::<u64>(
             "scm/mononoke:bookmarks_validator_sleep_ms",
             None,
-        )?))
+        )))
         .await;
     }
 }
@@ -156,8 +165,7 @@ async fn validate<R: CrossRepo>(
             } => (target_bookmark, None, Some(source_cs_id)),
             NoSyncOutcome { target_bookmark } => {
                 return Err(ValidationError::ValidationError(format!(
-                    "unexpected no sync outcome for {}",
-                    target_bookmark
+                    "unexpected no sync outcome for {target_bookmark}"
                 )));
             }
         };
@@ -165,7 +173,7 @@ async fn validate<R: CrossRepo>(
         // Check that large_bookmark actually pointed to a commit equivalent to small_cs_id
         // not so long ago.
         let max_log_records =
-            justknobs::get_as::<u32>("scm/mononoke:bookmarks_validator_max_log_records", None)?;
+            justknobs::get_as::<u32>("scm/mononoke:bookmarks_validator_max_log_records", None);
         let max_delay_secs: u32 = 300;
         let in_history = check_large_bookmark_history(
             ctx,
@@ -181,8 +189,7 @@ async fn validate<R: CrossRepo>(
             info!("all is well");
         } else {
             let err_msg = format!(
-                "{} points to {:?} in {}, but points to {:?} in {}",
-                large_bookmark, large_cs_id, large_repo_name, small_cs_id, small_repo_name,
+                "{large_bookmark} points to {large_cs_id:?} in {large_repo_name}, but points to {small_cs_id:?} in {small_repo_name}",
             );
             return Err(ValidationError::ValidationError(err_msg));
         }
@@ -409,7 +416,7 @@ mod tests {
         let mut last = None;
         for i in 1..10 {
             let cs_id = CreateCommitContext::new(&ctx, large_repo, vec!["master"])
-                .add_file("somefile", format!("content{}", i))
+                .add_file("somefile", format!("content{i}"))
                 .commit()
                 .await?;
             bookmark(&ctx, &large_repo, "master").set_to(cs_id).await?;
@@ -447,7 +454,7 @@ mod tests {
         // In that case validation should fail.
         for i in 1..10 {
             let cs_id = CreateCommitContext::new(&ctx, large_repo, vec!["master"])
-                .add_file("prefix/somefile", format!("content{}", i))
+                .add_file("prefix/somefile", format!("content{i}"))
                 .commit()
                 .await?;
             bookmark(&ctx, &large_repo, "master").set_to(cs_id).await?;
@@ -479,7 +486,7 @@ mod tests {
         // Move master a few times
         for i in 1..10 {
             let cs_id = CreateCommitContext::new(&ctx, large_repo, vec!["master"])
-                .add_file("somefile", format!("content{}", i))
+                .add_file("somefile", format!("content{i}"))
                 .commit()
                 .await?;
             bookmark(&ctx, &large_repo, "master").set_to(cs_id).await?;

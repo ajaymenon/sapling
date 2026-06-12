@@ -4,7 +4,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
 
 import subprocess
 import sys
@@ -337,8 +337,11 @@ class RestartTest(RestartTestBase, PexpectAssertionMixin):
             "directory will need to cd"
         )
         daemon_env = p.env
+        # pyrefly: ignore [unsupported-operation]
         self.assertEqual(daemon_env["FOO_TEST_VAR"], "foo")
+        # pyrefly: ignore [unsupported-operation]
         self.assertEqual(daemon_env["FOO_TEST_VAR2"], "bar")
+        # pyrefly: ignore [bad-argument-type]
         self.assertNotIn("FOO_TEST_VAR3", daemon_env)
         p.wait()
         self.assertEqual(p.exitstatus, 0)

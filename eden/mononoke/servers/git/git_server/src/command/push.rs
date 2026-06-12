@@ -13,7 +13,7 @@ use anyhow::bail;
 use bytes::Bytes;
 use gix_hash::ObjectId;
 use gix_packetline::PacketLineRef;
-use gix_packetline::StreamingPeekableIter;
+use gix_packetline::blocking_io::StreamingPeekableIter;
 
 use super::PUSH_MARKER;
 use super::fetch::parse_oid;
@@ -40,7 +40,7 @@ impl ObjectFormat {
         match format {
             "sha1" => Ok(Self::Sha1),
             "sha256" => Ok(Self::Sha256),
-            format => bail!("Invalid object format: {}", format),
+            format => bail!("Invalid object format: {format}"),
         }
     }
 }
@@ -99,7 +99,7 @@ impl RefUpdate {
                     to: to_oid,
                 })
             }
-            split_parts => bail!("Invalid format for ref-update: {:?}", split_parts),
+            split_parts => bail!("Invalid format for ref-update: {split_parts:?}"),
         }
     }
 
@@ -189,7 +189,7 @@ impl PushArgs {
                             .shallow
                             .push(parse_oid(oid.as_bytes(), b"shallow ")?);
                     } else {
-                        bail!("Invalid format for shallow: {:?}", parsed_input);
+                        bail!("Invalid format for shallow: {parsed_input:?}");
                     }
                     continue;
                 }
@@ -205,10 +205,7 @@ impl PushArgs {
                     _ => bail!("Incorrect format for push args: {:?}", from_utf8(data)),
                 }
             } else {
-                bail!(
-                    "Unexpected token {:?} in packetline during push arg parsing",
-                    token
-                );
+                bail!("Unexpected token {token:?} in packetline during push arg parsing");
             }
         }
         push_args.pack_file = tokens.into_inner();

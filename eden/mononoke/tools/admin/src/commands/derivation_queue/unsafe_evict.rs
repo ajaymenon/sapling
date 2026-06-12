@@ -5,15 +5,15 @@
  * GNU General Public License version 2.
  */
 
-use std::io::Write;
-
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::Args;
-use colored::Colorize;
 use context::CoreContext;
+use futures::StreamExt;
+use futures::stream;
 use mononoke_app::args::ChangesetArgs;
 use mononoke_app::args::DerivedDataArgs;
+use mononoke_types::MPath;
 use repo_derivation_queues::DagItemId;
 use repo_derivation_queues::RepoDerivationQueuesRef;
 use repo_identity::RepoIdentityRef;
@@ -28,6 +28,15 @@ pub struct UnsafeEvictArgs {
 
     #[clap(flatten)]
     derived_data_args: DerivedDataArgs,
+
+    /// Absolute path of the pipeline stage (e.g. `""` for root, `"fbcode"`).
+    /// Omit for non-pipeline items.
+    #[clap(long, value_parser = |s: &str| MPath::new(s.as_bytes()))]
+    stage_path: Option<MPath>,
+
+    /// Number of concurrent evictions
+    #[clap(long, default_value_t = 100)]
+    concurrency: usize,
 }
 
 pub async fn unsafe_evict(
@@ -36,45 +45,52 @@ pub async fn unsafe_evict(
     config_name: &str,
     args: UnsafeEvictArgs,
 ) -> Result<()> {
-    print!(
-        "{}",
-        "Evicting an item from the derivation queue is unsafe and can lead to stuck derivations. Are you sure you want to continue? (y/n) "
-            .red(),
-    );
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    match input.trim().to_lowercase().as_str() {
-        "y" | "yes" => {}
-        _ => {
-            info!("Eviction canceled");
-            return Ok(());
-        }
-    }
-
     let derivation_queue = repo
         .repo_derivation_queues()
         .queue(config_name)
-        .ok_or_else(|| anyhow!("Missing derivation queue for config {}", config_name))?;
+        .ok_or_else(|| anyhow!("Missing derivation queue for config {config_name}"))?;
 
     let derived_data_type = args.derived_data_args.resolve_type()?;
-    let cs_id = args.changeset_args.resolve_changeset(ctx, repo).await?;
+    let cs_ids = args.changeset_args.resolve_changesets(ctx, repo).await?;
+    let stage_hash = args.stage_path.as_ref().map(|p| p.get_path_hash());
 
-    derivation_queue
-        .unsafe_evict(
-            ctx,
-            DagItemId::new(
+    info!(
+        "Evicting {} items with concurrency {}",
+        cs_ids.len(),
+        args.concurrency
+    );
+
+    let results: Vec<_> = stream::iter(cs_ids)
+        .map(async |cs_id| {
+            let item_id = DagItemId::new(
                 repo.repo_identity().id(),
                 config_name.to_string(),
                 derived_data_type,
                 cs_id,
-            ),
-        )
-        .await?;
+                stage_hash,
+            );
+            derivation_queue
+                .unsafe_evict(ctx, item_id)
+                .await
+                .map_err(|e| (cs_id.to_string(), e))
+        })
+        .buffer_unordered(args.concurrency)
+        .collect()
+        .await;
+
+    let success = results.iter().filter(|r| r.is_ok()).count();
+    let failures: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+
+    for (cs_id, err) in &failures {
+        eprintln!("FAILED cs={cs_id}: {err:#}");
+    }
 
     info!(
-        "Evicted item cs_id={}, derived_data_type={}",
-        cs_id, derived_data_type
+        "Evicted {}/{} items ({} failed), derived_data_type={}",
+        success,
+        success + failures.len(),
+        failures.len(),
+        derived_data_type
     );
 
     Ok(())

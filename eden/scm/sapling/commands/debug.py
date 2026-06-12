@@ -17,7 +17,6 @@ import difflib
 import errno
 import operator
 import os
-import random
 import shlex
 import socket
 import ssl
@@ -54,6 +53,7 @@ from .. import (
     git,
     hg,
     httpconnection,
+    identity,
     json,
     lock as lockmod,
     match as matchmod,
@@ -65,7 +65,6 @@ from .. import (
     revset,
     revsetlang,
     scmutil,
-    setdiscovery,
     simplemerge,
     smartset,
     sslutil,
@@ -77,8 +76,7 @@ from .. import (
     visibility,
 )
 from ..i18n import _, _n, _x
-from ..node import bin, hex, nullid, nullrev, short
-from . import migratesymlinks
+from ..node import bin, hex, nullid, short
 from .cmdtable import command
 
 release = lockmod.release
@@ -103,6 +101,30 @@ def debugancestor(ui, repo, *args) -> None:
         raise error.Abort(_("either two or three arguments required"))
     a = r.ancestor(lookup(rev1), lookup(rev2))
     ui.write("%d:%s\n" % (r.rev(a), hex(a)))
+
+
+@command("debugrevdistance", [], _("REV1 REV2"))
+def debugrevdistance(ui, repo, rev1, rev2) -> None:
+    """calculate the distance between two revisions
+
+    Prints the number of commits in the symmetric difference between REV1
+    and REV2 — that is, commits reachable from one but not the other.
+
+    This is useful to check whether a revision range is safe to diff or
+    log over without triggering a slow full-repo scan.
+    """
+    ctx1 = scmutil.revsingle(repo, rev1)
+    ctx2 = scmutil.revsingle(repo, rev2)
+    distance = len(
+        repo.revs(
+            "(%n %% %n) + (%n %% %n)",
+            ctx1.node(),
+            ctx2.node(),
+            ctx2.node(),
+            ctx1.node(),
+        )
+    )
+    ui.write(_("%d\n") % distance)
 
 
 def _flattenresponse(response: Sized, sort: bool = False):
@@ -820,7 +842,10 @@ def debugcheckstate(ui, repo) -> None:
             ui.warn(_("%s in manifest1, but listed as state %s") % (f, state))
             errors += 1
     if errors:
-        msg = _(".hg/dirstate inconsistent with current parent's manifest")
+        msg = (
+            _("%s/dirstate inconsistent with current parent's manifest")
+            % identity.default().dotdir()
+        )
         raise error.Abort(msg)
 
 
@@ -1271,195 +1296,6 @@ def debugdiffdirs(ui, repo, *pats, **opts) -> None:
         fm.data(path=path, status=status)
 
     fm.end()
-
-
-@command(
-    "debugdiscovery",
-    [("", "rev", [], "restrict discovery to this set of revs")],
-    _("[--rev REV] [OTHER]"),
-)
-def debugdiscovery(ui, repo, remoteurl: str = "default", **opts) -> None:
-    """runs the changeset discovery protocol in isolation"""
-    remoteurl = hg.parseurl(ui.expandpath(remoteurl))
-    remote = hg.peer(repo, opts, remoteurl)
-    ui.status(_("comparing with %s\n") % util.hidepassword(remoteurl))
-
-    # make sure tests are repeatable
-    random.seed(12323)
-
-    def doit(pushedrevs, remote=remote):
-        nodes = None
-        if pushedrevs:
-            revs = scmutil.revrange(repo, pushedrevs)
-            nodes = [repo[r].node() for r in revs]
-        common, any, hds = setdiscovery.findcommonheads(
-            ui, repo, remote, ancestorsof=nodes
-        )
-        common = set(common)
-        rheads = set(hds)
-        lheads = set(repo.heads())
-        ui.write(_x("common heads: %s\n") % " ".join(sorted(short(n) for n in common)))
-        if lheads <= common:
-            ui.write(_x("local is subset\n"))
-        elif rheads <= common:
-            ui.write(_x("remote is subset\n"))
-
-    localrevs = opts["rev"]
-    doit(localrevs)
-
-
-@command(
-    "debugexportrevlog",
-    [],
-    _("PATH"),
-)
-def debugexportrevlog(ui, repo, path, **opts) -> None:
-    """exports to a legacy revlog repo
-
-    Export the repo in the old format (not necessarily supported by this
-    software) in destination. Useful for compatibility with other software
-    requiring the revlog format.
-    """
-
-    class RevlogInfo:
-        """state per revlog tracked by LiteRevlogRepo"""
-
-        def __init__(self):
-            self.next_rev = 0
-            self.next_offset = 0
-            self.node_to_rev = {}
-
-        def append(self, node: bytes, size: int):
-            rev = self.next_rev
-            self.node_to_rev[node] = rev
-            self.next_offset += size
-            self.next_rev += 1
-
-    class LiteRevlogRepo:
-        """lightweight revlog repo for export use-case only
-
-        Separated from the feature-complete revlog logic (revlog.revlog) so the
-        other revlog logic and its C dependency can be dropped independently.
-
-        Minimal. Does not support:
-        - Reading.
-        - Delta-chain.
-        - Compression.
-        - Non-inline revlog.
-        """
-
-        def __init__(self, path: str):
-            from .. import store
-
-            self.path = os.path.realpath(path)
-            self.path_to_info = {}
-            self.fnencode = store.encodefilename
-            self.append_raw("requires", b"treemanifest\nrevlogv1\nstore\n")
-
-        def store_join(self, path: str) -> str:
-            path = os.path.join(self.path, "store", self.fnencode(path))
-            return path
-
-        def append_raw(self, path: str, data: bytes):
-            full_path = os.path.join(self.path, path)
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "ab") as f:
-                f.write(data)
-
-        def revlog_info(self, path: str) -> RevlogInfo:
-            if path not in self.path_to_info:
-                self.path_to_info[path] = RevlogInfo()
-            return self.path_to_info[path]
-
-        def append_revlog(
-            self,
-            path: str,
-            p1: bytes,
-            p2: bytes,
-            data: bytes,
-            flags: int = 0,
-            node=None,
-        ):
-            info = self.revlog_info(path)
-            if node is None:
-                node = revlog.hash(data, p1, p2)
-            elif flags == 0:
-                # verify hash for non-LFS entries
-                new_node = revlog.hash(data, p1, p2)
-                assert node == new_node
-            if node in info.node_to_rev:
-                # skip existing entries
-                return node
-            rev = info.next_rev
-            p1rev = p2rev = nullrev
-            if p1 != nullid:
-                p1rev = info.node_to_rev[p1]
-            if p2 != nullid:
-                p2rev = info.node_to_rev[p2]
-            # u: uncompressed
-            compressed_data = b"u" + data
-            offset = info.next_offset
-            base_rev = rev  # means 'fulltext, no delta'
-            link_rev = self.revlog_info("00changelog.i").next_rev
-            index_data = revlog.indexformatng_pack(
-                revlog.offset_type(offset, flags),
-                len(compressed_data),
-                len(data),
-                base_rev,
-                link_rev,
-                p1rev,
-                p2rev,
-                node,
-            )
-            if rev == 0:
-                # The first 4 bytes are used for version and flags.
-                # See revlogio.packentry.
-                v = revlog.FLAG_INLINE_DATA | revlog.REVLOGV1
-                index_data = revlog.versionformat.pack(v) + index_data[4:]
-            data = index_data + compressed_data
-            # The offset in index does not include index content itself.
-            info.append(node, len(compressed_data))
-            revlog_i_path = self.store_join(path)
-            self.append_raw(revlog_i_path, data)
-            return node
-
-    # not using ui.identity.dotdir() for Mercurial compatibility
-    lite_repo = LiteRevlogRepo(os.path.join(path, ".hg"))
-
-    from .. import exchange
-
-    nodes = list(repo.nodes("_all()"))
-    items = exchange.findblobs(repo, nodes)
-    verbose = ui.verbose
-    for blobtype, path, node, (p1, p2), text in items:
-        if blobtype == "blob":
-            store_path = f"data/{path}.i"
-        elif blobtype == "tree":
-            if not path:
-                store_path = "00manifest.i"
-            else:
-                store_path = f"meta/{path}/00manifest.i"
-        else:
-            store_path = "00changelog.i"
-        lite_repo.append_revlog(store_path, p1, p2, text)
-        if verbose:
-            ui.write_err(_("exported %s at %r as %s\n") % (blobtype, path, hex(node)))
-
-    if nodes:
-        # Vanilla hg uses 00manifest.i for root trees, while this codebase uses
-        # 00manifesttree.i for root trees (so flat trees stay in 00manifest).
-        # Make a symlink for compatibility. But skip it if the repo is empty.
-        os.symlink(
-            "00manifest.i",
-            lite_repo.store_join("00manifesttree.i"),
-        )
-    else:
-        # Ensure key files exist for an empty repo.
-        lite_repo.append_raw("store/00changelog.i", b"")
-
-    # Export bookmarks
-    bookmarks_data = bindings.refencode.encodebookmarks(repo._bookmarks)
-    lite_repo.append_raw("bookmarks", bookmarks_data)
 
 
 @command(
@@ -3576,22 +3412,6 @@ def debugtreestate(ui, repo, cmd: str = "status", **opts) -> None:
 
 
 @command(
-    "debugmigratesymlinks",
-    [],
-    "hg debugmigratesymlinks [enable|disable]",
-)
-def debugmigratesymlinks(ui, repo, cmd: str = "enable", **opts) -> None:
-    """enables or disables symlink support on a repo on Windows
-
-    enable: makes the current repo support symlinks
-    disable: makes the current repo NOT support symlinks
-    """
-    if not util.iswindows:
-        raise error.Abort("this command only supports Windows")
-    migratesymlinks.changereposymlinkstatus(ui, repo, cmd == "enable")
-
-
-@command(
     "debugreadauthforuri",
     [("u", "user", "", _("Use a given user"), _("USER"))],
     _("uri"),
@@ -3756,7 +3576,7 @@ def debugruntest(ui, *paths, **opts) -> int:
     fix = opts.get("fix")
     isolate = not opts.get("direct")
 
-    exts = ["sapling.testing.ext.hg", "sapling.testing.ext.python"]
+    exts = ["sapling.testing.ext.sl", "sapling.testing.ext.python"]
     exts += opts.get("ext") or []
     if opts.get("record"):
         exts.append("sapling.testing.ext.record")

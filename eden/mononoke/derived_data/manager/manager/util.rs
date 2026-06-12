@@ -16,18 +16,19 @@ use crate::error::DerivationError;
 impl DerivedDataManager {
     /// Returns the passed-in `CoreContext` with the session class modified to
     /// the one that should be used for derivation.
-    pub(super) fn set_derivation_session_class(&self, mut ctx: CoreContext) -> CoreContext {
+    pub(super) fn set_derivation_session_class(
+        &self,
+        mut ctx: CoreContext,
+    ) -> Result<CoreContext, DerivationError> {
         if justknobs::eval(
             "scm/mononoke:derived_data_use_background_session_class",
             None,
             Some(self.repo_name()),
-        )
-        .unwrap_or_default()
-        {
+        ) {
             ctx.session_mut()
                 .override_session_class(SessionClass::BackgroundUnlessTooSlow);
         }
-        ctx
+        Ok(ctx)
     }
 
     pub(super) fn check_enabled<Derivable>(&self) -> Result<(), DerivationError>
@@ -35,6 +36,29 @@ impl DerivedDataManager {
         Derivable: BonsaiDerivable,
     {
         if self.config().types.contains(&Derivable::VARIANT) {
+            Ok(())
+        } else {
+            Err(DerivationError::Disabled(
+                Derivable::NAME,
+                self.repo_id(),
+                self.repo_name().to_string(),
+            ))
+        }
+    }
+
+    pub(super) fn check_readable<Derivable>(&self) -> Result<(), DerivationError>
+    where
+        Derivable: BonsaiDerivable,
+    {
+        // A type is readable if it's enabled in this manager's config
+        // OR if it's in extra_types_available_for_read
+        if self.config().types.contains(&Derivable::VARIANT)
+            || self
+                .repo_config()
+                .derived_data_config
+                .extra_types_available_for_read
+                .contains(&Derivable::VARIANT)
+        {
             Ok(())
         } else {
             Err(DerivationError::Disabled(

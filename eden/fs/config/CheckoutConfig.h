@@ -216,15 +216,6 @@ class CheckoutConfig {
   }
 #endif
 
-  /** Whether symlinks are enabled or not */
-  bool getEnableWindowsSymlinks() const {
-#ifdef _WIN32
-    return enableWindowsSymlinks_;
-#else
-    return true;
-#endif
-  }
-
  private:
   const AbsolutePath clientDirectory_;
   const AbsolutePath mountPath_;
@@ -244,7 +235,6 @@ class CheckoutConfig {
 
 #ifdef _WIN32
   Guid repoGuid_;
-  bool enableWindowsSymlinks_;
 #endif
 };
 

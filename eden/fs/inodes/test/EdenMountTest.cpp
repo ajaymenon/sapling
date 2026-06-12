@@ -19,8 +19,10 @@
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
+#include "eden/common/utils/FaultInjector.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/fuse/FuseChannel.h"
 #include "eden/fs/inodes/InodeError.h"
@@ -280,7 +282,7 @@ TEST(EdenMount, resetParents) {
           ParentCommit::WorkingCopyParentAndCheckedOutRevision{
               RootId("1"), RootId("1")}),
       edenMount->getCheckoutConfig()->getParentCommit());
-  auto latestJournalEntry = edenMount->getJournal().getLatest();
+  auto latestJournalEntry = edenMount->getJournal().observeLatest();
   ASSERT_TRUE(latestJournalEntry);
   EXPECT_EQ(RootId("1"), latestJournalEntry->fromRoot);
   EXPECT_EQ(RootId("1"), latestJournalEntry->toRoot);
@@ -296,7 +298,7 @@ TEST(EdenMount, resetParents) {
           ParentCommit::WorkingCopyParentAndCheckedOutRevision{
               RootId("2"), RootId("1")}),
       edenMount->getCheckoutConfig()->getParentCommit());
-  latestJournalEntry = edenMount->getJournal().getLatest();
+  latestJournalEntry = edenMount->getJournal().observeLatest();
   ASSERT_TRUE(latestJournalEntry);
   EXPECT_EQ(RootId("1"), latestJournalEntry->fromRoot);
   EXPECT_EQ(RootId("2"), latestJournalEntry->toRoot);
@@ -554,6 +556,13 @@ class ChownTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    // Close the FUSE channel and wait for preparePostFsChannelCompletion to
+    // complete before destroying the EdenMount. Otherwise, the detached future
+    // in preparePostFsChannelCompletion accesses a freed EdenMount.
+    fuse_->close();
+    edenMount_->getFsChannelCompletionFuture().within(kTimeout).getVia(
+        testMount_->getServerExecutor().get());
+    edenMount_.reset();
     testMount_.reset();
   }
 
@@ -994,7 +1003,7 @@ TEST(EdenMount, takeoverFuseFailsIfUnmountWasEverCalled) {
   mount.unmount(options).within(kTimeout).get();
   auto fuse = std::make_shared<FakeFuse>();
   EXPECT_THROW(
-      { mount.takeoverFuse(FuseChannelData{fuse->start(), {}}); },
+      mount.takeoverFuse(FuseChannelData{fuse->start(), {}}).get(kTimeout),
       EdenMountCancelled);
 }
 
@@ -1150,6 +1159,65 @@ TEST(EdenMountState, mountIsDestroyingWhileInodeIsReferencedDuringDestroy) {
   ASSERT_TRUE(mountDestroyDetector.mountIsAlive())
       << "Eden mount should be alive during EdenMount::destroy";
   EXPECT_EQ(mount.getState(), EdenMount::State::DESTROYING);
+}
+
+/**
+ * If channel_ is accessible during DESTROYING state,
+ * exposes a TOCTOU race in waitForPendingWrites().
+ */
+TEST(EdenMount, waitForPendingWritesDuringDestroy) {
+  auto testMount = TestMount{FakeTreeBuilder{}};
+  std::shared_ptr<EdenMount>& mount = testMount.getEdenMount();
+
+  auto mountDelegate = std::make_shared<MockMountDelegate>();
+  testMount.getPrivHelper()->registerMountDelegate(
+      mount->getPath(), mountDelegate);
+  auto fuse = std::make_shared<FakeFuse>();
+  mountDelegate->setMountFuseDevice(fuse->start());
+  mountDelegate->makeUnmountSucceed();
+
+  auto startChannelFuture = mount->startFsChannel(false);
+  fuse->sendInitRequest();
+  fuse->recvResponse();
+  std::move(startChannelFuture)
+      .within(kTimeout)
+      .getVia(testMount.getServerExecutor().get());
+
+  // Prevents delete-this so bgThread doesn't access freed EdenMount.
+  auto shutdownBlocker =
+      EdenMountShutdownBlocker::preventShutdownFromCompleting(*mount);
+
+  EdenMount* rawMount = mount.get();
+  auto& faultInjector = testMount.getServerState()->getFaultInjector();
+
+  faultInjector.injectBlock("waitForPendingWrites", ".*");
+
+  auto bgThread = std::thread([&] {
+    try {
+      rawMount->waitForPendingWrites().get(kTimeout);
+    } catch (...) {
+    }
+  });
+
+  ASSERT_TRUE(faultInjector.waitUntilBlocked("waitForPendingWrites", 10s));
+
+  fuse->close();
+  mount->getFsChannelCompletionFuture().within(kTimeout).getVia(
+      testMount.getServerExecutor().get());
+
+  auto& rootInode = testMount.getRootInode();
+  rootInode.reset();
+  mount.reset();
+
+  bool channelNullAfterDestroy = (rawMount->getFsChannel() == nullptr);
+
+  faultInjector.removeFault("waitForPendingWrites", ".*");
+  faultInjector.unblock("waitForPendingWrites", ".*");
+
+  bgThread.join();
+  shutdownBlocker.allowShutdownToComplete();
+
+  EXPECT_TRUE(channelNullAfterDestroy);
 }
 
 namespace {

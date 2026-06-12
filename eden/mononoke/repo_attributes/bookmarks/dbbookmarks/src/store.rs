@@ -40,12 +40,12 @@ use futures_watchdog::WatchdogExt;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
 use mononoke_types::Timestamp;
-use rand::Rng;
 use sql_ext::Connection;
 use sql_ext::SqlConnections;
 use sql_ext::mononoke_queries;
 use stats::prelude::*;
 
+use crate::locked_transaction::LockedBookmarkTransaction;
 use crate::subscription::SqlBookmarksSubscription;
 use crate::transaction::SqlBookmarksTransaction;
 
@@ -312,6 +312,32 @@ impl SqlBookmarks {
         }
     }
 
+    pub fn write_connection(&self) -> &Connection {
+        &self.connections.write_connection
+    }
+
+    /// Start a locked transaction for a specific bookmark.
+    ///
+    /// This acquires a per-bookmark SQL-level lock (FOR UPDATE) and reads
+    /// the current bookmark value, all within the same transaction. The
+    /// lock is held until the returned `LockedBookmarkTransaction` is
+    /// committed or rolled back.
+    ///
+    /// Used by pessimistic pushrebase to serialize writers per bookmark.
+    pub async fn start_locked_transaction(
+        &self,
+        ctx: &CoreContext,
+        bookmark: &BookmarkKey,
+    ) -> Result<LockedBookmarkTransaction> {
+        LockedBookmarkTransaction::new(
+            ctx,
+            &self.connections.write_connection,
+            self.repo_id,
+            bookmark.clone(),
+        )
+        .await
+    }
+
     pub fn connection(&self, ctx: &CoreContext, freshness: Freshness) -> &Connection {
         match freshness {
             Freshness::MaybeStale => {
@@ -375,7 +401,7 @@ impl SqlBookmarks {
                         // Sorting is only useful for pagination. If the query returns all bookmark
                         // names, then skip the sorting.
                         if limit == u64::MAX {
-                            let tok: i32 = rand::rng().random();
+                            let tok: i32 = rand::random();
                             SelectAllUnordered::query(
                                 &conn,
                                 ctx.sql_query_telemetry(),
@@ -540,8 +566,7 @@ impl SqlBookmarks {
             // on USC.
             client_main_id,
             None,
-        )
-        .unwrap_or(false);
+        );
 
         let conn = if read_from_replica && freshness == Freshness::MaybeStale {
             ctx.perf_counters()
@@ -650,7 +675,7 @@ impl BookmarkUpdateLog for SqlBookmarks {
         let repo_id = self.repo_id;
 
         async move {
-            let tok: i32 = rand::rng().random();
+            let tok: i32 = rand::random();
 
             let rows = match offset {
                 Some(offset) => {
@@ -763,8 +788,7 @@ impl BookmarkUpdateLog for SqlBookmarks {
                         None => "",
                     };
                     Err(anyhow!(
-                        "Failed to query further bookmark log entries{}",
-                        extra
+                        "Failed to query further bookmark log entries{extra}"
                     ))
                 }
             }

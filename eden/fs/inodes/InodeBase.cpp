@@ -125,9 +125,9 @@ folly::Future<folly::Unit> InodeBase::access(int /*mask*/) {
 }
 #endif
 
-void InodeBase::updateNfsLastUsedTime() {
+void InodeBase::updateLastFsRequestTime() {
   auto now = getNow();
-  nfsLastUsedTime_.exchange(now, std::memory_order_relaxed);
+  lastFsRequestTime_.exchange(now, std::memory_order_relaxed);
 }
 
 bool InodeBase::isUnlinked() const {
@@ -346,7 +346,7 @@ ParentInodeInfo InodeBase::getParentInfo() const {
           ParentContentsPtr{}};
     }
     // Now grab our parent's contents lock.
-    auto parentContents = parent->getContents().wlock();
+    auto parentContents = parent->lockContentsWrite();
 
     // After acquiring our parent's contents lock we have to make sure it is
     // actually still our parent.  If it is we are done and can break out of

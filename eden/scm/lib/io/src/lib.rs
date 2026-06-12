@@ -594,7 +594,7 @@ impl IO {
             Err(e) => match e.kind() {
                 std::io::ErrorKind::NotFound => {
                     if let Some(err) = inner.error.as_mut() {
-                        writeln!(err, "missing pager command '{}', skipping pager", pager_cmd)?;
+                        writeln!(err, "missing pager command '{pager_cmd}', skipping pager")?;
                     }
 
                     return Ok(());
@@ -719,12 +719,11 @@ impl IO {
         // Only use the pager for error stream if error stream is a tty.
         // This makes `hg 2>foo` works as expected.
         if err_is_tty {
-            pre_pager_error = Some(std::mem::replace(
-                &mut inner.error,
-                Some(
+            pre_pager_error = Some(
+                inner.error.replace(
                     Box::new(WriterWithTty::new(Box::new(err_write), err_is_tty)) as Box<dyn Write>,
                 ),
-            ));
+            );
             let separate =
                 config.get_opt::<bool>("pager", "separate-stderr").ok() == Some(Some(true));
             inner.redirect_err_to_out = !separate;

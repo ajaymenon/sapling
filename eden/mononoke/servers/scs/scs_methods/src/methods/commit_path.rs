@@ -75,17 +75,7 @@ impl SourceControlServiceImpl {
             },
             PathEntry::Tree(tree) => {
                 let summary = tree.summary().await?;
-                let tree_info = thrift::TreeInfo {
-                    id: tree.id().as_ref().to_vec(),
-                    simple_format_sha1: Some(summary.simple_format_sha1.as_ref().to_vec()),
-                    simple_format_sha256: Some(summary.simple_format_sha256.as_ref().to_vec()),
-                    child_files_count: summary.child_files_count as i64,
-                    child_files_total_size: summary.child_files_total_size as i64,
-                    child_dirs_count: summary.child_dirs_count as i64,
-                    descendant_files_count: summary.descendant_files_count as i64,
-                    descendant_files_total_size: summary.descendant_files_total_size as i64,
-                    ..Default::default()
-                };
+                let tree_info = (tree.id().clone(), summary).into_response();
                 thrift::CommitPathInfoResponse {
                     exists: true,
                     r#type: Some(thrift::EntryType::TREE),
@@ -143,7 +133,7 @@ impl SourceControlServiceImpl {
                             exists: true,
                             r#type: Some(thrift::EntryType::TREE),
                             info: Some(thrift::EntryInfo::tree(
-                                (*tree.id(), summary).into_response(),
+                                (tree.id().clone(), summary).into_response(),
                             )),
                             ..Default::default()
                         };
@@ -185,8 +175,7 @@ impl SourceControlServiceImpl {
                     .await
             }
             other_format => Err(scs_errors::invalid_request(format!(
-                "unsupported blame format {}",
-                other_format
+                "unsupported blame format {other_format}"
             ))
             .into()),
         }
@@ -223,9 +212,7 @@ impl SourceControlServiceImpl {
             "scm/mononoke:scs_disable_mutable_blame",
             None,
             Some(repo.name()),
-        )
-        .unwrap_or(false)
-        {
+        ) {
             false
         } else {
             params.follow_mutable_file_history.unwrap_or(false)
@@ -343,7 +330,7 @@ impl SourceControlServiceImpl {
             let mut parent_commit_ids = Vec::with_capacity(indexed_csids.len());
             for csid in indexed_csids {
                 let parents = changeset_parents.get(&csid).ok_or_else(|| {
-                    scs_errors::internal_error(format!("missing parents for {}", csid))
+                    scs_errors::internal_error(format!("missing parents for {csid}"))
                 })?;
                 let mut changeset_parent_commit_ids = Vec::with_capacity(parents.len());
                 for parent in parents {
@@ -352,8 +339,7 @@ impl SourceControlServiceImpl {
                             .get(parent)
                             .ok_or_else(|| {
                                 scs_errors::internal_error(format!(
-                                    "missing parent commit ids for {}",
-                                    parent
+                                    "missing parent commit ids for {parent}"
                                 ))
                             })?
                             .clone(),
@@ -525,7 +511,23 @@ impl SourceControlServiceImpl {
             }
         )?;
 
-        let limit: usize = check_range_and_convert("limit", params.limit, 0..)?;
+        // Cap `limit` at COMMIT_PATH_HISTORY_MAX_LIMIT for most clients, but
+        // allow a JustKnob switchval-based allowlist of clients to bypass the
+        // cap. Some clients pass i32::MAX as a sentinel for "unlimited"; this
+        // gives them a glide path to migrate without breakage. Shared knob
+        // across history methods (commit_history, commit_path_history).
+        let client_id = ctx.metadata().upstream_client_id();
+        let enforce_limit =
+            justknobs::eval("scm/mononoke:scs_history_enforce_limit", None, client_id);
+        let limit: usize = if enforce_limit {
+            check_range_and_convert(
+                "limit",
+                params.limit,
+                0..=source_control::COMMIT_PATH_HISTORY_MAX_LIMIT,
+            )?
+        } else {
+            check_range_and_convert("limit", params.limit, 0..)?
+        };
         let skip: usize = check_range_and_convert("skip", params.skip, 0..)?;
 
         // Time filter equal to zero might be mistaken by users for an unset, like None.
@@ -544,8 +546,7 @@ impl SourceControlServiceImpl {
         if let (Some(ats), Some(bts)) = (after_timestamp, before_timestamp) {
             if bts < ats {
                 return Err(scs_errors::invalid_request(format!(
-                    "after_timestamp ({}) cannot be greater than before_timestamp ({})",
-                    ats, bts,
+                    "after_timestamp ({ats}) cannot be greater than before_timestamp ({bts})",
                 ))
                 .into());
             }
@@ -553,8 +554,7 @@ impl SourceControlServiceImpl {
         if let (Some(ats), Some(bts)) = (after_committer_timestamp, before_committer_timestamp) {
             if bts < ats {
                 return Err(scs_errors::invalid_request(format!(
-                    "after_committer_timestamp ({}) cannot be greater than before_committer_timestamp ({})",
-                    ats, bts,
+                    "after_committer_timestamp ({ats}) cannot be greater than before_committer_timestamp ({bts})",
                 ))
                 .into());
             }
@@ -591,6 +591,7 @@ impl SourceControlServiceImpl {
             after_timestamp,
             before_committer_timestamp,
             after_committer_timestamp,
+            params.author,
             params.format,
             &params.identity_schemes,
         )

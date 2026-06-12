@@ -7,8 +7,8 @@
 
 use std::collections::HashSet;
 
+use anyhow::Context;
 use anyhow::Result;
-use anyhow::anyhow;
 use clap::Parser;
 use metaconfig_types::RepoReadOnly;
 use mononoke_app::MononokeApp;
@@ -42,26 +42,31 @@ struct Repo {
 pub async fn locking_status(app: &MononokeApp, args: LockingStatusArgs) -> Result<()> {
     let ctx = app.new_basic_context();
     let repos = args.repo.ids_or_names()?;
-    let repo_configs = app.repo_configs();
 
     let repo_ids = if repos.is_empty() {
-        repo_configs
-            .repos
-            .values()
-            .filter_map(|config| {
+        // Enumerate via `load_all_repo_configs` so split-loaded repos
+        // (only present in the per-tier RepoSpec manifest) are included
+        // — the legacy `repo_configs.repos.values()` would silently omit
+        // them.
+        app.configs()
+            .load_all_repo_configs()?
+            .into_iter()
+            .filter_map(|(_name, config)| {
                 (config.readonly == RepoReadOnly::ReadWrite).then_some(config.repoid)
             })
             .collect()
     } else {
         let mut repo_ids = HashSet::with_capacity(repos.len());
         for repo in repos {
-            let repo_id = match repo {
-                RepoArg::Id(id) => id,
+            // Route through `repo_config` so split-loaded repos that aren't
+            // in the legacy blob (e.g. AOSP after D102821672) still resolve
+            // by name via the per-tier manifest.
+            let repo_id = match &repo {
+                RepoArg::Id(id) => *id,
                 RepoArg::Name(name) => {
-                    repo_configs
-                        .repos
-                        .get(&name)
-                        .ok_or_else(|| anyhow!("Invalid repo name: {name}"))?
+                    app.repo_config(&repo)
+                        .with_context(|| format!("Invalid repo name: {name}"))?
+                        .1
                         .repoid
                 }
             };
@@ -90,7 +95,7 @@ pub async fn locking_status(app: &MononokeApp, args: LockingStatusArgs) -> Resul
     all_status.sort_unstable_by_key(|(name, _)| name.clone());
 
     for (name, state) in all_status {
-        println!("{:20} {:?}", name, state);
+        println!("{name:20} {state:?}");
     }
     Ok(())
 }

@@ -14,8 +14,10 @@ use bookmarks::BookmarkKey;
 use bookmarks::Freshness;
 use bytes::BytesMut;
 use cloned::cloned;
+use context::CoreContext;
 use context::PerfCounterType;
 use edenapi_types::BookmarkEntry;
+use edenapi_types::BookmarkKind as EdenApiBookmarkKind;
 use edenapi_types::HgId;
 use edenapi_types::ListBookmarkPatternsRequest;
 use edenapi_types::ListBookmarkPatternsResponse;
@@ -25,6 +27,7 @@ use edenapi_types::StreamingChangelogResponse;
 use edenapi_types::legacy::Metadata;
 use edenapi_types::legacy::StreamingChangelogBlob;
 use edenapi_types::legacy::StreamingChangelogData;
+use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::join_all;
 use futures::stream;
@@ -51,6 +54,58 @@ use crate::errors::ErrorKind;
 
 const TIMEOUT_SECS: Duration = Duration::from_hours(4);
 
+/// Aggregates blob chunk futures by the given factor, fetching chunks within
+/// each group in parallel and concatenating the results into larger blobs.
+fn aggregate_blob_chunks(
+    blob_futs: Vec<BoxFuture<'static, Result<bytes::Bytes, anyhow::Error>>>,
+    aggregation_factor: usize,
+    ctx: &CoreContext,
+    make_variant: fn(StreamingChangelogBlob) -> StreamingChangelogData,
+) -> Vec<BoxFuture<'static, StreamingChangelogResponse>> {
+    blob_futs
+        .into_iter()
+        .chunks(aggregation_factor)
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_id, chunk_futs)| {
+            let futs: Vec<_> = chunk_futs.collect();
+            cloned!(ctx);
+            async move {
+                let (stats, results) = join_all(futs).timed().await;
+
+                let mut combined = BytesMut::new();
+                for res in results {
+                    match res {
+                        Ok(bytes) => {
+                            combined.extend_from_slice(&bytes);
+                        }
+                        Err(e) => {
+                            return StreamingChangelogResponse {
+                                data: Err(ServerError::generic(format!("{e:?}"))),
+                            };
+                        }
+                    }
+                }
+
+                ctx.perf_counters().add_to_counter(
+                    PerfCounterType::SumManifoldPollTime,
+                    stats.poll_time.as_nanos_unchecked() as i64,
+                );
+                ctx.perf_counters()
+                    .add_to_counter(PerfCounterType::BytesSent, combined.len() as i64);
+
+                StreamingChangelogResponse {
+                    data: Ok(make_variant(StreamingChangelogBlob {
+                        chunk: combined.freeze().into(),
+                        chunk_id: chunk_id as u64,
+                    })),
+                }
+            }
+            .boxed()
+        })
+        .collect()
+}
+
 /// Legacy streaming changelog handler from wireproto.
 pub struct StreamingCloneHandler;
 
@@ -59,7 +114,7 @@ impl SaplingRemoteApiHandler for StreamingCloneHandler {
     type Request = StreamingChangelogRequest;
     type Response = StreamingChangelogResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::StreamingClone;
     const ENDPOINT: &'static str = "/streaming_clone";
 
@@ -77,109 +132,21 @@ impl SaplingRemoteApiHandler for StreamingCloneHandler {
         let aggregation_factor = justknobs::get_as::<usize>(
             "scm/mononoke:streaming_clone_chunk_aggregation_factor",
             None,
-        )?;
+        );
 
-        let data_blobs: Vec<_> = changelog
-            .data_blobs
-            .into_iter()
-            .chunks(aggregation_factor)
-            .into_iter()
-            .enumerate()
-            .map(|(chunk_id, chunk_futs)| {
-                let futs: Vec<_> = chunk_futs.collect();
-                cloned!(ctx);
-                async move {
-                    // Wrap all futures with timing and await in parallel
-                    let timed_futs: Vec<_> = futs.into_iter().map(|fut| fut.timed()).collect();
-                    let results = join_all(timed_futs).await;
+        let data_blobs = aggregate_blob_chunks(
+            changelog.data_blobs,
+            aggregation_factor,
+            &ctx,
+            StreamingChangelogData::DataBlobChunk,
+        );
 
-                    // Process results, accumulating stats
-                    let mut combined = BytesMut::new();
-                    let mut total_poll_time: i64 = 0;
-
-                    for (stats, res) in results {
-                        total_poll_time += stats.poll_time.as_nanos_unchecked() as i64;
-                        match res {
-                            Ok(bytes) => {
-                                combined.extend_from_slice(&bytes);
-                            }
-                            Err(e) => {
-                                return StreamingChangelogResponse {
-                                    data: Err(ServerError::generic(format!("{:?}", e))),
-                                };
-                            }
-                        }
-                    }
-
-                    // All blobs succeeded - record stats
-                    ctx.perf_counters()
-                        .add_to_counter(PerfCounterType::SumManifoldPollTime, total_poll_time);
-                    ctx.perf_counters()
-                        .add_to_counter(PerfCounterType::BytesSent, combined.len() as i64);
-
-                    StreamingChangelogResponse {
-                        data: Ok(StreamingChangelogData::DataBlobChunk(
-                            StreamingChangelogBlob {
-                                chunk: combined.freeze().into(),
-                                chunk_id: chunk_id as u64,
-                            },
-                        )),
-                    }
-                }
-                .boxed()
-            })
-            .collect();
-
-        let index_blobs: Vec<_> = changelog
-            .index_blobs
-            .into_iter()
-            .chunks(aggregation_factor)
-            .into_iter()
-            .enumerate()
-            .map(|(chunk_id, chunk_futs)| {
-                let futs: Vec<_> = chunk_futs.collect();
-                cloned!(ctx);
-                async move {
-                    // Wrap all futures with timing and await in parallel
-                    let timed_futs: Vec<_> = futs.into_iter().map(|fut| fut.timed()).collect();
-                    let results = join_all(timed_futs).await;
-
-                    // Process results, accumulating stats
-                    let mut combined = BytesMut::new();
-                    let mut total_poll_time: i64 = 0;
-
-                    for (stats, res) in results {
-                        total_poll_time += stats.poll_time.as_nanos_unchecked() as i64;
-                        match res {
-                            Ok(bytes) => {
-                                combined.extend_from_slice(&bytes);
-                            }
-                            Err(e) => {
-                                return StreamingChangelogResponse {
-                                    data: Err(ServerError::generic(format!("{:?}", e))),
-                                };
-                            }
-                        }
-                    }
-
-                    // All blobs succeeded - record stats
-                    ctx.perf_counters()
-                        .add_to_counter(PerfCounterType::SumManifoldPollTime, total_poll_time);
-                    ctx.perf_counters()
-                        .add_to_counter(PerfCounterType::BytesSent, combined.len() as i64);
-
-                    StreamingChangelogResponse {
-                        data: Ok(StreamingChangelogData::IndexBlobChunk(
-                            StreamingChangelogBlob {
-                                chunk: combined.freeze().into(),
-                                chunk_id: chunk_id as u64,
-                            },
-                        )),
-                    }
-                }
-                .boxed()
-            })
-            .collect();
+        let index_blobs = aggregate_blob_chunks(
+            changelog.index_blobs,
+            aggregation_factor,
+            &ctx,
+            StreamingChangelogData::IndexBlobChunk,
+        );
 
         debug!(
             "streaming changelog {} index bytes, {} data bytes",
@@ -220,7 +187,7 @@ impl SaplingRemoteApiHandler for ListBookmarkPatternsHandler {
     type Request = ListBookmarkPatternsRequest;
     type Response = ListBookmarkPatternsResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::ListBookmarkPatterns;
     const ENDPOINT: &'static str = "/bookmarks/list_patterns";
 
@@ -232,7 +199,7 @@ impl SaplingRemoteApiHandler for ListBookmarkPatternsHandler {
         let max = repo.repo_ctx().config().list_keys_patterns_max;
 
         let results: Vec<Result<Vec<BookmarkEntry>, Error>> = stream::iter(request.patterns)
-            .map(|pattern| list_bookmarks_for_pattern(&repo, pattern, max))
+            .map(|pattern| list_bookmarks_for_pattern(&repo, pattern, max, &request.kinds))
             .buffered(100)
             .collect()
             .await;
@@ -243,7 +210,7 @@ impl SaplingRemoteApiHandler for ListBookmarkPatternsHandler {
                 .map(|entry| Ok(ListBookmarkPatternsResponse { data: Ok(entry) }))
                 .collect::<Vec<_>>(),
             Err(e) => vec![Ok(ListBookmarkPatternsResponse {
-                data: Err(ServerError::generic(format!("{:?}", e))),
+                data: Err(ServerError::generic(format!("{e:?}"))),
             })],
         });
 
@@ -255,7 +222,7 @@ impl SaplingRemoteApiHandler for ListBookmarkPatternsHandler {
             .data
             .as_ref()
             .err()
-            .map(|err| format_err!("{:?}", err))
+            .map(|err| format_err!("{err:?}"))
     }
 }
 
@@ -266,22 +233,32 @@ async fn list_bookmarks_for_pattern<R: MononokeRepo>(
     repo: &HgRepoContext<R>,
     pattern: String,
     max: u64,
+    kinds: &[EdenApiBookmarkKind],
 ) -> Result<Vec<BookmarkEntry>, Error> {
+    // Default to PullDefaultPublishing only when kinds is empty.
+    let kinds: &[EdenApiBookmarkKind] = if kinds.is_empty() {
+        &[EdenApiBookmarkKind::PullDefaultPublishing]
+    } else {
+        kinds
+    };
+
+    // Derive include_scratch from kinds.
+    let include_scratch = kinds.contains(&EdenApiBookmarkKind::Scratch);
+
     if pattern.ends_with('*') {
         // Prefix match
         let prefix: &str = &pattern[..pattern.len() - 1];
 
         let bookmarks = repo
             .repo_ctx()
-            .list_bookmarks(true, Some(prefix), None, Some(max))
+            .list_bookmarks(include_scratch, Some(prefix), None, Some(max))
             .await?
             .try_collect::<Vec<(String, ChangesetId)>>()
             .await?;
 
         if bookmarks.len() >= max as usize {
             return Err(format_err!(
-                "Bookmark query was truncated after {} results, use a more specific prefix search.",
-                max,
+                "Bookmark query was truncated after {max} results, use a more specific prefix search.",
             ));
         }
 
@@ -314,7 +291,7 @@ async fn list_bookmarks_for_pattern<R: MononokeRepo>(
         let hgid = repo
             .resolve_bookmark(pattern.clone(), Freshness::MaybeStale)
             .await
-            .map_err(|_| ErrorKind::BookmarkResolutionFailed(pattern.clone()))?
+            .map_err(|e| ErrorKind::BookmarkResolutionFailed(pattern.clone(), e.into()))?
             .map(|id| HgId::from(id.into_nodehash()));
 
         match hgid {

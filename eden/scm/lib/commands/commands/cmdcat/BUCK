@@ -5,16 +5,18 @@ oncall("sapling")
 rust_library(
     name = "cmdcat",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "lib": {"name": "cmdcat"},
-        "package": {
-            "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-            "homepage": "https://sapling-scm.com/",
-            "license": "GPL-2.0-only",
-            "name": "cmdcat",
-            "repository": "https://github.com/facebook/sapling",
+    autocargo = {
+        "cargo_toml_config": {
+            "lib": {"name": "cmdcat"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "GPL-2.0-only",
+                "name": "cmdcat",
+                "repository": "https://github.com/facebook/sapling",
+            },
         },
-    }},
+    },
     crate_root = "src/lib.rs",
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -23,6 +25,7 @@ rust_library(
         "//eden/scm/lib/blob:blob",
         "//eden/scm/lib/clidispatch:clidispatch",
         "//eden/scm/lib/commands/cmdutil:cmdutil",
+        "//eden/scm/lib/filewalk:filewalk",
         "//eden/scm/lib/manifest:manifest",
         "//eden/scm/lib/manifest-tree:manifest-tree",
         "//eden/scm/lib/pathmatcher:pathmatcher",

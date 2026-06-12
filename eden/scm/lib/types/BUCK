@@ -5,28 +5,30 @@ oncall("sapling")
 rust_library(
     name = "types",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "features": {
-            "default": ["for-tests"],
-            "for-tests": [
-                "rand",
-                "quickcheck",
-            ],
+    autocargo = {
+        "cargo_toml_config": {
+            "features": {
+                "default": ["for-tests"],
+                "for-tests": [
+                    "rand",
+                    "quickcheck",
+                ],
+            },
+            "lib": {"name": "types"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "MIT",
+                "name": "sapling-types",
+                "repository": "https://github.com/facebook/sapling",
+            },
         },
-        "lib": {"name": "types"},
-        "package": {
-            "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-            "homepage": "https://sapling-scm.com/",
-            "license": "MIT",
-            "name": "sapling-types",
-            "repository": "https://github.com/facebook/sapling",
-        },
-    }},
+    },
     crate_root = "src/lib.rs",
     features = ["for-tests"],
     test_deps = [
         "fbsource//third-party/rust:quickcheck",
-        "fbsource//third-party/rust:rand_08",
+        "fbsource//third-party/rust:rand",
         "fbsource//third-party/rust:serde_cbor",
         "fbsource//third-party/rust:serde_json",
         "//common/rust/shed/quickcheck_arbitrary_derive:quickcheck_arbitrary_derive",
@@ -42,7 +44,7 @@ rust_library(
         "fbsource//third-party/rust:bytecount",
         "fbsource//third-party/rust:byteorder",
         "fbsource//third-party/rust:quickcheck",
-        "fbsource//third-party/rust:rand_08",
+        "fbsource//third-party/rust:rand",
         "fbsource//third-party/rust:ref-cast",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_bytes",

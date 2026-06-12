@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+mod delete_directory;
 mod pushrebase;
 mod rebase;
 mod split;
@@ -23,6 +24,7 @@ use commit_graph::CommitGraph;
 use commit_graph::CommitGraphRef;
 use commit_graph::CommitGraphWriter;
 use context::CoreContext;
+use filestore::FilestoreConfig;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use metaconfig_types::RepoConfig;
@@ -36,6 +38,7 @@ use repo_cross_repo::RepoCrossRepo;
 use repo_derived_data::RepoDerivedData;
 use repo_identity::RepoIdentity;
 
+use self::delete_directory::CommitDeleteDirectoryArgs;
 use self::pushrebase::CommitPushrebaseArgs;
 use self::rebase::CommitRebaseArgs;
 use self::split::CommitSplitArgs;
@@ -74,6 +77,9 @@ pub struct Repo {
     repo_blobstore: RepoBlobstore,
 
     #[facet]
+    filestore_config: FilestoreConfig,
+
+    #[facet]
     commit_graph: CommitGraph,
 
     #[facet]
@@ -81,6 +87,9 @@ pub struct Repo {
 
     #[facet]
     bookmarks: dyn Bookmarks,
+
+    #[facet]
+    sql_bookmarks: dbbookmarks::SqlBookmarks,
 
     #[facet]
     bookmark_attrs: RepoBookmarkAttrs,
@@ -120,6 +129,9 @@ pub enum CommitSubcommand {
     /// Rebases a commit from its current bookmark onto a bookmark, and moves
     /// that bookmark to the newly rebased commit.
     Pushrebase(CommitPushrebaseArgs),
+
+    /// Delete all files under a directory, creating a new commit
+    DeleteDirectory(CommitDeleteDirectoryArgs),
 }
 
 pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
@@ -135,6 +147,9 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
         CommitSubcommand::Rebase(rebase_args) => rebase::rebase(&ctx, &repo, rebase_args).await?,
         CommitSubcommand::Pushrebase(pushrebase_args) => {
             pushrebase::pushrebase(&ctx, &repo, pushrebase_args).await?
+        }
+        CommitSubcommand::DeleteDirectory(args) => {
+            delete_directory::delete_directory(&ctx, &repo, args).await?
         }
     }
 

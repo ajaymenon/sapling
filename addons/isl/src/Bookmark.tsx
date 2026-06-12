@@ -9,7 +9,6 @@ import type {ContextMenuItem} from 'shared/ContextMenu';
 import type {InternalTypes} from './InternalTypes';
 import type {CommitInfo} from './types';
 
-import * as stylex from '@stylexjs/stylex';
 import {Button} from 'isl-components/Button';
 import {Column} from 'isl-components/Flex';
 import {Icon} from 'isl-components/Icon';
@@ -18,15 +17,17 @@ import {TextField} from 'isl-components/TextField';
 import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
 import {useState} from 'react';
+import {cn} from 'shared/cn';
 import {useContextMenu} from 'shared/ContextMenu';
-import {spacing} from '../../components/theme/tokens.stylex';
 import {tracker} from './analytics';
+import css from './Bookmark.module.css';
 import {
   bookmarksDataStorage,
   recommendedBookmarksAtom,
   REMOTE_MASTER_BOOKMARK,
 } from './BookmarksData';
 import {Row} from './ComponentUtils';
+import {hiddenMasterFeatureAvailableAtom, shouldHideMasterAtom} from './HiddenMasterData';
 import {T, t} from './i18n';
 import {Internal} from './Internal';
 import {BookmarkCreateOperation} from './operations/BookmarkCreateOperation';
@@ -35,26 +36,27 @@ import {useRunOperation} from './operationsState';
 import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
 import {showModal} from './useModal';
 
-const styles = stylex.create({
-  stable: {
-    backgroundColor: 'var(--list-hover-background)',
-    color: 'var(--list-hover-foreground)',
-  },
-  fullLength: {
-    maxWidth: 'unset',
-  },
-  bookmarkTag: {
-    maxWidth: '300px',
-    display: 'flex',
-    alignItems: 'center',
-    gap: spacing.quarter,
-  },
-  modalButtonBar: {
-    justifyContent: 'flex-end',
-  },
-});
-
 export type BookmarkKind = 'remote' | 'local' | 'stable';
+
+function useShouldShowBookmark(): (bookmarkValue: string) => boolean {
+  const bookmarksData = useAtomValue(bookmarksDataStorage);
+  const shouldHideMaster = useAtomValue(shouldHideMasterAtom);
+  const hiddenMasterFeatureAvailable = useAtomValue(hiddenMasterFeatureAvailableAtom);
+  return (bookmarkValue: string): boolean => {
+    if (bookmarkValue === REMOTE_MASTER_BOOKMARK && hiddenMasterFeatureAvailable) {
+      const visibility = bookmarksData.masterBookmarkVisibility;
+      if (visibility === 'show') {
+        return true;
+      }
+      if (visibility === 'hide') {
+        return false;
+      }
+      // visibility === 'auto' or undefined - use sitevar config
+      return !shouldHideMaster;
+    }
+    return !bookmarksData.hiddenRemoteBookmarks.includes(bookmarkValue);
+  };
+}
 
 const logged = new Set<string>();
 function logExposureOncePerSession(location: string) {
@@ -117,11 +119,11 @@ export function Bookmark({
   const inner = (
     <Tag
       onContextMenu={contextMenu}
-      xstyle={[
-        kind === 'stable' && styles.stable,
-        styles.bookmarkTag,
-        fullLength === true && styles.fullLength,
-      ]}>
+      className={cn(
+        kind === 'stable' && css.stable,
+        css.bookmarkTag,
+        fullLength === true && css.fullLength,
+      )}>
       {icon && <Icon icon={icon} size="XS" style={{display: 'flex', height: '12px'}} />}
       {bookmark}
     </Tag>
@@ -140,9 +142,9 @@ export function AllBookmarksTruncated({
   local: ReadonlyArray<string>;
   fullRepoBranch?: InternalTypes['FullRepoBranch'] | undefined;
 }) {
-  const bookmarksData = useAtomValue(bookmarksDataStorage);
   const recommendedBookmarks = useAtomValue(recommendedBookmarksAtom);
   const showWarningOnMaster = Internal.shouldCheckRebase?.() ?? false;
+  const shouldShowBookmark = useShouldShowBookmark();
 
   const FullRepoBranchBookmark = Internal.FullRepoBranchBookmark;
   const compareFullRepoBranch = Internal.compareFullRepoBranch;
@@ -156,11 +158,8 @@ export function AllBookmarksTruncated({
   )
     .map(([kind, bookmarks]) =>
       bookmarks
-        .filter(
-          bookmark =>
-            !bookmarksData.hiddenRemoteBookmarks.includes(
-              typeof bookmark === 'string' ? bookmark : bookmark.value,
-            ),
+        .filter(bookmark =>
+          shouldShowBookmark(typeof bookmark === 'string' ? bookmark : bookmark.value),
         )
         .filter(bookmark =>
           compareFullRepoBranch ? compareFullRepoBranch(fullRepoBranch, bookmark) : true,
@@ -224,15 +223,13 @@ export function Bookmarks({
   bookmarks: ReadonlyArray<string | {value: string; description: string}>;
   kind: BookmarkKind;
 }) {
-  const bookmarksData = useAtomValue(bookmarksDataStorage);
+  const shouldShowBookmark = useShouldShowBookmark();
+
   return (
     <>
       {bookmarks
-        .filter(
-          bookmark =>
-            !bookmarksData.hiddenRemoteBookmarks.includes(
-              typeof bookmark === 'string' ? bookmark : bookmark.value,
-            ),
+        .filter(bookmark =>
+          shouldShowBookmark(typeof bookmark === 'string' ? bookmark : bookmark.value),
         )
         .map(bookmark => {
           const value = typeof bookmark === 'string' ? bookmark : bookmark.value;
@@ -268,7 +265,7 @@ function CreateBookmarkAtCommitModal({commit, dismiss}: {commit: CommitInfo; dis
         onChange={e => setBookmark(e.currentTarget.value)}
         aria-label={t('Bookmark Name')}
       />
-      <Row {...stylex.props(styles.modalButtonBar)}>
+      <Row className={css.modalButtonBar}>
         <Button
           onClick={() => {
             dismiss();

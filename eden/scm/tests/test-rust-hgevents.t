@@ -1,8 +1,7 @@
-#debugruntest-incompatible
 (the Python watchman client seems to have some issues under debugruntest on Windows)
 #chg-compatible
 
-#require fsmonitor
+#require fsmonitor no-windows
 
   $ configure modernclient
   $ setconfig checkout.use-rust=true
@@ -14,11 +13,11 @@ Test we emit watchman states across checkout:
   > A
   > EOS
 This will automatically exit after 2 seconds of inactivity.
-  $ hg debugwatchmansubscribe > ../watchman_out &
+  $ sl debugwatchmansubscribe > ../watchman_out &
 Give the subscription a chance to start.
   $ sleep 1
 Code under test (this should send state events to watchman):
-  $ SL_LOG=checkout_info=debug hg go -q $A
+  $ SL_LOG=checkout_info=debug sl go -q $A
   DEBUG checkout_info: checkout_mode="rust"
 Wait for debugwatchmansubscribe to exit.
   $ wait

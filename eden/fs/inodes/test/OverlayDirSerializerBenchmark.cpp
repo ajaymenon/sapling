@@ -14,12 +14,13 @@
 #include <functional>
 #include <random>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/InodeCatalogType.h"
 #include "eden/fs/inodes/DirEntry.h"
 #include "eden/fs/inodes/InodeCatalog.h"
 #include "eden/fs/inodes/Overlay.h"
+#include "eden/fs/inodes/test/OverlayTestUtil.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 
 using namespace facebook::eden;
@@ -144,14 +145,15 @@ void benchmarkOverlayDirSerialization(
   // overlayPath is parameterized to measure on different filesystem types.
   printf("Creating Overlay...\n");
 
+  auto noopErrorLogger = makeTestErrorLogger();
   auto overlay = Overlay::create(
       overlayPath,
       kPathMapDefaultCaseSensitive,
       overlayType,
       kDefaultInodeCatalogOptions,
-      std::make_shared<NullStructuredLogger>(),
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
-      true,
       *EdenConfig::createTestEdenConfig());
   printf("Initializing Overlay...\n");
 

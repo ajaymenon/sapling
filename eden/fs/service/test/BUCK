@@ -114,8 +114,23 @@ cpp_unittest(
     labels = ["autodeps2_generated"],
     deps = [
         "fbsource//third-party/googletest:gtest",
+        "//eden/common/utils:fault_injector",
+        "//eden/fs/inodes:inodes",
+        "//eden/fs/nfs:mountd_rpc",
+        "//eden/fs/nfs:nfs_server",
         "//eden/fs/service:server",
+        "//eden/fs/store:context",
+        "//eden/fs/takeover:takeover",
+        "//eden/fs/testharness:fake_backing_store_and_tree_builder",
+        "//eden/fs/testharness:fake_fuse",
+        "//eden/fs/testharness:test_mount",
         "//eden/fs/testharness:test_server",
         "//folly:cancellation_token",
+        "//folly:exception_wrapper",
+        "//folly:scope_guard",
+        "//folly/io:iobuf",
+    ],
+    external_deps = [
+        "gflags",
     ],
 )

@@ -132,11 +132,7 @@ async fn do_busy_work(repo: &RepoShard, terminate_execution: Arc<AtomicBool>) ->
         }
         // Fail at every 10th iteration and let the framework reassign this task
         if iteration % 10 == 0 {
-            bail!(
-                "Sample transient error for repo {} after {} iterations",
-                repo,
-                iteration
-            )
+            bail!("Sample transient error for repo {repo} after {iteration} iterations")
         }
     }
 }
@@ -226,6 +222,7 @@ async fn run_sharded(app: MononokeApp, sharded_service_name: String) -> Result<(
         SM_CLEANUP_TIMEOUT_SECS,
         Arc::new(process),
         true, // enable shard (repo) level healing
+        None,
     )?;
     let (sender, receiver) = tokio::sync::oneshot::channel::<bool>();
     executor.block_and_execute(receiver).await?;

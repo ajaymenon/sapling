@@ -46,6 +46,7 @@ use mercurial_types::blobs::HgBlobChangeset;
 use mercurial_types::blobs::HgBlobEnvelope;
 use mercurial_types::blobs::HgChangesetContent;
 use mercurial_types::blobs::fetch_manifest_envelope;
+use mercurial_types::nodehash::HgAugmentedManifestId;
 use mercurial_types::nodehash::HgFileNodeId;
 use mercurial_types::nodehash::HgManifestId;
 use mercurial_types::subtree::HgSubtreeChanges;
@@ -112,7 +113,7 @@ impl ChangesetHandle {
     ) -> Self {
         let (trigger, can_be_parent) = oneshot::channel();
         let can_be_parent = can_be_parent
-            .map_err(|e| format_err!("can_be_parent: {:?}", e))
+            .map_err(|e| format_err!("can_be_parent: {e:?}"))
             .boxed()
             .try_shared();
 
@@ -236,10 +237,7 @@ impl UploadEntries {
                 let envelope = fetch_manifest_envelope(ctx, &self.blobstore, manifest_id)
                     .await
                     .with_context(|| {
-                        format!(
-                            "Error processing manifest with id {} and path {}",
-                            manifest_id, path
-                        )
+                        format!("Error processing manifest with id {manifest_id} and path {path}")
                     })?;
 
                 envelope
@@ -255,10 +253,7 @@ impl UploadEntries {
                     .load(ctx, &self.blobstore)
                     .await
                     .with_context(|| {
-                        format!(
-                            "Error processing file with id {} and path {}",
-                            filenode_id, path
-                        )
+                        format!("Error processing file with id {filenode_id} and path {path}")
                     })?;
 
                 envelope
@@ -271,7 +266,7 @@ impl UploadEntries {
 
         {
             let mut inner = self.inner.lock().expect("Lock poisoned");
-            inner.parents.extend(parents.into_iter());
+            inner.parents.extend(parents);
         }
 
         Ok(())
@@ -288,14 +283,18 @@ impl UploadEntries {
                 if mfid.into_nodehash() == NULL_HASH {
                     return Ok(());
                 }
-
-                let key = mfid.blobstore_key();
-                if !blobstore
-                    .is_present(ctx, &key)
-                    .await?
-                    .assume_not_found_if_unsure()
-                {
-                    return Err(BlobstoreError::NotFound(key).into());
+                // Check if manifest exists — either as an augmented manifest
+                // (reconstructible) or as a direct HgManifest blob.
+                let aug_id = HgAugmentedManifestId::new(mfid.into_nodehash());
+                let (aug_present, hg_present) = futures::future::join(
+                    blobstore.is_present(ctx, &aug_id.blobstore_key()),
+                    blobstore.is_present(ctx, &mfid.blobstore_key()),
+                )
+                .await;
+                let exists = aug_present?.assume_not_found_if_unsure()
+                    || hg_present?.assume_not_found_if_unsure();
+                if !exists {
+                    return Err(BlobstoreError::NotFound(mfid.blobstore_key()).into());
                 }
             }
             Entry::Leaf(fnid) => {
@@ -339,7 +338,7 @@ impl UploadEntries {
                             let entry = entry.map_leaf(|(_, fnid)| fnid);
                             Self::assert_in_blobstore(ctx, &this.blobstore, entry)
                                 .await
-                                .with_context(|| format!("Error checking for path: {:?}", path))?;
+                                .with_context(|| format!("Error checking for path: {path:?}"))?;
                             Ok(())
                         }
                         .boxed()
@@ -365,7 +364,7 @@ impl UploadEntries {
                         Self::assert_in_blobstore(ctx, &this.blobstore, entry)
                             .await
                             .with_context(|| {
-                                format!("Error checking for a parent node: {:?}", entry)
+                                format!("Error checking for a parent node: {entry:?}")
                             })?;
                         STATS::parents_checked.add_value(1);
                         Result::<_, Error>::Ok(())

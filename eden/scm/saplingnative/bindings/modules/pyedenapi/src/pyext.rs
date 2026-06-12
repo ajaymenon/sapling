@@ -31,6 +31,7 @@ use edenapi_types::AlterSnapshotRequest;
 use edenapi_types::AlterSnapshotResponse;
 use edenapi_types::AnyFileContentId;
 use edenapi_types::AnyId;
+use edenapi_types::BookmarkKind;
 use edenapi_types::CloudShareWorkspaceRequest;
 use edenapi_types::CloudShareWorkspaceResponse;
 use edenapi_types::CommitGraphEntry;
@@ -254,6 +255,27 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
         let response = py
             .allow_threads(|| {
                 block_unless_interrupted(self.bookmarks(bookmarks, freshness.map(|v| v.0)))
+            })
+            .map_pyerr(py)?
+            .map_pyerr(py)?;
+
+        let bookmarks = PyDict::new(py);
+        for entry in response {
+            bookmarks.set_item(py, entry.bookmark, entry.hgid.map(|id| id.to_hex()))?;
+        }
+        Ok(bookmarks)
+    }
+
+    #[tracing::instrument(skip_all)]
+    fn list_bookmark_patterns_py(
+        &self,
+        py: Python,
+        patterns: Vec<String>,
+        kinds: Vec<BookmarkKind>,
+    ) -> PyResult<PyDict> {
+        let response = py
+            .allow_threads(|| {
+                block_unless_interrupted(self.list_bookmark_patterns(patterns, kinds))
             })
             .map_pyerr(py)?
             .map_pyerr(py)?;
@@ -559,8 +581,7 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
                         ))
                     }
                     _ => Err(SaplingRemoteApiError::Other(format_err!(
-                        "failed to fetch file content for the key '{}'",
-                        key
+                        "failed to fetch file content for the key '{key}'"
                     )))
                     .map_pyerr(py),
                 }
@@ -597,7 +618,7 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
 
                     // build the list of HgFilenodeData for upload
                     let filenodes_data = filenodes_data.into_iter().map(|(node_id, content_id, parents, copy_from)| {
-                        let file_content_upload_token = file_content_tokens.get(&content_id).ok_or_else(|| SaplingRemoteApiError::Other(format_err!("unexpected error: upload token is missing for ContentId({})", content_id)))?.clone();
+                        let file_content_upload_token = file_content_tokens.get(&content_id).ok_or_else(|| SaplingRemoteApiError::Other(format_err!("unexpected error: upload token is missing for ContentId({content_id})")))?.clone();
                         Ok(HgFilenodeData {
                             node_id,
                             parents,
@@ -694,7 +715,7 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
                 let cs_id = data.0.cs_id;
                 self.alter_snapshot(data.0)
                     .await
-                    .with_context(|| format_err!("Failed to alter snapshot {}", cs_id))
+                    .with_context(|| format_err!("Failed to alter snapshot {cs_id}"))
             })
         })
         .map_pyerr(py)?

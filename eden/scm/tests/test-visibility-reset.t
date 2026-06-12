@@ -18,8 +18,8 @@
   > |
   > A
   > EOS
-  $ hg up -q $E
-  $ hg bookmark test-bookmark
+  $ sl up -q $E
+  $ sl bookmark test-bookmark
   $ tglogm
   o  ee481a2a1e69 'F'
   │
@@ -33,7 +33,7 @@
   │
   o  426bada5c675 'A'
   
-  $ hg reset -C $D
+  $ sl reset -C $D
   2 changesets hidden
 
 Note that reset tried to hide 'C', but this was ignored because of 'F'.

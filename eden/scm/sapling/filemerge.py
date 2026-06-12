@@ -372,7 +372,7 @@ def _iprompt(repo, mynode, orig, fcd, fco, fca, toolconf, labels=None):
 
     try:
         if fco.isabsent():
-            ui.metrics.gauge("filemerge_rename_otherdeleted", 1)
+            ui.metrics.inc("filemerge_rename_otherdeleted", 1)
             index = ui.promptchoice(_localchangedotherdeletedmsg % prompts, 2)
             choice = ["local", "other", "unresolved"][index]
         elif fcd.isabsent():
@@ -424,7 +424,7 @@ def _iprompt(repo, mynode, orig, fcd, fco, fca, toolconf, labels=None):
                             _(" ignored invalid rename destination: %s\n") % (destpath,)
                         )
 
-            ui.metrics.gauge("filemerge_prompt_localdeleted", 1)
+            ui.metrics.inc("filemerge_prompt_localdeleted", 1)
             prompts["hint"] = _hint_for_missing_file(repo, fcd, fco, fd)
             index = ui.promptchoice(_otherchangedlocaldeletedmsg % prompts, 2)
             choice = ["other", "local", "unresolved", "rename"][index]
@@ -769,13 +769,21 @@ def _imerge3(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
     return _merge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels, "merge3")
 
 
+def _mergediff_onfailure(r, repo, mynode, orig, fcd, fco, fca):
+    relpath = repo.pathto(fcd.path())
+    return (
+        _(
+            "warning: conflicts while merging %s! "
+            "(edit, then use '@prog@ resolve --mark')\n"
+        )
+        % relpath
+    )
+
+
 @internaltool(
     "mergediff",
     mergeonly,
-    _(
-        "warning: conflicts while merging %s! "
-        "(edit, then use '@prog@ resolve --mark')\n"
-    ),
+    _mergediff_onfailure,
     precheck=_ismergeable,
 )
 def _imergediff(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
@@ -797,10 +805,7 @@ def _imergediff(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None)
 @internaltool(
     "mergediffs",
     mergeonly,
-    _(
-        "warning: conflicts while merging %s! "
-        "(edit, then use '@prog@ resolve --mark')\n"
-    ),
+    _mergediff_onfailure,
     precheck=_ismergeable,
 )
 def _imergediffs(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):

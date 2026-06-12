@@ -12,7 +12,7 @@ Setup server
   $ cd ..
 
 Clone
-  $ hg clone ssh://user@dummy/repo client -q
+  $ sl clone ssh://user@dummy/repo client -q
   $ cd client
 
 Create log dir
@@ -23,7 +23,7 @@ Setup background backup logging
 
 Check that logging fails because of wrong permissions
   $ echo foo > foo
-  $ hg commit -Aqm foo --debug --config infinitepushbackup.autobackup=true
+  $ sl commit -Aqm foo --debug --config infinitepushbackup.autobackup=true
   adding foo
   committing files:
   foo

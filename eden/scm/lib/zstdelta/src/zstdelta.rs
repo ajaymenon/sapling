@@ -150,10 +150,7 @@ pub fn apply(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
             let msg = format!("cannot decompress ({})", explain_error(outsize));
             Err(io::Error::other(msg))
         } else if outsize != size {
-            let msg = format!(
-                "decompress size mismatch (expected {}, got {})",
-                size, outsize
-            );
+            let msg = format!("decompress size mismatch (expected {size}, got {outsize})");
             Err(io::Error::other(msg))
         } else {
             Ok(buf)
@@ -164,7 +161,7 @@ pub fn apply(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use quickcheck::quickcheck;
-    use rand::RngCore;
+    use rand::Rng as _;
     use rand::SeedableRng;
     use rand_chacha::ChaChaRng;
 

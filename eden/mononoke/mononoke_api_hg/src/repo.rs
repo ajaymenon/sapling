@@ -36,13 +36,9 @@ use filestore::FilestoreConfigRef;
 use filestore::StoreRequest;
 use futures::Stream;
 use futures::StreamExt;
-use futures::TryStream;
 use futures::TryStreamExt;
-use futures::compat::Stream01CompatExt;
-use futures::future;
 use futures::stream;
 use futures_util::try_join;
-use hgproto::GettreepackArgs;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_mutation::HgMutationEntry;
 use mercurial_mutation::HgMutationStoreRef;
@@ -64,12 +60,10 @@ use mononoke_types::ContentId;
 use mononoke_types::ContentMetadataV2;
 use mononoke_types::RepoPath;
 use mononoke_types::hash::GitSha1;
-use mononoke_types::path::MPath;
 use phases::PhasesRef;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_client::find_new_draft_commits_and_derive_filenodes_for_public_roots;
-use repo_client::gettreepack_entries;
 use repo_update_logger::CommitInfo;
 use repo_update_logger::log_new_commits;
 use tracing::debug;
@@ -172,8 +166,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         .await?
         .ok_or_else(|| {
             MononokeError::InvalidRequest(format!(
-                "failed to fetch or rebuild metadata for ContentId('{}'), file content must be prior uploaded",
-                content_id
+                "failed to fetch or rebuild metadata for ContentId('{content_id}'), file content must be prior uploaded"
             ))
         })?
         .total_size)
@@ -223,7 +216,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             Ok(cid) => Ok(Some(cid)),
             Err(LoadableError::Missing(_)) => Ok(None),
             Err(LoadableError::Error(err)) => {
-                Err(err).with_context(|| format_err!("While fetching ContentId for {:?}", hash))?
+                Err(err).with_context(|| format_err!("While fetching ContentId for {hash:?}"))?
             }
         }
     }
@@ -261,8 +254,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
                 AnyId::AnyFileContentId(file_id) => file_id.into(),
                 e => {
                     return Err(MononokeError::from(format_err!(
-                        "Id is not of a file: {:?}",
-                        e
+                        "Id is not of a file: {e:?}"
                     )));
                 }
             },
@@ -446,56 +438,6 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             .await?)
     }
 
-    /// Request all of the tree nodes in the repo under a given path.
-    ///
-    /// The caller must specify a list of desired versions of the subtree for
-    /// this path, specified as a list of manifest IDs of tree nodes
-    /// corresponding to different versions of the root node of the subtree.
-    ///
-    /// The caller may also specify a list of versions of the subtree to
-    /// delta against. The server will only return tree nodes that are in
-    /// the requested subtrees that are not in the base subtrees.
-    ///
-    /// Returns a stream of `HgTreeContext`s, each corresponding to a node in
-    /// the requested versions of the subtree, along with its associated path.
-    ///
-    /// This method is equivalent to Mercurial's `gettreepack` wire protocol
-    /// command.
-    pub fn trees_under_path<
-        T: IntoIterator<Item = HgManifestId>,
-        U: IntoIterator<Item = HgManifestId>,
-    >(
-        &self,
-        path: MPath,
-        root_versions: T,
-        base_versions: U,
-        depth: Option<usize>,
-    ) -> impl TryStream<Ok = (HgTreeContext<R>, MPath), Error = MononokeError> + use<R, T, U> {
-        let ctx = self.ctx().clone();
-        let repo = self.repo_ctx.repo();
-        let args = GettreepackArgs {
-            rootdir: path,
-            mfnodes: root_versions.into_iter().collect(),
-            basemfnodes: base_versions.into_iter().collect(),
-            directories: vec![], // Not supported.
-            depth,
-        };
-
-        gettreepack_entries(ctx, repo, args)
-            .compat()
-            .map_err(MononokeError::from)
-            .and_then({
-                let repo = self.clone();
-                move |(mfid, path): (HgManifestId, MPath)| {
-                    let repo = repo.clone();
-                    async move {
-                        let tree = HgTreeContext::new(repo, mfid).await?;
-                        Ok((tree, path))
-                    }
-                }
-            })
-    }
-
     // TODO(mbthomas): get_hg_from_bonsai -> derive_hg_changeset
     pub async fn get_hg_from_bonsai(
         &self,
@@ -530,12 +472,16 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             .repo_ctx()
             .location_to_changeset_id(cs_location, count)
             .await?;
-        let hg_id_futures = result_csids
-            .iter()
-            .map(|result_csid| self.repo().derive_hg_changeset(self.ctx(), *result_csid));
-        future::try_join_all(hg_id_futures)
+        stream::iter(result_csids)
+            .map(|bcs_id| async move {
+                self.repo()
+                    .derive_hg_changeset(self.ctx(), bcs_id)
+                    .await
+                    .map_err(MononokeError::from)
+            })
+            .buffered(100)
+            .try_collect()
             .await
-            .map_err(MononokeError::from)
     }
 
     /// This provides the same functionality as
@@ -550,7 +496,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         let all_hg_ids: Vec<_> = hg_ids
             .iter()
             .cloned()
-            .chain(hg_master_heads.clone().into_iter())
+            .chain(hg_master_heads.clone())
             .collect();
         let hg_to_bonsai: HashMap<HgChangesetId, ChangesetId> = self
             .repo()
@@ -563,8 +509,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             .map(|master_id| {
                 hg_to_bonsai.get(master_id).cloned().ok_or_else(|| {
                     MononokeError::InvalidRequest(format!(
-                        "failed to find bonsai equivalent for client head {}",
-                        master_id
+                        "failed to find bonsai equivalent for client head {master_id}"
                     ))
                 })
             })
@@ -588,8 +533,8 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             .get_hg_bonsai_mapping(
                 self.ctx().clone(),
                 cs_to_blocations
-                    .iter()
-                    .filter_map(|(_, result)| match result {
+                    .values()
+                    .filter_map(|result| match result {
                         Ok(l) => Some(l.descendant),
                         _ => None,
                     })
@@ -612,8 +557,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
                     Ok(cs_location) => cs_location.try_map_descendant(|descendant| {
                         bonsai_to_hg.get(&descendant).cloned().ok_or_else(|| {
                             MononokeError::InvalidRequest(format!(
-                                "failed to find hg equivalent for bonsai {}",
-                                descendant
+                                "failed to find hg equivalent for bonsai {descendant}"
                             ))
                         })
                     }),
@@ -843,7 +787,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             bonsai_hg_mapping
                 .get(&cs_id)
                 .cloned()
-                .with_context(|| format_err!("failed to find bonsai '{}' mapping to hg", cs_id))
+                .with_context(|| format_err!("failed to find bonsai '{cs_id}' mapping to hg"))
         };
 
         let hg_parent_mapping = cs_parent_mapping
@@ -866,16 +810,12 @@ impl<R: MononokeRepo> HgRepoContext<R> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use anyhow::Error;
-    use blobstore::Loadable;
     use fbinit::FacebookInit;
     use mononoke_api::repo::Repo;
+    use mononoke_api::repo::RepoContext;
     use mononoke_macros::mononoke;
-    use mononoke_types::ChangesetId;
-    use tests_utils::CreateCommitContext;
 
     use super::*;
     use crate::RepoContextHgExt;
@@ -891,59 +831,5 @@ mod tests {
         assert_eq!(hg.repo_ctx().name(), "repo");
 
         Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn test_trees_under_path(fb: FacebookInit) -> Result<(), MononokeError> {
-        let ctx = CoreContext::test_mock(fb);
-        let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
-
-        // Create test stack; child commit modifies 2 directories.
-        let commit_1 = CreateCommitContext::new_root(&ctx, &repo)
-            .add_file("dir1/a", "1")
-            .add_file("dir2/b", "1")
-            .add_file("dir3/c", "1")
-            .commit()
-            .await?;
-        let commit_2 = CreateCommitContext::new(&ctx, &repo, vec![commit_1])
-            .add_file("dir1/a", "2")
-            .add_file("dir3/a/b/c", "1")
-            .commit()
-            .await?;
-
-        let root_mfid_1 = root_manifest_id(ctx.clone(), &repo, commit_1).await?;
-        let root_mfid_2 = root_manifest_id(ctx.clone(), &repo, commit_2).await?;
-
-        let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
-        let hg = repo_ctx.hg();
-
-        let trees = hg
-            .trees_under_path(MPath::ROOT, vec![root_mfid_2], vec![root_mfid_1], Some(2))
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        let paths = trees
-            .into_iter()
-            .map(|(_, path)| format!("{}", path))
-            .collect::<BTreeSet<_>>();
-        let expected = vec!["", "dir3", "dir1", "dir3/a"]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(paths, expected);
-
-        Ok(())
-    }
-
-    /// Get the HgManifestId of the root tree manifest for the given commit.
-    async fn root_manifest_id(
-        ctx: CoreContext,
-        repo: &Repo,
-        csid: ChangesetId,
-    ) -> Result<HgManifestId, Error> {
-        let hg_cs_id = repo.derive_hg_changeset(&ctx, csid).await?;
-        let hg_cs = hg_cs_id.load(&ctx, &repo.repo_blobstore().clone()).await?;
-        Ok(hg_cs.manifestid())
     }
 }

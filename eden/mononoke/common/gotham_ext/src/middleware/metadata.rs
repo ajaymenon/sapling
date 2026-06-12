@@ -9,19 +9,21 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 
 use cats::try_get_cats_idents;
+use cats_constants::X_FORWARDED_CATS_HEADER;
 use clientinfo::CLIENT_INFO_HEADER;
 use clientinfo::ClientEntryPoint;
 use clientinfo::ClientInfo;
 use fbinit::FacebookInit;
+use gotham::handler::IntoBody as _;
+use gotham::helpers::http::Body;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham::state::client_addr;
 use gotham_derive::StateData;
-use hyper::Body;
-use hyper::Response;
-use hyper::StatusCode;
-use hyper::Uri;
-use hyper::header::HeaderMap;
+use http::Response;
+use http::StatusCode;
+use http::Uri;
+use http::header::HeaderMap;
 use metaconfig_types::Identity;
 use metadata::Metadata;
 use percent_encoding::percent_decode;
@@ -31,14 +33,12 @@ use tracing::error;
 
 use super::Middleware;
 use crate::socket_data::TlsCertificateIdentities;
-use crate::state_ext::StateExt;
 
 const INGRESS_LEAF_CERT_HEADER: &str = "X-Amzn-Mtls-Clientcert-Leaf";
 const ENCODED_CLIENT_IDENTITY: &str = "x-fb-validated-client-encoded-identity";
 const CLIENT_IP: &str = "tfb-orig-client-ip";
 const CLIENT_PORT: &str = "tfb-orig-client-port";
 const HEADER_REVPROXY_REGION: &str = "x-fb-revproxy-region";
-const HEADER_FORWARDED_CATS: &str = "x-forwarded-cats";
 const FETCH_CAUSE_HEADER: &str = "X-Fetch-Cause";
 const FETCH_FROM_CAS_ATTEMPTED_HEADER: &str = "X-Fetch-From-CAS-Attempted";
 
@@ -155,7 +155,7 @@ impl Middleware for MetadataMiddleware {
                 metadata.add_revproxy_region(revproxy_region);
             }
             if let Some(vi_cats) = headers
-                .get(HEADER_FORWARDED_CATS)
+                .get(X_FORWARDED_CATS_HEADER)
                 .and_then(|x| x.to_str().ok())
                 .map(|x| x.to_string())
             {
@@ -166,26 +166,7 @@ impl Middleware for MetadataMiddleware {
                 ingress_request_identities_from_headers(headers)
             } else {
                 let maybe_cat_idents =
-                    match try_get_cats_idents(self.fb, headers, &self.internal_identity) {
-                        Err(e) => {
-                            let msg = format!("Error extracting CATs identities: {}.", &e,);
-                            error!("{}", &msg,);
-                            let response = Response::builder()
-                                .status(StatusCode::UNAUTHORIZED)
-                                .body(
-                                    format!(
-                                        "{{\"message:\"{}\", \"request_id\":\"{}\"}}",
-                                        msg,
-                                        state.short_request_id()
-                                    )
-                                    .into(),
-                                )
-                                .expect("Couldn't build http response");
-
-                            return Some(response);
-                        }
-                        Ok(maybe_cats) => maybe_cats,
-                    };
+                    try_get_cats_idents(self.fb, headers, &self.internal_identity);
 
                 let maybe_tls_or_proxied_idents: Option<MononokeIdentitySet> =
                     cert_idents.and_then(|x| self.extract_client_identities(x, headers));
@@ -209,13 +190,12 @@ impl Middleware for MetadataMiddleware {
 
             if client_info.is_none() && self.require_client_info(state) {
                 let msg = format!(
-                    "Error: {} header not provided or wrong format (expected json).",
-                    CLIENT_INFO_HEADER
+                    "Error: {CLIENT_INFO_HEADER} header not provided or wrong format (expected json)."
                 );
                 error!("{}", &msg,);
                 let response = Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
-                    .body(format!("{{\"message:\"{}\"}}", msg,).into())
+                    .body(format!("{{\"message:\"{msg}\"}}").into_body())
                     .expect("Couldn't build http response");
                 return Some(response);
             }

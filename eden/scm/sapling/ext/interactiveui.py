@@ -6,6 +6,7 @@
 # interactiveui.py: display information and allow for left/right control
 
 
+import collections
 import os
 import sys
 from enum import Enum
@@ -98,9 +99,52 @@ def getchar() -> Union[None, bytes, str]:
 # End of code from link
 
 
+def _splitkeypresses(output):
+    if output is None:
+        return []
+    if isinstance(output, str):
+        output = output.encode()
+
+    keys = []
+    index = 0
+    escape_keys = {
+        viewframe.KEY_UP,
+        viewframe.KEY_DOWN,
+        viewframe.KEY_RIGHT,
+        viewframe.KEY_LEFT,
+    }
+    while index < len(output):
+        matched = False
+        for key in escape_keys:
+            if output.startswith(key, index):
+                keys.append(key)
+                index += len(key)
+                matched = True
+                break
+        if matched:
+            continue
+        keys.append(output[index : index + 1])
+        index += 1
+    return keys
+
+
 class Alignment(Enum):
     top = 1
     bottom = 2
+
+
+renderstate = collections.namedtuple(
+    "renderstate",
+    [
+        "width",
+        "height",
+        "statuslines",
+        "logsize",
+        "visible_start",
+        "visible_end",
+        "visible_lines",
+    ],
+)
 
 
 class viewframe:
@@ -135,33 +179,80 @@ class viewframe:
         # handle user keypress
         pass
 
+    def handlekeypresses(self, keys):
+        redraw = False
+        for key in keys:
+            self.handlekeypress(key)
+            if not self._active:
+                return False
+            redraw = True
+        return redraw
+
     def finish(self):
         # End interactive session
         self._active = False
 
 
-def _write_output(viewobj):
-    screensize = scmutil.termsize(viewobj.ui)[1]
+def getrenderstate(viewobj, lines, alignment):
+    width, height = scmutil.termsize(viewobj.ui)
     statuslines = viewobj.status.splitlines()
     statussize = len(statuslines)
-    logsize = screensize - statussize
-    clearscreen(viewobj.ui)
-    lines, alignment = viewobj.render()
+    logsize = height - statussize
+    visible_start = 0
+    visible_end = len(lines)
     if alignment is not None and len(lines) > logsize:
         index, direction = alignment
         if direction == Alignment.top:
-            end = min(len(lines), index + logsize)
-            start = min(index, end - logsize)
+            visible_end = min(len(lines), index + logsize)
+            visible_start = min(index, visible_end - logsize)
         elif direction == Alignment.bottom:
-            start = max(0, index - logsize)
-            end = max(index, start + logsize)
-        lines = lines[start:end]
+            visible_start = max(0, index - logsize)
+            visible_end = max(index, visible_start + logsize)
+    visible_lines = lines[visible_start:visible_end]
+    return renderstate(
+        width=width,
+        height=height,
+        statuslines=statuslines,
+        logsize=logsize,
+        visible_start=visible_start,
+        visible_end=visible_end,
+        visible_lines=visible_lines,
+    )
 
-    lines += statuslines
+
+def rewrite_rows(viewobj, row_updates) -> None:
+    if not row_updates:
+        return
+    row_updates = sorted(row_updates)
     if util.istest():
-        viewobj.ui.write("\n".join(lines))
+        viewobj.ui.write(_x("===== Screen Refresh =====\n"))
+        render_cache = getattr(viewobj, "_render_cache", None)
+        if render_cache is not None:
+            state = render_cache.get("renderstate")
+            if state is not None:
+                output_lines = state.visible_lines + state.statuslines
+                viewobj.ui.write("\n".join(output_lines))
+                viewobj.ui.flush()
+                return
+        viewobj.ui.write("\n".join(line for _screen_row, line in row_updates))
+        viewobj.ui.flush()
+        return
+    for screen_row, line in row_updates:
+        viewobj.ui.write(_x("\033[%d;1H") % (screen_row + 1))
+        viewobj.ui.write(_x("\033[2K"))
+        viewobj.ui.write(_x("\r") + line)
+    viewobj.ui.flush()
+
+
+def _write_output(viewobj):
+    clearscreen(viewobj.ui)
+    lines, alignment = viewobj.render()
+    state = getrenderstate(viewobj, lines, alignment)
+    output_lines = state.visible_lines + state.statuslines
+    if util.istest():
+        viewobj.ui.write("\n".join(output_lines))
     else:
-        viewobj.ui.write("\n".join("\r" + line for line in lines))
+        viewobj.ui.write("\n".join("\r" + line for line in output_lines))
     viewobj.ui.flush()
 
 
@@ -179,12 +270,15 @@ def view(viewobj, readinput=getchar) -> None:
         viewobj.ui.write(_x("\x1b[?7l"))
         viewobj.ui.write(_x("\033[?25l"))  # hide cursor
     try:
+        redraw = True
         while viewobj._active:
-            _write_output(viewobj)
+            if redraw:
+                _write_output(viewobj)
+                redraw = False
             output = readinput()
             if output is None:
                 break
-            viewobj.handlekeypress(output)
+            redraw = viewobj.handlekeypresses(_splitkeypresses(output))
     finally:
         if not util.istest():
             viewobj.ui.write(_x("\033[?25h"))  # show cursor

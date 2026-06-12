@@ -10,6 +10,7 @@ import type {Json} from 'shared/typeUtils';
 import {Checkbox} from 'isl-components/Checkbox';
 import {Dropdown} from 'isl-components/Dropdown';
 import {Column} from 'isl-components/Flex';
+import {Subtle} from 'isl-components/Subtle';
 import {Tooltip} from 'isl-components/Tooltip';
 import {shouldWarnAboutDiagnosticsAtom} from 'isl/src/Diagnostics';
 import {Setting} from 'isl/src/Setting';
@@ -23,13 +24,11 @@ export default function VSCodeSettings() {
   const panelMode = useAtomValue(comparisonPanelMode);
   const [openBesides, setOpenBesides] = useAtom(openBesidesSetting);
   const [checkDiagnostics, setCheckDiagnostics] = useAtom(shouldWarnAboutDiagnosticsAtom);
+  const [showInSidebar, setShowInSidebar] = useAtom(showInSidebarSetting);
   return (
     <Setting title={<T>VS Code Settings</T>}>
       <Column alignStart>
-        <Tooltip
-          title={t(
-            'Whether to always open a separate panel to view comparisons, or to open the comparison inside an existing ISL window.',
-          )}>
+        <Tooltip title={t('How comparisons should be displayed when viewing diffs and changes.')}>
           <div className="dropdown-container setting-inline-dropdown">
             <label>
               <T>Comparison Panel Mode</T>
@@ -59,12 +58,24 @@ export default function VSCodeSettings() {
             <T>Check diagnostics before committing / amending</T>
           </Checkbox>
         </Tooltip>
+        <Tooltip
+          title={t(
+            'If true, Interactive Smartlog will appear in the sidebar. If false, it will appear as a normal editor panel. Reload required to take effect.',
+          )}>
+          <Checkbox checked={showInSidebar} onChange={checked => setShowInSidebar(checked)}>
+            <T>Show ISL in Sidebar</T>
+          </Checkbox>
+        </Tooltip>
+        <Subtle>
+          <T>Reload required after changing sidebar setting</T>
+        </Subtle>
       </Column>
     </Setting>
   );
 }
 
 const openBesidesSetting = vscodeConfigBackedAtom<boolean>('sapling.isl.openBeside', false);
+const showInSidebarSetting = vscodeConfigBackedAtom<boolean>('sapling.isl.showInSidebar', false);
 
 function vscodeConfigBackedAtom<T extends Json>(
   configName: string,

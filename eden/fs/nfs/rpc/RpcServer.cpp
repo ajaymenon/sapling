@@ -14,10 +14,11 @@
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocket.h>
 
-#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/Throw.h"
 #include "eden/fs/nfs/rpc/Rpc.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
+#include "eden/fs/utils/FsChannelTypes.h"
 
 using folly::AsyncServerSocket;
 using folly::AsyncSocket;
@@ -118,14 +119,14 @@ RpcConnectionHandler::RpcConnectionHandler(
     std::shared_ptr<RpcServerProcessor> proc,
     AsyncSocket::UniquePtr&& socket,
     std::shared_ptr<folly::Executor> threadPool,
-    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
     std::weak_ptr<RpcServer> owningServer,
     size_t maximumInFlightRequests,
     std::chrono::nanoseconds highNfsRequestsLogInterval)
     : proc_(proc),
       sock_(std::move(socket)),
       threadPool_(std::move(threadPool)),
-      errorLogger_(structuredLogger),
+      errorLogger_(edenFsEventsLogger),
       state_(sock_->getEventBase()),
       owningServer_(std::move(owningServer)),
       maximumInFlightRequests_(maximumInFlightRequests),
@@ -235,103 +236,7 @@ std::string displayBuffer(folly::IOBuf* buf) {
   auto bytes = buf->coalesce();
   return folly::hexDump(bytes.data(), bytes.size());
 }
-} // namespace
 
-void RpcConnectionHandler::tryConsumeReadBuffer() noexcept {
-  // Iterate over all the complete fragments and dispatch these to the
-  // threadPool_.
-  while (true) {
-    auto buf = readOneRequest();
-    if (!buf) {
-      break;
-    }
-    XLOG(DBG7, "received a request");
-
-    auto now = std::chrono::steady_clock::now();
-    auto should_log = false;
-    {
-      // state isn't actually locked, this scoping is just for show.
-      // we skipped the lock since it's only ever accessed by one thread so a
-      // lock is unnecessary.
-      auto& state = state_.get();
-      state.pendingRequests += 1;
-
-      if (maximumInFlightRequests_ > 0 &&
-          state.pendingRequests == maximumInFlightRequests_ &&
-          now >= state.lastHighNfsRequestsLog_ + highNfsRequestsLogInterval_) {
-        should_log = true;
-        state.lastHighNfsRequestsLog_ = now;
-      }
-    }
-
-    if (should_log) {
-      errorLogger_->logEvent(ManyLiveFsChannelRequests{});
-    }
-
-    // Send the work to a thread pool to increase the number of inflight
-    // requests that can be handled concurrently.
-    threadPool_->add(
-        [this, buf = std::move(buf), guard = DestructorGuard(this)]() mutable {
-          XLOGF(DBG8, "Received:\n{}", displayBuffer(buf.get()));
-          // We use a scope so that the cursor is not still around after we
-          // delete part of the IOBuf later. Attempting to use this cursor
-          // after mutating the buffer could result in bad memory accesses.
-          {
-            folly::io::Cursor c(buf.get());
-            uint32_t fragmentHeader = c.readBE<uint32_t>();
-            bool isLast = (fragmentHeader & 0x80000000) != 0;
-
-            // Supporting multiple fragments is expensive and requires playing
-            // with IOBuf to avoid copying data. Since neither macOS nor Linux
-            // are sending requests spanning multiple segments, let's not
-            // support these.
-            XCHECK(isLast);
-          }
-
-          // Trim off the fragment header.
-          // We need to upgrade to an IOBufQueue because the IOBuf here is
-          // actually part of a chain. The first buffer in the chain may not
-          // have the full fragment header. Thus we need to be trimming off the
-          // whole chain and not just from the first buffer.
-          //
-          // For example, this IOBuf might be the head of a chain of two IOBufs,
-          // and the first IOBuf only contains 2 bytes. Trimming the IOBuf
-          // would fail in this case.
-          folly::IOBufQueue bufQueue{};
-          bufQueue.append(std::move(buf));
-          bufQueue.trimStart(sizeof(uint32_t));
-
-          dispatchAndReply(bufQueue.move(), std::move(guard));
-        });
-  }
-}
-
-std::unique_ptr<folly::IOBuf> RpcConnectionHandler::readOneRequest() noexcept {
-  if (!readBuf_.front()) {
-    return nullptr;
-  }
-  folly::io::Cursor c(readBuf_.front());
-  while (true) {
-    uint32_t fragmentHeader;
-    if (!c.tryReadBE<uint32_t>(fragmentHeader)) {
-      // We can't even read the fragment header, bail out.
-      return nullptr;
-    }
-    auto len = fragmentHeader & 0x7fffffff;
-    bool isLast = (fragmentHeader & 0x80000000) != 0;
-    if (!c.canAdvance(len)) {
-      // we don't have a complete request, so try again later
-      return nullptr;
-    }
-    c.skip(len);
-    if (isLast) {
-      break;
-    }
-  }
-  return readBuf_.split(c.getCurrentPosition());
-}
-
-namespace {
 void serializeRpcMismatch(folly::io::QueueAppender& ser, uint32_t xid) {
   rpc_msg_reply reply{
       xid,
@@ -390,6 +295,168 @@ std::unique_ptr<folly::IOBuf> finalizeFragment(
 }
 } // namespace
 
+template <typename F>
+void RpcConnectionHandler::writeInlineReply(F&& serializeBody) {
+  auto iobufQueue = std::make_unique<folly::IOBufQueue>(
+      folly::IOBufQueue::cacheChainLength());
+  folly::io::QueueAppender ser(iobufQueue.get(), 64);
+  XdrTrait<uint32_t>::serialize(ser, 0); // fragment header placeholder
+  serializeBody(ser);
+  sock_->writeChain(this, finalizeFragment(std::move(iobufQueue)));
+}
+
+void RpcConnectionHandler::tryConsumeReadBuffer() noexcept {
+  // Iterate over all the complete fragments and dispatch these to the
+  // threadPool_.
+  while (true) {
+    auto buf = readOneRequest();
+    if (!buf) {
+      break;
+    }
+    auto requestReceived = std::chrono::steady_clock::now();
+    XLOG(DBG7, "received a request");
+
+    // Pre-parse the RPC header for inline operations on the EventBase thread.
+    auto peek = peekRpcCallHeader(*buf);
+
+    std::unique_ptr<RequestPermit> permit;
+    if (peek) {
+      // Fast-path and backpressure: handle inline on the EventBase thread
+      // when the fast-path config is enabled.
+      if (proc_->shouldFastPathRPCs()) {
+        if (peek->proc == 0) {
+          writeInlineReply([&](auto& ser) {
+            serializeReply(ser, accept_stat::SUCCESS, peek->xid);
+          });
+          XLOG(DBG7, "Fast-pathed null RPC reply");
+          continue;
+        }
+        if (proc_->isUnimplementedProc(peek->proc)) {
+          writeInlineReply([&](auto& ser) {
+            serializeReply(ser, accept_stat::PROC_UNAVAIL, peek->xid);
+          });
+          XLOG(DBG7, "Fast-pathed PROC_UNAVAIL reply");
+          continue;
+        }
+
+        // JUKEBOX backpressure: reject inline if the rate limiter denies
+        // a permit. This sheds load on the EventBase thread before
+        // requests queue in the thread pool.
+        {
+          auto result = proc_->tryInlineReject();
+          if (result.rejected) {
+            XDCHECK(!result.permit)
+                << "tryInlineReject returned rejected=true with a non-null permit";
+            writeInlineReply([&](auto& ser) {
+              proc_->serializeInlineReject(peek->proc, peek->xid, ser);
+            });
+            XLOG(DBG7, "JUKEBOX backpressure: rejected inline");
+            continue;
+          }
+          permit = std::move(result.permit);
+        }
+      }
+    }
+
+    RpcRequestTimeline timeline;
+    timeline.requestReceived = requestReceived;
+
+    auto should_log = false;
+    {
+      // state isn't actually locked, this scoping is just for show.
+      // we skipped the lock since it's only ever accessed by one thread so a
+      // lock is unnecessary.
+      auto& state = state_.get();
+      state.pendingRequests += 1;
+
+      if (maximumInFlightRequests_ > 0 &&
+          state.pendingRequests == maximumInFlightRequests_ &&
+          requestReceived >=
+              state.lastHighNfsRequestsLog_ + highNfsRequestsLogInterval_) {
+        should_log = true;
+        state.lastHighNfsRequestsLog_ = requestReceived;
+      }
+    }
+
+    if (should_log) {
+      if (errorLogger_) {
+        errorLogger_->logEvent(ManyLiveFsChannelRequests{});
+      }
+    }
+
+    timeline.dispatched = std::chrono::steady_clock::now();
+
+    // Send the work to a thread pool to increase the number of inflight
+    // requests that can be handled concurrently.
+    threadPool_->add([this,
+                      buf = std::move(buf),
+                      guard = DestructorGuard(this),
+                      permit = std::move(permit),
+                      timeline]() mutable {
+      timeline.handlerStart = std::chrono::steady_clock::now();
+      XLOGF(DBG8, "Received:\n{}", displayBuffer(buf.get()));
+      // We use a scope so that the cursor is not still around after we
+      // delete part of the IOBuf later. Attempting to use this cursor
+      // after mutating the buffer could result in bad memory accesses.
+      {
+        folly::io::Cursor c(buf.get());
+        uint32_t fragmentHeader = c.readBE<uint32_t>();
+        bool isLast = (fragmentHeader & 0x80000000) != 0;
+
+        // Supporting multiple fragments is expensive and requires playing
+        // with IOBuf to avoid copying data. Since neither macOS nor Linux
+        // are sending requests spanning multiple segments, let's not
+        // support these.
+        XCHECK(isLast);
+      }
+
+      // Trim off the fragment header.
+      // We need to upgrade to an IOBufQueue because the IOBuf here is
+      // actually part of a chain. The first buffer in the chain may not
+      // have the full fragment header. Thus we need to be trimming off the
+      // whole chain and not just from the first buffer.
+      //
+      // For example, this IOBuf might be the head of a chain of two IOBufs,
+      // and the first IOBuf only contains 2 bytes. Trimming the IOBuf
+      // would fail in this case.
+      folly::IOBufQueue bufQueue{};
+      bufQueue.append(std::move(buf));
+      bufQueue.trimStart(sizeof(uint32_t));
+
+      dispatchAndReply(
+          bufQueue.move(),
+          std::move(guard),
+          std::move(permit),
+          std::move(timeline));
+    });
+  }
+}
+
+std::unique_ptr<folly::IOBuf> RpcConnectionHandler::readOneRequest() noexcept {
+  if (!readBuf_.front()) {
+    return nullptr;
+  }
+  folly::io::Cursor c(readBuf_.front());
+  while (true) {
+    uint32_t fragmentHeader;
+    if (!c.tryReadBE<uint32_t>(fragmentHeader)) {
+      // We can't even read the fragment header, bail out.
+      return nullptr;
+    }
+    auto len = fragmentHeader & 0x7fffffff;
+    bool isLast = (fragmentHeader & 0x80000000) != 0;
+    if (!c.canAdvance(len)) {
+      // we don't have a complete request, so try again later
+      return nullptr;
+    }
+    c.skip(len);
+    if (isLast) {
+      break;
+    }
+  }
+  return readBuf_.split(c.getCurrentPosition());
+}
+
 void RpcConnectionHandler::recordParsingError(
     const RpcParsingError& err,
     std::unique_ptr<folly::IOBuf> input) {
@@ -401,10 +468,12 @@ void RpcConnectionHandler::recordParsingError(
 
   XLOG(ERR, message);
 
-  errorLogger_->logEvent(
-      NfsParsingError{
-          folly::to<std::string>("FS", " - ", err.getProcedureContext()),
-          message});
+  if (errorLogger_) {
+    errorLogger_->logEvent(
+        NfsParsingError{
+            folly::to<std::string>("FS", " - ", err.getProcedureContext()),
+            message});
+  }
 }
 
 void RpcConnectionHandler::replyServerError(
@@ -419,13 +488,56 @@ void RpcConnectionHandler::replyServerError(
   serializeReply(errSer, err, xid);
 }
 
+namespace {
+class RequestWriteCallback : public folly::AsyncWriter::WriteCallback {
+  using DestructorGuard = folly::DelayedDestruction::DestructorGuard;
+
+ public:
+  RequestWriteCallback(
+      RpcRequestTimeline timeline,
+      RpcConnectionHandler* handler,
+      DestructorGuard guard)
+      : timeline_(std::move(timeline)),
+        handler_(handler),
+        guard_(std::move(guard)) {}
+
+  void writeSuccess() noexcept override {
+    timeline_.responseSent = std::chrono::steady_clock::now();
+    handler_->recordPhaseTimings(timeline_);
+    delete this;
+  }
+
+  void writeErr(
+      size_t /*bytesWritten*/,
+      const folly::AsyncSocketException& ex) noexcept override {
+    XLOGF(
+        ERR,
+        "Write error in RequestWriteCallback: {}",
+        folly::exceptionStr(ex));
+    timeline_.responseSent = std::chrono::steady_clock::now();
+    handler_->recordPhaseTimings(timeline_);
+    delete this;
+  }
+
+ private:
+  RpcRequestTimeline timeline_;
+  RpcConnectionHandler* handler_;
+  DestructorGuard guard_;
+};
+} // namespace
+
 void RpcConnectionHandler::dispatchAndReply(
     std::unique_ptr<folly::IOBuf> input,
-    DestructorGuard guard) {
+    DestructorGuard guard,
+    std::unique_ptr<RequestPermit> permit,
+    RpcRequestTimeline timeline) {
   makeImmediateFutureWith(
-      [&]() mutable -> ImmediateFuture<std::unique_ptr<folly::IOBuf>> {
+      [&]() mutable
+          -> ImmediateFuture<
+              std::pair<std::unique_ptr<folly::IOBuf>, RpcRequestTimeline>> {
         folly::io::Cursor deser(input.get());
         rpc_msg_call call = XdrTrait<rpc_msg_call>::deserialize(deser);
+        timeline.procNumber = call.cbody.proc;
 
         auto iobufQueue = std::make_unique<folly::IOBufQueue>(
             folly::IOBufQueue::cacheChainLength());
@@ -435,13 +547,17 @@ void RpcConnectionHandler::dispatchAndReply(
 
         if (call.cbody.rpcvers != kRPCVersion) {
           serializeRpcMismatch(ser, call.xid);
-          return finalizeFragment(std::move(iobufQueue));
+          timeline.handlerDone = std::chrono::steady_clock::now();
+          return std::pair{
+              finalizeFragment(std::move(iobufQueue)), std::move(timeline)};
         }
 
         if (auto auth = proc_->checkAuthentication(call.cbody);
             auth != auth_stat::AUTH_OK) {
           serializeAuthError(ser, auth, call.xid);
-          return finalizeFragment(std::move(iobufQueue));
+          timeline.handlerDone = std::chrono::steady_clock::now();
+          return std::pair{
+              finalizeFragment(std::move(iobufQueue)), std::move(timeline)};
         }
 
         XLOG(DBG7, "dispatching a request");
@@ -459,7 +575,12 @@ void RpcConnectionHandler::dispatchAndReply(
             [this,
              input = std::move(input),
              iobufQueue = std::move(iobufQueue),
-             call = std::move(call)](folly::Try<folly::Unit> result) mutable {
+             call = std::move(call),
+             timeline =
+                 std::move(timeline)](folly::Try<folly::Unit> result) mutable
+                -> std::pair<
+                    std::unique_ptr<folly::IOBuf>,
+                    RpcRequestTimeline> {
               XLOG(DBG7, "Request done, sending response.");
               if (result.hasException()) {
                 if (auto* err =
@@ -480,7 +601,9 @@ void RpcConnectionHandler::dispatchAndReply(
                       accept_stat::SYSTEM_ERR, call.xid, iobufQueue);
                 }
               }
-              return finalizeFragment(std::move(iobufQueue));
+              timeline.handlerDone = std::chrono::steady_clock::now();
+              return {
+                  finalizeFragment(std::move(iobufQueue)), std::move(timeline)};
             });
       })
       .semi()
@@ -492,22 +615,30 @@ void RpcConnectionHandler::dispatchAndReply(
       .via(threadPool_.get())
       // Then move it back to the EventBase to write the result to the socket.
       .via(this->sock_->getEventBase())
-      .then([this](folly::Try<std::unique_ptr<folly::IOBuf>> result) {
-        // This code runs in the EventBase and thus must be as fast as
-        // possible to avoid unnecessary overhead in the EventBase. Always
-        // prefer duplicating work in the future above to adding code here.
+      .then(
+          [this](
+              folly::Try<
+                  std::pair<std::unique_ptr<folly::IOBuf>, RpcRequestTimeline>>
+                  result) {
+            // This code runs in the EventBase and thus must be as fast as
+            // possible to avoid unnecessary overhead in the EventBase. Always
+            // prefer duplicating work in the future above to adding code here.
 
-        if (result.hasException()) {
-          // XXX: This should never happen.
-        } else {
-          auto resultBuffer = std::move(result).value();
-          XLOG(DBG7, "About to write to the socket.");
-          // TODO: Wait until the write completes before considering
-          // the request finished.
-          sock_->writeChain(this, std::move(resultBuffer));
-        }
-      })
-      .ensure([this, guard = std::move(guard)]() {
+            if (result.hasException()) {
+              XLOGF(
+                  DFATAL,
+                  "Unexpected exception in RPC response pipeline: {}",
+                  folly::exceptionStr(result.exception()));
+            } else {
+              auto [resultBuffer, tl] = std::move(result).value();
+              XLOG(DBG7, "About to write to the socket.");
+              auto* writeCb = new RequestWriteCallback(
+                  std::move(tl), this, DestructorGuard(this));
+              sock_->writeChain(writeCb, std::move(resultBuffer));
+            }
+          })
+      .ensure([this, guard = std::move(guard), permit = std::move(permit)]() {
+        (void)permit; // held for RAII lifetime, released when request completes
         XLOG(DBG7, "Request complete");
         auto& state = this->state_.get();
         state.pendingRequests -= 1;
@@ -519,6 +650,11 @@ void RpcConnectionHandler::dispatchAndReply(
           pendingRequestsComplete_.setValue();
         }
       });
+}
+
+void RpcConnectionHandler::recordPhaseTimings(
+    const RpcRequestTimeline& t) noexcept {
+  proc_->onRequestComplete(t);
 }
 
 void RpcServer::connectionAccepted(
@@ -533,7 +669,7 @@ void RpcServer::connectionAccepted(
           proc_,
           std::move(socket),
           threadPool_,
-          structuredLogger_,
+          edenFsEventsLogger_,
           weak_from_this(),
           maximumInFlightRequests_,
           highNfsRequestsLogInterval_));
@@ -580,7 +716,7 @@ std::shared_ptr<RpcServer> RpcServer::create(
     std::shared_ptr<RpcServerProcessor> proc,
     folly::EventBase* evb,
     std::shared_ptr<folly::Executor> threadPool,
-    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
     size_t maximumInFlightRequests,
     std::chrono::nanoseconds highNfsRequestsLogInterval) {
   return std::shared_ptr<RpcServer>{
@@ -588,7 +724,7 @@ std::shared_ptr<RpcServer> RpcServer::create(
           std::move(proc),
           evb,
           std::move(threadPool),
-          structuredLogger,
+          edenFsEventsLogger,
           maximumInFlightRequests,
           highNfsRequestsLogInterval},
       [](RpcServer* p) { p->destroy(); }};
@@ -598,12 +734,12 @@ RpcServer::RpcServer(
     std::shared_ptr<RpcServerProcessor> proc,
     folly::EventBase* evb,
     std::shared_ptr<folly::Executor> threadPool,
-    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
     size_t maximumInFlightRequests,
     std::chrono::nanoseconds highNfsRequestsLogInterval)
     : evb_(evb),
       threadPool_(threadPool),
-      structuredLogger_(structuredLogger),
+      edenFsEventsLogger_(edenFsEventsLogger),
       serverSocket_(new AsyncServerSocket(evb_)),
       proc_(std::move(proc)),
       state_{evb},
@@ -638,7 +774,7 @@ void RpcServer::initializeConnectedSocket(folly::File socket) {
           AsyncSocket::newSocket(
               evb_, folly::NetworkSocket::fromFd(socket.release())),
           threadPool_,
-          structuredLogger_,
+          edenFsEventsLogger_,
           weak_from_this(),
           maximumInFlightRequests_,
           highNfsRequestsLogInterval_));
@@ -651,6 +787,20 @@ void RpcServer::initializeServerSocket(folly::File socket) {
 
   serverSocket_->useExistingSocket(
       folly::NetworkSocket::fromFd(socket.release()));
+  serverSocket_->addAcceptCallback(this, nullptr);
+  serverSocket_->startAccepting();
+}
+
+void RpcServer::resumeAccepting() {
+  evb_->checkIsInEventBaseThread();
+
+  auto& state = state_.get();
+  if (!state.acceptStopped) {
+    return;
+  }
+
+  state.acceptStopped = false;
+
   serverSocket_->addAcceptCallback(this, nullptr);
   serverSocket_->startAccepting();
 }

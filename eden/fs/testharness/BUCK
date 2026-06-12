@@ -30,6 +30,7 @@ cpp_library(
         "//eden/fs/service:pretty_printers",
         "//eden/fs/store:backing_store_interface",
         "//eden/fs/store:store",
+        "//eden/fs/telemetry:error_logger",
         "//eden/fs/telemetry:scribe_logger",
         "//eden/fs/telemetry:stats",
         "//eden/fs/utils:eden_error",
@@ -205,7 +206,9 @@ cpp_library(
         "//eden/fs/store:context",
         "//folly:exception_wrapper",
         "//folly:range",
+        "//folly/container:f14_hash",
         "//folly/coro:task",
+        "//folly/coro/safe:now_task",
     ],
 )
 
@@ -222,6 +225,7 @@ cpp_library(
         "//eden/fs/model:model",
         "//eden/fs/store:context",
         "//eden/fs/store:store",
+        "//folly/coro/safe:now_task",
     ],
 )
 
@@ -230,6 +234,7 @@ cpp_library(
     headers = ["FakeFilter.h"],
     exported_deps = [
         "//eden/fs/store/filter:filters",
+        "//folly/coro/safe:now_task",
     ],
 )
 
@@ -280,10 +285,12 @@ cpp_library(
         "//eden/fs/store:backing_store_interface",
         "//eden/fs/telemetry:activity_recorder",
         "//eden/fs/telemetry:scribe_logger",
+        "//folly/io/async:async_base",
     ],
     exported_deps = [
         "//eden/common/utils:path",
         "//eden/fs/service:startup_status_subscriber",
+        "//folly/futures:core",
         "//folly/testing:test_util",
     ],
     external_deps = [
@@ -314,6 +321,7 @@ cpp_library(
         "//eden/fs/config:config",
         "//eden/fs/inodes:inodes",
         "//eden/fs/notifications:command_notifier",
+        "//eden/fs/telemetry:error_logger",
         "//eden/fs/telemetry:scribe_logger",
         "//eden/fs/telemetry:stats",
         "//folly/executors:manual_executor",

@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use std::env;
 
 use anyhow::Error;
+use gotham::helpers::http::Body;
 use gotham::helpers::http::header::X_REQUEST_ID;
 use gotham::state::State;
-use hyper::Body;
-use hyper::Response;
-use hyper::header::HeaderValue;
+use http::Response;
+use http::header::HeaderValue;
 
 use super::Middleware;
 use crate::state_ext::StateExt;
@@ -42,10 +42,7 @@ impl ServerIdentityMiddleware {
         let tw_job_user = env::var("TW_JOB_USER")?;
         let tw_job_name = env::var("TW_JOB_NAME")?;
         let tw_task_id = env::var("TW_TASK_ID")?;
-        let task = format!(
-            "{}/{}/{}/{}",
-            tw_job_cluster, tw_job_user, tw_job_name, tw_task_id
-        );
+        let task = format!("{tw_job_cluster}/{tw_job_user}/{tw_job_name}/{tw_task_id}");
         let header = HeaderValue::from_str(&task)?;
         headers.insert("X-TW-Task", header);
         Ok(())

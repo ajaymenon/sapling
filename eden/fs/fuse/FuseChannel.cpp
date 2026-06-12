@@ -13,19 +13,30 @@
 #include <folly/futures/Future.h>
 #include <folly/logging/xlog.h>
 #include <folly/system/ThreadName.h>
+#include <re2/re2.h>
+#include <algorithm>
+#if EDEN_HAVE_FUSE_IO_URING
+#include <sys/utsname.h>
+#endif
 #include <chrono>
 #include <csignal>
+#include <exception>
 #include <type_traits>
 
-#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/Bug.h"
 #include "eden/common/utils/IDGen.h"
 #include "eden/common/utils/Synchronized.h"
 #include "eden/common/utils/SystemError.h"
+#include "eden/fs/fuse/DevFuseTransport.h"
 #include "eden/fs/fuse/FuseDirList.h"
 #include "eden/fs/fuse/FuseDispatcher.h"
 #include "eden/fs/fuse/FuseRequestContext.h"
+#include "eden/fs/fuse/FuseTransport.h"
+#include "eden/fs/fuse/IoUringFuseTransport.h"
 #include "eden/fs/privhelper/PrivHelper.h"
+#include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/telemetry/FsEventLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/StaticAssert.h"
@@ -61,6 +72,13 @@ struct FuseArg {
     // Throws std::out_of_range if too small.
     range.advance(sizeof(T));
     return *static_cast<const T*>(data);
+  }
+
+  /**
+   * Skips n bytes without interpreting them.
+   */
+  void skip(size_t n) {
+    range.advance(n);
   }
 
   /**
@@ -155,8 +173,14 @@ constexpr RenderFn release = default_render;
 constexpr RenderFn fsync = default_render;
 
 std::string setxattr(FuseArg arg) {
+#ifdef __linux__
+  // Skip the compat-sized setxattr_in (8 bytes) because EdenFS does not
+  // negotiate FUSE_SETXATTR_EXT, so the kernel sends the old 2-field layout.
+  arg.skip(FUSE_COMPAT_SETXATTR_IN_SIZE);
+#else
   auto& in = arg.read<fuse_setxattr_in>();
   (void)in;
+#endif
   auto name = arg.readz();
   return fmt::format("name={}", name);
 }
@@ -583,7 +607,7 @@ constexpr const HandlerEntry* lookupFuseHandlerEntry(uint32_t opcode) {
   return entry.name.empty() ? nullptr : &entry;
 }
 
-constexpr std::pair<uint32_t, const char*> kCapsLabels[] = {
+constexpr std::pair<uint64_t, const char*> kCapsLabels[] = {
     {FUSE_ASYNC_READ, "ASYNC_READ"},
     {FUSE_POSIX_LOCKS, "POSIX_LOCKS"},
     {FUSE_ATOMIC_O_TRUNC, "ATOMIC_O_TRUNC"},
@@ -622,9 +646,18 @@ constexpr std::pair<uint32_t, const char*> kCapsLabels[] = {
 #ifdef FUSE_NO_OPENDIR_SUPPORT
     {FUSE_NO_OPENDIR_SUPPORT, "NO_OPENDIR_SUPPORT"},
 #endif
+#ifdef FUSE_INIT_EXT
+    {FUSE_INIT_EXT, "INIT_EXT"},
+#endif
+#if EDEN_HAVE_FUSE_IO_URING
+    {FUSE_OVER_IO_URING, "OVER_IO_URING"},
+#endif
+#ifdef FUSE_ALLOW_IDMAP
+    {FUSE_ALLOW_IDMAP, "ALLOW_IDMAP"},
+#endif
 };
 
-std::string capsFlagsToLabel(uint32_t flags) {
+std::string capsFlagsToLabel(uint64_t flags) {
   std::vector<const char*> bits;
   bits.reserve(std::size(kCapsLabels));
   for (const auto& [flag, name] : kCapsLabels) {
@@ -643,6 +676,49 @@ std::string capsFlagsToLabel(uint32_t flags) {
     return str;
   }
   return fmt::format("{} unknown:0x{:x}", str, flags);
+}
+
+folly::exception_wrapper makeTakeoverReadinessStopException(
+    FuseChannel::StopReason reason) {
+  return folly::make_exception_wrapper<std::runtime_error>(fmt::format(
+      "FUSE transport stopped before readiness completed: reason={}",
+      static_cast<int>(reason)));
+}
+
+#if EDEN_HAVE_FUSE_IO_URING
+std::string getRunningKernelRelease() {
+  struct utsname uts = {};
+  if (uname(&uts) != 0) {
+    const auto savedErrno = errno;
+    XLOGF(
+        WARN,
+        "failed to read running kernel release while evaluating FUSE io_uring support: errno={}",
+        savedErrno);
+    return {};
+  }
+  return uts.release;
+}
+#endif
+uint64_t fuseInitFlags(const fuse_init_out& connInfo) {
+  uint64_t flags = connInfo.flags;
+#ifdef FUSE_INIT_EXT
+  if (flags & FUSE_INIT_EXT) {
+    flags |= uint64_t{connInfo.flags2} << 32;
+  }
+#endif
+  return flags;
+}
+
+// fuse:use-io-uring config only gates whether we request FUSE_OVER_IO_URING
+// during FUSE_INIT. After init, including takeover, the transport must follow
+// the capability that was actually negotiated for this FUSE connection.
+bool negotiatedIoUringTransport(const fuse_init_out& connInfo) {
+#if EDEN_HAVE_FUSE_IO_URING
+  return (fuseInitFlags(connInfo) & FUSE_OVER_IO_URING) != 0;
+#else
+  (void)connInfo;
+  return false;
+#endif
 }
 
 void sigusr2Handler(int /* signum */) {
@@ -697,6 +773,27 @@ ProcessAccessLog::AccessType fuseOpcodeAccessType(uint32_t opcode) {
   return entry ? entry->accessType
                : ProcessAccessLog::AccessType::FsChannelOther;
 }
+
+#if EDEN_HAVE_FUSE_IO_URING
+bool FuseChannel::isKernelAllowedForIoUring(
+    folly::StringPiece kernelRelease) const {
+  if (ioUringKernelReleaseRegex_.empty()) {
+    return false;
+  }
+
+  re2::RE2 regex{ioUringKernelReleaseRegex_};
+  if (!regex.ok()) {
+    XLOGF(
+        WARN,
+        "Not negotiating FUSE io_uring because kernel release regex \"{}\" is invalid: {}",
+        ioUringKernelReleaseRegex_,
+        regex.error());
+    return false;
+  }
+
+  return re2::RE2::PartialMatch(kernelRelease.str(), regex);
+}
+#endif
 
 FuseChannel::DataRange::DataRange(int64_t off, int64_t len)
     : offset(off), length(len) {}
@@ -753,24 +850,7 @@ FuseChannel::InvalidationEntry::
 }
 
 void FuseChannel::replyError(const fuse_in_header& request, int errorCode) {
-  fuse_out_header err;
-  err.len = sizeof(err);
-  err.error = -errorCode;
-  err.unique = request.unique;
-  XLOGF(
-      DBG7,
-      "replyError unique={} error={} {}",
-      err.unique,
-      errorCode,
-      folly::errnoStr(errorCode));
-  auto res = write(fuseDevice_.fd(), &err, sizeof(err));
-  if (res != sizeof(err)) {
-    if (res < 0) {
-      throwSystemError("replyError: error writing to fuse device");
-    } else {
-      throw std::runtime_error("unexpected short write to FUSE device");
-    }
-  }
+  transport_->replyError(*this, request, errorCode);
 }
 
 void FuseChannel::sendReply(
@@ -817,6 +897,10 @@ void FuseChannel::sendReply(
 }
 
 void FuseChannel::sendRawReply(const iovec iov[], size_t count) const {
+  transport_->sendRawReply(const_cast<FuseChannel&>(*this), iov, count);
+}
+
+void FuseChannel::sendRawReplyDevFuse(const iovec iov[], size_t count) const {
   // Ensure that the length is set correctly
   XDCHECK_EQ(iov[0].iov_len, sizeof(fuse_out_header));
   const auto header = reinterpret_cast<fuse_out_header*>(iov[0].iov_base);
@@ -857,7 +941,8 @@ FuseChannel::FuseChannel(
     const folly::Logger* straceLogger,
     std::shared_ptr<ProcessInfoCache> processInfoCache,
     std::shared_ptr<FsEventLogger> fsEventLogger,
-    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
+    ErrorLogger& errorLogger,
     folly::Duration requestTimeout,
     std::shared_ptr<Notifier> notifier,
     CaseSensitivity caseSensitive,
@@ -867,14 +952,29 @@ FuseChannel::FuseChannel(
     std::chrono::nanoseconds highFuseRequestsLogInterval,
     std::chrono::nanoseconds longRunningFSRequestThreshold,
     bool useWriteBackCache,
-    size_t fuseTraceBusCapacity)
+    size_t fuseTraceBusCapacity,
+    std::optional<uint32_t> fuseBdiReadAheadKb,
+    uint32_t fuseMaxPages,
+    bool useIoUring,
+    std::string ioUringKernelReleaseRegex,
+    uint32_t ioUringQueueDepth)
     : privHelper_{privHelper},
-      bufferSize_(std::max(size_t(getpagesize()) + 0x1000, MIN_BUFSIZE)),
+      // Pre-allocate based on configured max_pages so the buffer can handle
+      // the larger requests we'll negotiate during FUSE_INIT. This is
+      // optimistic: if the kernel doesn't support FUSE_MAX_PAGES, the buffer
+      // will be larger than necessary but still correct.
+      bufferSize_(
+          std::max(
+              MIN_BUFSIZE,
+              fuseMaxPages > 0
+                  ? size_t(fuseMaxPages) * size_t(getpagesize()) + 0x1000
+                  : size_t(getpagesize()) + 0x1000)),
       threadPool_{std::move(threadPool)},
-      numThreads_(numThreads),
+      configuredWorkerThreadCount_(numThreads),
       dispatcher_(std::move(dispatcher)),
       straceLogger_(straceLogger),
-      structuredLogger_(structuredLogger),
+      edenFsEventsLogger_(edenFsEventsLogger),
+      errorLogger_(errorLogger),
       mountPath_(mountPath),
       requestTimeout_(requestTimeout),
       notifier_(std::move(notifier)),
@@ -885,7 +985,13 @@ FuseChannel::FuseChannel(
       highFuseRequestsLogInterval_{highFuseRequestsLogInterval},
       longRunningFSRequestThreshold_{longRunningFSRequestThreshold},
       useWriteBackCache_{useWriteBackCache},
+      fuseBdiReadAheadKb_{fuseBdiReadAheadKb},
+      fuseMaxPages_{fuseMaxPages},
+      useIoUring_{useIoUring},
+      ioUringKernelReleaseRegex_{std::move(ioUringKernelReleaseRegex)},
+      ioUringQueueDepth_{ioUringQueueDepth},
       fuseDevice_(std::move(fuseDevice)),
+      transport_(std::make_unique<DevFuseTransport>()),
       processAccessLog_(std::move(processInfoCache)),
       traceDetailedArguments_(std::make_shared<std::atomic<size_t>>(0)),
       traceBus_(
@@ -894,15 +1000,17 @@ FuseChannel::FuseChannel(
               fuseTraceBusCapacity)) {
   XLOGF(
       INFO,
-      "Creating FuseChannel: mountPath={}, numThreads={}, caseSensitive={}, requireUtf8={}, maximumBackgroundRequests={}, maximumInFlightRequests={}, useWriteBackCache={}",
+      "Creating FuseChannel: mountPath={}, numThreads={}, caseSensitive={}, requireUtf8={}, maximumBackgroundRequests={}, maximumInFlightRequests={}, useWriteBackCache={}, fuseMaxPages={}",
       mountPath,
       numThreads,
       caseSensitive,
       requireUtf8Path,
       maximumBackgroundRequests,
       maximumInFlightRequests,
-      useWriteBackCache);
-  XCHECK_GE(numThreads_, 1ul);
+      useWriteBackCache,
+      fuseMaxPages_);
+  XCHECK_GE(configuredWorkerThreadCount_, 1ul);
+  updateEffectiveWorkerThreadCount();
   installSignalHandler();
 
   initializeInflightRequestsRateLimiter(maximumInFlightRequests);
@@ -954,36 +1062,149 @@ FuseChannel::~FuseChannel() {
       << "This shared_ptr should not be copied; see attached comment.";
 }
 
+const char* FuseChannel::getTransportName() const {
+  return transport_ ? transport_->getName() : "unknown";
+}
+
+const char* FuseChannel::getDesiredTransportName() const {
+#if EDEN_HAVE_FUSE_IO_URING
+  if (useIoUring_ && isKernelAllowedForIoUring(getRunningKernelRelease())) {
+    return kIoUringFuseTransportName;
+  }
+#endif
+  return kDevFuseTransportName;
+}
+
+void FuseChannel::logTakeoverTransportMismatch(
+    const fuse_init_out& connInfo) const {
+  const char* inheritedTransport = negotiatedIoUringTransport(connInfo)
+      ? kIoUringFuseTransportName
+      : kDevFuseTransportName;
+  const char* desiredTransport = getDesiredTransportName();
+  if (folly::StringPiece{inheritedTransport} == desiredTransport) {
+    return;
+  }
+
+  XLOGF(
+      WARN,
+      "FUSE transport config changed for mount \"{}\": configured transport is {}, but the existing FUSE connection negotiated {}. Graceful restart will preserve the existing {} transport; run a full EdenFS restart to apply the new transport config.",
+      mountPath_,
+      desiredTransport,
+      inheritedTransport,
+      inheritedTransport);
+}
+
+void FuseChannel::dispatchRequestFromTransport(
+    const fuse_in_header& header,
+    folly::ByteRange arg,
+    pid_t myPid) {
+  dispatchRequest(header, arg, myPid);
+}
+
+void FuseChannel::requestSessionExitFromTransport(StopReason reason) {
+  requestSessionExit(reason);
+}
+
+void FuseChannel::notifyTransportWorkerReady(
+    size_t queueId,
+    size_t expectedWorkerCount) {
+  if (!takeoverReadinessStarted_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  const auto readyCount =
+      takeoverReadyWorkerCount_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  XLOGF(
+      DBG6,
+      "FUSE transport worker ready mount={} transport={} queueId={} readyWorkers={} expectedWorkers={}",
+      mountPath_,
+      transport_->getName(),
+      queueId,
+      readyCount,
+      expectedWorkerCount);
+
+  if (readyCount == expectedWorkerCount) {
+    fulfillTakeoverReadiness();
+  } else if (readyCount > expectedWorkerCount) {
+    XLOGF(
+        WARN,
+        "FUSE transport reported more ready workers than expected mount={} transport={} readyWorkers={} expectedWorkers={}",
+        mountPath_,
+        transport_->getName(),
+        readyCount,
+        expectedWorkerCount);
+  }
+}
+
+void FuseChannel::logUnmountEventAndExit() {
+  folly::call_once(unmountLogFlag_, [this] {
+    XLOGF(DBG3, "received unmount event ENODEV on mount {}", mountPath_);
+  });
+  requestSessionExit(StopReason::UNMOUNTED);
+}
+
 Future<FuseChannel::StopFuture> FuseChannel::initialize() {
   // Start one worker thread which will perform the initialization,
   // and will then start the remaining worker threads and signal success
   // once initialization completes.
   return folly::makeFutureWith([&] {
     auto state = state_.wlock();
-    state->workerThreads.reserve(numThreads_);
+    state->workerThreads.reserve(configuredWorkerThreadCount_);
     state->workerThreads.emplace_back([this] { initWorkerThread(); });
     return initPromise_.getFuture();
   });
 }
 
+void FuseChannel::maybeSetFuseReadAhead() {
+  if (fuseBdiReadAheadKb_.has_value()) {
+    privHelper_->setFuseReadAhead(mountPath_.view(), *fuseBdiReadAheadKb_)
+        .thenError([this](folly::exception_wrapper&& ew) {
+          XLOGF(
+              WARN,
+              "Failed to set FUSE read-ahead for {}: {}",
+              mountPath_,
+              ew.what());
+        });
+  }
+}
+
 FuseChannel::StopFuture FuseChannel::initializeFromTakeover(
     fuse_init_out connInfo) {
+  takeoverReadinessStarted_.store(true, std::memory_order_release);
   connInfo_ = connInfo;
+  if (negotiatedIoUringTransport(connInfo)) {
+    transport_ = std::make_unique<IoUringFuseTransport>(ioUringQueueDepth_);
+  }
+  updateEffectiveWorkerThreadCount();
   dispatcher_->initConnection(connInfo);
+  maybeSetFuseReadAhead();
+
   XLOGF(
       DBG1,
-      "Takeover using max_write={}, max_readahead={}, want={}",
+      "Takeover using transport={}, max_write={}, max_readahead={}, want={}",
+      transport_->getName(),
       connInfo_->max_write,
       connInfo_->max_readahead,
-      capsFlagsToLabel(connInfo_->flags));
+      capsFlagsToLabel(fuseInitFlags(*connInfo_)));
   startWorkerThreads();
+  if (!usesIoUringTransport()) {
+    fulfillTakeoverReadiness();
+  }
   return sessionCompletePromise_.getFuture();
+}
+
+folly::Future<folly::Unit> FuseChannel::takeoverReadyFuture() {
+  return takeoverReadyPromise_.getFuture();
 }
 
 folly::SemiFuture<folly::Unit> FuseChannel::unmount(UnmountOptions options) {
   // TODO: This does not handle the situation where the mount has been moved by,
   // for example, renaming a parent directory, or `mount --move`.
-  return privHelper_->fuseUnmount(mountPath_.view(), options);
+  return privHelper_->fuseUnmount(mountPath_.view(), options)
+      .thenTry([this](Try<Unit>&& result) {
+        requestSessionExit(StopReason::UNMOUNTED);
+        return std::move(result);
+      });
 }
 
 void FuseChannel::startWorkerThreads() {
@@ -1001,8 +1222,8 @@ void FuseChannel::startWorkerThreads() {
   }
 
   try {
-    state->workerThreads.reserve(numThreads_);
-    while (state->workerThreads.size() < numThreads_) {
+    state->workerThreads.reserve(effectiveWorkerThreadCount_);
+    while (state->workerThreads.size() < effectiveWorkerThreadCount_) {
       state->workerThreads.emplace_back([this] { fuseWorkerThread(); });
     }
 
@@ -1010,7 +1231,13 @@ void FuseChannel::startWorkerThreads() {
   } catch (const std::exception& ex) {
     XLOGF(ERR, "Error starting FUSE worker threads: {}", exceptionStr(ex));
     // Request any threads we did start to stop now.
-    requestSessionExit(state, StopReason::INIT_FAILED);
+    const auto shouldFailTakeoverReadiness =
+        requestSessionExitLocked(state, StopReason::INIT_FAILED);
+    state.unlock();
+    if (shouldFailTakeoverReadiness) {
+      failTakeoverReadiness(
+          makeTakeoverReadinessStopException(StopReason::INIT_FAILED));
+    }
     stopInvalidationThread();
     throw;
   }
@@ -1018,10 +1245,16 @@ void FuseChannel::startWorkerThreads() {
 
 void FuseChannel::destroy() {
   std::vector<std::thread> threads;
+  bool shouldFailTakeoverReadiness = false;
   {
     auto state = state_.wlock();
-    requestSessionExit(state, StopReason::DESTRUCTOR);
+    shouldFailTakeoverReadiness =
+        requestSessionExitLocked(state, StopReason::DESTRUCTOR);
     threads.swap(state->workerThreads);
+  }
+  if (shouldFailTakeoverReadiness) {
+    failTakeoverReadiness(
+        makeTakeoverReadinessStopException(StopReason::DESTRUCTOR));
   }
 
   for (auto& thread : threads) {
@@ -1137,6 +1370,8 @@ void FuseChannel::sendInvalidation(InvalidationEntry& entry) {
           "error sending invalidation request: {}:{}",
           entry,
           folly::exceptionStr(ex));
+      errorLogger_.log(
+          EdenErrorInfo::fuse(ex, entry.inode.get(), mountPath_.asString()));
     }
   } catch (const std::exception& ex) {
     XLOGF(
@@ -1144,6 +1379,8 @@ void FuseChannel::sendInvalidation(InvalidationEntry& entry) {
         "error sending invalidation request: {}:{}",
         entry,
         folly::exceptionStr(ex));
+    errorLogger_.log(
+        EdenErrorInfo::fuse(ex, entry.inode.get(), mountPath_.asString()));
   }
 }
 
@@ -1175,7 +1412,9 @@ void FuseChannel::sendInvalidateInode(
   iov[1].iov_len = sizeof(notify);
 
   try {
-    sendRawReply(iov.data(), iov.size());
+    // Invalidation are always send over devfuse (not io_uring). Then we don't
+    // use transport to send the requests.
+    sendRawReplyDevFuse(iov.data(), iov.size());
     XLOGF(
         DBG7, "sendInvalidateInode(ino={}, off={}, len={}) OK!", ino, off, len);
   } catch (const std::system_error& exc) {
@@ -1243,7 +1482,9 @@ void FuseChannel::sendInvalidateEntry(
   iov[3].iov_len = 1;
 
   try {
-    sendRawReply(iov.data(), iov.size());
+    // Invalidation are always send over devfuse (not io_uring). Then we don't
+    // use transport to send the requests.
+    sendRawReplyDevFuse(iov.data(), iov.size());
   } catch (const std::system_error& exc) {
     // Ignore ENOENT.  This can happen for inode numbers that we allocated on
     // our own and haven't actually told the kernel about yet.
@@ -1289,10 +1530,29 @@ TraceDetailedArgumentsHandle FuseChannel::traceDetailedArguments() const {
 }
 
 void FuseChannel::requestSessionExit(StopReason reason) {
-  requestSessionExit(state_.wlock(), reason);
+  const auto shouldFailTakeoverReadiness = [&] {
+    auto state = state_.wlock();
+    return requestSessionExitLocked(state, reason);
+  }();
+  if (shouldFailTakeoverReadiness) {
+    failTakeoverReadiness(makeTakeoverReadinessStopException(reason));
+  }
 }
 
-void FuseChannel::requestSessionExit(
+void FuseChannel::requestTransportStopWakeup() {
+  try {
+    transport_->requestStopWakeup();
+  } catch (const std::exception& ex) {
+    XLOGF(
+        WARN,
+        "failed to wake FUSE transport {} during shutdown for {}: {}",
+        transport_->getName(),
+        mountPath_,
+        exceptionStr(ex));
+  }
+}
+
+bool FuseChannel::requestSessionExitLocked(
     const Synchronized<State>::LockedPtr& state,
     StopReason reason) {
   // We have already been asked to stop before.
@@ -1303,7 +1563,7 @@ void FuseChannel::requestSessionExit(
         !isFuseDeviceValid(state->stopReason)) {
       state->stopReason = reason;
     }
-    return;
+    return false;
   }
 
   // This was the first time requestSessionExit has been called.
@@ -1313,6 +1573,8 @@ void FuseChannel::requestSessionExit(
 
   // Update stop_ so that worker threads will break out of their loop.
   stop_.store(true, std::memory_order_relaxed);
+
+  requestTransportStopWakeup();
 
   // Send a signal to knock our workers out of their blocking read() syscalls
   // TODO: This code is slightly racy, since threads could receive the signal
@@ -1324,6 +1586,7 @@ void FuseChannel::requestSessionExit(
       pthread_kill(thr.native_handle(), SIGUSR2);
     }
   }
+  return true;
 }
 
 void FuseChannel::setThreadSigmask() {
@@ -1342,15 +1605,36 @@ void FuseChannel::initWorkerThread() noexcept {
   try {
     setThreadSigmask();
     setThreadName(fmt::format("fuse{}", mountPath_.basename()));
+    XLOGF(
+        DBG6,
+        "Fuse init worker starting for mount={} transport={} useIoUringConfig={}",
+        mountPath_,
+        transport_->getName(),
+        useIoUring_);
 
     // Read the INIT packet
     readInitPacket();
+    XLOGF(
+        DBG6,
+        "Fuse init handshake completed for mount={} negotiated transport={}",
+        mountPath_,
+        transport_->getName());
 
     // Start the other FUSE worker threads.
     startWorkerThreads();
+    XLOGF(
+        DBG6,
+        "Fuse worker threads started for mount={} threadCount={} transport={}",
+        mountPath_,
+        effectiveWorkerThreadCount_,
+        transport_->getName());
   } catch (...) {
     auto ew = folly::exception_wrapper(std::current_exception());
     XLOGF(ERR, "Error performing FUSE channel initialization: {}", ew);
+    ew.with_exception([&](const std::exception& ex) {
+      errorLogger_.log(
+          EdenErrorInfo::fuse(ex, std::nullopt, mountPath_.asString()));
+    });
     // Indicate that initialization failed.
     initPromise_.setException(std::move(ew));
     return;
@@ -1374,6 +1658,9 @@ void FuseChannel::fuseWorkerThread() noexcept {
     processSession();
   } catch (const std::exception& ex) {
     XLOGF(ERR, "unexpected error in FUSE worker thread: {}", exceptionStr(ex));
+    errorLogger_.log(
+        EdenErrorInfo::fuse(ex, std::nullopt, mountPath_.asString()));
+    failTakeoverReadiness(folly::exception_wrapper(std::current_exception()));
     // Request that all other FUSE threads exit.
     // This will cause us to stop processing the mount and signal our session
     // complete future.
@@ -1393,7 +1680,8 @@ void FuseChannel::fuseWorkerThread() noexcept {
     // but there are still outstanding requests we will invoke
     // sessionComplete() when we process the final stage of the request
     // processing for the last request.
-    if (state->stoppedThreads == numThreads_ && state->pendingRequests == 0) {
+    if (state->stoppedThreads == effectiveWorkerThreadCount_ &&
+        state->pendingRequests == 0) {
       sessionComplete(std::move(state));
     }
   }
@@ -1460,7 +1748,7 @@ void FuseChannel::readInitPacket() {
     // https://github.com/torvalds/linux/commit/1fb027d7596464d3fad3ed59f70f43807ef926c6
     // we have to request at least 8KB even for the init request
     char padding_[FUSE_MIN_READ_BUFFER];
-  } init;
+  } init = {};
 
   // Loop until we receive the INIT packet, or until we are stopped.
   while (true) {
@@ -1471,7 +1759,8 @@ void FuseChannel::readInitPacket() {
           "\" stopped while waiting for INIT packet");
     }
 
-    auto res = read(fuseDevice_.fd(), &init, sizeof(init));
+    auto res =
+        transport_->readInitPacket(fuseDevice_.fd(), &init, sizeof(init));
     if (res < 0) {
       int errnum = errno;
       if (stop_.load(std::memory_order_relaxed)) {
@@ -1502,11 +1791,18 @@ void FuseChannel::readInitPacket() {
       throw FuseDeviceUnmountedDuringInitialization(mountPath_);
     }
 
-    // Error out if the kernel sends less data than we expected.
-    // We currently don't error out for now if we receive more data: maybe this
-    // could happen for future kernel versions that speak a newer FUSE protocol
-    // with extra fields in fuse_init_in?
-    if (static_cast<size_t>(res) < sizeof(init) - sizeof(init.padding_)) {
+    // Error out if the kernel sends less data than the minimum INIT packet.
+#ifdef __linux__
+    // On Linux, use the compat size (16 bytes) for the original fuse_init_in
+    // before flags2 was added. Newer kernels may send a larger fuse_init_in
+    // with flags2, which we accept but don't require.
+    if (static_cast<size_t>(res) <
+        sizeof(init.header) + FUSE_COMPAT_INIT_IN_SIZE)
+#else
+    // On macOS (osxfuse), fuse_init_in is fixed at 16 bytes.
+    if (static_cast<size_t>(res) < sizeof(init) - sizeof(init.padding_))
+#endif
+    {
       throw_<std::runtime_error>(
           "received partial FUSE_INIT packet on mount \"",
           mountPath_,
@@ -1549,8 +1845,13 @@ void FuseChannel::readInitPacket() {
   // Allow the kernel to default connInfo.congestion_threshold. Linux
   // picks 3/4 of max_background.
 
-  const auto capable = init.init.flags;
-  auto& want = connInfo.flags;
+  uint64_t capable = init.init.flags;
+#ifdef FUSE_INIT_EXT
+  if (capable & FUSE_INIT_EXT) {
+    capable |= uint64_t{init.init.flags2} << 32;
+  }
+#endif
+  uint64_t want = 0;
 
   // TODO: follow up and look at the new flags; particularly
   // FUSE_DO_READDIRPLUS, FUSE_READDIRPLUS_AUTO. FUSE_SPLICE_XXX are interesting
@@ -1580,6 +1881,15 @@ void FuseChannel::readInitPacket() {
   want |= FUSE_PARALLEL_DIROPS;
 #endif
 
+#ifdef FUSE_MAX_PAGES
+  if (fuseMaxPages_ > 0) {
+    // Allow the kernel to send larger read requests (up to max_pages *
+    // PAGE_SIZE). Default max_pages=32 caps reads at 128KB. Setting this flag
+    // lets us configure max_pages in the FUSE_INIT response.
+    want |= FUSE_MAX_PAGES;
+  }
+#endif
+
 #ifdef FUSE_WRITEBACK_CACHE
   if (useWriteBackCache_) {
     // Writes go to the cache then write back to the underlying fs.
@@ -1607,21 +1917,58 @@ void FuseChannel::readInitPacket() {
   (void)caseSensitive_;
 #endif
 
-  // Only return the capabilities the kernel supports.
-  want &= capable;
+#ifdef FUSE_ALLOW_IDMAP
+  // Allow processes whose uid/gid doesn't map into our user namespace to
+  // access this mount. Without this, the kernel FUSE layer rejects requests
+  // from such processes with EOVERFLOW.
+  want |= FUSE_ALLOW_IDMAP;
+#endif
 
-  XLOGF(
-      DBG1,
-      "Speaking fuse protocol kernel={}.{} local={}.{} on mount \"{}\", max_write={}, max_readahead={}, capable={}, want={}",
-      init.init.major,
-      init.init.minor,
-      FUSE_KERNEL_VERSION,
-      FUSE_KERNEL_MINOR_VERSION,
-      mountPath_,
-      connInfo.max_write,
-      connInfo.max_readahead,
-      capsFlagsToLabel(capable),
-      capsFlagsToLabel(want));
+  // Only return the capabilities the kernel supports.
+#if EDEN_HAVE_FUSE_IO_URING
+  if (useIoUring_) {
+    const auto kernelRelease = getRunningKernelRelease();
+    if (isKernelAllowedForIoUring(kernelRelease)) {
+      want |= FUSE_OVER_IO_URING;
+    } else {
+      XLOGF(
+          DBG1,
+          "Not negotiating FUSE io_uring on mount \"{}\": kernel release \"{}\" does not match configured regex \"{}\"",
+          mountPath_,
+          kernelRelease,
+          ioUringKernelReleaseRegex_);
+    }
+  }
+#else
+  (void)useIoUring_;
+#endif
+
+#ifdef FUSE_INIT_EXT
+  if (want & 0xffffffff00000000ULL) {
+    want |= FUSE_INIT_EXT;
+  }
+#endif
+
+  want &= capable;
+  connInfo.flags = static_cast<uint32_t>(want);
+#ifdef FUSE_INIT_EXT
+  connInfo.flags2 = static_cast<uint32_t>(want >> 32);
+#endif
+
+#ifdef FUSE_MAX_PAGES
+  // Set max_pages only if the kernel actually supports FUSE_MAX_PAGES
+  // (the flag survived the want &= capable check above).
+  if (fuseMaxPages_ > 0 && (want & FUSE_MAX_PAGES)) {
+    connInfo.max_pages =
+        static_cast<uint16_t>(std::min(fuseMaxPages_, uint32_t(256)));
+  }
+#endif
+
+#ifdef FUSE_MAX_PAGES
+  const auto logMaxPages = connInfo.max_pages;
+#else
+  const auto logMaxPages = 0;
+#endif
 
   if (init.init.major != FUSE_KERNEL_VERSION) {
     replyError(init.header, EPROTO);
@@ -1668,351 +2015,384 @@ void FuseChannel::readInitPacket() {
   sendReply(init.header, connInfo);
 #endif
 
+  if (negotiatedIoUringTransport(connInfo)) {
+    XLOGF(
+        DBG1,
+        "Switching mount={} transport from {} to io_uring queueDepth={}",
+        mountPath_,
+        transport_->getName(),
+        ioUringQueueDepth_);
+    transport_ = std::make_unique<IoUringFuseTransport>(ioUringQueueDepth_);
+  }
+  updateEffectiveWorkerThreadCount();
+
+  XLOGF(
+      DBG1,
+      "Speaking fuse protocol kernel={}.{} local={}.{} on mount \"{}\" via {}, max_write={}, max_readahead={}, max_pages={}, capable={}, want={}",
+      init.init.major,
+      init.init.minor,
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      mountPath_,
+      transport_->getName(),
+      connInfo.max_write,
+      connInfo.max_readahead,
+      logMaxPages,
+      capsFlagsToLabel(capable),
+      capsFlagsToLabel(want));
+
   dispatcher_->initConnection(connInfo);
+  maybeSetFuseReadAhead();
 }
 
 void FuseChannel::processSession() {
-  std::vector<char> buf(bufferSize_);
-  // Save this for the sanity check later in the loop to avoid
-  // additional syscalls on each loop iteration.
-  auto myPid = getpid();
+  transport_->processSession(*this);
+}
 
-  while (!stop_.load(std::memory_order_relaxed)) {
-    // TODO: FUSE_SPLICE_READ allows using splice(2) here if we enable it.
-    // We can look at turning this on once the main plumbing is complete.
-    auto res = read(fuseDevice_.fd(), buf.data(), buf.size());
-    if (UNLIKELY(res < 0)) {
-      int error = errno;
-      if (stop_.load(std::memory_order_relaxed)) {
-        break;
-      }
+bool FuseChannel::usesIoUringTransport() const {
+  return dynamic_cast<IoUringFuseTransport*>(transport_.get()) != nullptr;
+}
 
-      if (error == EINTR || error == EAGAIN) {
-        // If we got interrupted by a signal while reading the next
-        // fuse command, we will simply retry and read the next thing.
-        continue;
-      } else if (error == ENOENT) {
-        // According to comments in the libfuse code:
-        // ENOENT means the operation was interrupted; it's safe to restart
-        continue;
-      } else if (error == ENODEV) {
-        // ENODEV means the filesystem was unmounted
-        folly::call_once(unmountLogFlag_, [this] {
-          XLOGF(DBG3, "received unmount event ENODEV on mount {}", mountPath_);
-        });
-        requestSessionExit(StopReason::UNMOUNTED);
-        break;
-      } else {
-        XLOGF(
-            WARNING,
-            "error reading from fuse channel: {}",
-            folly::errnoStr(error));
-        requestSessionExit(StopReason::FUSE_READ_ERROR);
+void FuseChannel::fulfillTakeoverReadiness() {
+  if (!takeoverReadinessStarted_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (takeoverReadyFinished_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  XLOGF(
+      DBG6,
+      "FUSE transport ready mount={} transport={} readyWorkers={}",
+      mountPath_,
+      transport_->getName(),
+      takeoverReadyWorkerCount_.load(std::memory_order_acquire));
+  takeoverReadyPromise_.setValue();
+}
+
+void FuseChannel::failTakeoverReadiness(folly::exception_wrapper&& ew) {
+  if (!takeoverReadinessStarted_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (takeoverReadyFinished_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  XLOGF(
+      WARN,
+      "FUSE transport readiness failed mount={} transport={}: {}",
+      mountPath_,
+      transport_->getName(),
+      ew.what());
+  takeoverReadyPromise_.setException(std::move(ew));
+}
+
+void FuseChannel::updateEffectiveWorkerThreadCount() {
+  effectiveWorkerThreadCount_ =
+      transport_->getWorkerThreadCount(configuredWorkerThreadCount_);
+}
+
+void FuseChannel::dispatchRequest(
+    const fuse_in_header& header,
+    ByteRange arg,
+    pid_t myPid) {
+  XLOGF(
+      DBG7,
+      "fuse request opcode={} {} unique={} len={} nodeid={} uid={} gid={} pid={}",
+      header.opcode,
+      fuseOpcodeName(header.opcode),
+      header.unique,
+      header.len,
+      header.nodeid,
+      header.uid,
+      header.gid,
+      header.pid);
+
+  // On Linux, if security caps are enabled and the FUSE filesystem implements
+  // xattr support, every FUSE_WRITE opcode is preceded by FUSE_GETXATTR for
+  // "security.capability". Until we discover a way to tell the kernel that
+  // they will always return nothing in an Eden mount, short-circuit that path
+  // as efficiently and as early as possible.
+  //
+  // On some systems, the kernel also frequently requests
+  // POSIX ACL xattrs, so fast track those too, if only to make strace
+  // logs easier to follow.
+  if (header.opcode == FUSE_GETXATTR) {
+    const auto getxattr = reinterpret_cast<const fuse_getxattr_in*>(arg.data());
+
+    // Evaluate strlen before the comparison loop below.
+    const StringPiece namePiece{reinterpret_cast<const char*>(getxattr + 1)};
+    static constexpr StringPiece kFastTracks[] = {
+        "security.capability",
+        "security.selinux",
+        "system.posix_acl_access",
+        "system.posix_acl_default"};
+
+    // Unclear whether one strlen and matching compares is better than
+    // strcmps, but it's probably in the noise.
+    bool matched = false;
+    for (auto fastTrack : kFastTracks) {
+      if (namePiece == fastTrack) {
+        replyError(header, ENODATA);
+        matched = true;
         break;
       }
     }
-
-    const auto arg_size = static_cast<size_t>(res);
-    if (arg_size < sizeof(struct fuse_in_header)) {
-      if (arg_size == 0) {
-        // This code path is hit when a fake FUSE channel is closed in our unit
-        // tests.  On real FUSE channels we should get ENODEV to indicate that
-        // the FUSE channel was shut down.  However, in our unit tests that use
-        // fake FUSE connections we cannot send an ENODEV error, and so we just
-        // close the channel instead.
-        requestSessionExit(StopReason::UNMOUNTED);
-      } else {
-        // We got a partial FUSE header.  This shouldn't ever happen unless
-        // there is a bug in the FUSE kernel code.
-        XLOGF(
-            ERR,
-            "read truncated message from kernel fuse device: len={}",
-            arg_size);
-        requestSessionExit(StopReason::FUSE_TRUNCATED_REQUEST);
-      }
+    if (matched) {
       return;
     }
+  }
 
-    const auto* header = reinterpret_cast<fuse_in_header*>(buf.data());
-    const ByteRange arg{
-        reinterpret_cast<const uint8_t*>(header + 1),
-        arg_size - sizeof(fuse_in_header)};
-
+  // Sanity check to ensure that the request wasn't from ourself.
+  //
+  // We should never make requests to ourself via normal filesystem
+  // operations going through the kernel.  Otherwise we risk deadlocks if the
+  // kernel calls us while holding an inode lock, and we then end up making a
+  // filesystem call that need the same inode lock.  We will then not be able
+  // to resolve this deadlock on kernel inode locks without rebooting the
+  // system.
+  if (UNLIKELY(static_cast<pid_t>(header.pid) == myPid)) {
+    replyError(header, EIO);
     XLOGF(
-        DBG7,
-        "fuse request opcode={} {} unique={} len={} nodeid={} uid={} gid={} pid={}",
-        header->opcode,
-        fuseOpcodeName(header->opcode),
-        header->unique,
-        header->len,
-        header->nodeid,
-        header->uid,
-        header->gid,
-        header->pid);
+        CRITICAL,
+        "Received FUSE request from our own pid: opcode={} nodeid={} pid={}",
+        header.opcode,
+        header.nodeid,
+        header.pid);
+    return;
+  }
 
-    // On Linux, if security caps are enabled and the FUSE filesystem implements
-    // xattr support, every FUSE_WRITE opcode is preceded by FUSE_GETXATTR for
-    // "security.capability". Until we discover a way to tell the kernel that
-    // they will always return nothing in an Eden mount, short-circuit that path
-    // as efficiently and as early as possible.
-    //
-    // On some systems, the kernel also frequently requests
-    // POSIX ACL xattrs, so fast track those too, if only to make strace
-    // logs easier to follow.
-    if (header->opcode == FUSE_GETXATTR) {
-      const auto getxattr =
-          reinterpret_cast<const fuse_getxattr_in*>(arg.data());
+  auto* handlerEntry = lookupFuseHandlerEntry(header.opcode);
+  processAccessLog_.recordAccess(
+      header.pid,
+      handlerEntry ? handlerEntry->accessType : AccessType::FsChannelOther);
 
-      // Evaluate strlen before the comparison loop below.
-      const StringPiece namePiece{reinterpret_cast<const char*>(getxattr + 1)};
-      static constexpr StringPiece kFastTracks[] = {
-          "security.capability",
-          "security.selinux",
-          "system.posix_acl_access",
-          "system.posix_acl_default"};
+  switch (header.opcode) {
+    case FUSE_INIT:
+      replyError(header, EPROTO);
+      throw std::runtime_error(
+          "received FUSE_INIT after we have been initialized!?");
 
-      // Unclear whether one strlen and matching compares is better than
-      // strcmps, but it's probably in the noise.
-      bool matched = false;
-      for (auto fastTrack : kFastTracks) {
-        if (namePiece == fastTrack) {
-          replyError(*header, ENODATA);
-          matched = true;
-          break;
-        }
-      }
-      if (matched) {
-        continue;
-      }
-    }
-
-    // Sanity check to ensure that the request wasn't from ourself.
-    //
-    // We should never make requests to ourself via normal filesystem
-    // operations going through the kernel.  Otherwise we risk deadlocks if the
-    // kernel calls us while holding an inode lock, and we then end up making a
-    // filesystem call that need the same inode lock.  We will then not be able
-    // to resolve this deadlock on kernel inode locks without rebooting the
-    // system.
-    if (UNLIKELY(static_cast<pid_t>(header->pid) == myPid)) {
-      replyError(*header, EIO);
-      XLOGF(
-          CRITICAL,
-          "Received FUSE request from our own pid: opcode={} nodeid={} pid={}",
-          header->opcode,
-          header->nodeid,
-          header->pid);
-      continue;
-    }
-
-    auto* handlerEntry = lookupFuseHandlerEntry(header->opcode);
-    processAccessLog_.recordAccess(
-        header->pid,
-        handlerEntry ? handlerEntry->accessType : AccessType::FsChannelOther);
-
-    switch (header->opcode) {
-      case FUSE_INIT:
-        replyError(*header, EPROTO);
-        throw std::runtime_error(
-            "received FUSE_INIT after we have been initialized!?");
-
-      case FUSE_GETLK:
-      case FUSE_SETLK:
-      case FUSE_SETLKW:
-        // Deliberately not handling locking; this causes
-        // the kernel to do it for us
-        XLOG(DBG7, fuseOpcodeName(header->opcode));
-        replyError(*header, ENOSYS);
-        break;
+    case FUSE_GETLK:
+    case FUSE_SETLK:
+    case FUSE_SETLKW:
+      // Deliberately not handling locking; this causes
+      // the kernel to do it for us
+      XLOG(DBG7, fuseOpcodeName(header.opcode));
+      replyError(header, ENOSYS);
+      break;
 
 #ifdef __linux__
-      case FUSE_LSEEK:
-        // We only support stateless file handles, so lseek() is meaningless
-        // for us.  Returning ENOSYS causes the kernel to implement it for us,
-        // and will cause it to stop sending subsequent FUSE_LSEEK requests.
-        XLOG(DBG7, "FUSE_LSEEK");
-        replyError(*header, ENOSYS);
-        break;
+    case FUSE_LSEEK:
+      // We only support stateless file handles, so lseek() is meaningless
+      // for us.  Returning ENOSYS causes the kernel to implement it for us,
+      // and will cause it to stop sending subsequent FUSE_LSEEK requests.
+      XLOG(DBG7, "FUSE_LSEEK");
+      replyError(header, ENOSYS);
+      break;
 #endif
 
-      case FUSE_POLL:
-        // We do not currently implement FUSE_POLL.
-        XLOG(DBG7, "FUSE_POLL");
-        replyError(*header, ENOSYS);
-        break;
+    case FUSE_POLL:
+      // We do not currently implement FUSE_POLL.
+      XLOG(DBG7, "FUSE_POLL");
+      replyError(header, ENOSYS);
+      break;
 
-      case FUSE_INTERRUPT: {
-        // no reply is required
-        XLOG(DBG7, "FUSE_INTERRUPT");
-        // Ignore it: we don't have a reliable way to guarantee
-        // that interrupting functions correctly.
-        // In addition, the kernel (certainly on macOS) may recycle
-        // ids too quickly for us to safely track by `unique` id.
-        break;
+    case FUSE_INTERRUPT:
+      // no reply is required
+      XLOG(DBG7, "FUSE_INTERRUPT");
+      // Ignore it: we don't have a reliable way to guarantee
+      // that interrupting functions correctly.
+      // In addition, the kernel (certainly on macOS) may recycle
+      // ids too quickly for us to safely track by `unique` id.
+      if (usesIoUringTransport()) {
+        // Classic /dev/fuse can treat this as a true no-reply request.
+        // io_uring cannot: each decoded kernel request owns a ring entry that
+        // stays outstanding until we submit a commit back through io_uring.
+        // Sending a synthetic success reply is how we drive that commit path
+        // and return the entry to the kernel so it can fetch the next request.
+        replyError(header, 0);
       }
+      break;
 
-      case FUSE_DESTROY:
-        XLOG(DBG7, "FUSE_DESTROY");
-        dispatcher_->destroy();
-        // FUSE on linux doesn't care whether we reply to FUSE_DESTROY
-        // but the macOS implementation blocks the unmount syscall until
-        // we have responded, which in turn blocks our attempt to gracefully
-        // unmount, so we respond here.  It doesn't hurt Linux to respond
-        // so we do it for both platforms.
-        replyError(*header, 0);
-        break;
+    case FUSE_DESTROY:
+      XLOG(DBG7, "FUSE_DESTROY");
+      dispatcher_->destroy();
+      // FUSE on linux doesn't care whether we reply to FUSE_DESTROY
+      // but the macOS implementation blocks the unmount syscall until
+      // we have responded, which in turn blocks our attempt to gracefully
+      // unmount, so we respond here.  It doesn't hurt Linux to respond
+      // so we do it for both platforms.
+      replyError(header, 0);
+      break;
 
-      case FUSE_NOTIFY_REPLY:
-        XLOG(DBG7, "FUSE_NOTIFY_REPLY");
-        // Don't strictly need to do anything here, but may want to
-        // turn the kernel notifications in Futures and use this as
-        // a way to fulfil the promise
-        break;
+    case FUSE_NOTIFY_REPLY:
+      XLOG(DBG7, "FUSE_NOTIFY_REPLY");
+      // Don't strictly need to do anything here, but may want to
+      // turn the kernel notifications in Futures and use this as
+      // a way to fulfil the promise
+      if (usesIoUringTransport()) {
+        // Classic /dev/fuse can drop this on the floor, but io_uring must
+        // still commit the outstanding ring entry for this request. A
+        // zero-error reply is the transport-level completion that recycles the
+        // entry and lets the kernel post another fetch on it.
+        replyError(header, 0);
+      }
+      break;
 
-      case FUSE_IOCTL:
-        // Rather than the default ENOSYS, we need to return ENOTTY
-        // to indicate that the requested ioctl is not supported
-        replyError(*header, ENOTTY);
-        break;
+    case FUSE_IOCTL:
+      // Rather than the default ENOSYS, we need to return ENOTTY
+      // to indicate that the requested ioctl is not supported
+      replyError(header, ENOTTY);
+      break;
 
-      default: {
-        if (handlerEntry && handlerEntry->handler) {
-          auto requestId = generateUniqueID();
-          if (handlerEntry->argRenderer &&
-              traceDetailedArguments_->load(std::memory_order_acquire)) {
-            traceBus_->publish(
-                FuseTraceEvent::start(
-                    requestId, *header, handlerEntry->argRenderer(arg)));
-          } else {
-            traceBus_->publish(FuseTraceEvent::start(requestId, *header));
+    default: {
+      if (handlerEntry && handlerEntry->handler) {
+        auto requestId = generateUniqueID();
+        if (handlerEntry->argRenderer &&
+            traceDetailedArguments_->load(std::memory_order_acquire)) {
+          traceBus_->publish(
+              FuseTraceEvent::start(
+                  requestId, header, handlerEntry->argRenderer(arg)));
+        } else {
+          traceBus_->publish(FuseTraceEvent::start(requestId, header));
+        }
+
+        // Acquire a RequestPermit before executing the FUSE request. This
+        // function will block if there are too many inflight requests. This
+        // needs to be captured in the ensure block to ensure the permit is
+        // only destroyed after the request has finished
+        auto requestPermit = acquireFsRequestPermit();
+
+        // This is a shared_ptr because, due to timeouts, the internal request
+        // lifetime may not match the FUSE request lifetime, so we capture it
+        // in both. I'm sure this could be improved with some cleverness.
+        auto request = std::make_shared<FuseRequestContext>(this, header);
+
+        auto now = std::chrono::steady_clock::now();
+        auto should_log = false;
+        {
+          auto state = state_.wlock();
+          ++state->pendingRequests;
+
+          // TODO(helsel): Use the rate limiter to log when the maximum number
+          // of inflight requests are hit instead of keeping track of pending
+          // requests separately.
+          if (maximumInFlightRequests_ > 0 &&
+              state->pendingRequests == maximumInFlightRequests_ &&
+              now >= state->lastHighFuseRequestsLog_ +
+                      highFuseRequestsLogInterval_) {
+            should_log = true;
+            state->lastHighFuseRequestsLog_ = now;
           }
+        }
 
-          // Acquire a RequestPermit before executing the FUSE request. This
-          // function will block if there are too many inflight requests. This
-          // needs to be captured in the ensure block to ensure the permit is
-          // only destroyed after the request has finished
-          auto requestPermit = acquireFsRequestPermit();
+        if (should_log && this->edenFsEventsLogger_) {
+          this->edenFsEventsLogger_->logEvent(ManyLiveFsChannelRequests{});
+        }
 
-          // This is a shared_ptr because, due to timeouts, the internal request
-          // lifetime may not match the FUSE request lifetime, so we capture it
-          // in both. I'm sure this could be improved with some cleverness.
-          auto request = std::make_shared<FuseRequestContext>(this, *header);
+        auto headerCopy = header;
 
-          auto now = std::chrono::steady_clock::now();
-          auto should_log = false;
-          {
-            auto state = state_.wlock();
-            ++state->pendingRequests;
-
-            // TODO(helsel): Use the rate limiter to log when the maximum number
-            // of inflight requests are hit instead of keeping track of pending
-            // requests separately.
-            if (maximumInFlightRequests_ > 0 &&
-                state->pendingRequests == maximumInFlightRequests_ &&
-                now >= state->lastHighFuseRequestsLog_ +
-                        highFuseRequestsLogInterval_) {
-              should_log = true;
-              state->lastHighFuseRequestsLog_ = now;
-            }
+        FB_LOG(*straceLogger_, DBG7, ([&]() -> std::string {
+          std::string rendered;
+          if (handlerEntry->argRenderer) {
+            rendered = handlerEntry->argRenderer(arg);
           }
+          return fmt::format(
+              "{}({}{}{})",
+              handlerEntry->getShortName(),
+              headerCopy.nodeid,
+              rendered.empty() ? "" : ", ",
+              rendered);
+        })());
 
-          if (should_log) {
-            this->structuredLogger_->logEvent(ManyLiveFsChannelRequests{});
-          }
+        request
+            ->catchErrors(
+                folly::makeFutureWith([&] {
+                  request->startRequest(
+                      dispatcher_->getStats().copy(),
+                      handlerEntry->duration,
+                      *(liveRequestWatches_.get()));
+                  auto fut = (this->*handlerEntry->handler)(
+                      *request, request->getReq(), arg);
+                  if (fut.isReady()) {
+                    // In the case where the handler executed immediately,
+                    // let's avoid an expensive context switch by simply
+                    // extracting the value from the future.
+                    return folly::makeFuture<folly::Unit>(std::move(fut).get());
+                  } else {
+                    return std::move(fut).semi().via(threadPool_.get());
+                  }
+                }).ensure([request] {
+                  }).within(requestTimeout_),
+                notifier_.get(),
+                dispatcher_->getStats().copy(),
+                handlerEntry->countSuccessful,
+                handlerEntry->countFailure)
+            .ensure([this,
+                     request,
+                     requestId,
+                     headerCopy,
+                     requestPermit = std::move(requestPermit)] {
+              traceBus_->publish(
+                  FuseTraceEvent::finish(
+                      requestId, headerCopy, request->getResult()));
 
-          auto headerCopy = *header;
-
-          FB_LOG(*straceLogger_, DBG7, ([&]() -> std::string {
-            std::string rendered;
-            if (handlerEntry->argRenderer) {
-              rendered = handlerEntry->argRenderer(arg);
-            }
-            return fmt::format(
-                "{}({}{}{})",
-                handlerEntry->getShortName(),
-                headerCopy.nodeid,
-                rendered.empty() ? "" : ", ",
-                rendered);
-          })());
-
-          request
-              ->catchErrors(
-                  folly::makeFutureWith([&] {
-                    request->startRequest(
-                        dispatcher_->getStats().copy(),
-                        handlerEntry->duration,
-                        *(liveRequestWatches_.get()));
-                    auto fut = (this->*handlerEntry->handler)(
-                        *request, request->getReq(), arg);
-                    if (fut.isReady()) {
-                      // In the case where the handler executed immediately,
-                      // let's avoid an expensive context switch by simply
-                      // extracting the value from the future.
-                      return folly::makeFuture<folly::Unit>(
-                          std::move(fut).get());
-                    } else {
-                      return std::move(fut).semi().via(threadPool_.get());
-                    }
-                  }).ensure([request] {
-                    }).within(requestTimeout_),
-                  notifier_.get(),
-                  dispatcher_->getStats().copy(),
-                  handlerEntry->countSuccessful,
-                  handlerEntry->countFailure)
-              .ensure([this,
-                       request,
-                       requestId,
-                       headerCopy,
-                       requestPermit = std::move(requestPermit)] {
-                traceBus_->publish(
-                    FuseTraceEvent::finish(
-                        requestId, headerCopy, request->getResult()));
-
-                // We may be complete; check to see if all requests are
-                // done and whether there are any threads remaining.
-                auto state = state_.wlock();
-                XCHECK_NE(state->pendingRequests, 0u)
-                    << "pendingRequests double decrement";
-                if (--state->pendingRequests == 0 &&
-                    state->stoppedThreads == numThreads_) {
+              // We may be complete; check to see if all requests are
+              // done and whether there are any threads remaining.
+              auto state = state_.wlock();
+              XCHECK_NE(state->pendingRequests, 0u)
+                  << "pendingRequests double decrement";
+              if (--state->pendingRequests == 0) {
+                // If workers are still running, wake transport-specific waits
+                // so they can observe that shutdown has fully drained. If they
+                // already stopped, completing the final request completes the
+                // session immediately.
+                if (state->stopReason != StopReason::RUNNING &&
+                    state->stoppedThreads != effectiveWorkerThreadCount_) {
+                  requestTransportStopWakeup();
+                }
+                if (state->stoppedThreads == effectiveWorkerThreadCount_) {
                   sessionComplete(std::move(state));
                 }
-
-                // The requestPermit will automatically release the permit when
-                // it's destroyed at the end of this lambda, so we don't need an
-                // explicit releasePermit() call
-              });
-          break;
-        }
-
-        const auto opcode = header->opcode;
-        tryRlockCheckBeforeUpdate<folly::Unit>(
-            unhandledOpcodes_,
-            [&](const auto& unhandledOpcodes) -> std::optional<folly::Unit> {
-              if (unhandledOpcodes.find(opcode) != unhandledOpcodes.end()) {
-                return folly::unit;
               }
-              return std::nullopt;
-            },
-            [&](auto& unhandledOpcodes) -> folly::Unit {
-              XLOGF(
-                  WARN,
-                  "unhandled fuse opcode {}({})",
-                  opcode,
-                  fuseOpcodeName(opcode));
-              unhandledOpcodes->insert(opcode);
-              return folly::unit;
-            });
 
-        try {
-          replyError(*header, ENOSYS);
-        } catch (const std::system_error& exc) {
-          XLOGF(ERR, "Failed to write error response to fuse: {}", exc.what());
-          requestSessionExit(StopReason::FUSE_WRITE_ERROR);
-          return;
-        }
+              // The requestPermit will automatically release the permit when
+              // it's destroyed at the end of this lambda, so we don't need an
+              // explicit releasePermit() call
+            });
         break;
       }
+
+      const auto opcode = header.opcode;
+      tryRlockCheckBeforeUpdate<folly::Unit>(
+          unhandledOpcodes_,
+          [&](const auto& unhandledOpcodes) -> std::optional<folly::Unit> {
+            if (unhandledOpcodes.find(opcode) != unhandledOpcodes.end()) {
+              return folly::unit;
+            }
+            return std::nullopt;
+          },
+          [&](auto& unhandledOpcodes) -> folly::Unit {
+            XLOGF(
+                WARN,
+                "unhandled fuse opcode {}({})",
+                opcode,
+                fuseOpcodeName(opcode));
+            unhandledOpcodes->insert(opcode);
+            return folly::unit;
+          });
+
+      try {
+        replyError(header, ENOSYS);
+      } catch (const std::system_error& exc) {
+        XLOGF(ERR, "Failed to write error response to fuse: {}", exc.what());
+        errorLogger_.log(
+            EdenErrorInfo::fuse(exc, std::nullopt, mountPath_.asString()));
+        requestSessionExit(StopReason::FUSE_WRITE_ERROR);
+        return;
+      }
+      break;
     }
   }
 }
@@ -2127,7 +2507,15 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseForget(
   XLOGF(
       DBG7, "FUSE_FORGET inode={} nlookup={}", header.nodeid, forget->nlookup);
   dispatcher_->forget(InodeNumber{header.nodeid}, forget->nlookup);
-  request.replyNone();
+  if (usesIoUringTransport()) {
+    // FORGET has no semantic FUSE reply, but the io_uring transport still has
+    // to commit the ring entry that delivered the request. replyError(0)
+    // produces the minimal success completion needed to hand that entry back
+    // to the kernel so it can be reused for future fetches.
+    request.replyError(0);
+  } else {
+    request.replyNone();
+  }
   return folly::unit;
 }
 
@@ -2371,7 +2759,17 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseSetXAttr(
     const fuse_in_header& header,
     ByteRange arg) {
   const auto setxattr = reinterpret_cast<const fuse_setxattr_in*>(arg.data());
+#ifdef __linux__
+  // Use the compat size (8 bytes) because EdenFS does not negotiate
+  // FUSE_SETXATTR_EXT, so the kernel sends the old 2-field struct.
+  // sizeof(fuse_setxattr_in) is 16 bytes in FUSE 7.33+, which would
+  // overshoot the name offset.
+  const auto nameStr =
+      reinterpret_cast<const char*>(arg.data()) + FUSE_COMPAT_SETXATTR_IN_SIZE;
+#else
+  // On macOS, fuse_setxattr_in is the original struct.
   const auto nameStr = reinterpret_cast<const char*>(setxattr + 1);
+#endif
   const StringPiece attrName{nameStr};
   const auto bufPtr = nameStr + attrName.size() + 1;
   const StringPiece value(bufPtr, setxattr->size);
@@ -2612,7 +3010,15 @@ ImmediateFuture<folly::Unit> FuseChannel::fuseBatchForget(
     dispatcher_->forget(InodeNumber{item->nodeid}, item->nlookup);
     ++item;
   }
-  request.replyNone();
+  if (usesIoUringTransport()) {
+    // BATCH_FORGET is the same transport issue as FORGET above: there is no
+    // logical reply payload, but io_uring still requires a success completion
+    // so the outstanding ring entry can commit and return to the kernel's
+    // fetch pool.
+    request.replyError(0);
+  } else {
+    request.replyNone();
+  }
   return folly::unit;
 }
 

@@ -23,13 +23,7 @@ use crate::Repo;
 
 pub(crate) fn should_run_hooks(authz: &AuthorizationContext, reason: BookmarkUpdateReason) -> bool {
     if authz.is_service() {
-        let enable_hooks_on_service_pushrebase = justknobs::eval(
-            "scm/mononoke:enable_hooks_on_service_pushrebase",
-            None,
-            None,
-        )
-        .unwrap_or_default();
-        reason == BookmarkUpdateReason::Pushrebase && enable_hooks_on_service_pushrebase
+        reason == BookmarkUpdateReason::Pushrebase
     } else {
         true
     }
@@ -43,7 +37,7 @@ pub enum BookmarkKindRestrictions {
 }
 
 impl BookmarkKindRestrictions {
-    pub(crate) fn check_kind(
+    pub fn check_kind(
         &self,
         repo: &impl RepoConfigRef,
         name: &BookmarkKey,
@@ -131,9 +125,7 @@ pub(crate) async fn ensure_ancestor_of(
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Bookmark '{}' does not exist, but it should be a descendant of '{}'!",
-                descendant_bookmark,
-                bookmark_to_move
+                "Bookmark '{descendant_bookmark}' does not exist, but it should be a descendant of '{bookmark_to_move}'!"
             )
         })?;
 

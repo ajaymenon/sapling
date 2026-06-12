@@ -40,7 +40,6 @@ use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
 use sorted_vector_map::SortedVectorMap;
 use tracing::debug;
-use tracing::error;
 
 use crate::git_submodules::SubmoduleExpansionData;
 use crate::git_submodules::sync_commit_with_submodule_expansion;
@@ -442,40 +441,19 @@ pub fn rewrite_commit_with_implicit_deletes<'a>(
         cs.parents = new_parents
     }
 
-    let enable_commit_extra_stripping =
-        justknobs::eval("scm/mononoke:strip_commit_extras_in_xrepo_sync", None, None)
-            .unwrap_or_else(|err| {
-                error!(
-                    "Failed to read just knob scm/mononoke:strip_commit_extras_in_xrepo_sync: {err}"
-                );
-                false
-            });
-
-    if enable_commit_extra_stripping {
-        match rewrite_opts.strip_commit_extras {
-            StripCommitExtras::Hg => {
-                // Set to an empty map to strip the hg extras
-                cs.hg_extra = Default::default();
-            }
-            StripCommitExtras::Git => {
-                // Set to an empty map to strip the git extras
-                cs.git_extra_headers = None;
-            }
-            StripCommitExtras::None => {}
-        };
-    }
+    match rewrite_opts.strip_commit_extras {
+        StripCommitExtras::Hg => {
+            // Set to an empty map to strip the hg extras
+            cs.hg_extra = Default::default();
+        }
+        StripCommitExtras::Git => {
+            // Set to an empty map to strip the git extras
+            cs.git_extra_headers = None;
+        }
+        StripCommitExtras::None => {}
+    };
 
     cs.hg_extra.extend(rewrite_opts.add_hg_extras);
-
-    let enable_should_set_committer_info_to_author_info_if_empty = justknobs::eval(
-        "scm/mononoke:should_set_committer_info_to_author_info_if_empty",
-        None,
-        None,
-    )
-    .unwrap_or_else(|err| {
-        error!("Failed to read just knob scm/mononoke:should_set_committer_info_to_author_info_if_empty: {err}");
-        false
-    });
 
     // Hg doesn't have a concept of committer and committer date, so commits
     // that are originally created in Hg have these fields empty when synced
@@ -483,9 +461,7 @@ pub fn rewrite_commit_with_implicit_deletes<'a>(
     //
     // This setting determines if, in Hg->Git sync, the committer and committer
     // date fields should be set to the author and date fields if empty.
-    if enable_should_set_committer_info_to_author_info_if_empty
-        && rewrite_opts.should_set_committer_info_to_author_info_if_empty
-    {
+    if rewrite_opts.should_set_committer_info_to_author_info_if_empty {
         if cs.committer.is_none() {
             cs.committer = Some(cs.author.clone());
         }
@@ -516,7 +492,7 @@ pub fn create_directory_source_to_target_multi_mover(
     Ok(Arc::new(move |path: &MPath| -> Result<Vec<MPath>, Error> {
         for (override_prefix_src, dsts) in &overrides {
             let override_prefix_src = MPath::new(override_prefix_src.clone())?;
-            if override_prefix_src.is_prefix_of(path.into_iter()) {
+            if override_prefix_src.is_prefix_of(path) {
                 let suffix: Vec<_> = path
                     .into_iter()
                     .skip(override_prefix_src.num_components())

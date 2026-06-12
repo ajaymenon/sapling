@@ -12,8 +12,13 @@ use bytes::Bytes;
 use context::PerfCounterType;
 use edenapi_types::AnyId;
 use edenapi_types::Batch;
+use edenapi_types::CheckManifestPermissionRequest;
+use edenapi_types::CheckManifestPermissionResponse;
+use edenapi_types::CheckPathPermissionRequest;
+use edenapi_types::CheckPathPermissionResponse;
 use edenapi_types::FileAuxData;
 use edenapi_types::SaplingRemoteApiServerError;
+use edenapi_types::SaplingRemoteApiServerErrorKind;
 use edenapi_types::TreeAttributes;
 use edenapi_types::TreeAuxData;
 use edenapi_types::TreeChildEntry;
@@ -47,13 +52,19 @@ use mercurial_types::HgManifestId;
 use mercurial_types::HgNodeHash;
 use mononoke_api::MononokeRepo;
 use mononoke_api::Repo;
+use mononoke_api::errors::MononokeError;
+use mononoke_api_hg::HgAugmentedTreeRestrictionContext;
 use mononoke_api_hg::HgDataContext;
 use mononoke_api_hg::HgDataId;
 use mononoke_api_hg::HgRepoContext;
 use mononoke_api_hg::HgTreeContext;
+use mononoke_types::MPath;
+use mononoke_types::MPathElement;
+use permission_checker::MononokeIdentitySetExt;
 use rate_limiting::Metric;
 use rate_limiting::Scope;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_identity::RepoIdentityRef;
 use serde::Deserialize;
 use stats::define_stats;
 use stats::prelude::TimeseriesStatic;
@@ -76,6 +87,7 @@ use crate::utils::parse_wire_request;
 define_stats! {
     prefix = "mononoke.trees";
     manifests_served: timeseries(Rate, Sum),
+    trees_batch_keys_requested: timeseries(Rate, Sum),
 }
 
 // The size is optimized for the batching settings in EdenFs.
@@ -124,12 +136,14 @@ fn fetch_all_trees<R: MononokeRepo>(
 ) -> impl Stream<Item = Result<TreeEntry, SaplingRemoteApiServerError>> {
     let ctx = repo.ctx().clone();
 
+    STATS::trees_batch_keys_requested.add_value(request.keys.len() as i64);
+
     let fetches = request.keys.into_iter().map(move |key| match flavour {
         SlapiCommitIdentityScheme::Git => fetch_git_object_as_tree(key.clone(), repo.clone())
             .map(|r| r.map_err(|e| SaplingRemoteApiServerError::with_key(key, e)))
             .left_future(),
         SlapiCommitIdentityScheme::Hg => fetch_tree(repo.clone(), key.clone(), request.attributes)
-            .map(|r| r.map_err(|e| SaplingRemoteApiServerError::with_key(key, e)))
+            .map(|r| r.map_err(|e| tree_fetch_error_to_slapi_error(key, e)))
             .right_future(),
     });
 
@@ -140,6 +154,31 @@ fn fetch_all_trees<R: MononokeRepo>(
                 .bump_load(Metric::TotalManifests, Scope::Regional, 1.0);
             STATS::manifests_served.add_value(1);
         })
+}
+
+fn tree_fetch_error_to_slapi_error(key: Key, err: Error) -> SaplingRemoteApiServerError {
+    let permission_request_group =
+        err.chain()
+            .find_map(|cause| match cause.downcast_ref::<MononokeError>() {
+                Some(MononokeError::RestrictedPathsAuthorizationError(err))
+                    if err.is_manifest_access() =>
+                {
+                    Some(err.permission_request_group().to_string())
+                }
+                _ => None,
+            });
+
+    if let Some(permission_request_group) = permission_request_group {
+        SaplingRemoteApiServerError {
+            err: SaplingRemoteApiServerErrorKind::PermissionDenied {
+                tree_id: key.hgid,
+                request_acl: permission_request_group,
+            },
+            key: Some(key),
+        }
+    } else {
+        SaplingRemoteApiServerError::with_key(key, err)
+    }
 }
 
 // Sapling wants to use trees the same way for Hg and Git, so shaping somehow
@@ -156,6 +195,8 @@ async fn fetch_git_object_as_tree<R: MononokeRepo>(
         parents: None,
         children: None,
         tree_aux_data: None,
+        // Path ACLs are not supported in Git
+        has_acl: None,
     })
 }
 
@@ -185,6 +226,7 @@ async fn fetch_tree<R: MononokeRepo>(
                 augmented_manifest_id: ctx.augmented_manifest_id().clone().into(),
                 augmented_manifest_size: ctx.augmented_manifest_size(),
             });
+            entry.with_has_acl(ctx.is_restricted().await?);
 
             if attributes.parents {
                 entry.with_parents(Some(ctx.hg_parents().into()));
@@ -195,63 +237,22 @@ async fn fetch_tree<R: MononokeRepo>(
                     .perf_counters()
                     .increment_counter(PerfCounterType::EdenapiTreesAuxData);
 
-                entry.with_children(Some(
-                    ctx.augmented_children_entries()
-                        .map(|(path, augmented_entry)| match augmented_entry {
-                            HgAugmentedManifestEntry::FileNode(file) => {
-                                Ok(TreeChildEntry::new_file_entry(
-                                    Key {
-                                        hgid: file.filenode.into(),
-                                        path: RepoPathBuf::from_string(path.to_string()).map_err(
-                                            |e| {
-                                                SaplingRemoteApiServerError::with_key(
-                                                    key.clone(),
-                                                    e,
-                                                )
-                                            },
-                                        )?,
-                                    },
-                                    FileAuxData {
-                                        blake3: file.content_blake3.clone().into(),
-                                        sha1: file.content_sha1.clone().into(),
-                                        total_size: file.total_size.clone(),
-                                        file_header_metadata: Some(
-                                            file.file_header_metadata
-                                                .clone()
-                                                .unwrap_or(Bytes::new())
-                                                .into(),
-                                        ),
-                                    }
-                                    .into(),
-                                ))
-                            }
-                            HgAugmentedManifestEntry::DirectoryNode(tree) => {
-                                Ok(TreeChildEntry::new_directory_entry(
-                                    Key {
-                                        hgid: tree.treenode.into(),
-                                        path: RepoPathBuf::from_string(path.to_string()).map_err(
-                                            |e| {
-                                                SaplingRemoteApiServerError::with_key(
-                                                    key.clone(),
-                                                    e,
-                                                )
-                                            },
-                                        )?,
-                                    },
-                                    TreeAuxData {
-                                        augmented_manifest_id: tree
-                                            .augmented_manifest_id
-                                            .clone()
-                                            .into(),
-                                        augmented_manifest_size: tree
-                                            .augmented_manifest_size
-                                            .clone(),
-                                    },
-                                ))
-                            }
-                        })
-                        .collect(),
-                ));
+                let child_restrictions = ctx
+                    .children_restrictions(MAX_CONCURRENT_METADATA_FETCHES_PER_TREE_FETCH)
+                    .await?;
+                let children = ctx
+                    .augmented_children_entries()
+                    .map(|(path, augmented_entry)| {
+                        fetch_augmented_child_metadata(
+                            &key,
+                            path,
+                            augmented_entry,
+                            child_restrictions.get(path).copied().unwrap_or(false),
+                        )
+                    })
+                    .collect();
+
+                entry.with_children(Some(children));
             }
 
             if attributes.manifest_blob {
@@ -315,6 +316,48 @@ async fn fetch_tree<R: MononokeRepo>(
     }
 
     Ok(entry)
+}
+
+/// Builds child metadata from preloaded augmented manifest entries.
+fn fetch_augmented_child_metadata(
+    key: &Key,
+    path: &MPathElement,
+    augmented_entry: &HgAugmentedManifestEntry,
+    directory_has_acl: bool,
+) -> Result<TreeChildEntry, SaplingRemoteApiServerError> {
+    match augmented_entry {
+        HgAugmentedManifestEntry::FileNode(file) => Ok(TreeChildEntry::new_file_entry(
+            Key {
+                hgid: file.filenode.into(),
+                path: RepoPathBuf::from_string(path.to_string())
+                    .map_err(|e| SaplingRemoteApiServerError::with_key(key.clone(), e))?,
+            },
+            FileAuxData {
+                blake3: file.content_blake3.clone().into(),
+                sha1: file.content_sha1.clone().into(),
+                total_size: file.total_size.clone(),
+                file_header_metadata: Some(
+                    file.file_header_metadata
+                        .clone()
+                        .unwrap_or(Bytes::new())
+                        .into(),
+                ),
+            }
+            .into(),
+        )),
+        HgAugmentedManifestEntry::DirectoryNode(tree) => Ok(TreeChildEntry::new_directory_entry(
+            Key {
+                hgid: tree.treenode.into(),
+                path: RepoPathBuf::from_string(path.to_string())
+                    .map_err(|e| SaplingRemoteApiServerError::with_key(key.clone(), e))?,
+            },
+            TreeAuxData {
+                augmented_manifest_id: tree.augmented_manifest_id.clone().into(),
+                augmented_manifest_size: tree.augmented_manifest_size.clone(),
+            },
+            Some(directory_has_acl),
+        )),
+    }
 }
 
 async fn fetch_child_file_metadata_entries<'a, R: MononokeRepo>(
@@ -408,7 +451,7 @@ impl SaplingRemoteApiHandler for UploadTreesHandler {
     type Request = Batch<UploadTreeRequest>;
     type Response = UploadTreeResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::UploadTrees;
     const ENDPOINT: &'static str = "/upload/trees";
 
@@ -425,5 +468,232 @@ impl SaplingRemoteApiHandler for UploadTreesHandler {
         Ok(stream::iter(tokens)
             .buffer_unordered(MAX_CONCURRENT_UPLOAD_TREES_PER_REQUEST)
             .boxed())
+    }
+}
+
+pub struct CheckManifestPermissionHandler;
+
+#[async_trait]
+impl SaplingRemoteApiHandler for CheckManifestPermissionHandler {
+    type Request = CheckManifestPermissionRequest;
+    type Response = CheckManifestPermissionResponse;
+
+    const HTTP_METHOD: http::Method = http::Method::POST;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CheckManifestPermission;
+    const ENDPOINT: &'static str = "/check_manifest_permission";
+
+    async fn handler(
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor, Repo>,
+        request: Self::Request,
+    ) -> HandlerResult<'async_trait, Self::Response> {
+        let repo = ectx.repo();
+
+        Ok(stream::iter(request.manifest_ids)
+            .map(move |manifest_id| {
+                let repo = repo.clone();
+                async move {
+                    let hg_manifest_id = HgManifestId::new(
+                        HgNodeHash::from_bytes(manifest_id.as_ref())
+                            .map_err(|e| anyhow::anyhow!("Invalid manifest id: {e}"))?,
+                    );
+
+                    let restriction_ctx = HgAugmentedTreeRestrictionContext::new_check_exists(
+                        repo.clone(),
+                        hg_manifest_id.into(),
+                    )
+                    .await?;
+                    let restriction_checks = restriction_ctx.restriction_check().await?;
+                    let has_access = restriction_checks
+                        .iter()
+                        .all(|check| check.has_authorization());
+
+                    // TODO(T248658346): change the Eden API response to return
+                    // all permission request groups instead of only the first one.
+                    let permission_request_group = restriction_checks
+                        .iter()
+                        .find(|check| !check.has_authorization())
+                        .map(|check| {
+                            check
+                                .restriction_info()
+                                .permission_request_group
+                                .to_string()
+                        });
+
+                    for check in &restriction_checks {
+                        repo.ctx()
+                            .scuba()
+                            .clone()
+                            .add("repo", repo.repo().repo_identity().name())
+                            .add("edenapi_method", "check_manifest_permission")
+                            .add_opt(
+                                "edenapi_user",
+                                repo.ctx()
+                                    .metadata()
+                                    .identities()
+                                    .username()
+                                    .map(ToString::to_string),
+                            )
+                            .add(
+                                "unix_username",
+                                repo.ctx()
+                                    .metadata()
+                                    .identities()
+                                    .username()
+                                    .map(ToString::to_string),
+                            )
+                            .add(
+                                "restricted_path_acl",
+                                check.restriction_info().repo_region_acl.clone(),
+                            )
+                            .add("has_restricted_path_acl_access", check.has_acl_access())
+                            .add("is_allowlisted_tooling", check.is_allowlisted_tooling())
+                            .add("is_rollout_allowlisted", check.is_rollout_allowlisted())
+                            .add("has_restricted_path_access", check.has_authorization())
+                            .log_with_msg("Checked manifest permission", None);
+                    }
+
+                    Ok(CheckManifestPermissionResponse {
+                        manifest_id,
+                        has_access,
+                        request_acl: permission_request_group,
+                    })
+                }
+            })
+            .buffer_unordered(20)
+            .boxed())
+    }
+}
+
+pub struct CheckPathPermissionHandler;
+
+#[async_trait]
+impl SaplingRemoteApiHandler for CheckPathPermissionHandler {
+    type Request = CheckPathPermissionRequest;
+    type Response = CheckPathPermissionResponse;
+
+    const HTTP_METHOD: http::Method = http::Method::POST;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CheckPathPermission;
+    const ENDPOINT: &'static str = "/check_path_permission";
+
+    async fn handler(
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor, Repo>,
+        request: Self::Request,
+    ) -> HandlerResult<'async_trait, Self::Response> {
+        let repo = ectx.repo();
+        let repo_ctx = repo.repo_ctx().clone();
+        let cs = repo_ctx
+            .changeset(request.hg_cs_id)
+            .await
+            .context("Failed to resolve changeset")?
+            .ok_or_else(|| anyhow::anyhow!("Changeset not found: {}", request.hg_cs_id))?;
+
+        Ok(stream::iter(request.paths)
+            .map(move |path| {
+                let cs = cs.clone();
+                async move {
+                    let mpath = MPath::new(path.as_str().as_bytes())
+                        .with_context(|| format!("Invalid path: {path}"))?;
+                    let restriction_ctx = cs
+                        .path_restriction(mpath)
+                        .await
+                        .with_context(|| format!("Failed to check path restriction: {path}"))?;
+                    let restriction_infos = restriction_ctx.restriction_info(true).await?;
+
+                    let has_access = restriction_infos
+                        .iter()
+                        .all(|info| info.has_access.unwrap_or(false));
+
+                    let permission_request_groups = restriction_infos
+                        .iter()
+                        .map(|info| info.permission_request_group().to_string())
+                        .collect();
+
+                    let repo_region_acls = restriction_infos
+                        .iter()
+                        .map(|info| info.repo_region_acl().to_string())
+                        .collect();
+
+                    Ok(CheckPathPermissionResponse {
+                        path,
+                        has_access,
+                        request_acls: permission_request_groups,
+                        repo_region_acls,
+                    })
+                }
+            })
+            .buffer_unordered(20)
+            .boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use mononoke_macros::mononoke;
+    use restricted_paths::ManifestId;
+    use restricted_paths::PermissionRequestGroup;
+    use restricted_paths::RestrictedPathAccess;
+    use restricted_paths::RestrictedPathsAuthorizationError;
+    use types::HgId;
+
+    use super::*;
+
+    #[mononoke::test]
+    fn test_tree_fetch_error_to_slapi_error_preserves_manifest_permission_denied() -> Result<()> {
+        let key = test_key()?;
+        let err = restricted_paths_error(
+            RestrictedPathAccess::Manifest(ManifestId::from(
+                "1111111111111111111111111111111111111111",
+            )),
+            "REPO_REGION:test_acl",
+        )?;
+
+        let slapi_error = tree_fetch_error_to_slapi_error(key.clone(), err);
+        match slapi_error.err {
+            SaplingRemoteApiServerErrorKind::PermissionDenied {
+                tree_id,
+                request_acl: permission_request_group,
+            } => {
+                assert_eq!(tree_id, key.hgid);
+                assert_eq!(permission_request_group, "REPO_REGION:test_acl");
+            }
+            err => anyhow::bail!("expected PermissionDenied, got {err:?}"),
+        }
+        assert_eq!(slapi_error.key, Some(key));
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_tree_fetch_error_to_slapi_error_ignores_path_permission_denied() -> Result<()> {
+        let key = test_key()?;
+        let err = restricted_paths_error(
+            RestrictedPathAccess::Path(MPath::new("restricted")?),
+            "REPO_REGION:test_acl",
+        )?;
+
+        let slapi_error = tree_fetch_error_to_slapi_error(key.clone(), err);
+        if let SaplingRemoteApiServerErrorKind::PermissionDenied { .. } = slapi_error.err {
+            anyhow::bail!("path access denial should not be converted to tree PermissionDenied");
+        }
+        assert_eq!(slapi_error.key, Some(key));
+        Ok(())
+    }
+
+    fn restricted_paths_error(
+        access: RestrictedPathAccess,
+        permission_request_group: &str,
+    ) -> Result<Error> {
+        let permission_request_group: PermissionRequestGroup = permission_request_group.parse()?;
+        Ok(Error::new(MononokeError::RestrictedPathsAuthorizationError(
+            RestrictedPathsAuthorizationError::new(access, permission_request_group),
+        ))
+        .context("failed to fetch tree"))
+    }
+
+    fn test_key() -> Result<Key> {
+        Ok(Key {
+            hgid: HgId::null_id().clone(),
+            path: RepoPathBuf::from_string("restricted".to_string())?,
+        })
     }
 }

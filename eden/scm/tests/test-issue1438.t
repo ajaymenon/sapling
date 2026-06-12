@@ -8,24 +8,23 @@
 
 # https://bz.mercurial-scm.org/1438
 
-  $ setconfig devel.segmented-changelog-rev-compat=true
   $ eagerepo
-  $ hg init repo
+  $ sl init repo
   $ cd repo
 
   $ ln -s foo link
-  $ hg add link
-  $ hg ci -mbad link
-  $ hg rm link
-  $ hg ci -mok
-  $ hg diff -g -r '0:1' > bad.patch
+  $ sl add link
+  $ sl ci -mbad link
+  $ sl rm link
+  $ sl ci -mok
+  $ sl diff -g -r 'desc(bad)' -r 'desc(ok)' > bad.patch
 
-  $ hg up 0
+  $ sl up 'desc(bad)'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
-  $ hg import --no-commit bad.patch
+  $ sl import --no-commit bad.patch
   applying bad.patch
 
-  $ hg status
+  $ sl status
   R link
   ? bad.patch

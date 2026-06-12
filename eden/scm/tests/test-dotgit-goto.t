@@ -3,7 +3,7 @@
   $ . $TESTDIR/git.sh
   $ setconfig diff.git=true ui.allowemptycommit=true
   $ setconfig workingcopy.rust-checkout=true
-  $ enable shelve morestatus
+  $ enable shelve morestatus hgevents
   $ setconfig morestatus.show=true
 
 Prepare git repo

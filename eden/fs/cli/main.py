@@ -6,9 +6,9 @@
 
 # pyre-strict
 
-
 import argparse
 import asyncio
+import concurrent
 import concurrent.futures
 import enum
 import errno
@@ -19,7 +19,6 @@ import platform
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import traceback
@@ -28,10 +27,20 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Type
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Type, Union
 
+# Must import util before any module that imports thrift (like check_filesystems)
+# to set up Windows DLL directories for native module loading.
+from eden.fs.cli import util as _util_setup  # noqa: F401
 from eden.fs.cli.doctor.check_filesystems import check_disk_usage
 from eden.fs.cli.util import get_chef_log_path
+from eden.fs.service.eden.thrift_clients import EdenService
+from eden.fs.service.eden.thrift_types import (
+    ChangeOwnershipRequest,
+    MountInfo,
+    MountState,
+    SendNotificationRequest,
+)
 
 # Constants
 CHEF_LOG_TIMESTAMP_KEY = "chef.run_success_timestamp"
@@ -42,6 +51,57 @@ CHEF_RUN_AGE_PROBLEM = timedelta(days=14)
 DEFAULT_STOP_TIMEOUT = 20
 # Timeout for stopping aux processes
 AUX_PROCESSES_STOP_TIMEOUT = 60
+
+CONFIG_DIR_ENV_VAR = "EDENFSCTL_CONFIG_DIR"
+ETC_EDEN_DIR_ENV_VAR = "EDENFSCTL_ETC_EDEN_DIR"
+HOME_DIR_ENV_VAR = "EDENFSCTL_HOME_DIR"
+
+
+def _get_aux_processes_stop_timeout() -> int:
+    """Get the timeout for stopping aux processes.
+
+    Can be overridden via EDENFS_AUX_PROCESSES_TIMEOUT_SECS environment variable for testing.
+    """
+    env_timeout = os.environ.get("EDENFS_AUX_PROCESSES_TIMEOUT_SECS")
+    if env_timeout:
+        try:
+            return int(env_timeout)
+        except ValueError:
+            pass
+    return AUX_PROCESSES_STOP_TIMEOUT
+
+
+def _get_test_delay() -> Optional[float]:
+    """Get delay to inject for testing.
+
+    Returns the delay in seconds if TEST_ONLY_AUX_PROCESSES_STOP_DELAY_SECS is set, else None.
+    """
+    env_delay = os.environ.get("TEST_ONLY_AUX_PROCESSES_STOP_DELAY_SECS")
+    if env_delay:
+        try:
+            return float(env_delay)
+        except ValueError:
+            pass
+    return None
+
+
+# Global event for cancelling test delays.
+import threading
+
+_test_cancel_event = threading.Event()
+
+
+def _cancel_test_delays() -> None:
+    """Cancel any in-progress test delays by setting the cancel event.
+
+    This wakes up any threads blocked on _test_cancel_event.wait().
+    """
+    _test_cancel_event.set()
+
+
+def _reset_test_cancel_event() -> None:
+    """Reset the test cancel event for the next operation."""
+    _test_cancel_event.clear()
 
 
 class ForegroundColor(Enum):
@@ -55,7 +115,6 @@ class ForegroundColor(Enum):
     RESET = "\033[0m"
 
 
-import thrift.transport
 from eden.fs.cli.version import VersionInfo
 
 try:
@@ -98,19 +157,14 @@ from eden.fs.cli.util import (
     is_apple_silicon,
     wait_for_instance_healthy,
 )
-from eden.thrift.legacy import EdenClient, EdenNotRunningError
-from facebook.eden import EdenService
-from facebook.eden.ttypes import (
-    ChangeOwnershipRequest,
-    GetCurrentSnapshotInfoRequest,
-    GetScmStatusParams,
-    MountId,
-    MountInfo,
-    MountState,
-    RootIdOptions,
-    SendNotificationRequest,
+from eden.fs.service.eden.thrift_types import EdenError
+from eden.thrift.client import EdenNotRunningError
+from fb303_core.thrift_types import fb303_status
+from thrift.python.exceptions import (
+    ApplicationError,
+    ApplicationErrorType,
+    TransportError,
 )
-from fb303_core.ttypes import fb303_status
 
 from . import (
     config as config_mod,
@@ -146,14 +200,8 @@ from .doctor.problem import ProblemSeverity
 if sys.platform == "win32":
     from .file_handler_tools import WinFileHandlerReleaser
 from .prompt import prompt_confirmation
-from .stats_print import format_size
 from .subcmd import Subcmd
-from .util import (
-    can_enable_windows_symlinks,
-    get_environment_suitable_for_subprocess,
-    print_stderr,
-    ShutdownError,
-)
+from .util import print_stderr, ShutdownError
 
 try:
     from .facebook.util import (
@@ -343,16 +391,27 @@ class StatusCmd(Subcmd):
             help="Wait up to TIMEOUT seconds for the daemon to respond "
             "(default=%(default)s).",
         )
+        parser.add_argument(
+            "--debug",
+            action="store_true",
+            help="Show full systemctl status output when the daemon is managed by systemd",
+        )
 
     def run(self, args: argparse.Namespace) -> int:
         instance = get_eden_instance(args)
         health_info = instance.check_health(timeout=args.timeout)
         if health_info.is_healthy():
             print("edenfs running normally (pid {})".format(health_info.pid))
-            return 0
+            exit_code = 0
+        else:
+            print("edenfs not healthy: {}".format(health_info.detail))
+            exit_code = 1
 
-        print("edenfs not healthy: {}".format(health_info.detail))
-        return 1
+        if sys.platform == "linux" and args.debug:
+            print()
+            daemon.print_systemd_status_full(instance)
+
+        return exit_code
 
 
 @subcmd("list", "List available checkouts")
@@ -364,6 +423,13 @@ class ListCmd(Subcmd):
             default=False,
             help="Print the output in JSON format",
         )
+        parser.add_argument(
+            "--verbose",
+            "-v",
+            action="store_true",
+            default=False,
+            help="Show additional details such as filesystem channel and transport type",
+        )
 
     def run(self, args: argparse.Namespace) -> int:
         instance = get_eden_instance(args)
@@ -373,7 +439,7 @@ class ListCmd(Subcmd):
         if args.json:
             self.print_mounts_json(out, mounts)
         else:
-            self.print_mounts(out, mounts)
+            self.print_mounts(out, mounts, verbose=args.verbose)
         return 0
 
     @staticmethod
@@ -388,7 +454,11 @@ class ListCmd(Subcmd):
         out.writeln(json_str)
 
     @staticmethod
-    def print_mounts(out: ui.Output, mount_points: Dict[Path, ListMountInfo]) -> None:
+    def print_mounts(
+        out: ui.Output,
+        mount_points: Dict[Path, ListMountInfo],
+        verbose: bool = False,
+    ) -> None:
         for path, mount_info in sorted(mount_points.items()):
             if not mount_info.configured:
                 suffix = " (unconfigured)"
@@ -402,10 +472,19 @@ class ListCmd(Subcmd):
                 # We only show the state if the mount is in an unusual state.
                 state_str = ""
             else:
-                state_name = MountState._VALUES_TO_NAMES[mount_info.state]
+                state_name = mount_info.state.name
                 state_str = f" ({state_name})"
 
-            out.writeln(f"{path.as_posix()}{state_str}{suffix}")
+            transport_str = ""
+            if verbose and mount_info.fs_channel_type is not None:
+                if mount_info.fuse_transport is not None:
+                    transport_str = (
+                        f" ({mount_info.fs_channel_type}, {mount_info.fuse_transport})"
+                    )
+                else:
+                    transport_str = f" ({mount_info.fs_channel_type})"
+
+            out.writeln(f"{path.as_posix()}{state_str}{transport_str}{suffix}")
 
 
 @subcmd("clone", "Create a clone of a specific repo and check it out")
@@ -481,8 +560,9 @@ class CloneCmd(Subcmd):
         parser.add_argument(
             "--enable-windows-symlinks",
             action="store_true",
-            help="Enable symlink support for the cloned mount",
+            help="Symlink is enabled on all Windows mounts. This argument is a no-op that is kept for legacy compatibility",
         )
+
         parser.add_argument(
             "--filter-paths",
             "--filter-path",
@@ -492,6 +572,17 @@ class CloneCmd(Subcmd):
                 "--backing-store=filteredhg. When this option is omitted, no "
                 "filter is applied to the repo but FilteredFS is still used. "
                 'Passing "" or "null" will result in similar behavior.'
+            ),
+        )
+
+        parser.add_argument(
+            "--skip-commit-resolve",
+            action="store_true",
+            default=False,
+            help=(
+                "Skip resolving the commit hash via hg/git. Use only when --rev is "
+                "already a full 40-character hex commit hash AND the commit is "
+                "already present in the local changelog of the backing repo."
             ),
         )
 
@@ -543,6 +634,21 @@ class CloneCmd(Subcmd):
 
         args.path = os.path.realpath(args.path)
         args.nfs = args.nfs or is_nfs_default()
+
+        # We've observed that a large number of clones can cause
+        # OOMs at startup. Optionally configure a limit for
+        # environments with limited memory. A value of 0 (the
+        # default) means unlimited.
+        max_clones = instance.get_config_int("clone.max-clones", 0)
+        if max_clones > 0:
+            current_clone_count = len(instance.get_checkouts())
+            if current_clone_count >= max_clones:
+                print_stderr(
+                    f"error: maximum number of Eden clones ({max_clones}) reached. "
+                    f"You currently have {current_clone_count} clone(s). "
+                    f"Remove existing clones with `eden rm` before creating a new one."
+                )
+                return 1
 
         # Check if requested path is inside an existing checkout or backing_repo of existing checkout
         instance = EdenInstance(args.config_dir, args.etc_eden_dir, args.home_dir)
@@ -617,10 +723,6 @@ is case-sensitive. This is not recommended and is intended only for testing."""
 
         # Find the repository information
         try:
-            enable_windows_symlinks = (
-                args.enable_windows_symlinks
-                or instance.get_config_bool("experimental.windows-symlinks", False)
-            ) and can_enable_windows_symlinks()
             repo, repo_config = config_mod.get_repo_info(
                 instance,
                 args.repo,
@@ -630,7 +732,6 @@ is case-sensitive. This is not recommended and is intended only for testing."""
                 overlay_type=args.overlay_type,
                 backing_store_type=args.backing_store,
                 re_use_case=args.re_use_case,
-                enable_windows_symlinks=enable_windows_symlinks,
                 off_mount_repo_dir=instance.get_config_bool(
                     "clone.off-mount-repo-dir",
                     # Enable by default in tests.
@@ -645,13 +746,24 @@ is case-sensitive. This is not recommended and is intended only for testing."""
         if not args.backing_store or args.backing_store in HG_REPO_TYPES:
             # Find the commit to check out
             if args.rev is not None:
-                try:
-                    commit = repo.get_commit_hash(args.rev)
-                except Exception as ex:
-                    print_stderr(
-                        f"error: unable to find hash for commit {args.rev!r}: {ex}"
-                    )
-                    return 1
+                if args.skip_commit_resolve:
+                    if not (
+                        len(args.rev) == 40
+                        and all(c in "0123456789abcdefABCDEF" for c in args.rev)
+                    ):
+                        print_stderr(
+                            f"error: --skip-commit-resolve requires a full 40-character hex hash, got {args.rev!r}"
+                        )
+                        return 1
+                    commit = args.rev
+                else:
+                    try:
+                        commit = repo.get_commit_hash(args.rev)
+                    except Exception as ex:
+                        print_stderr(
+                            f"error: unable to find hash for commit {args.rev!r}: {ex}"
+                        )
+                        return 1
             else:
                 try:
                     commit = repo.get_commit_hash(repo_config.default_revision)
@@ -738,11 +850,12 @@ is case-sensitive. This is not recommended and is intended only for testing."""
             # process here to prefetch files that we think the user is likely
             # to want to access soon.
             return 0
-        except EdenService.EdenError as ex:
+        except EdenError as ex:
             print_stderr(
                 f"{ForegroundColor.RED.value}Failed to clone.{ForegroundColor.RESET.value} Error from EdenFS: {ex}"
             )
-            return int(ex.errorCode) if ex.errorCode else 1
+            error_code = getattr(ex, "errorCode", None)
+            return int(error_code) if error_code else 1
         except Exception as ex:
             print_stderr(
                 f"{ForegroundColor.RED.value}Failed to clone.{ForegroundColor.RESET.value} Error: {ex}"
@@ -1123,17 +1236,14 @@ class HealthReportCmd(Subcmd):
         if notify and config_notify_health_report and sys.platform == "win32":
             for error_code in HealthReportCmd.error_codes.keys():
                 try:
-                    with instance.get_thrift_client_legacy() as client:
+                    with instance.get_thrift_client() as client:
                         request = SendNotificationRequest(
                             title=error_code.summary(),
                             description=error_code.remediation(),
                         )
                         client.sendNotification(request)
-                except thrift.transport.TTransport.TTransportException as e:
-                    # Ignore TTransportException if it is a UNKNOWN_METHOD error, this can
-                    # happen if the running version predates this endpoint
-                    if e.type != thrift.Thrift.TApplicationException.UNKNOWN_METHOD:
-                        print_stderr(f"warning: edenfs daemon is not responding: {e}")
+                except TransportError as e:
+                    print_stderr(f"warning: edenfs daemon is not responding: {e}")
                 except EdenNotRunningError:
                     print_stderr("error: edenfs is not running")
                 except Exception as e:
@@ -1410,7 +1520,7 @@ class GcCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance = get_eden_instance(args)
 
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             # TODO: unload
             print("Clearing and compacting local caches...", end="", flush=True)
             print()
@@ -1463,13 +1573,15 @@ class ChownCmd(Subcmd):
         gid = self.resolve_gid(args.gid)
 
         instance, checkout, _rel_path = require_checkout(args, args.path)
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             print("Chowning EdenFS repository...", end="", flush=True)
             try:
-                request = ChangeOwnershipRequest(mountPoint=args.path, uid=uid, gid=gid)
+                request = ChangeOwnershipRequest(
+                    mountPoint=os.fsencode(args.path), uid=uid, gid=gid
+                )
                 client.changeOwnership(request)
-            except thrift.Thrift.TApplicationException as exc:
-                if exc.type == thrift.Thrift.TApplicationException.UNKNOWN_METHOD:
+            except ApplicationError as exc:
+                if exc.type == ApplicationErrorType.UNKNOWN_METHOD:
                     client.chown(args.path, uid, gid)
                 else:
                     raise exc
@@ -1560,7 +1672,7 @@ class MountCmd(Subcmd):
                 exitcode = instance.mount(path, args.read_only)
                 if exitcode:
                     return exitcode
-            except (EdenService.EdenError, EdenNotRunningError) as ex:
+            except (EdenError, EdenNotRunningError) as ex:
                 print_stderr("error: {}", ex)
                 return 1
 
@@ -1655,10 +1767,10 @@ def remove_legacyephemeral_checkouts(
     # slightly larger window for a race condition to be hit since the mount status can change by
     # the time we try to remove the checkout, but in practice it shouldn't be a problem.
     # It's cheaper to do this once than in every for loop iteration
-    mount_info: List[MountInfo] = []
+    mount_info: Sequence[MountInfo] = []
     try:
-        with instance.get_thrift_client_legacy() as client:
-            mount_info = client.listMounts()
+        with instance.get_thrift_client() as client:
+            mount_info = list(client.listMounts())
     except EdenNotRunningError:
         # Daemon not running, no mounts active
         pass
@@ -1741,6 +1853,7 @@ def remove_checkout_impl(
     skip_destroy: bool = False,
     debug: bool = False,
     proceed_on_unmount_failure: bool = True,
+    aux_timeout: Optional[int] = None,
 ) -> RemoveCheckoutResult:
     """
     Core checkout removal logic shared by remove commands.
@@ -1760,6 +1873,7 @@ def remove_checkout_impl(
         debug: If True, include debug info in cleanup_mount
         proceed_on_unmount_failure: If True, continue with destroy/cleanup even if unmount fails.
             If False, return early with unmount_error set.
+        aux_timeout: Timeout in seconds for stopping auxiliary processes. If None, uses the default.
     """
     result = RemoveCheckoutResult()
 
@@ -1768,9 +1882,15 @@ def remove_checkout_impl(
         # Step 1a: Stop aux processes (redirections, internal processes)
         try:
             output.write(f"Stopping aux processes for {path}...\n")
+            timeout = (
+                aux_timeout
+                if aux_timeout is not None
+                else _get_aux_processes_stop_timeout()
+            )
             stop_aux_processes_for_path(
                 path,
                 complain_about_failing_to_unmount_redirs=complain_about_redirections,
+                timeout=timeout,
             )
         except Exception as e:
             result.aux_process_error = e
@@ -1861,6 +1981,14 @@ class RemoveCmd(Subcmd):
             action="store_true",
             help=argparse.SUPPRESS,
         )
+        parser.add_argument(
+            "--timeout",
+            type=int,
+            default=None,
+            metavar="SECONDS",
+            help="Timeout in seconds for stopping auxiliary processes (e.g., redirections). "
+            f"Defaults to {AUX_PROCESSES_STOP_TIMEOUT} seconds if not specified.",
+        )
 
     # pyre-fixme[3]: Return type must be annotated.
     def optional_traceback(self, ex: Exception, debug: bool):
@@ -1884,6 +2012,7 @@ Do you still want to delete {path}?"""
             return 1
         return 0
 
+    # pyrefly: ignore [bad-return]
     def run(self, args: argparse.Namespace) -> int:
         instance = get_eden_instance(args)
 
@@ -1992,6 +2121,11 @@ Do you still want to delete {path}?"""
 
             # Unmount and destroy everything
             exit_code = 0
+            aux_timeout = (
+                args.timeout
+                if args.timeout is not None
+                else _get_aux_processes_stop_timeout()
+            )
             for mount, remove_type in mounts:
                 print(f"Removing {mount}...")
                 # Removing reidrection targets from checkout config to allow deletion of redirected paths
@@ -2013,12 +2147,13 @@ Do you still want to delete {path}?"""
                     skip_destroy=(remove_type == RemoveType.CLEANUP_ONLY),
                     debug=args.debug,
                     proceed_on_unmount_failure=False,
+                    aux_timeout=aux_timeout,
                 )
 
                 # Handle aux process error (log but continue)
                 if result.aux_process_error:
                     msg = f"error stopping auxiliary processes {mount}: {result.aux_process_error}"
-                    telemetry_sample.add_string("problem_fixable", msg)
+                    telemetry_sample.fail(msg)
                     print_stderr(msg)
                     exit_code = 1
                     # We intentionally fall through here - unmount may still work
@@ -2120,7 +2255,7 @@ class UnmountCmd(Subcmd):
                 )
                 if args.destroy:
                     instance.destroy_mount(path)
-            except (EdenService.EdenError, EdenNotRunningError) as ex:
+            except (EdenError, EdenNotRunningError) as ex:
                 print_stderr(f"error: {ex}")
                 return 1
         return 0
@@ -2298,7 +2433,7 @@ class StartCmd(Subcmd):
         """Send notification for EdenFS health status."""
         health_info = instance.check_health()
         try:
-            with instance.get_thrift_client_legacy() as client:
+            with instance.get_thrift_client() as client:
                 if result == 1 or not health_info.is_healthy():
                     request = SendNotificationRequest(
                         title="EdenFS not healthy",
@@ -2327,7 +2462,7 @@ class StartCmd(Subcmd):
                     )
                 client.sendNotification(request)
         except (
-            thrift.transport.TTransport.TTransportException,
+            TransportError,
             EdenNotRunningError,
         ) as e:
             print_stderr(f"EdenFS not running: {e}")
@@ -2367,6 +2502,65 @@ class StartCmd(Subcmd):
             raise Exception("execve should never return")
 
 
+@subcmd(
+    "systemd-start",
+    "Start the EdenFS daemon from an arguments file (invoked by systemd)",
+)
+class SystemdStartCmd(Subcmd):
+    """Internal subcommand invoked by systemd ExecStart/ExecReload.
+
+    Reads the daemon command and environment from a JSON args file
+    written by _systemctl_start_or_reload(), then spawns the daemon.
+    This command is not intended to be run directly by users.
+    """
+
+    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--args-file",
+            required=True,
+            help="Path to JSON file containing daemon command and environment",
+        )
+
+    def run(self, args: argparse.Namespace) -> int:
+        if "INVOCATION_ID" not in os.environ:
+            print_stderr(
+                "error: this command is only meant to be invoked by systemd. "
+                "Use 'eden start' or 'eden restart' instead."
+            )
+            return 1
+
+        args_file_age: Optional[int] = None
+        try:
+            import time
+
+            args_file_age = int(time.time() - os.path.getmtime(args.args_file))
+        except OSError:
+            pass
+
+        exit_code = 1
+        exception = None
+        try:
+            exit_code = daemon_util.start_daemon_from_args_file(args.args_file)
+        except daemon_util.SystemdStartDaemonError as e:
+            print_stderr(f"failed to start daemon from args file: {e}")
+            exception = str(e)
+        finally:
+            try:
+                instance = get_eden_instance(args)
+                sample_kwargs: dict[str, Union[bool, int, str, float]] = {
+                    "success": exit_code == 0,
+                    "exit_code": exit_code,
+                }
+                if exception is not None:
+                    sample_kwargs["exception"] = exception
+                if args_file_age is not None:
+                    sample_kwargs["args_file_age_s"] = args_file_age
+                instance.log_sample("systemd_start", **sample_kwargs)
+            except Exception:
+                pass
+        return exit_code
+
+
 def unmount_redirections_for_path(
     repo_path: str, complain_about_failing_to_unmount_redirs: bool
 ) -> None:
@@ -2382,10 +2576,29 @@ def unmount_redirections_for_path(
 
 
 def _stop_aux_processes_for_path_impl(
-    repo_path: str, complain_about_failing_to_unmount_redirs: bool
+    repo_path: str,
+    complain_about_failing_to_unmount_redirs: bool,
+    current_step: List[str],
 ) -> None:
-    """Internal implementation for stopping aux processes."""
+    """Internal implementation for stopping aux processes.
+
+    Args:
+        repo_path: Path to the repository.
+        complain_about_failing_to_unmount_redirs: Whether to log warnings about
+            failing to unmount redirections.
+        current_step: Mutable list to track the current step being executed.
+            Will be updated with the current step name so that on timeout
+            the caller can report which step was running.
+    """
+    # Inject test delay if env var is set (for integration testing)
+    test_delay = _get_test_delay()
+    if test_delay is not None:
+        _test_cancel_event.wait(timeout=test_delay)
+
+    current_step[0] = "unmounting redirections"
     unmount_redirections_for_path(repo_path, complain_about_failing_to_unmount_redirs)
+
+    current_step[0] = "stopping internal processes (e.g., Myles)"
     stop_internal_processes(repo_path)
 
 
@@ -2398,7 +2611,7 @@ class AuxProcessTimeoutError(Exception):
 def stop_aux_processes_for_path(
     repo_path: str,
     complain_about_failing_to_unmount_redirs: bool = True,
-    timeout: float = AUX_PROCESSES_STOP_TIMEOUT,
+    timeout: int = AUX_PROCESSES_STOP_TIMEOUT,
 ) -> None:
     """Tear down processes that will hold onto file handles and prevent shutdown
     for a given mount point/repo.
@@ -2409,22 +2622,36 @@ def stop_aux_processes_for_path(
         AuxProcessTimeoutError: If stopping aux processes exceeds the timeout.
         Exception: Any exception raised by the underlying implementation.
     """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    # Track the current step so we can report which step timed out
+    current_step: List[str] = ["initializing"]
+
+    # Reset the test cancel event at the start
+    _reset_test_cancel_event()
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
         future = executor.submit(
             _stop_aux_processes_for_path_impl,
             repo_path,
             complain_about_failing_to_unmount_redirs,
+            current_step,
         )
         try:
             future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
+            # Cancel any test delays so the worker thread can exit quickly
+            _cancel_test_delays()
+            step_name = current_step[0]
             raise AuxProcessTimeoutError(
                 f"Stopping aux processes for {repo_path} timed out after "
-                f"{timeout} seconds"
+                f"{timeout} seconds while {step_name}"
             )
+    finally:
+        # Don't wait for the worker thread if we timed out
+        executor.shutdown(wait=False)
 
 
-def stop_aux_processes(client: EdenClient) -> None:
+def stop_aux_processes(client: EdenService.Sync) -> None:
     """Tear down processes that will hold onto file handles and prevent shutdown
     for all mounts"""
 
@@ -2676,19 +2903,102 @@ class RestartCmd(Subcmd):
             )
             return 3
 
+    def _normalize_eden_dir(self, eden_dir: str) -> Tuple[str, bool]:
+        """Strip the user's home dir prefix from eden_dir for low-cardinality logging."""
+        import pwd
+
+        normalized = eden_dir.rstrip("/")
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir.rstrip("/")
+        except KeyError:
+            return normalized, False
+        is_default_config_dir = normalized in (f"{home}/.eden", f"{home}/local/.eden")
+        if normalized.startswith(home + "/"):
+            normalized = normalized[len(home) + 1 :]
+        return normalized, is_default_config_dir
+
+    @staticmethod
+    def _get_fuse_transport_mismatch_direction(
+        transport_mismatches: Sequence[config_mod.FuseTransportMismatch],
+    ) -> str:
+        def get_transport_name(transports: Set[str]) -> str:
+            if len(transports) == 1:
+                return next(iter(transports))
+            return "mixed"
+
+        active_transport = get_transport_name(
+            {mismatch.active_transport for mismatch in transport_mismatches}
+        )
+        desired_transport = get_transport_name(
+            {mismatch.desired_transport for mismatch in transport_mismatches}
+        )
+        return f"{active_transport}_to_{desired_transport}"
+
+    # pyrefly: ignore [bad-return]
     def _graceful_restart(self, instance: EdenInstance) -> int:
         print("Performing a graceful restart...")
-
-        # Clean up legacyephemeral checkouts before the takeover attempt. With this decision, there
-        # is a tradeoff for the case of unsuccessful takeover and old daemon recovery: The old
-        # daemon will not be able to recover the legacy ephemeral checkouts. Due to the
-        # nature of these checkouts, the tradeoff is acceptable considering the complexity of
-        # getting the recovery logic right for this edge case.
-        remove_legacyephemeral_checkouts(instance, ui.get_output())
 
         with instance.get_telemetry_logger().new_sample(
             "graceful_restart"
         ) as telemetry_sample:
+            eden_dir_normalized, is_default_config_dir = self._normalize_eden_dir(
+                str(instance.state_dir)
+            )
+            telemetry_sample.add_string("eden_dir", eden_dir_normalized)
+            telemetry_sample.add_bool("is_default_config_dir", is_default_config_dir)
+            if config_mod.is_fuse_transport_mismatch_restart_enabled(instance):
+                transport_mismatches = config_mod.get_fuse_transport_mismatches(
+                    instance
+                )
+            else:
+                transport_mismatches = []
+
+            if transport_mismatches:
+                telemetry_sample.add_string("reason", "fuse_transport_mismatch")
+                telemetry_sample.add_string(
+                    "transport_name",
+                    self._get_fuse_transport_mismatch_direction(transport_mismatches),
+                )
+                print(
+                    "FUSE transport config changed; performing a full restart instead of graceful restart."
+                )
+                for mismatch in transport_mismatches:
+                    print(
+                        f"  {mismatch.mount}: running {mismatch.active_transport}, configured {mismatch.desired_transport}"
+                    )
+                health = instance.check_health()
+                edenfs_pid = health.pid
+                if edenfs_pid is None:
+                    telemetry_sample.fail(
+                        "FUSE transport mismatch required full restart, but EdenFS was not running"
+                    )
+                    return self._start(instance)
+
+                status = self._full_restart(
+                    instance,
+                    edenfs_pid,
+                    self.args.migrate_to,
+                    self.args.prompt,
+                    self.args.allow_root,
+                )
+                instance.log_sample(
+                    "full_restart",
+                    success=status == 0,
+                    triggered_by="fuse_transport_mismatch",
+                )
+                if status != 0:
+                    telemetry_sample.fail(
+                        "FUSE transport mismatch fallback full restart failed"
+                    )
+                return status
+
+            # Clean up legacyephemeral checkouts before the takeover attempt. With this decision, there
+            # is a tradeoff for the case of unsuccessful takeover and old daemon recovery: The old
+            # daemon will not be able to recover the legacy ephemeral checkouts. Due to the
+            # nature of these checkouts, the tradeoff is acceptable considering the complexity of
+            # getting the recovery logic right for this edge case.
+            remove_legacyephemeral_checkouts(instance, ui.get_output())
+
             # The status here is returned by the exit status of the startup
             # logger. If this is successful, we will ensure the new process
             # itself starts. If this was not successful, we will assume that
@@ -2771,10 +3081,12 @@ re-open these files after EdenFS is restarted.
         # precedence over the default timeout passed in by our caller.
         if self.args.shutdown_timeout is not None:
             timeout = typing.cast(float, self.args.shutdown_timeout)
-        daemon.wait_for_shutdown(pid, config_dir=instance.state_dir, timeout=timeout)
+        daemon.wait_for_shutdown(
+            pid, config_dir=instance.state_dir, timeout=timeout, instance=instance
+        )
 
     def _do_stop(self, instance: EdenInstance, pid: int, timeout: int) -> None:
-        with instance.get_thrift_client_legacy(timeout=timeout) as client:
+        with instance.get_thrift_client(timeout=timeout) as client:
             try:
                 stop_aux_processes(client)
             except Exception:
@@ -2847,10 +3159,7 @@ class RageCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         instance = get_eden_instance(args)
         instance.log_sample("eden_rage")
-        rage_processor = instance.get_config_value("rage.reporter", default="")
-
-        # Allow "{hostname}" substitution in rage.reporter config.
-        rage_processor = rage_processor.format(hostname=socket.getfqdn())
+        rage_processor = rage_mod.get_rage_reporter(instance)
 
         if args.report:
             rage_mod.report_edenfs_bug(instance, rage_processor)
@@ -2926,10 +3235,22 @@ class StopCmd(Subcmd):
             return self._stop(instance, args)
 
     def _stop(self, instance: EdenInstance, args: argparse.Namespace) -> int:
+        if sys.platform == "linux":
+            try:
+                unit = daemon._get_systemd_unit(instance)
+                if daemon._is_systemd_unit_active(unit):
+                    # as long as the service is managed by systemd, we should use
+                    # systemctl to stop it otherwise it will be restarted by systemd
+                    return self._systemd_stop(instance, args, unit)
+            except Exception as ex:
+                print_stderr(
+                    f"warning: systemd detection failed, using legacy stop: {ex}"
+                )
+
         pid = None
         try:
             try:
-                with instance.get_thrift_client_legacy(
+                with instance.get_thrift_client(
                     timeout=self.__thrift_timeout(args)
                 ) as client:
                     pid = client.getPid()
@@ -2941,7 +3262,10 @@ class StopCmd(Subcmd):
                         # os.getuid() is not available on Windows
                         request_info += f" uid={os.getuid()}"
                     client.initiateShutdown(f"`eden stop` requested by {request_info}")
-            except thrift.transport.TTransport.TTransportException as e:
+            except (
+                TransportError,
+                EdenNotRunningError,
+            ) as e:
                 print_stderr(f"warning: edenfs daemon is not responding: {e}")
                 if pid is None:
                     pid = check_health_using_lockfile(instance.state_dir).pid
@@ -2951,13 +3275,49 @@ class StopCmd(Subcmd):
             print_stderr("error: edenfs is not running")
             return SHUTDOWN_EXIT_CODE_NOT_RUNNING_ERROR
 
-        if args.timeout == 0:
+        return self._await_shutdown(instance, pid, args.timeout)
+
+    def _systemd_stop(
+        self, instance: EdenInstance, args: argparse.Namespace, unit: str
+    ) -> int:
+        """Stop edenfs via systemctl for systemd-managed instances."""
+        pid = check_health_using_lockfile(instance.state_dir).pid
+        if pid is None:
+            print_stderr("error: edenfs is not running")
+            return SHUTDOWN_EXIT_CODE_NOT_RUNNING_ERROR
+
+        # Stop aux processes if thrift is available
+        try:
+            with instance.get_thrift_client(
+                timeout=self.__thrift_timeout(args)
+            ) as client:
+                stop_aux_processes(client)
+        except Exception as e:
+            print_stderr(f"warning: failed to stop aux processes: {e}")
+
+        print(f"Stopping edenfs daemon (pid {pid}) via systemd...")
+        result = subprocess.run(
+            ["systemctl", "--user", "stop", "--no-block", unit],
+            env=daemon.get_systemd_user_env(),
+        )
+        rc = result.returncode
+        if rc != 0:
+            print_stderr(f"warning: systemctl stop failed with exit code {rc}")
+
+        return self._await_shutdown(instance, pid, args.timeout)
+
+    def _await_shutdown(self, instance: EdenInstance, pid: int, timeout: float) -> int:
+        """Wait for edenfs to shut down and return the appropriate exit code."""
+        if timeout == 0:
             print_stderr("Sent async shutdown request to edenfs.")
             return SHUTDOWN_EXIT_CODE_REQUESTED_SHUTDOWN
 
         try:
             if daemon.wait_for_shutdown(
-                pid, config_dir=instance.state_dir, timeout=args.timeout
+                pid,
+                config_dir=instance.state_dir,
+                timeout=timeout,
+                instance=instance,
             ):
                 print_stderr("edenfs exited cleanly.")
                 return SHUTDOWN_EXIT_CODE_NORMAL
@@ -2981,7 +3341,10 @@ class StopCmd(Subcmd):
 
         try:
             daemon.sigkill_process(
-                pid, config_dir=instance.state_dir, timeout=args.timeout
+                pid,
+                config_dir=instance.state_dir,
+                timeout=args.timeout,
+                instance=instance,
             )
             print_stderr("Terminated edenfs with SIGKILL.")
             return SHUTDOWN_EXIT_CODE_NORMAL
@@ -3009,14 +3372,30 @@ def create_parser() -> argparse.ArgumentParser:
     # but doesn't really contain configuration.
     global_opts.add_argument(
         "--config-dir",
-        help="Path to directory where EdenFS stores its internal state",
+        default=_get_global_path_default(CONFIG_DIR_ENV_VAR),
+        type=_expand_path,
+        help=(
+            "Path to directory where EdenFS stores its internal state. "
+            f"Defaults to ${CONFIG_DIR_ENV_VAR} if set."
+        ),
     )
     global_opts.add_argument(
         "--etc-eden-dir",
-        help="Path to directory that holds the system configuration files",
+        default=_get_global_path_default(ETC_EDEN_DIR_ENV_VAR),
+        type=_expand_path,
+        help=(
+            "Path to directory that holds the system configuration files. "
+            f"Defaults to ${ETC_EDEN_DIR_ENV_VAR} if set."
+        ),
     )
     global_opts.add_argument(
-        "--home-dir", help="Path to directory where .edenrc config file is stored"
+        "--home-dir",
+        default=_get_global_path_default(HOME_DIR_ENV_VAR),
+        type=_expand_path,
+        help=(
+            "Path to directory where .edenrc config file is stored. "
+            f"Defaults to ${HOME_DIR_ENV_VAR} if set."
+        ),
     )
     global_opts.add_argument("--checkout-dir", help=argparse.SUPPRESS)
     global_opts.add_argument(
@@ -3047,6 +3426,33 @@ def create_parser() -> argparse.ArgumentParser:
     subcmd_mod.add_subcommands(parser, subcmd.commands + subcmd_add_list)
 
     return parser
+
+
+def _expand_path(value: str) -> str:
+    """Expand environment variable references and a leading `~` in a path.
+
+    Environment variable vars are expanded first, then any resulting `~`
+    is expanded against the user's home directory.
+    Used as the argparse `type=` for the global path flags so that values
+    coming in via flag and via env var are normalized identically.
+    """
+    return os.path.expanduser(os.path.expandvars(value))
+
+
+def _get_global_path_default(env_var: str) -> Optional[str]:
+    """Default value for parser for global path flags.
+
+    Returns the raw environment variable value, or `None` when the variable
+    is unset or empty. The returned string is later passed through
+    `_expand_path` by argparse's `type=` conversion (argparse applies
+    `type=` to string defaults). Empty env values map to `None` so that
+    exporting an empty variable behaves the same as not exporting it.
+    """
+    value = os.environ.get(env_var)
+    if not value:
+        return None
+
+    return value
 
 
 def normalize_path_arg(path_arg: str, may_need_tilde_expansion: bool = False) -> str:
@@ -3121,6 +3527,7 @@ Please run "cd / && cd -" to update your shell's working directory."""
         return EX_OSFILE
 
     print(f"Warning: {msg}", file=sys.stderr)
+    # pyrefly: ignore [bad-assignment]
     doctor_mod.working_directory_was_stale = True
     return None
 
@@ -3172,6 +3579,14 @@ except AttributeError:
 
 
 def main() -> int:
+    # Ensure stdout/stderr use UTF-8 encoding. On Windows, Python defaults to
+    # the system code page (e.g. cp1252) which cannot encode non-Latin paths.
+    # This matches Sapling's utf8_mode=1 pre-initialization (python.rs).
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors=stream.errors)
+
     # This is called hundreds of millions of times on unique hosts.
     # Increase how often it's sampled.
     usage.set_sample_rate(automation=10000)

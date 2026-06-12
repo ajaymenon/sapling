@@ -15,9 +15,6 @@ import '@testing-library/jest-dom';
 // console.log still works for debugging tests.
 jest.mock('./logger');
 
-// jest doesn't have the stylex compilation step, let's just mock it
-jest.mock('@stylexjs/stylex');
-
 // Mock MessageBus via LocalWebSocketEventBus before other logic which might have effects on it.
 jest.mock('./LocalWebSocketEventBus', () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/consistent-type-imports
@@ -47,3 +44,12 @@ configure({
 global.ResizeObserver = require('resize-observer-polyfill');
 
 global.fetch = jest.fn().mockImplementation(() => Promise.resolve());
+
+// Default all QE flags to false in tests so they don't hang waiting for server responses
+beforeEach(() => {
+  // Use lazy require() to avoid loading featureFlags (and its transitive deps like i18n)
+  // at module level, which would prevent test-specific jest.mock() calls from taking effect.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const {__TEST__: featureFlagTestUtils} = require('./featureFlags');
+  featureFlagTestUtils.enableQeFlagOverrides();
+});

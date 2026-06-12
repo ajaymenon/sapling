@@ -214,8 +214,7 @@ impl<R: MononokeRepo> RepoContext<R> {
 
         if !public.is_empty() {
             return Err(MononokeError::InvalidRequest(format!(
-                "Cannot fold public commits: {}",
-                bottom_id
+                "Cannot fold public commits: {bottom_id}"
             )));
         }
         let top_id = top_id.unwrap_or(bottom_id);
@@ -431,6 +430,7 @@ impl<R: MononokeRepo> RepoContext<R> {
                         repo_blobstore.clone(),
                         Some(&stack_changes),
                         std::slice::from_ref(&base_ctx),
+                        checks.copy_from_path,
                     )
                     .await?;
             }
@@ -477,6 +477,7 @@ impl<R: MononokeRepo> RepoContext<R> {
                 Some(&stack_changes),
                 prefix_paths,
                 &path_changes,
+                checks.prefix_files_deleted,
             )
             .timed()
             .await
@@ -739,7 +740,9 @@ impl<R: MononokeRepo> RepoContext<R> {
 
         Ok(merged)
     }
+}
 
+impl<R> RepoContext<R> {
     /// Apply file changes to the working tree, tracking copy chains and replaced directories.
     ///
     /// Converts FileChange to CreateChange and delegates to apply_create_changes.

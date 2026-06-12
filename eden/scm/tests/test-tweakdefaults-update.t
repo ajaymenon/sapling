@@ -9,7 +9,6 @@
 
   $ eagerepo
 
-  $ setconfig devel.segmented-changelog-rev-compat=true
   $ cat >> $HGRCPATH << 'EOF'
   > [extensions]
   > tweakdefaults=
@@ -21,75 +20,75 @@
 
 # Set up the repository.
 
-  $ hg init repo
+  $ sl init repo
   $ cd repo
-  $ hg debugbuilddag -m '+4 *3 +1'
-  $ hg log --graph -r '0::' -T '{rev}'
-  o  5
+  $ sl debugbuilddag -m '+4 *3 +1'
+  $ sl log --graph -r 'all()' -T '{desc}'
+  o  r5
   │
-  o  4
+  o  r4
   │
-  │ o  3
+  │ o  r3
   │ │
-  │ o  2
+  │ o  r2
   ├─╯
-  o  1
+  o  r1
   │
-  o  0
+  o  r0
 
-  $ hg up 3
+  $ sl up 'desc(r3)'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 # Make an uncommitted change.
 
   $ echo foo > foo
-  $ hg add foo
-  $ hg st
+  $ sl add foo
+  $ sl st
   A foo
 
 # Can always update to current commit.
 
-  $ hg up .
+  $ sl up .
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 # Abort with --check set, succeed with --merge
 
-  $ hg up 2 --check
+  $ sl up 'desc(r2)' --check
   abort: uncommitted changes
   [255]
-  $ hg up --merge 2
+  $ sl up --merge 'desc(r2)'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 # Updates to other branches should fail without --merge.
 
-  $ hg up 4 --check
+  $ sl up 'desc(r4)' --check
   abort: uncommitted changes
   [255]
-  $ hg up --merge 4
+  $ sl up --merge 'desc(r4)'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 # Certain flags shouldn't work together.
 
-  $ hg up --check --merge 3
+  $ sl up --check --merge 'desc(r3)'
   abort: can only specify one of -C/--clean, -c/--check, or -m/--merge
   [255]
-  $ hg up --check --clean 3
+  $ sl up --check --clean 'desc(r3)'
   abort: can only specify one of -C/--clean, -c/--check, or -m/--merge
   [255]
-  $ hg up --clean --merge 3
+  $ sl up --clean --merge 'desc(r3)'
   abort: can only specify one of -C/--clean, -c/--check, or -m/--merge
   [255]
 
 # --clean should work as expected.
 
-  $ hg st
+  $ sl st
   A foo
-  $ hg up --clean 3
+  $ sl up --clean 'desc(r3)'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg st
+  $ sl st
   ? foo
   $ enable amend
-  $ hg goto '.^'
+  $ sl goto '.^'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  hint[update-prev]: use 'hg prev' to move to the parent changeset
-  hint[hint-ack]: use 'hg hint --ack update-prev' to silence these hints
+  hint[update-prev]: use 'sl prev' to move to the parent changeset
+  hint[hint-ack]: use 'sl hint --ack update-prev' to silence these hints

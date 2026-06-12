@@ -15,6 +15,7 @@ import platform
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -129,6 +130,11 @@ class IOWithRedaction:
 
     def flush(self) -> None:
         self.wrapped.flush()
+
+
+def get_rage_reporter(instance: EdenInstance) -> str:
+    processor = instance.get_config_value("rage.reporter", default="")
+    return processor.format(hostname=socket.getfqdn())
 
 
 THRIFT_COUNTER_REGEX = (
@@ -250,11 +256,19 @@ def print_host_dashboard(out: IOWithRedaction, host: str) -> None:
 
 
 def get_rotated_edenfs_log_path(instance: EdenInstance) -> Optional[Path]:
-    all_rotated_logs = [
-        (f)
-        for f in instance.get_log_dir().iterdir()
-        if f.name.endswith(".gz") and f.name.startswith("edenfs.log")
-    ]
+    try:
+        all_rotated_logs = [
+            (f)
+            for f in instance.get_log_dir().iterdir()
+            if f.name.endswith(".gz") and f.name.startswith("edenfs.log")
+        ]
+    except FileNotFoundError:
+        print(
+            f"Warning: EdenFS log directory {instance.get_log_dir()} does not "
+            "exist. The EdenFS daemon may be using a non-default --logPath.",
+            file=sys.stderr,
+        )
+        return None
     all_rotated_logs.sort(key=lambda x: x.stat().st_ctime, reverse=True)
     if len(all_rotated_logs) == 0:
         return None
@@ -281,7 +295,11 @@ def get_eden_logs(
             out.write(f"Snippet of rotated log file {str(rotated_log_file)}: ")
             paste_output(
                 lambda sink, log=rotated_log_file: print_log_file(
-                    log, sink, open_fn=gzip.open
+                    # pyrefly: ignore [bad-argument-type]
+                    log,
+                    sink,
+                    # pyrefly: ignore [bad-argument-type]
+                    open_fn=gzip.open,
                 ),
                 processor,
                 out,
@@ -363,7 +381,7 @@ def print_diagnostic_info(
     print_build_info(out, host, instance)
     print_host_dashboard(out, host)
 
-    processor = instance.get_config_value("rage.reporter", default="")
+    processor = get_rage_reporter(instance)
     get_eden_logs(out, processor, instance, dry_run)
 
     print_watchman_log(out, processor, dry_run)
@@ -563,6 +581,7 @@ def report_edenfs_bug(instance: EdenInstance, reporter: str) -> None:
     rage_lambda: Callable[[EdenInstance, IO[bytes]], None] = (
         lambda inst, sink: print_diagnostic_info(inst, sink, False)
     )
+    # pyrefly: ignore [bad-argument-type]
     _report_edenfs_bug(rage_lambda, instance, reporter)
 
 
@@ -651,6 +670,7 @@ def print_log_file(
     open_fn: Callable[
         [Path, str],
         BinaryIO,
+        # pyrefly: ignore [bad-function-definition]
     ] = open,
     tail_limit: Optional[int] = 1000000,
 ) -> None:
@@ -746,6 +766,7 @@ def _get_running_eden_process_windows() -> List[Tuple[str, str, str, str, str, s
         lines.append(
             (line[4], line[3], start_time.strftime("%b %d %H:%M"), elapsed, line[1])
         )
+    # pyrefly: ignore [bad-return]
     return lines
 
 
@@ -817,7 +838,7 @@ def print_counters(
 ) -> None:
     try:
         section_title(f"{counter_type} counters:", out)
-        with instance.get_thrift_client_legacy(timeout=3) as client:
+        with instance.get_thrift_client(timeout=3) as client:
             counters = client.getRegexCounters(regex)
             for key, value in counters.items():
                 out.write(f"{key}: {value}\n")

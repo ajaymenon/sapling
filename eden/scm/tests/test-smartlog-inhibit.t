@@ -7,7 +7,6 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-  $ setconfig devel.segmented-changelog-rev-compat=true
   $ cat >> $HGRCPATH << 'EOF'
   > [extensions]
   > amend=
@@ -18,32 +17,32 @@
 
 # Test that changesets with visible precursors are rendered as x's
 
-  $ hg init repo
+  $ sl init repo
   $ cd repo
-  $ hg debugbuilddag +4
-  $ hg book -r 3 test
-  $ hg up 1
+  $ sl debugbuilddag +4
+  $ sl book -r 'desc(r3)' test
+  $ sl up 'desc(r1)'
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m amended --no-rebase
-  hint[amend-restack]: descendants of 66f7d451a68b are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg smartlog -T '{rev} {bookmarks}'
-  o  3 test
+  $ sl amend -m amended --no-rebase
+  hint[amend-restack]: descendants of 66f7d451a68b are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl smartlog -T '{desc|firstline} {bookmarks}'
+  o  r3 test
   │
-  o  2
+  o  r2
   │
-  x  1
+  x  r1
   │
-  │ @  4
+  │ @  amended
   ├─╯
-  o  0
-  $ hg unamend
-  $ hg up 2
+  o  r0
+  $ sl unamend
+  $ sl up 'desc(r2)'
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg debugmakepublic -r .
-  $ hg smartlog -T '{rev} {bookmarks}'
-  o  3 test
+  $ sl debugmakepublic -r .
+  $ sl smartlog -T '{desc|firstline} {bookmarks}'
+  o  r3 test
   │
-  @  2
+  @  r2
   │
   ~

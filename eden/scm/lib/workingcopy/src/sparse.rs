@@ -26,6 +26,7 @@ use pathmatcher::ExactMatcher;
 use pathmatcher::UnionMatcher;
 pub use sparse::Root;
 use storemodel::FileStore;
+use types::FetchCause;
 use types::FetchContext;
 use types::RepoPath;
 use types::RepoPathBuf;
@@ -113,7 +114,11 @@ pub fn fetch_sparse_profile_content(
         None => return Ok(None),
     };
 
-    let blob = store.get_content(FetchContext::default(), &repo_path, file_id)?;
+    let blob = store.get_content(
+        FetchContext::new_with_cause(FetchCause::SaplingSparse),
+        &repo_path,
+        file_id,
+    )?;
     let mut bytes = blob.into_bytes().into_vec();
     if let Some(extra) = overrides.get(&path) {
         bytes.append(&mut extra.to_string().into_bytes());
@@ -503,7 +508,7 @@ inc
             unimplemented!()
         }
 
-        fn flush(&mut self) -> anyhow::Result<HgId> {
+        fn persist(&mut self, _opts: manifest::PersistOpts<'_, Self>) -> anyhow::Result<HgId> {
             unimplemented!()
         }
 

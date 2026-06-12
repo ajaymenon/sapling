@@ -23,12 +23,14 @@ import sys
 import time
 import typing
 import uuid
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import (
     Any,
     Callable,
     Dict,
+    Generator,
     IO,
     KeysView,
     List,
@@ -39,13 +41,20 @@ from typing import (
     Union,
 )
 
-import facebook.eden.ttypes as eden_ttypes
 import toml
-from eden.thrift import legacy
-from eden.thrift.legacy import EdenNotRunningError
-from facebook.eden.ttypes import MountInfo as ThriftMountInfo, MountState
+from eden.fs.service.eden.thrift_clients import EdenService
+from eden.fs.service.eden.thrift_types import (
+    EdenError,
+    MountArgument,
+    MountId,
+    MountInfo,
+    MountState,
+    UnmountArgument,
+)
+from eden.thrift import client
+from eden.thrift.client import EdenNotRunningError
 from filelock import BaseFileLock, FileLock
-from thrift.Thrift import TApplicationException
+from thrift.python.exceptions import ApplicationError, ApplicationErrorType
 
 from . import configinterpolator, configutil, telemetry, util, version
 
@@ -222,7 +231,6 @@ class CheckoutConfig(typing.NamedTuple):
     enable_sqlite_overlay: bool
     use_write_back_cache: bool
     re_use_case: str
-    enable_windows_symlinks: bool
     inode_catalog_type: Optional[str]
     off_mount_repo_dir: bool
 
@@ -233,20 +241,30 @@ class ListMountInfo(typing.NamedTuple):
     state: Optional[MountState]
     configured: bool
     backing_repo: Optional[Path]
+    fs_channel_type: Optional[str] = None
+    fuse_transport: Optional[str] = None
 
     def to_json_dict(self) -> Dict[str, Any]:
-        return {
+        if self.state is None:
+            state_str = "NOT_RUNNING"
+        elif hasattr(self.state, "name"):
+            state_str = self.state.name
+        else:
+            # State is a raw int
+            state_str = MountState(self.state).name
+        d: Dict[str, Any] = {
             "data_dir": self.data_dir.as_posix(),
-            "state": (
-                MountState._VALUES_TO_NAMES.get(self.state)
-                if self.state is not None
-                else "NOT_RUNNING"
-            ),
+            "state": state_str,
             "configured": self.configured,
             "backing_repo": (
                 self.backing_repo.as_posix() if self.backing_repo is not None else None
             ),
         }
+        if self.fs_channel_type is not None:
+            d["fs_channel_type"] = self.fs_channel_type
+        if self.fuse_transport is not None:
+            d["fuse_transport"] = self.fuse_transport
+        return d
 
 
 class SnapshotState(typing.NamedTuple):
@@ -273,6 +291,8 @@ class AbstractEdenInstance:
     ) -> configutil.Strs: ...
 
     def get_checkouts(self) -> List["EdenCheckout"]: ...
+
+    def get_mounts(self) -> Dict[Path, ListMountInfo]: ...
 
 
 class EdenInstance(AbstractEdenInstance):
@@ -426,6 +446,17 @@ class EdenInstance(AbstractEdenInstance):
         if "INTEGRATION_TEST" in os.environ or "EDENFS_UNITTEST" in os.environ:
             return telemetry.NullTelemetryLogger()
 
+        if self.get_config_bool("telemetry.enable-xplatlogger-events", default=False):
+            try:
+                # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
+                from eden.fs.cli.facebook.xplat_logger import XplatLogger  # @manual
+
+                return XplatLogger()
+            except ImportError:
+                pass
+            except Exception as ex:
+                log.warning(f"XplatLogger construction failed, falling back: {ex}")
+
         try:
             # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
             from eden.fs.cli.facebook import scuba_telemetry  # @manual
@@ -493,7 +524,7 @@ class EdenInstance(AbstractEdenInstance):
     def get_current_and_running_versions(self) -> Tuple[str, Optional[str]]:
         try:
             running = self.get_running_version()
-        except legacy.EdenNotRunningError:
+        except EdenNotRunningError:
             # return None if EdenFS does not currently appear to be running
             running = None
         return version.get_current_version(), running
@@ -534,13 +565,15 @@ class EdenInstance(AbstractEdenInstance):
         """Return the paths of the set mount points stored in config.json"""
         return [str(path) for path in self._get_directory_map().keys()]
 
-    def get_thrift_client_legacy(
+    @contextmanager
+    def get_thrift_client(
         self, timeout: Optional[float] = None
-    ) -> legacy.EdenClient:
-        return legacy.create_thrift_client(
+    ) -> Generator[EdenService.Sync, None, None]:
+        with client.create_thrift_client(
             eden_dir=str(self._config_dir),
-            timeout=timeout,
-        )
+            timeout=timeout if timeout is not None else 0,
+        ) as thrift_client:
+            yield thrift_client
 
     def get_checkout_info(
         self, path: Union[Path, str]
@@ -581,9 +614,6 @@ class EdenInstance(AbstractEdenInstance):
         if checkout_config.inode_catalog_type is not None:
             ret["inode_catalog_type"] = checkout_config.inode_catalog_type
 
-        if sys.platform == "win32":
-            ret["symlinks_enabled"] = checkout_config.enable_windows_symlinks
-
         if snapshot is not None:
             ret["checked_out_revision"] = snapshot.last_checkout_hash
             ret["working_copy_parent"] = snapshot.working_copy_parent
@@ -594,8 +624,8 @@ class EdenInstance(AbstractEdenInstance):
 
     def get_mounts(self) -> Dict[Path, ListMountInfo]:
         try:
-            with self.get_thrift_client_legacy() as client:
-                thrift_mounts = client.listMounts()
+            with self.get_thrift_client() as client:
+                thrift_mounts: List[MountInfo] = list(client.listMounts())
         except EdenNotRunningError:
             thrift_mounts = []
 
@@ -605,20 +635,14 @@ class EdenInstance(AbstractEdenInstance):
     @classmethod
     def _combine_mount_info(
         cls,
-        thrift_mounts: List[ThriftMountInfo],
+        thrift_mounts: List[MountInfo],
         config_checkouts: List["EdenCheckout"],
     ) -> Dict[Path, ListMountInfo]:
         mount_points: Dict[Path, ListMountInfo] = {}
 
         for thrift_mount in thrift_mounts:
             path = Path(os.fsdecode(thrift_mount.mountPoint))
-            # Older versions of EdenFS did not report the state field.
-            # If it is missing, set it to RUNNING.
-            state = (
-                thrift_mount.state
-                if thrift_mount.state is not None
-                else MountState.RUNNING
-            )
+            state = thrift_mount.state
             data_dir = Path(os.fsdecode(thrift_mount.edenClientPath))
 
             # this line is for pyre :(
@@ -635,25 +659,43 @@ class EdenInstance(AbstractEdenInstance):
                 state=state,
                 configured=False,
                 backing_repo=backing_repo,
+                fs_channel_type=thrift_mount.fsChannelType,
+                fuse_transport=thrift_mount.fuseTransport,
             )
 
         # Add all mount points listed in the config that were not reported
         # in the thrift call.
         for checkout in config_checkouts:
             mount_info = mount_points.get(checkout.path, None)
+            checkout_config: Optional[CheckoutConfig] = None
+            try:
+                if mount_info is None or mount_info.backing_repo is None:
+                    checkout_config = checkout.get_config()
+            except CheckoutConfigCorruptedError as ex:
+                if isinstance(ex.__cause__, FileNotFoundError):
+                    log.warning(
+                        "Skipping configured checkout with missing client state: %s (%s)",
+                        checkout.path,
+                        checkout.state_dir,
+                    )
+                    continue
+                raise
+
             if mount_info is not None:
                 if mount_info.backing_repo is None:
+                    assert checkout_config is not None
                     mount_info = mount_info._replace(
-                        backing_repo=checkout.get_config().backing_repo
+                        backing_repo=checkout_config.backing_repo
                     )
                 mount_points[checkout.path] = mount_info._replace(configured=True)
             else:
+                assert checkout_config is not None
                 mount_points[checkout.path] = ListMountInfo(
                     path=checkout.path,
                     data_dir=checkout.state_dir,
                     state=None,
                     configured=True,
-                    backing_repo=checkout.get_config().backing_repo,
+                    backing_repo=checkout_config.backing_repo,
                 )
 
         return mount_points
@@ -699,7 +741,7 @@ Do you want to run `eden mount %s` instead?"""
         checkout.save_config(checkout_config)
 
         # Prepare to mount
-        mount_info = eden_ttypes.MountArgument(
+        mount_info = MountArgument(
             mountPoint=os.fsencode(path),
             edenClientPath=os.fsencode(client_dir),
             readOnly=False,
@@ -712,7 +754,7 @@ Do you want to run `eden mount %s` instead?"""
         if mount_timeout == 0:
             mount_timeout = None
 
-        with self.get_thrift_client_legacy(timeout=mount_timeout) as client:
+        with self.get_thrift_client(timeout=mount_timeout) as client:
             client.mount(mount_info)
 
         self._post_clone_checkout_setup(checkout, snapshot_id, filter_paths)
@@ -921,14 +963,16 @@ Do you want to run `eden mount %s` instead?"""
                 raise
 
         # Ask eden to mount the path
-        mount_info = eden_ttypes.MountArgument(
-            mountPoint=bytes(path), edenClientPath=bytes(client_dir), readOnly=read_only
+        mount_info = MountArgument(
+            mountPoint=os.fsencode(path),
+            edenClientPath=os.fsencode(client_dir),
+            readOnly=read_only,
         )
 
         try:
-            with self.get_thrift_client_legacy() as client:
+            with self.get_thrift_client() as client:
                 client.mount(mount_info)
-        except eden_ttypes.EdenError as ex:
+        except EdenError as ex:
             if "already mounted" in str(ex):
                 print_stderr(
                     f"ERROR: Mount point in use! {path} is already mounted by EdenFS."
@@ -948,21 +992,21 @@ Do you want to run `eden mount %s` instead?"""
         #
         # For now at least time out here so the CLI commands do not hang in this
         # case.
-        with self.get_thrift_client_legacy(timeout=UNMOUNT_TIMEOUT_SECONDS) as client:
-            mountPoint = os.fsencode(path)
-            unmount_arg = eden_ttypes.UnmountArgument(
-                mountId=eden_ttypes.MountId(mountPoint=mountPoint),
-                useForce=use_force,
-            )
+        mount_point = os.fsencode(path)
+        unmount_arg = UnmountArgument(
+            mountId=MountId(mountPoint=mount_point),
+            useForce=use_force,
+        )
 
+        with self.get_thrift_client(timeout=UNMOUNT_TIMEOUT_SECONDS) as client:
             try:
                 client.unmountV2(unmount_arg)
-            except TApplicationException as e:
+            except ApplicationError as e:
                 # Fallback to old unmount in the case that this is running
                 # against an older version of EdenFS in which unmountV2 is
                 # not known
-                if e.type == TApplicationException.UNKNOWN_METHOD:
-                    client.unmount(mountPoint)
+                if e.type == ApplicationErrorType.UNKNOWN_METHOD:
+                    client.unmount(mount_point)
                 else:
                     raise e
 
@@ -1023,6 +1067,7 @@ Do you want to run `eden mount %s` instead?"""
                 except Exception:
                     return "directory and files ..."
 
+            # pyrefly: ignore [missing-attribute]
             shutil._rmtree_unsafe = util.hook_recursive_with_spinner(
                 # We're gently caressing an internal shutil function
                 # pyre-ignore[16]: Module shutil has no attribute _rmtree_unsafe.
@@ -1058,6 +1103,7 @@ Do you want to run `eden mount %s` instead?"""
                 except Exception:
                     return "directory and files ..."
 
+            # pyrefly: ignore [missing-attribute]
             shutil._rmtree_safe_fd = util.hook_recursive_with_spinner(
                 # We're gently caressing an internal shutil function
                 # pyre-ignore[16]: Module shutil has no attribute _rmtree_safe_fd.
@@ -1071,7 +1117,9 @@ Do you want to run `eden mount %s` instead?"""
             self._remove_path_from_directory_map(path)
 
         # Restore the original rmtree
+        # pyrefly: ignore [missing-attribute]
         shutil._rmtree_unsafe = old_rmtree_unsafe
+        # pyrefly: ignore [missing-attribute]
         shutil._rmtree_safe_fd = old_rmtree_safe_fd
 
     def _cleanup_unix_mount(self, path: Path, preserve_mount_point: bool) -> None:
@@ -1198,7 +1246,7 @@ Do you want to run `eden mount %s` instead?"""
         Returns a HealthStatus object containing health information.
         """
         return util.check_health(
-            self.get_thrift_client_legacy, self._config_dir, timeout=timeout
+            self.get_thrift_client, self._config_dir, timeout=timeout
         )
 
     def check_privhelper_connection(self) -> bool:
@@ -1207,7 +1255,7 @@ Do you want to run `eden mount %s` instead?"""
 
         Returns True if so, False if not.
         """
-        with self.get_thrift_client_legacy() as client:
+        with self.get_thrift_client() as client:
             return client.checkPrivHelper().connected
 
     def get_log_dir(self) -> Path:
@@ -1305,12 +1353,12 @@ Do you want to run `eden mount %s` instead?"""
         return self._config_dir / CLIENTS_DIR
 
     def get_server_build_info(self) -> Dict[str, str]:
-        with self.get_thrift_client_legacy(timeout=3) as client:
-            return client.getRegexExportedValues("^build_.*")
+        with self.get_thrift_client(timeout=3) as client:
+            return dict(client.getRegexExportedValues("^build_.*"))
 
     def get_uptime(self) -> datetime.timedelta:
         now = datetime.datetime.now()
-        with self.get_thrift_client_legacy(timeout=3) as client:
+        with self.get_thrift_client(timeout=3) as client:
             since_in_seconds = client.aliveSince()
         since = datetime.datetime.fromtimestamp(since_in_seconds)
         return now - since
@@ -1456,7 +1504,6 @@ class EdenCheckout:
                 "require-utf8-path": checkout_config.require_utf8_path,
                 "enable-sqlite-overlay": checkout_config.enable_sqlite_overlay,
                 "use-write-back-cache": checkout_config.use_write_back_cache,
-                "enable-windows-symlinks": checkout_config.enable_windows_symlinks,
                 "inode-catalog-type": checkout_config.inode_catalog_type,
                 "off-mount-repo-dir": checkout_config.off_mount_repo_dir,
             },
@@ -1474,7 +1521,7 @@ class EdenCheckout:
 
         if checkout_config.predictive_prefetch_num_dirs:
             config_data["predictive-prefetch"]["predictive-prefetch-num-dirs"] = (
-                checkout_config.predictive_prefetch_num_dirs
+                checkout_config.predictive_prefetch_num_dirs  # pyrefly: ignore [bad-assignment, bad-typed-dict-key]
             )
 
         util.write_file_atomically(
@@ -1628,10 +1675,6 @@ class EdenCheckout:
             if recas.get("use-case") is not None:
                 re_use_case = str(recas.get("use-case"))
 
-        enable_windows_symlinks = repository.get("enable-windows-symlinks")
-        if not isinstance(enable_windows_symlinks, bool):
-            enable_windows_symlinks = False
-
         off_mount_repo_dir = repository.get("off-mount-repo-dir")
         if not isinstance(off_mount_repo_dir, bool):
             off_mount_repo_dir = False
@@ -1676,12 +1719,12 @@ class EdenCheckout:
                 repository.get("default-revision") or DEFAULT_REVISION[scm_type]
             ),
             active_prefetch_profiles=prefetch_profiles,
+            # pyrefly: ignore [bad-argument-type]
             predictive_prefetch_profiles_active=predictive_prefetch_active,
             predictive_prefetch_num_dirs=predictive_num_dirs,
             enable_sqlite_overlay=enable_sqlite_overlay,
             use_write_back_cache=use_write_back_cache,
             re_use_case=re_use_case,
-            enable_windows_symlinks=enable_windows_symlinks,
             inode_catalog_type=inode_catalog_type,
             off_mount_repo_dir=off_mount_repo_dir,
         )
@@ -1839,6 +1882,19 @@ def parse_snapshot_component(buf: bytes, scm_type: str) -> Tuple[str, Optional[b
 
 _MIGRATE_EXISTING_TO_NFS = "core.migrate_existing_to_nfs"
 _MIGRATE_EXISTING_TO_NFS_ALL_MACOS = "core.migrate_existing_to_nfs_all_macos"
+_FUSE_USE_IO_URING = "fuse.use-io-uring"
+_FUSE_IO_URING_KERNEL_RELEASE_REGEX = "fuse.io-uring-kernel-release-regex"
+_FUSE_RESTART_ON_TRANSPORT_MISMATCH = "fuse.restart-on-transport-mismatch"
+_DEFAULT_FUSE_IO_URING_KERNEL_RELEASE_REGEX = r"^6\.13\."
+
+FUSE_TRANSPORT_DEVFUSE = "devfuse"
+FUSE_TRANSPORT_IO_URING = "io_uring"
+
+
+class FuseTransportMismatch(typing.NamedTuple):
+    mount: Path
+    active_transport: str
+    desired_transport: str
 
 
 # Fuse is still not functional on Ventura, so users will need to use NFS on
@@ -1859,6 +1915,67 @@ def should_migrate_mount_protocol_to_nfs(instance: AbstractEdenInstance) -> bool
         return instance.get_config_bool(_MIGRATE_EXISTING_TO_NFS, default=False)
 
     return False
+
+
+def is_fuse_transport_mismatch_restart_enabled(
+    instance: AbstractEdenInstance,
+) -> bool:
+    return sys.platform == "linux" and instance.get_config_bool(
+        _FUSE_RESTART_ON_TRANSPORT_MISMATCH, default=False
+    )
+
+
+def get_desired_fuse_transport(instance: AbstractEdenInstance) -> Optional[str]:
+    if sys.platform != "linux":
+        return None
+
+    if not instance.get_config_bool(_FUSE_USE_IO_URING, default=False):
+        return FUSE_TRANSPORT_DEVFUSE
+
+    kernel_release_regex = instance.get_config_value(
+        _FUSE_IO_URING_KERNEL_RELEASE_REGEX,
+        default=_DEFAULT_FUSE_IO_URING_KERNEL_RELEASE_REGEX,
+    )
+    if not kernel_release_regex:
+        return FUSE_TRANSPORT_DEVFUSE
+
+    try:
+        if re.search(kernel_release_regex, os.uname().release) is not None:
+            return FUSE_TRANSPORT_IO_URING
+    except re.error as ex:
+        log.warning(
+            "Invalid FUSE io_uring kernel release regex %r: %s",
+            kernel_release_regex,
+            ex,
+        )
+
+    return FUSE_TRANSPORT_DEVFUSE
+
+
+def get_fuse_transport_mismatches(
+    instance: AbstractEdenInstance,
+) -> List[FuseTransportMismatch]:
+    if sys.platform != "linux":
+        return []
+
+    desired_transport = get_desired_fuse_transport(instance)
+    if desired_transport is None:
+        return []
+
+    mismatches: List[FuseTransportMismatch] = []
+    for mount_info in instance.get_mounts().values():
+        active_transport = mount_info.fuse_transport
+        if active_transport is None:
+            continue
+        if active_transport != desired_transport:
+            mismatches.append(
+                FuseTransportMismatch(
+                    mount=mount_info.path,
+                    active_transport=active_transport,
+                    desired_transport=desired_transport,
+                )
+            )
+    return mismatches
 
 
 _MIGRATE_EXISTING_TO_IN_MEMORY_CATALOG = "core.migrate_existing_to_in_memory_catalog"
@@ -1978,7 +2095,8 @@ def detect_checkout_path_problem(
         # However, we prefer to get the list from the current eden process (if one's running)
         instance.get_running_version()
         checkout_list = instance.get_mounts().items()
-    except EdenNotRunningError:  # If EdenFS isn't running, we should fail
+    except EdenNotRunningError:
+        # If EdenFS isn't running, we should fail
         return None, None
 
     # Checkout list must be sorted so that parent paths are checked first
@@ -2198,7 +2316,7 @@ def load_toml_config(path: Path) -> TomlConfigDict:
         if line_num != -1:
             line = get_line_by_number(data, line_num)
             if line is not None:
-                hint += f"Detected here (line {line_num}): \n\n{line}\n"
+                hint += f"Detected here (line {line_num}):\n\n{line}\n"
 
         raise FileError(f"toml config file {str(path)} not valid: {str(e)}{hint}")
     except Exception as e:
@@ -2216,7 +2334,6 @@ def get_repo_info(
     overlay_type: Optional[str],
     backing_store_type: Optional[str] = None,
     re_use_case: Optional[str] = None,
-    enable_windows_symlinks: bool = False,
     off_mount_repo_dir: bool = False,
 ) -> Tuple[util.Repo, CheckoutConfig]:
     # Check to see if repo_arg points to an existing EdenFS mount
@@ -2249,7 +2366,6 @@ def get_repo_info(
         overlay_type,
         backing_store_type=backing_store_type,
         re_use_case=re_use_case,
-        enable_windows_symlinks=enable_windows_symlinks,
         off_mount_repo_dir=off_mount_repo_dir,
     )
 
@@ -2264,7 +2380,6 @@ def create_checkout_config(
     overlay_type: Optional[str],
     backing_store_type: Optional[str] = None,
     re_use_case: Optional[str] = None,
-    enable_windows_symlinks: bool = False,
     off_mount_repo_dir: bool = False,
 ) -> CheckoutConfig:
     mount_protocol = util.get_protocol(nfs)
@@ -2318,7 +2433,6 @@ def create_checkout_config(
         enable_sqlite_overlay=enable_sqlite_overlay,
         use_write_back_cache=False,
         re_use_case=re_use_case or "buck2-default",
-        enable_windows_symlinks=enable_windows_symlinks,
         inode_catalog_type=overlay_type,
         off_mount_repo_dir=off_mount_repo_dir,
     )

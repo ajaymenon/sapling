@@ -9,6 +9,7 @@ import type {ServerPlatform} from 'isl-server/src/serverPlatform';
 import type {RepositoryContext} from 'isl-server/src/serverTypes';
 import type {
   AbsolutePath,
+  CwdInfo,
   Diagnostic,
   DiagnosticSeverity,
   PlatformSpecificClientToServerMessages,
@@ -57,6 +58,7 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
     message: PlatformSpecificClientToServerMessages,
     postMessage: (message: ServerToClientMessage) => void,
     onDispose: (cb: () => unknown) => void,
+    onConnectionDispose: (cb: () => unknown) => void = onDispose,
   ) {
     try {
       switch (message.type) {
@@ -106,8 +108,34 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
           executeVSCodeCommand('sapling.open-file-diff', uri, message.comparison);
           break;
         }
+        case 'platform/revealInFileExplorer': {
+          if (repo != null) {
+            const path: AbsolutePath = pathModule.join(repo.info.repoRoot, message.path);
+            const uri = vscode.Uri.file(path);
+            vscode.commands.executeCommand('revealFileInOS', uri);
+          }
+          break;
+        }
+        case 'platform/revealInExplorerView': {
+          if (repo != null) {
+            const path: AbsolutePath = pathModule.join(repo.info.repoRoot, message.path);
+            const uri = vscode.Uri.file(path);
+            vscode.commands.executeCommand('revealInExplorer', uri);
+          }
+          break;
+        }
         case 'platform/openExternal': {
           vscode.env.openExternal(vscode.Uri.parse(message.url));
+          break;
+        }
+        case 'platform/openInNewWindow': {
+          const folderUri = vscode.Uri.file(message.path);
+          vscode.commands.executeCommand('vscode.openFolder', folderUri, {forceNewWindow: true});
+          break;
+        }
+        case 'platform/openFolder': {
+          const folderUri = vscode.Uri.file(message.path);
+          vscode.commands.executeCommand('vscode.openFolder', folderUri, {forceNewWindow: false});
           break;
         }
         case 'platform/changeTitle': {
@@ -221,12 +249,26 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
         }
         case 'platform/subscribeToAvailableCwds': {
           const postAllAvailableCwds = async () => {
-            const options = await Promise.all(
-              (vscode.workspace.workspaceFolders ?? []).map(folder => {
-                const cwd = folder.uri.fsPath;
-                return Repository.getCwdInfo({...ctx, cwd});
-              }),
+            const focusedEnv = Internal.basecampGetFocusedEnvironment?.();
+            const focusedPaths = focusedEnv?.folderPaths;
+
+            // When a focused environment is set, only
+            // show workspace folders that belong to that environment.
+            const folders = (vscode.workspace.workspaceFolders ?? []).filter(folder => {
+              if (!focusedPaths || focusedPaths.length === 0) {
+                return true;
+              }
+              return (
+                focusedPaths.includes(folder.uri.fsPath) || focusedPaths.includes(folder.uri.path)
+              );
+            });
+
+            const results = await Promise.allSettled(
+              folders.map(folder => Repository.getCwdInfo({...ctx, cwd: folder.uri.fsPath})),
             );
+            const options = results
+              .filter((r): r is PromiseFulfilledResult<CwdInfo> => r.status === 'fulfilled')
+              .map(r => r.value);
             postMessage({
               type: 'platform/availableCwds',
               options,
@@ -235,7 +277,11 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
 
           postAllAvailableCwds();
           const dispose = vscode.workspace.onDidChangeWorkspaceFolders(postAllAvailableCwds);
-          onDispose(() => dispose.dispose());
+          const envDispose = Internal.basecampOnDidChangeFocusedEnvironment?.(postAllAvailableCwds);
+          onConnectionDispose(() => {
+            dispose.dispose();
+            envDispose?.dispose();
+          });
           break;
         }
         case 'platform/setVSCodeConfig': {
@@ -268,34 +314,38 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
             }
           });
           sendLatestValue();
-          onDispose(() => dispose.dispose());
+          onConnectionDispose(() => dispose.dispose());
           break;
         }
         case 'platform/executeVSCodeCommand': {
-          vscode.commands.executeCommand(message.command, ...message.args);
+          if (message.command === 'sapling.open-comparison-view' && repo != null) {
+            // Inject repo root so the multi-diff editor opens for the correct repository
+            vscode.commands.executeCommand(message.command, ...message.args, repo.info.repoRoot);
+          } else {
+            vscode.commands.executeCommand(message.command, ...message.args);
+          }
           break;
         }
         case 'platform/resolveAllCommentsWithAI': {
-          const {diffId, comments, filePaths, repoPath} = message;
+          const {diffId, comments, filePaths, repoPath, userContext} = message;
           Internal.promptAIAgent?.(
-            {type: 'resolveAllComments', diffId, comments, filePaths, repoPath},
+            {type: 'resolveAllComments', diffId, comments, filePaths, repoPath, userContext},
             ActionTriggerType.ISL2SmartActions,
           );
           break;
         }
         case 'platform/resolveFailedSignalsWithAI': {
-          const {diffId, diffVersionNumber, repoPath} = message;
+          const {diffId, diffVersionNumber, repoPath, userContext} = message;
           Internal.promptAIAgent?.(
-            {type: 'resolveFailedSignals', diffId, diffVersionNumber, repoPath},
+            {type: 'resolveFailedSignals', diffId, diffVersionNumber, repoPath, userContext},
             ActionTriggerType.ISL2SmartActions,
           );
           break;
         }
         case 'platform/fillCommitMessageWithAI': {
-          const {source} = message;
-          // Prompt AI to generate a commit message based on the current changes
+          const {source, userContext} = message;
           Internal.promptAIAgent?.(
-            {type: 'fillCommitMessage'},
+            {type: 'fillCommitMessage', userContext},
             source === 'commitInfoView'
               ? ActionTriggerType.ISL2CommitInfoView
               : ActionTriggerType.ISL2SmartActions,
@@ -303,10 +353,9 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
           break;
         }
         case 'platform/splitCommitWithAI': {
-          const {diffCommit, args, repoPath} = message;
-          // Prompt AI to split a commit based on the changes
+          const {diffCommit, args, repoPath, userContext} = message;
           Internal.promptAIAgent?.(
-            {type: 'splitCommit', diffCommit, args, repoPath},
+            {type: 'splitCommit', diffCommit, args, repoPath, userContext},
             ActionTriggerType.ISL2SplitCommit,
           );
           break;
@@ -315,14 +364,38 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
           Internal.promptTestGeneration?.();
           break;
         }
+        case 'platform/recommendTestPlanWithAI': {
+          const {commitHash, userContext} = message;
+          await Internal.promptAIAgent?.(
+            {type: 'recommendTestPlan', commitHash, repoPath: repo?.info.repoRoot, userContext},
+            ActionTriggerType.ISL2CommitInfoView,
+            undefined,
+            {postMessage},
+          );
+          break;
+        }
+        case 'platform/generateSummaryWithAI': {
+          const {commitHash, userContext} = message;
+          await Internal.promptAIAgent?.(
+            {type: 'generateSummary', commitHash, repoPath: repo?.info.repoRoot, userContext},
+            ActionTriggerType.ISL2CommitInfoView,
+            undefined,
+            {postMessage},
+          );
+          break;
+        }
         case 'platform/validateChangesWithAI': {
-          Internal.promptAIAgent?.({type: 'validateChanges'}, ActionTriggerType.ISL2SmartActions);
+          const {userContext} = message;
+          Internal.promptAIAgent?.(
+            {type: 'validateChanges', userContext},
+            ActionTriggerType.ISL2SmartActions,
+          );
           break;
         }
         case 'platform/resolveAllConflictsWithAI': {
-          const {conflicts} = message;
+          const {userContext} = message;
           Internal.promptAIAgent?.(
-            {type: 'resolveAllConflicts', conflicts, repository: repo, context: ctx},
+            {type: 'resolveAllConflicts', userContext},
             ActionTriggerType.ISL2MergeConflictView,
           );
           break;
@@ -356,9 +429,16 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
           break;
         }
         case 'platform/runAICodeReviewChat': {
-          const {source, reviewScope} = message;
+          const {source, reviewScope, userContext, agentBackend, reviewAndFix} = message;
           await Internal.promptAIAgent?.(
-            {type: 'reviewCode', repoPath: repo?.info.repoRoot, reviewScope},
+            {
+              type: 'reviewCode',
+              repoPath: repo?.info.repoRoot,
+              reviewScope,
+              userContext,
+              agentBackend,
+              reviewAndFix,
+            },
             source === 'commitInfoView'
               ? ActionTriggerType.ISL2CommitInfoView
               : ActionTriggerType.ISL2SmartActions,

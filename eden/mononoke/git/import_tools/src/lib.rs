@@ -42,6 +42,7 @@ use futures::future::BoxFuture;
 use futures::future::try_join3;
 use futures::stream;
 use futures::try_join;
+use futures_stats::FutureStats;
 use futures_stats::TimedTryFutureExt;
 use git_symbolic_refs::GitSymbolicRefsEntry;
 pub use git_types::git_lfs::LfsPointerData;
@@ -56,6 +57,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use scuba_ext::FutureStatsScubaExt;
+use scuba_ext::MononokeScubaSampleBuilder;
 use sorted_vector_map::SortedVectorMap;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -81,6 +83,7 @@ pub use crate::gitimport_objects::GitimportTarget;
 pub use crate::gitimport_objects::TagMetadata;
 pub use crate::gitimport_objects::oid_to_sha1;
 pub use crate::gitlfs::GitImportLfs;
+pub use crate::gitlfs::LfsServerUrlFormat;
 
 pub const HGGIT_MARKER_EXTRA: &str = "hg-git-rename-source";
 pub const HGGIT_MARKER_VALUE: &[u8] = b"git";
@@ -125,7 +128,7 @@ where
                                     .with_parsed(|parsed| {
                                         parsed.as_blob().map(|blob_ref| blob_ref.into_owned())
                                     })
-                                    .ok_or_else(|| format_err!("{} is not a blob", oid))?;
+                                    .ok_or_else(|| format_err!("{oid} is not a blob"))?;
 
                                 let upload_packfile = uploader.upload_packfile_base_item(
                                     &ctx,
@@ -230,12 +233,12 @@ pub async fn create_changeset_for_annotated_tag<Uploader: GitUploader, Reader: G
     // Get the parsed Git Tag
     let tag_metadata = TagMetadata::new(ctx, *tag_id, maybe_tag_name, &reader)
         .await
-        .with_context(|| format_err!("Failed to create TagMetadata from git tag {}", tag_id))?;
+        .with_context(|| format_err!("Failed to create TagMetadata from git tag {tag_id}"))?;
     // Create the corresponding changeset for the Git Tag at Mononoke end
     let changeset_id = uploader
         .generate_changeset_for_annotated_tag(ctx, original_changeset_id, tag_metadata)
         .await
-        .with_context(|| format_err!("Failed to generate changeset for git tag {}", tag_id))?;
+        .with_context(|| format_err!("Failed to generate changeset for git tag {tag_id}"))?;
     Ok(changeset_id)
 }
 
@@ -252,10 +255,7 @@ async fn upload_git_object_by_content<Uploader: GitUploader>(
             .upload_packfile_base_item(ctx, *object_id, object_bytes)
             .await
             .with_context(|| {
-                format_err!(
-                    "Failed to upload packfile item for git object {}",
-                    object_id
-                )
+                format_err!("Failed to upload packfile item for git object {object_id}")
             })
     };
     // Upload Git object
@@ -263,7 +263,7 @@ async fn upload_git_object_by_content<Uploader: GitUploader>(
         uploader
             .upload_object(ctx, *object_id, raw_object_bytes)
             .await
-            .with_context(|| format_err!("Failed to upload raw git object {}", object_id))
+            .with_context(|| format_err!("Failed to upload raw git object {object_id}"))
     };
     try_join!(upload_packfile, upload_git_object)?;
     Ok(())
@@ -278,7 +278,7 @@ pub async fn upload_git_object<Uploader: GitUploader, Reader: GitReader>(
     let object_bytes = reader
         .read_raw_object(object_id)
         .await
-        .with_context(|| format_err!("Failed to fetch git object {}", object_id))?;
+        .with_context(|| format_err!("Failed to fetch git object {object_id}"))?;
     upload_git_object_by_content(ctx, uploader, object_id, object_bytes).await?;
     Ok(())
 }
@@ -320,7 +320,7 @@ pub fn upload_git_tag<'a, Uploader: GitUploader, Reader: GitReader>(
         if let Some((target_kind, target)) = reader
             .get_object(tag_id)
             .await
-            .with_context(|| format_err!("Invalid object {:?}", tag_id))?
+            .with_context(|| format_err!("Invalid object {tag_id:?}"))?
             .with_parsed_as_tag(|tag| (tag.target_kind, tag.target()))
         {
             upload_git_object(ctx, uploader.clone(), reader.clone(), tag_id).await?;
@@ -330,7 +330,7 @@ pub fn upload_git_tag<'a, Uploader: GitUploader, Reader: GitReader>(
                 upload_git_tag(ctx, uploader.clone(), reader.clone(), &target).await?;
             }
         } else {
-            bail!("Not a tag: {:?}", tag_id);
+            bail!("Not a tag: {tag_id:?}");
         }
         Ok(())
     }
@@ -576,7 +576,7 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
                     async move {
                         let extracted_commit = ExtractedCommit::new(&ctx, oid, &reader)
                             .await
-                            .with_context(|| format!("While extracting {}", oid))?;
+                            .with_context(|| format!("While extracting {oid}"))?;
 
                         let diff = extracted_commit.diff(&ctx, &reader, submodules);
                         let file_changes_uploader = uploader.clone();
@@ -650,7 +650,7 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
             }
         })
         .try_buffered(prefs.concurrency);
-    async {
+    let producer = async {
         while let Some((extracted_commit, file_changes)) = commits_with_file_changes
             .try_next()
             .try_timed()
@@ -667,44 +667,126 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
                 .context("Receiver dropped while sending Vec<(ExtractedCommit, FileChanges)>")?;
         }
         anyhow::Ok(())
-    }
-    .try_timed()
-    .await?
-    .log_future_stats(
-        scuba.clone(),
-        "Uploaded Content Blob, Git Blob, Commits and Trees for all commits",
-        "Import".to_string(),
-    );
-    // Drop the sender since we finished sending all the commits to the bonsai creator
-    drop(bonsai_sender);
-    // Ensure that the bonsai creator has completed before we exit
-    bonsai_creator
-        .try_timed()
-        .await
-        .context("Error while running bonsai_creator for commits")?
-        .log_future_stats(
-            scuba.clone(),
-            "Completed Bonsai Changeset creation for all commits",
-            "Import".to_string(),
-        )
-        .context("Panic while running bonsai_creator for commits")?;
-    // Ensure that the batch finalization has completed before we exit
-    batch_finalizer
-        .try_timed()
-        .await
-        .context("Error while running finalize_batch for commits")?
-        .log_future_stats(
-            scuba.clone(),
+    };
+    if prefs.persist_partial_mappings {
+        // Await consumers so they flush their in-flight batch and persist
+        // mapping rows for commits that made it through before the
+        // failure. Also surfaces the consumer's real error instead of the
+        // producer's "Receiver dropped..." SendError cascade — see
+        // `prefer_deepest_error` for the preference rationale.
+        let producer_result = producer.try_timed().await;
+        drop(bonsai_sender);
+        let bonsai_outer = bonsai_creator
+            .try_timed()
+            .await
+            .context("Error while running bonsai_creator for commits");
+        let finalize_outer = batch_finalizer
+            .try_timed()
+            .await
+            .context("Error while running finalize_batch for commits");
+
+        let finalize_res = peel_joined(
+            finalize_outer,
+            &scuba,
             "Completed Finalize Batch for all commits",
+            "Panic while running finalize_batch for commits",
+        );
+        let bonsai_res = peel_joined(
+            bonsai_outer,
+            &scuba,
+            "Completed Bonsai Changeset creation for all commits",
+            "Panic while running bonsai_creator for commits",
+        );
+        // `producer` is a plain async block (not a `JoinHandle`), so its
+        // `try_timed` shape is `Result<(FutureStats, ()), Error>` — no
+        // inner Result to peel.
+        let producer_res: Result<(), Error> = match producer_result {
+            Ok(tuple) => {
+                tuple.log_future_stats(
+                    scuba.clone(),
+                    "Uploaded Content Blob, Git Blob, Commits and Trees for all commits",
+                    "Import".to_string(),
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+
+        prefer_deepest_error(finalize_res, bonsai_res, producer_res)?;
+    } else {
+        producer.try_timed().await?.log_future_stats(
+            scuba.clone(),
+            "Uploaded Content Blob, Git Blob, Commits and Trees for all commits",
             "Import".to_string(),
-        )
-        .context("Panic while running finalize_batch for commits")?;
+        );
+        // Drop the sender since we finished sending all the commits to the bonsai creator
+        drop(bonsai_sender);
+        // Ensure that the bonsai creator has completed before we exit
+        bonsai_creator
+            .try_timed()
+            .await
+            .context("Error while running bonsai_creator for commits")?
+            .log_future_stats(
+                scuba.clone(),
+                "Completed Bonsai Changeset creation for all commits",
+                "Import".to_string(),
+            )
+            .context("Panic while running bonsai_creator for commits")?;
+        // Ensure that the batch finalization has completed before we exit
+        batch_finalizer
+            .try_timed()
+            .await
+            .context("Error while running finalize_batch for commits")?
+            .log_future_stats(
+                scuba.clone(),
+                "Completed Finalize Batch for all commits",
+                "Import".to_string(),
+            )
+            .context("Panic while running finalize_batch for commits")?;
+    }
 
     debug!("Completed git import for repo {}.", repo_name);
     let acc = Arc::try_unwrap(acc).map_err(|_| {
         anyhow::anyhow!("Expected only one strong reference to GitimportAccumulator at this point")
     })?;
     Ok(acc.into_inner())
+}
+
+/// Peel `Result<(FutureStats, Result<R, Error>), Error>` (the shape returned by
+/// `JoinHandle::try_timed().await.context(...)`) to `Result<R, Error>`, logging
+/// the labeled stats entry on the way through. `log_future_stats` is
+/// implemented on the `(FutureStats, T)` tuple — the tuple must be kept intact
+/// when invoking the trait method.
+fn peel_joined<R>(
+    joined: Result<(FutureStats, Result<R, Error>), Error>,
+    scuba: &MononokeScubaSampleBuilder,
+    label: &'static str,
+    panic_context: &'static str,
+) -> Result<R, Error> {
+    let tuple = joined?;
+    let inner = tuple.log_future_stats(scuba.clone(), label, "Import".to_string());
+    inner.context(panic_context)
+}
+
+/// Prefer the deepest consumer's error from a 3-stage pipeline.
+///
+/// When a downstream consumer fails, upstream stages typically also fail with
+/// cascaded `Receiver dropped while sending ...` SendErrors. Those cascades
+/// are consequences, not causes — the downstream's error is the real root
+/// cause. Preference order: `finalize` > `bonsai` > `producer`.
+///
+/// If any of these is an `Err`, return it (deepest wins). If all are `Ok`,
+/// return `Ok(())`.
+fn prefer_deepest_error(
+    finalize: Result<(), Error>,
+    bonsai: Result<(), Error>,
+    producer: Result<(), Error>,
+) -> Result<(), Error> {
+    finalize
+        .err()
+        .or(bonsai.err())
+        .or(producer.err())
+        .map_or(Ok(()), Err)
 }
 
 /// Enum for the different types of targets for a Git ref
@@ -805,11 +887,7 @@ pub async fn read_symref(
                 tag_name.to_string(),
                 TAG_REF.to_string(),
             )?,
-            None => anyhow::bail!(
-                "Unexpected ref format {} for symref {}",
-                ref_mapping,
-                symref_name
-            ),
+            None => anyhow::bail!("Unexpected ref format {ref_mapping} for symref {symref_name}"),
         },
     };
     Ok(symref_entry)
@@ -937,7 +1015,7 @@ pub async fn import_tree_as_single_bonsai_changeset<Uploader: GitUploader>(
 
     let mut extracted_commit = ExtractedCommit::new(ctx, git_cs_id, &reader)
         .await
-        .with_context(|| format!("While extracting {}", git_cs_id))?;
+        .with_context(|| format!("While extracting {git_cs_id}"))?;
     // Discard the parents: the commit we want to create has no parents
     extracted_commit.metadata.parents = Vec::new();
 
@@ -953,7 +1031,7 @@ pub async fn import_tree_as_single_bonsai_changeset<Uploader: GitUploader>(
         extracted_commit.original_commit.clone(),
     )
     .await
-    .with_context(|| format_err!("Failed to upload raw git commit {}", git_cs_id))?;
+    .with_context(|| format_err!("Failed to upload raw git commit {git_cs_id}"))?;
 
     upload_git_tree_recursively(
         ctx,
@@ -963,10 +1041,7 @@ pub async fn import_tree_as_single_bonsai_changeset<Uploader: GitUploader>(
     )
     .await
     .with_context(|| {
-        format_err!(
-            "Failed to upload git trees corresponding to commit {}",
-            git_cs_id
-        )
+        format_err!("Failed to upload git trees corresponding to commit {git_cs_id}")
     })?;
 
     uploader
@@ -993,4 +1068,62 @@ pub async fn import_tree_as_single_bonsai_changeset<Uploader: GitUploader>(
                 })
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::prefer_deepest_error;
+
+    // The bug `prefer_deepest_error` fixes: when batch_finalizer fails first,
+    // the SendError cascades up through bonsai_creator and producer. Before
+    // this helper, the sequential `?` evaluation returned the bonsai cascade
+    // (masking the real finalize error). Asserts the deepest error wins.
+    #[test]
+    fn finalize_wins_over_cascaded_send_errors() {
+        let result = prefer_deepest_error(
+            Err(anyhow!("real root cause from batch_finalizer")),
+            Err(anyhow!(
+                "Receiver dropped while sending Vec<(bonsai_id, git_sha1)>"
+            )),
+            Err(anyhow!(
+                "Receiver dropped while sending Vec<(ExtractedCommit, FileChanges)>"
+            )),
+        );
+        let err = result.expect_err("expected Err — all three results were Err");
+        assert_eq!(
+            err.to_string(),
+            "real root cause from batch_finalizer",
+            "expected finalize's error to win, not a cascaded SendError",
+        );
+    }
+
+    #[test]
+    fn bonsai_wins_when_finalize_ok() {
+        let result = prefer_deepest_error(
+            Ok(()),
+            Err(anyhow!("bonsai-specific failure")),
+            Err(anyhow!("Receiver dropped while sending ...")),
+        );
+        assert_eq!(
+            result.expect_err("expected Err").to_string(),
+            "bonsai-specific failure",
+        );
+    }
+
+    #[test]
+    fn producer_wins_when_only_producer_fails() {
+        let result = prefer_deepest_error(Ok(()), Ok(()), Err(anyhow!("producer-side error")));
+        assert_eq!(
+            result.expect_err("expected Err").to_string(),
+            "producer-side error",
+        );
+    }
+
+    #[test]
+    fn all_ok_returns_ok() {
+        let result = prefer_deepest_error(Ok(()), Ok(()), Ok(()));
+        assert!(result.is_ok(), "all three Ok should return Ok");
+    }
 }

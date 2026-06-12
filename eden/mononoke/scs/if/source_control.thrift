@@ -130,6 +130,15 @@ struct CommitPathSpecifier {
   2: Path path;
 }
 
+/// The type of manifest backing a tree ID.
+enum TreeIdType {
+  /// An FsnodeId (legacy default).
+  FSNODE = 0,
+
+  /// A ContentManifestId.
+  CONTENT_MANIFEST = 1,
+}
+
 /// Specifies a tree by its ID.
 struct TreeIdSpecifier {
   /// The repository that contains the tree.
@@ -137,6 +146,10 @@ struct TreeIdSpecifier {
 
   /// The ID of the tree, obtained from a previous call to the service.
   2: binary id;
+
+  /// The type of the tree ID. If absent, defaults to FSNODE for backward
+  /// compatibility with existing clients.
+  3: optional TreeIdType id_type;
 }
 
 @hack.MigrationBlockingLegacyJSONSerialization
@@ -195,6 +208,8 @@ struct RepoInfo {
   /// Name of a large repo to which this repo is push redirected, i.e. when
   /// the large repo is the source of truth.
   3: optional string push_redirected_to;
+  /// Name of the ACL that controls access to this repo.
+  4: optional string acl_name;
 }
 
 struct CommitInfo {
@@ -329,15 +344,16 @@ struct FileInfo {
   14: binary content_seeded_blake3;
 }
 
+@thrift.ReserveIds{ids = [2, 3]}
 struct TreeInfo {
   /// The id of the tree that can be used in subsequent look-ups.
   1: binary id;
 
-  /// DEPRECATED: The sha1 of the simple format of the directory.
-  2: optional binary simple_format_sha1;
+  /// DELETED: The sha1 of the simple format of the directory.
+  /// 2: optional binary simple_format_sha1;
 
-  /// DEPRECATED: The sha256 of the simple format of the directory.
-  3: optional binary simple_format_sha256;
+  /// DELETED: The sha256 of the simple format of the directory.
+  /// 3: optional binary simple_format_sha256;
 
   /// The count of files inside the directory (excluding files inside
   /// subdirectories).
@@ -358,6 +374,10 @@ struct TreeInfo {
   /// The total size of all files in the directory (including files in
   /// subdirectories).
   8: i64 descendant_files_total_size;
+
+  /// The type of the tree ID. Clients should pass this back when looking
+  /// up a tree by ID so the server can decode it correctly.
+  9: optional TreeIdType id_type;
 }
 
 @hack.MigrationBlockingLegacyJSONSerialization
@@ -518,6 +538,9 @@ enum MetadataDiffFileContentType {
 
   /// File content includes NUL bytes, thus is likely to be binary
   BINARY = 3,
+
+  /// File is a Git LFS pointer (content is stored externally)
+  LFS_POINTER = 4,
 }
 
 enum FileGeneratedStatus {
@@ -736,6 +759,7 @@ enum HistoryFormat {
 enum MutationHistoryFormat {
   COMMIT_ID = 1,
   HG_MUTATION = 2,
+  GIT_MUTATION = 3,
 }
 
 @hack.MigrationBlockingLegacyJSONSerialization
@@ -1113,6 +1137,15 @@ struct CreateCommitChecks {
   /// the fixes for the previous checks if they are in FIX mode. FIX mode will still
   /// throw for this check as there's no reasonable way to fix it
   3: CreateCommitCheckMode empty_changeset_check = CreateCommitCheckMode.CHECK;
+  /// Check that the source path of any copy-from declaration exists as a file in
+  /// the parent it is being copied from. Depends on derived data of the parent.
+  /// Only SKIP is currently supported. FIX has no defined behavior.
+  4: CreateCommitCheckMode copy_from_path_check = CreateCommitCheckMode.CHECK;
+  /// Check that when a file replaces a directory (or a file added under a path
+  /// previously occupied by a file in any parent), the prior file is marked as
+  /// deleted. Depends on derived data of the parents.
+  /// Only SKIP is currently supported. FIX has no defined behavior.
+  5: CreateCommitCheckMode prefix_files_deleted_check = CreateCommitCheckMode.CHECK;
 }
 
 enum CreateCommitCheckMode {
@@ -1303,6 +1336,31 @@ struct CommitInfoParams {
 
 struct CommitGenerationParams {}
 
+enum CommitFingerprintVersion {
+  UNKNOWN = 0,
+  /// V1: root FsnodeId blake2 hash. Universally available — every production
+  /// repo derives Fsnodes — but not the long-term recommendation. Prefer V2
+  /// where available.
+  V1 = 1,
+  /// V2: root ContentManifestId blake2 hash. Recommended long-term default.
+  /// Requires `derived_data_use_content_manifests` enabled for the repo;
+  /// otherwise the request fails with InvalidRequest (no auto-fallback).
+  V2 = 2,
+}
+
+/// Parameters for the `commit_fingerprint` method.
+struct CommitFingerprintParams {
+  1: CommitFingerprintVersion version;
+}
+
+/// Response for the `commit_fingerprint` method.
+struct CommitFingerprintResponse {
+  /// The fingerprint hash bytes.
+  1: binary fingerprint;
+  /// The algorithm version that produced this fingerprint.
+  2: CommitFingerprintVersion version;
+}
+
 /// Parameters for the `commit_is_ancestor_of` method.
 ///
 /// This method takes a commit specifier (the target commit), and checks
@@ -1314,6 +1372,30 @@ struct CommitIsAncestorOfParams {
 }
 
 struct CommitIsPublicParams {}
+
+/// Parameters for the `commit_filter_ancestors` method.
+///
+/// Given a target commit (the potential descendant), this method checks
+/// which of the provided candidate commits are ancestors of the target.
+/// Returns only those candidates that ARE ancestors.
+struct CommitFilterAncestorsParams {
+  /// Candidate commits to check. Each is tested for being an ancestor
+  /// of the target commit specified in the CommitSpecifier.
+  1: list<CommitId> candidate_ancestor_ids;
+
+  /// Which identity schemes to include in the response for matching commits.
+  2: set<CommitIdentityScheme> identity_schemes;
+}
+
+/// Maximum number of candidates for commit_filter_ancestors.
+const i64 COMMIT_FILTER_ANCESTORS_MAX_CANDIDATES = 10000;
+
+/// Response for the `commit_filter_ancestors` method.
+struct CommitFilterAncestorsResponse {
+  /// The subset of candidate_ancestor_ids that ARE ancestors of the target
+  /// commit, with their identities mapped to the requested schemes.
+  1: list<map<CommitIdentityScheme, CommitId>> ancestors;
+}
 
 struct CommitCommonBaseWithParams {
   1: CommitId other_commit_id;
@@ -1437,6 +1519,8 @@ struct CommitChangedPathsApproxResponse {
   1: set<string> paths;
 }
 
+const i32 COMMIT_HISTORY_MAX_LIMIT = 100000;
+
 /// Parameters for the `commit_history` method.
 ///
 /// By default, this will include all commits that are ancestors of
@@ -1495,7 +1579,11 @@ struct CommitHistoryParams {
   /// Similar to the after_timestamp above, this filters on
   /// committer_date instead of author_date.
   10: optional i64 after_committer_timestamp;
+  /// Filter commits by author name (case-insensitive substring match).
+  11: optional string author;
 }
+
+const i32 COMMIT_LINEAR_HISTORY_MAX_LIMIT = 30000;
 
 /// Parameters for the `commit_linear_history` method.
 ///
@@ -1530,8 +1618,9 @@ struct CommitLinearHistoryParams {
   7: optional CommitId descendants_of;
   /// Exclude commit and all of its linear ancestor from results.
   8: optional CommitId exclude_changeset_and_ancestors;
+  /// Filter commits by author name (case-insensitive substring match).
+  9: optional string author;
 }
-
 const i64 COMMIT_LIST_DESCENDANT_BOOKMARKS_MAX_LIMIT = 10000;
 
 struct CommitListDescendantBookmarksParams {
@@ -1559,12 +1648,65 @@ struct CommitRunHooksParams {
   2: optional map<string, binary> pushvars;
 }
 
+/// Parameters for checking commit rate limits.
+struct CommitRateLimitCheckParams {
+  /// The bookmark to check rate limits against.
+  1: string bookmark;
+}
+
+/// A rate limit rule was not exceeded.
+struct CommitRateLimitAllowed {}
+
+/// A rate limit rule was exceeded.
+struct CommitRateLimitExceeded {
+  /// Current number of commits in the window.
+  1: i64 current_count;
+  /// Maximum allowed commits in the window.
+  2: i64 max_commits;
+  /// Length of the rate limit window in seconds.
+  3: i64 window_secs;
+}
+
+/// Outcome of checking a single rate limit rule.
+@hack.MigrationBlockingLegacyJSONSerialization
+union CommitRateLimitRuleOutcome {
+  1: CommitRateLimitAllowed allowed;
+  2: CommitRateLimitExceeded exceeded;
+}
+
+/// Result of checking a single rate limit rule.
+struct CommitRateLimitRuleResult {
+  /// Name of the rate limit rule.
+  1: string rule_name;
+  /// Whether the rule was exceeded or not.
+  2: CommitRateLimitRuleOutcome outcome;
+  /// Username the rule was scoped to, if the rule applies per-user.
+  /// Unset for global (non-per-user) rules.
+  3: optional string user_filter;
+  /// Directories the rule was scoped to, if the rule restricts to a
+  /// directory prefix set. Unset for rules with no directory scope.
+  4: optional list<string> directories;
+}
+
+/// Response for a commit rate limit check.
+struct CommitRateLimitCheckResponse {
+  /// Whether all rate limit rules passed.
+  1: bool passed;
+  /// Per-rule results.
+  2: list<CommitRateLimitRuleResult> rule_results;
+}
+
 struct CommitSubtreeChangesParams {
   /// Commit identity schemes to return.
   1: set<CommitIdentityScheme> identity_schemes;
 }
 
 struct CommitHgMutationHistoryParams {
+  /// The format of the mutation history to return.
+  1: MutationHistoryFormat format;
+}
+
+struct CommitGitMutationHistoryParams {
   /// The format of the mutation history to return.
   1: MutationHistoryFormat format;
 }
@@ -1616,6 +1758,8 @@ struct CommitPathBlameParams {
   5: optional bool follow_mutable_file_history;
 }
 
+const i32 COMMIT_PATH_HISTORY_MAX_LIMIT = 100000;
+
 /// Parameters for the `commit_path_history` method.
 ///
 /// By default, this will include all commits that are ancestors of
@@ -1656,6 +1800,8 @@ struct CommitPathHistoryParams {
   /// Similar to the after_timestamp above, this filters on
   /// committer_date instead of author_date.
   12: optional i64 after_committer_timestamp;
+  /// Filter commits by author name (case-insensitive substring match).
+  13: optional string author;
 }
 
 struct CommitPathLastChangedParams {
@@ -1685,6 +1831,11 @@ struct CommitFindRestrictedPathsParams {
   /// Paths under which to find all restriction roots and the ACLs needed to access them.
   /// Pass empty set for the entire repository.
   1: set<Path> roots;
+  /// Determines if ACLs should be checked and the `has_access` field should be populated.
+  2: optional bool check_permissions;
+  /// Determines if the stream should be filtered to only restriction roots the caller can access.
+  /// This may trigger internal permission checks even when `check_permissions` is false.
+  3: optional bool return_only_accessible;
 }
 
 struct CommitRestrictedPathsChangesParams {}
@@ -1824,8 +1975,6 @@ struct RepoCreationRequest {
 struct CreateReposParams {
   /// Lists of repos to create
   1: list<RepoCreationRequest> repos;
-  /// Dry run:
-  2: bool dry_run;
 }
 
 struct CreateReposToken {
@@ -2370,6 +2519,27 @@ struct HgMutation {
   6: DateTime date;
 }
 
+struct CommitGitMutationHistoryResponse {
+  1: GitMutationHistory git_mutation_history;
+}
+
+@hack.MigrationBlockingLegacyJSONSerialization
+union GitMutationHistory {
+  1: list<CommitId> commit_ids;
+  2: list<GitMutation> git_mutations;
+}
+
+/// Git mutation entry extracted from predecessor/predecessor-op
+/// extra headers on git commit objects.
+struct GitMutation {
+  /// The commit that replaced the predecessors.
+  1: CommitId successor;
+  /// The commit(s) that were replaced (comma-separated SHA1s for fold).
+  2: list<CommitId> predecessors;
+  /// The operation that created this mutation (amend, rebase, cherry-pick).
+  3: string op;
+}
+
 struct DirectoryBranchCluster {
   // The primary path of this cluster.  This should be considered the "main" branch.
   1: Path primary_path;
@@ -2471,6 +2641,9 @@ struct CommitFindRestrictedPathsStreamItem {
   1: Path path;
   /// ACLs protecting this restriction root
   2: list<PathAcl> acls;
+  /// Whether the caller has authorization to access this restriction root.
+  /// Present only when permission checks were requested.
+  3: optional bool has_access;
 }
 
 struct CommitRestrictedPathsChangesResponse {
@@ -2769,6 +2942,11 @@ struct CloudWorkspaceSmartlogParams {
   1: WorkspaceSpecifier workspace;
   /// Options about what info to include in the response
   2: list<CloudWorkspaceSmartlogFlags> flags;
+  /// Optional maximum age in days for workspace heads. If set, heads
+  /// with author dates older than (now - max_age_days) are excluded
+  /// before the graph traversal, avoiding expensive ancestry computation
+  /// for stale heads.
+  3: optional i32 max_age_days;
 }
 
 struct CloudWorkspaceSmartlogResponse {
@@ -2794,6 +2972,142 @@ struct AsyncPingResponse {
 union AsyncPingPollResponse {
   1: PollPending poll_pending;
   2: AsyncPingResponse response;
+}
+
+/// Token for derive_boundaries async request
+struct DeriveBoundariesToken {
+  1: i64 id;
+}
+
+/// Request to derive boundary changesets
+struct DeriveBoundariesParams {
+  1: i64 repo_id;
+  2: string derived_data_type;
+  3: list<binary> boundary_cs_ids;
+  4: i32 concurrency;
+  5: bool use_predecessor_derivation;
+  /// Optional config name to select an alternative derived data configuration.
+  6: optional string config_name;
+}
+
+/// Result for derive_boundaries request
+struct DeriveBoundariesResponse {
+  1: i64 derived_count;
+  2: optional string error_message;
+}
+
+@hack.MigrationBlockingLegacyJSONSerialization
+union DeriveBoundariesPollResponse {
+  1: PollPending poll_pending;
+  2: DeriveBoundariesResponse response;
+}
+
+/// Token for derive_slice async request
+struct DeriveSliceToken {
+  1: i64 id;
+}
+
+/// A segment within a slice (head..base range of commits)
+struct DeriveSliceSegment {
+  1: binary head;
+  2: binary base;
+}
+
+/// Request to derive a slice of commits
+struct DeriveSliceParams {
+  1: i64 repo_id;
+  2: string derived_data_type;
+  3: list<DeriveSliceSegment> segments;
+  /// Optional config name to select an alternative derived data configuration.
+  4: optional string config_name;
+}
+
+/// Result for derive_slice request
+struct DeriveSliceResponse {
+  1: i64 derived_count;
+  2: optional string error_message;
+}
+
+@hack.MigrationBlockingLegacyJSONSerialization
+union DeriveSlicePollResponse {
+  1: PollPending poll_pending;
+  2: DeriveSliceResponse response;
+}
+
+/// Token for derive_backfill async request
+struct DeriveBackfillToken {
+  1: i64 id;
+}
+
+/// A single repo entry for backfill: repo_id + its changeset IDs.
+struct DeriveBackfillRepoEntry {
+  1: i64 repo_id;
+  2: list<binary> cs_ids;
+}
+
+/// Request to backfill derived data for one or more repositories.
+/// The worker will iterate over repo_entries, compute slices for each repo,
+/// and enqueue boundary/slice sub-requests tracked via root_request_id.
+struct DeriveBackfillParams {
+  1: string derived_data_type;
+  2: list<DeriveBackfillRepoEntry> repo_entries;
+  3: i64 slice_size;
+  4: i32 boundaries_concurrency;
+  5: bool rederive;
+  6: optional string config_name;
+  /// Whether to compute slices as if all commits were underived,
+  /// regardless of their actual derivation status.
+  7: bool reslice;
+  /// Number of separate boundary derivation requests to create for parallelization.
+  8: i32 num_boundary_requests;
+}
+
+/// Result for derive_backfill request
+struct DeriveBackfillResponse {
+  /// Total number of sub-requests enqueued (boundaries + slices)
+  1: i64 total_sub_requests;
+  2: optional string error_message;
+}
+
+@hack.MigrationBlockingLegacyJSONSerialization
+union DeriveBackfillPollResponse {
+  1: PollPending poll_pending;
+  2: DeriveBackfillResponse response;
+}
+
+/// Token for derive_backfill_repo async request
+struct DeriveBackfillRepoToken {
+  1: i64 id;
+}
+
+/// Request to backfill derived data for a single repository.
+/// Enqueued by DeriveBackfill, computes slices and boundaries for one repo
+/// and enqueues DeriveBoundaries/DeriveSlice sub-requests.
+struct DeriveBackfillRepoParams {
+  1: i64 repo_id;
+  2: string derived_data_type;
+  3: list<binary> cs_ids;
+  4: i64 slice_size;
+  5: i32 boundaries_concurrency;
+  6: bool rederive;
+  7: optional string config_name;
+  8: bool reslice;
+  /// Number of separate boundary derivation requests to create for parallelization
+  /// (forwarded from DeriveBackfillParams).
+  9: i32 num_boundary_requests;
+}
+
+/// Result for derive_backfill_repo request
+struct DeriveBackfillRepoResponse {
+  /// Total number of sub-requests enqueued (boundaries + slices)
+  1: i64 total_sub_requests;
+  2: optional string error_message;
+}
+
+@hack.MigrationBlockingLegacyJSONSerialization
+union DeriveBackfillRepoPollResponse {
+  1: PollPending poll_pending;
+  2: DeriveBackfillRepoResponse response;
 }
 
 /// Exceptions
@@ -2887,6 +3201,21 @@ stateful client exception HookRejectionsException {
   1: string reason;
   /// Always non-empty
   2: list<HookRejection> rejections;
+}
+
+/// Identifies the restricted resource that an authorization check denied:
+/// either a path, or a manifest id (as a hex string).
+union RestrictedPathAccess {
+  1: string path;
+  2: string manifest_id;
+}
+
+stateful client exception RestrictedPathsAuthorizationError {
+  @thrift.ExceptionMessage
+  1: string reason;
+  2: RestrictedPathAccess access;
+  /// Group name only, e.g. "gradient_source_control".
+  3: string permission_request_group;
 }
 
 /// Service Definition
@@ -3104,6 +3433,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Returns the raw changed paths recorded in a Bonsai
@@ -3184,10 +3514,37 @@ service SourceControlService extends fb303_core.BaseService {
     3: OverloadError overload_error,
   );
 
+  /// Get a content-based fingerprint for a commit.
+  ///
+  /// Returns a hash that depends only on the file tree contents,
+  /// not on metadata (author, date, message). Two commits with
+  /// identical file trees produce the same fingerprint.
+  CommitFingerprintResponse commit_fingerprint(
+    1: CommitSpecifier commit,
+    2: CommitFingerprintParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
   /// Check if this commit is an ancestor of some other commit.
   bool commit_is_ancestor_of(
     1: CommitSpecifier commit,
     2: CommitIsAncestorOfParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// Given a target commit, filter a list of candidate commits to only
+  /// those that are ancestors of the target. More efficient than calling
+  /// commit_is_ancestor_of repeatedly because the server can share
+  /// frontier traversal work across all candidates.
+  CommitFilterAncestorsResponse commit_filter_ancestors(
+    1: CommitSpecifier commit,
+    2: CommitFilterAncestorsParams params,
   ) throws (
     1: RequestError request_error,
     2: InternalError internal_error,
@@ -3227,6 +3584,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Find files within the commit that match criteria.
@@ -3304,9 +3662,31 @@ service SourceControlService extends fb303_core.BaseService {
     3: OverloadError overload_error,
   );
 
+  /// Check commit rate limits for a commit without landing it.
+  /// Returns whether all rate limit rules pass, along with per-rule details.
+  CommitRateLimitCheckResponse commit_rate_limit_check(
+    1: CommitSpecifier commit,
+    2: CommitRateLimitCheckParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
   CommitHgMutationHistoryResponse commit_hg_mutation_history(
     1: CommitSpecifier commit,
     2: CommitHgMutationHistoryParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// Returns the git mutation history of a commit, extracted from
+  /// predecessor/predecessor-op extra headers on the commit object.
+  CommitGitMutationHistoryResponse commit_git_mutation_history(
+    1: CommitSpecifier commit,
+    2: CommitGitMutationHistoryParams params,
   ) throws (
     1: RequestError request_error,
     2: InternalError internal_error,
@@ -3333,6 +3713,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Get information about a path in a commit.
@@ -3343,6 +3724,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Get information about multiple paths in a commit.
@@ -3353,6 +3735,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   CommitPathBlameResponse commit_path_blame(
@@ -3362,6 +3745,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   CommitPathHistoryResponse commit_path_history(
@@ -3371,6 +3755,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   CommitPathLastChangedResponse commit_path_last_changed(
@@ -3380,6 +3765,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   CommitMultiplePathLastChangedResponse commit_multiple_path_last_changed(
@@ -3389,6 +3775,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Path Restriction Methods
@@ -3481,6 +3868,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// List the contents of a directory.
@@ -3491,6 +3879,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// File Methods
@@ -3501,6 +3890,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Get information about a file.
@@ -3508,6 +3898,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Get a chunk of a file's content.
@@ -3518,6 +3909,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Compare a file with another file.
@@ -3528,6 +3920,7 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+    4: RestrictedPathsAuthorizationError restricted_paths_authorization_error,
   );
 
   /// Cross-Repo Methods

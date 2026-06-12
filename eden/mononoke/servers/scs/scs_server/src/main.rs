@@ -29,7 +29,6 @@ use environment::BookmarkCacheOptions;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
 use executor_lib::args::ShardedExecutorArgs;
-use factory_group::FactoryGroup;
 use fb303_core_services::make_BaseService_server;
 use fbinit::FacebookInit;
 use git_source_of_truth::GitSourceOfTruthConfig;
@@ -44,29 +43,30 @@ use mononoke_app::args::HooksAppExtension;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
 use mononoke_app::args::WarmBookmarksCacheExtension;
-use mysql_client::ConnectionOptionsBuilder;
-use mysql_client::ConnectionPoolOptionsBuilder;
+use mysql_client::ConnectionOptions;
+use mysql_client::ConnectionPoolOptions;
 use panichandler::Fate;
 use scs_methods::source_control_impl::SourceControlServiceImpl;
+use service_framework_load_monitor_module::LoadMonitorModule;
 use sharding_ext::RepoShard;
 use source_control_services::make_SourceControlService_server;
 use sql_construct::SqlConstruct;
 use sql_storage::Destination;
 use sql_storage::XdbFactory;
-use srserver::ThriftExecutor;
+use srserver::BetterOverloadHandlerConfig;
+use srserver::BohPidConfig;
+use srserver::BohResourceConfig;
 use srserver::ThriftServer;
 use srserver::ThriftServerBuilder;
-use srserver::ThriftStreamExecutor;
-use srserver::service_framework::BuildModule;
-use srserver::service_framework::ContextPropModule;
-use srserver::service_framework::Fb303Module;
-use srserver::service_framework::ProfileModule;
-use srserver::service_framework::ServiceFramework;
-use srserver::service_framework::ThriftStatsModule;
+use srserver_service_framework_light::BuildModule;
+use srserver_service_framework_light::ContextPropModule;
+use srserver_service_framework_light::Fb303Module;
+use srserver_service_framework_light::ProfileModule;
+use srserver_service_framework_light::ServiceFramework;
+use srserver_service_framework_light::ThriftStatsModule;
 use thrift_factory::ThriftFactoryBuilder;
 use tokio::task;
 use tracing::info;
-use tracing::warn;
 
 mod facebook;
 mod metadata;
@@ -75,7 +75,6 @@ mod monitoring;
 const SERVICE_NAME: &str = "mononoke_scs_server";
 const MONONOKE_PRODUCTION_SHARD_NAME: &str = "xdb.mononoke_production";
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
-const NUM_PRIORITY_QUEUES: usize = 2;
 
 /// Mononoke Source Control Service Server
 #[derive(Parser)]
@@ -101,9 +100,9 @@ struct ScsServerArgs {
     /// Max memory to use for the thrift server
     #[clap(long)]
     max_memory: Option<usize>,
-    /// Thrift server mode;
-    #[clap(long, value_enum, default_value_t = ThriftServerMode::Default)]
-    thift_server_mode: ThriftServerMode,
+    /// Deprecated: ThriftFactory is now always used. Kept for backwards compatibility.
+    #[clap(long, value_enum, default_value_t = DeprecatedThriftServerMode::ThriftFactory, hide = true)]
+    thift_server_mode: DeprecatedThriftServerMode,
     /// Thrift queue size
     #[clap(long, default_value = "0")]
     thrift_queue_size: usize,
@@ -113,11 +112,11 @@ struct ScsServerArgs {
     /// Number of Thrift workers
     #[clap(long, default_value = "1000")]
     thrift_workers_num: usize,
-    /// Number of Thrift workers for fast methods
-    #[clap(long, default_value = "1000")]
+    /// Deprecated: FactoryGroup mode has been removed. Kept for backwards compatibility.
+    #[clap(long, default_value = "1000", hide = true)]
     thrift_workers_num_fast: usize,
-    /// Number of Thrift workers for slow methods
-    #[clap(long, default_value = "5")]
+    /// Deprecated: FactoryGroup mode has been removed. Kept for backwards compatibility.
+    #[clap(long, default_value = "5", hide = true)]
     thrift_workers_num_slow: usize,
     /// Some long-running requests are processed asynchronously by default. This flag disables that behavior; requests will fail.
     #[clap(long, default_value = "false")]
@@ -132,8 +131,11 @@ struct ScsServerArgs {
     load_all_repos_in_tier: bool,
 }
 
+/// Deprecated: ThriftFactory is now always used. This enum is kept only so that
+/// existing CLI invocations (e.g. from TW specs) that pass `--thift-server-mode`
+/// continue to parse without error.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-enum ThriftServerMode {
+enum DeprecatedThriftServerMode {
     Default,
     ThriftFactory,
     FactoryGroup,
@@ -162,7 +164,7 @@ impl RepoShardedProcess for ScsServerProcess {
         if self.repos_mgr.repos().get_by_name(repo_name).is_none() {
             // The input repo is a deep-sharded repo, so it needs to be added now.
             self.repos_mgr.add_repo(repo_name).await.with_context(|| {
-                format!("Failure in setting up repo {} in SCS service", repo_name)
+                format!("Failure in setting up repo {repo_name} in SCS service")
             })?;
             info!("Completed repo {} setup in SCS service", repo_name);
         } else {
@@ -223,13 +225,8 @@ impl RepoShardedProcessExecutor for ScsServerProcessExecutor {
 async fn create_git_source_of_truth_config(
     fb: FacebookInit,
 ) -> Result<Arc<dyn GitSourceOfTruthConfig>, Error> {
-    let pool_options = ConnectionPoolOptionsBuilder::default()
-        .build()
-        .map_err(Error::msg)?;
-
-    let conn_options = ConnectionOptionsBuilder::default()
-        .build()
-        .map_err(Error::msg)?;
+    let pool_options = ConnectionPoolOptions::default();
+    let conn_options = ConnectionOptions::default();
     let destination = Destination::Prod;
     let xdb_factory = XdbFactory::new(fb, destination, pool_options, conn_options)?;
     let mononoke_production_xdb = xdb_factory
@@ -273,7 +270,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     let will_exit = Arc::new(AtomicBool::new(false));
     let (sm_shutdown_sender, sm_shutdown_receiver) = tokio::sync::oneshot::channel::<bool>();
-    let (quiesce_sender, quiesce_receiver) = tokio::sync::oneshot::channel::<bool>();
 
     if let Some(max_memory) = args.max_memory {
         memory::set_max_memory(max_memory);
@@ -293,39 +289,20 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     let git_source_of_truth_config = runtime.block_on(create_git_source_of_truth_config(fb))?;
 
-    let source_control_server = {
-        let maybe_factory_group = if let ThriftServerMode::FactoryGroup = args.thift_server_mode {
-            let worker_counts: [usize; NUM_PRIORITY_QUEUES] =
-                vec![args.thrift_workers_num_fast, args.thrift_workers_num_slow]
-                    .try_into()
-                    .unwrap();
-            Some(Arc::new(runtime.block_on(FactoryGroup::<
-                { NUM_PRIORITY_QUEUES },
-            >::new(
-                fb,
-                "requests-pri-queues",
-                worker_counts,
-                None,
-            ))?))
-        } else {
-            None
-        };
-        runtime.block_on(SourceControlServiceImpl::new(
-            fb,
-            &app,
-            mononoke.clone(),
-            megarepo_api,
-            scuba_builder,
-            args.scribe_logging_args.get_scribe(fb)?,
-            security_checker,
-            app.configs(),
-            &app.repo_configs().common,
-            maybe_factory_group,
-            async_requests_queue_client,
-            git_source_of_truth_config,
-            args.watchdog_method_max_poll,
-        ))?
-    };
+    let source_control_server = runtime.block_on(SourceControlServiceImpl::new(
+        fb,
+        &app,
+        mononoke.clone(),
+        megarepo_api,
+        scuba_builder,
+        args.scribe_logging_args.get_scribe(fb)?,
+        security_checker,
+        app.configs(),
+        &app.repo_configs().common,
+        async_requests_queue_client,
+        git_source_of_truth_config,
+        args.watchdog_method_max_poll,
+    ))?;
 
     let monitoring_forever = {
         let monitoring_ctx = CoreContext::new(fb);
@@ -333,27 +310,16 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     };
     runtime.spawn(monitoring_forever);
 
-    let thrift = match args.thift_server_mode {
-        ThriftServerMode::Default => setup_thrift_server(
-            fb,
-            &args,
-            &will_exit,
-            source_control_server,
-            runtime.clone(),
-        ),
-        _ => {
-            let (factory, _processing_handle) = runtime.block_on(async move {
-                ThriftFactoryBuilder::new(fb, "main-thrift-incoming", args.thrift_workers_num)
-                    .with_queueing_limit(args.thrift_queue_size)
-                    .with_queueing_timeout(Some(Duration::from_millis(args.thrift_queue_timeout)))
-                    .build()
-                    .await
-                    .expect("Failed to build thrift factory")
-            });
-            setup_thrift_server(fb, &args, &will_exit, source_control_server, factory)
-        }
-    }
-    .context("Failed to set up Thrift server")?;
+    let (factory, _processing_handle) = runtime.block_on(async move {
+        ThriftFactoryBuilder::new(fb, "main-thrift-incoming", args.thrift_workers_num)
+            .with_queueing_limit(args.thrift_queue_size)
+            .with_queueing_timeout(Some(Duration::from_millis(args.thrift_queue_timeout)))
+            .build()
+            .await
+            .expect("Failed to build thrift factory")
+    });
+    let thrift = setup_thrift_server(fb, &args, &will_exit, source_control_server, factory)
+        .context("Failed to set up Thrift server")?;
 
     let mut service_framework = ServiceFramework::from_server(SERVICE_NAME, thrift)
         .context("Failed to create service framework server")?;
@@ -363,6 +329,15 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     service_framework.add_module(Fb303Module)?;
     service_framework.add_module(ProfileModule)?;
     service_framework.add_module(ContextPropModule)?;
+    service_framework.add_module(
+        LoadMonitorModule::builder()
+            .fb(fb)
+            .memory_stats_ttl(Duration::from_millis(50))
+            .cgroup_stats_ttl(Duration::from_millis(50))
+            .counters_update_interval(Duration::from_millis(100))
+            .cgroup_root_path("/cgroup2".into())
+            .build(),
+    )?;
 
     service_framework
         .serve_background()
@@ -382,13 +357,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         writer.write_all(b"\n")?;
     }
 
-    let timeout_secs = justknobs::get_as::<u64>(
-        "scm/mononoke:shardmanager_shutdown_timeout_secs",
-        Some("scs_server"),
-    )
-    .unwrap();
-    let quiesce_timeout = std::time::Duration::from_secs(timeout_secs);
-
     if let Some(executor) = args.sharded_executor_args.build_executor(
         fb,
         runtime.clone(),
@@ -398,11 +366,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     )? {
         // The Sharded Process Executor needs to branch off and execute
         // on its own dedicated task spawned off the common tokio runtime.
-        runtime.spawn(executor.block_and_execute_with_quiesce_timeout(
-            sm_shutdown_receiver,
-            Some(quiesce_timeout),
-            Some(quiesce_sender),
-        ));
+        runtime.spawn(executor.block_and_execute(sm_shutdown_receiver));
     }
 
     // Monitoring is provided by the `Fb303Module`, but we must still start
@@ -416,18 +380,13 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         },
         args.shutdown_timeout_args.shutdown_grace_period,
         async {
-            // Note that async blocks are lazy, so this isn't called until first poll
-            match quiesce_receiver.await {
-                Ok(_) => info!("received signal from quiesce sender"),
-                Err(_) => warn!("quiesce sender dropped"),
-            };
             let _ = task::spawn_blocking(move || {
                 // Calling `stop` blocks until the service has completed all requests.
                 service_framework.stop();
             })
             .await;
         },
-        args.shutdown_timeout_args.shutdown_timeout + quiesce_timeout,
+        args.shutdown_timeout_args.shutdown_timeout,
         None,
     )?;
 
@@ -440,7 +399,7 @@ fn setup_thrift_server(
     args: &ScsServerArgs,
     will_exit: &Arc<AtomicBool>,
     source_control_server: SourceControlServiceImpl,
-    exec: impl 'static + Clone + ThriftExecutor + ThriftStreamExecutor,
+    exec: thrift_factory::ThriftFactory,
 ) -> anyhow::Result<ThriftServer> {
     let fb303_base = {
         cloned!(will_exit);
@@ -459,6 +418,29 @@ fn setup_thrift_server(
         }
     };
 
+    // BetterOverloadHandler: memory-based overload protection at the Thrift
+    // layer, before requests are dispatched to Rust. This is a safety net
+    // against OOMs from large request payloads (see S627561).
+    // PID values from recommended starting config:
+    // https://www.internalfb.com/wiki/Users/sazonovk/Thrift/BetterOverloadHandler/
+    let mem_limit = 0.9;
+    let mem_boh_config = BohResourceConfig {
+        setpoint: 0.8,
+        limit: Some(&mem_limit),
+        pid_config: BohPidConfig {
+            k_p: 4.0,
+            k_i: 0.3,
+            k_d: 0.1,
+            dt: 0.1,
+        },
+    };
+    let boh_config = BetterOverloadHandlerConfig {
+        interval_ms: 100,
+        cpu_config: None,
+        mem_config: Some(&mem_boh_config),
+        net_config: None,
+    };
+
     Ok(ThriftServerBuilder::new(fb)
         .with_name(SERVICE_NAME)
         .expect("failed to set name")
@@ -466,6 +448,8 @@ fn setup_thrift_server(
         .with_tls()
         .expect("failed to enable TLS")
         .with_cancel_if_client_disconnected()
+        .with_static_better_overload_handler(&boh_config)
+        .context("Failed to configure BetterOverloadHandler")?
         .add_factory(exec, move || service, Some(metadata::create_metadata()))
         .build())
 }

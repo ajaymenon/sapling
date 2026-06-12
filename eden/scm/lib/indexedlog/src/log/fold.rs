@@ -119,14 +119,14 @@ impl FoldState {
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("corrupted FoldState (no checksum): {:?}", data),
+                        format!("corrupted FoldState (no checksum): {data:?}"),
                     ));
                 }
             };
             if xxhash(&data[8..]) != checksum {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("corrupted FoldState (wrong checksum): {:?}", data),
+                    format!("corrupted FoldState (wrong checksum): {data:?}"),
                 ));
             }
             let mut reader = &data[8..];
@@ -171,7 +171,13 @@ impl FoldState {
             .map(|p| p.join(format!("fold-{}", self.def.name)));
         if let Some(path) = &opt_path {
             if let Err(e) = self.load_from_file(path) {
-                tracing::warn!("cannot load FoldState: {}", e);
+                // ENOENT is expected on first open; `save_to_file` creates it lazily below.
+                match e.io_error_kind() {
+                    io::ErrorKind::NotFound => {
+                        tracing::debug!("FoldState not on disk yet: {}", e)
+                    }
+                    _ => tracing::warn!("cannot load FoldState: {}", e),
+                }
             }
         }
 
@@ -307,7 +313,7 @@ mod test {
         let dir = tempdir().unwrap();
         let path = dir.path().join("foo");
         let def = FoldDef::new("foo", || Box::<ConcatFold>::default());
-        let d = |v: &FoldState| format!("{:?}", v);
+        let d = |v: &FoldState| format!("{v:?}");
 
         let mut state1 = def.empty_state();
         let mut state2 = def.empty_state();

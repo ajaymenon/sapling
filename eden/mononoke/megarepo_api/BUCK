@@ -1,6 +1,6 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "megarepo_mapping",
@@ -20,7 +20,7 @@ rust_library(
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
-        "//common/rust/shed/justknobs_stub:justknobs",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",
         "//eden/mononoke/common/sql_construct:sql_construct",
         "//eden/mononoke/derived_data:fsnodes",
@@ -93,7 +93,6 @@ rust_library(
         "pushredirect/schemas/**/*.sql",
     ]),
     autocargo = {"cargo_toml_dir": "pushredirect"},
-    named_deps = {"bincode": "fbsource//third-party/rust:bincode-2"},
     test_deps = [
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
@@ -102,11 +101,12 @@ rust_library(
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_derive",
         "//common/rust/shed/facet:facet",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//common/rust/shed/sql:sql",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",
         "//eden/mononoke/common/sql_construct:sql_construct",
         "//eden/mononoke/metaconfig:metaconfig_types",
@@ -142,10 +142,10 @@ rust_library(
         "//common/rust/shed/async_once_cell:async_once_cell",
         "//common/rust/shed/futures_retry:futures_retry",
         "//common/rust/shed/futures_stats:futures_stats",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//common/rust/shed/sorted_vector_map:sorted_vector_map",
         "//eden/mononoke/blobstore:blobstore",
         "//eden/mononoke/cmdlib/mononoke_app:mononoke_app",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/derived_data:bulk_derivation",
         "//eden/mononoke/derived_data:fsnodes",
         "//eden/mononoke/derived_data/content_manifest_derivation:content_manifest_derivation",

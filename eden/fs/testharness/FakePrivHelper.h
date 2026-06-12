@@ -80,6 +80,7 @@ class FakePrivHelper final : public PrivHelper {
       std::chrono::nanoseconds duration) override;
   folly::Future<folly::Unit> setUseEdenFs(bool useEdenFs) override;
   folly::Future<pid_t> getServerPid() override;
+  folly::Future<NamespaceInfo> getNamespaceInfo(pid_t daemonPid) override;
   folly::Future<pid_t> startFam(
       const std::vector<std::string>& paths,
       const std::string& tmpOutputPath,
@@ -89,6 +90,9 @@ class FakePrivHelper final : public PrivHelper {
   folly::Future<folly::Unit> setMemoryPriorityForProcess(
       pid_t pid,
       int priority) override;
+  folly::Future<folly::Unit> setFuseReadAhead(
+      folly::StringPiece mountPath,
+      uint32_t readAheadKb) override;
   int stop() override;
   int getRawClientFd() const override {
     return -1;

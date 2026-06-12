@@ -11,6 +11,7 @@
 
 #include <boost/filesystem.hpp>
 #include <fcntl.h>
+#include <fmt/core.h>
 #include <folly/portability/Unistd.h>
 #include <ctime>
 
@@ -18,7 +19,6 @@
 #include <folly/ExceptionWrapper.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
-#include <folly/Format.h>
 #include <folly/Overload.h>
 #include <folly/String.h>
 #include <folly/gen/Base.h>
@@ -49,17 +49,20 @@ struct OverlayChecker::Impl {
   FsFileContentStore* const fcs;
   std::optional<InodeNumber> loadedNextInodeNumber;
   InodeCatalog::LookupCallback& lookupCallback;
+  CaseSensitivity caseSensitive;
   std::unordered_map<InodeNumber, InodeInfo> inodes;
 
   Impl(
       InodeCatalog* inodeCatalog,
       FsFileContentStore* fcs,
       std::optional<InodeNumber> nextInodeNumber,
-      InodeCatalog::LookupCallback& lookupCallback)
+      InodeCatalog::LookupCallback& lookupCallback,
+      CaseSensitivity caseSensitive)
       : inodeCatalog{inodeCatalog},
         fcs{fcs},
         loadedNextInodeNumber{nextInodeNumber},
-        lookupCallback{lookupCallback} {}
+        lookupCallback{lookupCallback},
+        caseSensitive{caseSensitive} {}
 };
 
 class OverlayChecker::RepairState {
@@ -365,10 +368,8 @@ class OverlayChecker::UnexpectedInodeShard : public OverlayChecker::Error {
 
 class OverlayChecker::InodeDataError : public OverlayChecker::Error {
  public:
-  template <typename... Args>
-  explicit InodeDataError(InodeNumber number, Args&&... args)
-      : number_(number),
-        message_(folly::sformat(std::forward<Args>(args)...)) {}
+  explicit InodeDataError(InodeNumber number, std::string message)
+      : number_(number), message_(std::move(message)) {}
 
   string getMessage(OverlayChecker*) const override {
     return fmt::format(
@@ -762,24 +763,130 @@ OverlayChecker::OverlayChecker(
     FsFileContentStore* fcs,
     optional<InodeNumber> nextInodeNumber,
     InodeCatalog::LookupCallback& lookupCallback,
-    uint64_t numErrorDiscoveryThreads)
+    uint64_t numErrorDiscoveryThreads,
+    CaseSensitivity caseSensitive)
     : impl_{std::make_unique<Impl>(
           inodeCatalog,
           fcs,
           nextInodeNumber,
-          lookupCallback)},
+          lookupCallback,
+          caseSensitive)},
       numErrorDiscoveryThreads_{numErrorDiscoveryThreads} {
   XCHECK_GT(numErrorDiscoveryThreads_, 0u);
 }
 
 OverlayChecker::~OverlayChecker() = default;
 
-void OverlayChecker::scanForErrors(const ProgressCallback& progressCallback) {
+bool OverlayChecker::recoverWalFiles() {
+  // Kept out of scanForErrors so `eden fsck --dry-run` stays read-only
+  // (see header). Every WAL we observe is unconditionally removed after
+  // a best-effort replay:
+  //   - Base present: merge WAL into the base file.
+  //   - Base missing but WAL replays into a non-empty dir: synthesize a
+  //     new base, mirroring Overlay::loadOverlayDir's runtime behavior.
+  //     Without this, inodes referenced only by WAL-ADD entries would
+  //     become orphans for fsck to quarantine in lost+found/.
+  //   - Base missing and WAL replays to empty (only REMOVEs/MATERIALIZEs
+  //     that no-op against an empty base, or a torn WAL): skip the save -
+  //     creating an empty base for an unreferenced inode would just give
+  //     fsck a new orphan to quarantine.
+  //   - Torn or empty WAL on an existing base (replayWal returned 0): no
+  //     rewrite needed.
+  // The only exception is when an exception escapes (e.g., I/O error
+  // unrelated to corruption); in that case we log and skip removal so the
+  // next mount can retry.
+  auto walInodes = impl_->fcs->scanForWalFiles();
+  size_t recoveredCount = 0;
+  for (auto ino : walInodes) {
+    try {
+      auto dirData = impl_->inodeCatalog->loadOverlayDir(ino);
+      const bool baseWasMissing = !dirData.has_value();
+      if (baseWasMissing) {
+        dirData.emplace();
+      }
+      // Best-effort merge; replayWal stops at the first torn entry but
+      // keeps the good prefix. parseErrors are discarded here because
+      // OverlayChecker has no EdenStats; fsck-discovered torn WALs are
+      // captured by fsck's own structured logs, not OverlayStats.
+      auto walResult =
+          impl_->fcs->replayWal(ino, *dirData, impl_->caseSensitive);
+      // On missing base, only ADDs grow an empty dir; parse count would
+      // lie on REMOVE-only WALs and synthesize a useless empty base.
+      const bool shouldSave = baseWasMissing ? !dirData->entries()->empty()
+                                             : walResult.rawEntriesParsed > 0;
+      if (shouldSave) {
+        if (baseWasMissing) {
+          XLOGF(
+              WARN,
+              "fsck: overlay base missing for inode {} but WAL present; "
+              "synthesized base with {} entries from WAL replay",
+              ino,
+              dirData->entries()->size());
+        }
+        // Only rewrite the base when needed. For an existing base, a
+        // 0-entry replay leaves dirData equal to disk so the rewrite
+        // would be redundant I/O on a large mount with many torn WALs.
+        // For a missing base, a replay that net-collapses to empty would
+        // create an orphan inode for fsck to quarantine.
+        impl_->inodeCatalog->saveOverlayDir(
+            ino, std::move(*dirData), /*crashSafe=*/true);
+        ++recoveredCount;
+      }
+      impl_->fcs->removeWal(ino);
+    } catch (const std::exception& e) {
+      XLOGF(WARN, "fsck: failed to replay WAL for inode {}: {}", ino, e.what());
+    }
+  }
+  if (recoveredCount > 0) {
+    XLOGF(INFO, "fsck: merged {} WAL files; rescanning", recoveredCount);
+  }
+  return recoveredCount > 0;
+}
+
+void OverlayChecker::scanForWalChildren() {
+  auto walInodes = impl_->fcs->scanForWalFiles();
+  for (auto ino : walInodes) {
+    try {
+      auto dirData = impl_->inodeCatalog->loadOverlayDir(ino);
+      if (!dirData.has_value()) {
+        dirData.emplace();
+      }
+
+      auto walResult = impl_->fcs->replayWal(ino, *dirData);
+      if (walResult.rawEntriesParsed == 0 && dirData->entries()->empty()) {
+        continue;
+      }
+
+      auto iter = impl_->inodes.find(ino);
+      if (iter != impl_->inodes.end()) {
+        iter->second.children = std::move(*dirData);
+      } else if (!dirData->entries()->empty()) {
+        impl_->inodes.emplace(ino, InodeInfo{ino, std::move(*dirData)});
+        updateMaxInodeNumber(ino);
+      }
+    } catch (const std::exception& e) {
+      XLOGF(WARN, "fsck: failed to replay WAL for inode {}: {}", ino, e.what());
+    }
+  }
+}
+
+void OverlayChecker::scanForErrors(
+    const ProgressCallback& progressCallback,
+    bool includeWalChildren) {
   XLOGF(INFO, "Starting fsck scan on overlay {}", impl_->fcs->getLocalDir());
+
+  impl_->inodes.clear();
+  errors_.clear();
+  pathCache_.clear();
+  maxInodeNumber_ = kRootNodeId.get();
+
   if (auto callback = progressCallback) {
     callback(0);
   }
   readInodes(progressCallback);
+  if (includeWalChildren) {
+    scanForWalChildren();
+  }
   linkInodeChildren();
   scanForParentErrors();
   checkNextInodeNumber();
@@ -798,7 +905,11 @@ void OverlayChecker::scanForErrors(const ProgressCallback& progressCallback) {
   }
 }
 
-optional<OverlayChecker::RepairResult> OverlayChecker::repairErrors() {
+optional<OverlayChecker::RepairResult> OverlayChecker::repairErrors(
+    const ProgressCallback& progressCallback) {
+  recoverWalFiles();
+  scanForErrors(progressCallback);
+
   if (errors_.empty()) {
     return std::nullopt;
   }
@@ -1045,6 +1156,16 @@ void OverlayChecker::readInodes(const ProgressCallback& progressCallback) {
             while (iterator != endIterator) {
               const auto& dirEntry = *iterator;
               AbsolutePath inodePath = canonicalPath(dirEntry.path().string());
+              if (folly::StringPiece{inodePath.basename().value()}.endsWith(
+                      ".wal")) {
+                iterator.increment(error);
+                if (error.value() != 0) {
+                  errors.wlock()->push_back(
+                      make_error<ShardDirectoryEnumerationError>(path, error));
+                  break;
+                }
+                continue;
+              }
               auto entryInodeNumber =
                   folly::tryTo<uint64_t>(inodePath.basename().value());
               if (entryInodeNumber.hasValue()) {

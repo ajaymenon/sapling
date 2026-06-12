@@ -207,6 +207,12 @@ pub struct GitimportPreferences {
     pub lfs: GitImportLfs,
     pub git_command_path: PathBuf,
     pub backfill_derivation: BackfillDerivation,
+    /// On producer failure, await consumers so they flush partial work
+    /// (commits already fully processed get their `bonsai_git_mapping`
+    /// persisted). Lets retries resume from the failing commit instead of
+    /// re-importing the whole range. Also surfaces the consumer's real
+    /// error to Scuba instead of the producer's SendError cascade.
+    pub persist_partial_mappings: bool,
 }
 
 impl Default for GitimportPreferences {
@@ -220,6 +226,7 @@ impl Default for GitimportPreferences {
             backfill_derivation: BackfillDerivation::No,
             stream_for_changed_trees: true,
             allow_content_refs: false,
+            persist_partial_mappings: false,
         }
     }
 }
@@ -300,9 +307,9 @@ impl GitimportTarget {
     async fn write_filter_list(&self, rev_list: &mut Child) -> Result<(), Error> {
         if let Some(wanted) = self.wanted.as_ref() {
             let mut stdin = rev_list.stdin.take().context("stdin not set up properly")?;
-            stdin.write_all(format!("{}\n", wanted).as_bytes()).await?;
+            stdin.write_all(format!("{wanted}\n").as_bytes()).await?;
             for commit in self.known.keys() {
-                stdin.write_all(format!("^{}\n", commit).as_bytes()).await?;
+                stdin.write_all(format!("^{commit}\n").as_bytes()).await?;
             }
         }
 
@@ -350,16 +357,13 @@ impl TagMetadata {
             .get_object(&oid)
             .await?
             .with_parsed_as_tag(|tag| {
-                let author_date = tag
-                    .tagger
-                    .and_then(|tagger| {
-                        if let Ok(time) = tagger.time() {
-                            Some(DateTime::from_gix(time))
-                        } else {
-                            None
-                        }
-                    })
-                    .transpose()?;
+                let author_date = if let Ok(Some(tagger)) = tag.tagger()
+                    && let Ok(time) = tagger.time()
+                {
+                    Some(DateTime::from_gix(time)?)
+                } else {
+                    None
+                };
                 // This maintains a pre-existing bug where we used to double-take. I don't want to
                 // fix it in the middle of this diff and potentially hit unexpected side-effects.
                 // The old code looked like this:
@@ -515,10 +519,12 @@ impl ExtractedCommit {
         object
             .with_parsed_as_commit(|commit| {
                 let tree_oid = commit.tree();
-                let author_date = DateTime::from_gix(commit.author.time()?)?;
-                let committer_date = DateTime::from_gix(commit.committer.time()?)?;
-                let author = format_signature(commit.author);
-                let committer = format_signature(commit.committer);
+                let author = commit.author().unwrap_or_default();
+                let author_date = DateTime::from_gix(author.time()?)?;
+                let committer = commit.committer().unwrap_or_default();
+                let committer_date = DateTime::from_gix(committer.time()?)?;
+                let author = format_signature(author);
+                let committer = format_signature(committer);
                 let message =
                     decode_message(commit.message, &commit.encoding.map(|e| e.to_owned()))?;
                 let parents = commit.parents().collect();
@@ -674,7 +680,7 @@ mod tests {
     fn should_decode_into(message: &[u8], encoding: &Option<BString>, expected: &str) {
         let m = decode_message(message, encoding);
         if m.is_err() {
-            panic!("{:?}", m);
+            panic!("{m:?}");
         }
         assert_eq!(expected, &m.unwrap())
     }

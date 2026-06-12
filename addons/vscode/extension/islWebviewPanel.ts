@@ -22,6 +22,7 @@ interface ISLWebviewResult<W extends WebviewPanel | WebviewView> {
 }
 
 import {onClientConnection} from 'isl-server/src';
+import {repositoryCache} from 'isl-server/src/RepositoryCache';
 import {deserializeFromString, serializeToString} from 'isl/src/serialize';
 import type {PartiallySelectedDiffCommit} from 'isl/src/stackEdit/diffSplitTypes';
 import {ComparisonType, isComparison, labelForComparison} from 'shared/Comparison';
@@ -30,8 +31,10 @@ import {defer} from 'shared/utils';
 import * as vscode from 'vscode';
 import {executeVSCodeCommand} from './commands';
 import {getCLICommand, PERSISTED_STORAGE_KEY_PREFIX, shouldOpenBeside} from './config';
-import {getWebviewOptions, htmlForWebview} from './htmlForWebview';
+import {assignWebviewHtml, getWebviewOptions} from './htmlForWebview';
 import {locale, t} from './i18n';
+import {Internal} from './Internal';
+import {hasMultiDiffEditorSupport, openMultiDiffEditor} from './multiDiffEditor';
 import {extensionVersion} from './utils';
 
 /**
@@ -83,7 +86,7 @@ function expandLineRange(
   }
 
   // If we get here with lines.length !== 2, the input format is unexpected.
-  // This shouldn't happen with proper agent output - log a warning.
+  // eslint-disable-next-line no-console -- intentional warning for unexpected input
   console.warn(
     `expandLineRange received unexpected format with ${lines.length} elements. Expected a range [start, end] or array of ranges.`,
   );
@@ -93,6 +96,9 @@ function expandLineRange(
 let islPanelOrViewResult: ISLWebviewResult<vscode.WebviewPanel | vscode.WebviewView> | undefined =
   undefined;
 let hasOpenedISLWebviewBeforeState = false;
+
+/** Most recently selected cwd across all ISL webviews. */
+let mostRecentISLCwd: string | undefined = undefined;
 
 const islViewType = 'sapling.isl';
 const comparisonViewType = 'sapling.comparison';
@@ -214,6 +220,63 @@ function replaceExistingOrphanedISLWindows(
   }
 }
 
+/**
+ * Opens the native VS Code multi-diff editor for a comparison using Sapling's
+ * own file status fetching and content providers. Returns true if successful,
+ * false if it falls back to the webview comparison.
+ */
+async function openNativeMultiDiffEditor(
+  comparison: Comparison,
+  repoRoot?: string,
+): Promise<boolean> {
+  if (!(await hasMultiDiffEditorSupport())) {
+    return false;
+  }
+
+  // Resolve repo: explicit repoRoot -> active editor file -> ISL's selected cwd -> workspace folders.
+  let repo;
+  if (repoRoot) {
+    repo = repositoryCache.cachedRepositoryForPath(repoRoot);
+  }
+  if (!repo) {
+    const activeUri = vscode.window.activeTextEditor?.document.uri;
+    if (activeUri && activeUri.scheme === 'file') {
+      repo = repositoryCache.cachedRepositoryForPath(activeUri.fsPath);
+    }
+  }
+  if (!repo && mostRecentISLCwd) {
+    repo = repositoryCache.cachedRepositoryForPath(mostRecentISLCwd);
+  }
+  if (!repo) {
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      repo = repositoryCache.cachedRepositoryForPath(folder.uri.fsPath);
+      if (repo) {
+        break;
+      }
+    }
+  }
+  if (!repo) {
+    return false;
+  }
+
+  try {
+    const files = await repo.getFilesChangedForComparison(
+      repo.initialConnectionContext,
+      comparison,
+    );
+    if (files.length === 0) {
+      vscode.window.showInformationMessage(t('No changed files to display'));
+      return true; // Handled, just nothing to show
+    }
+
+    await openMultiDiffEditor(repo.info.repoRoot, comparison, files);
+    return true;
+  } catch (err) {
+    // If multi-diff editor fails, fall back to webview
+    return false;
+  }
+}
+
 export function registerISLCommands(
   context: vscode.ExtensionContext,
   platform: VSCodeServerPlatform,
@@ -246,7 +309,7 @@ export function registerISLCommands(
     }),
     vscode.commands.registerCommand(
       'sapling.open-isl-with-commit-message',
-      async (title: string, description: string, mode?: 'commit' | 'amend') => {
+      async (title: string, description: string, mode?: 'commit' | 'amend', hash?: string) => {
         try {
           let readySignal: Deferred<void>;
 
@@ -268,6 +331,7 @@ export function registerISLCommands(
               title,
               description,
               mode,
+              hash,
             };
 
             currentPanelOrViewResult.panel.webview.postMessage(serializeToString(message));
@@ -334,22 +398,36 @@ export function registerISLCommands(
         executeVSCodeCommand('workbench.action.closeSidebar');
       }
     }),
-    vscode.commands.registerCommand('sapling.open-comparison-view-uncommitted', () => {
-      createComparisonWebviewCommand({type: ComparisonType.UncommittedChanges});
+    vscode.commands.registerCommand('sapling.open-comparison-view-uncommitted', async () => {
+      const comparison: Comparison = {type: ComparisonType.UncommittedChanges};
+      if (!(await openNativeMultiDiffEditor(comparison))) {
+        createComparisonWebviewCommand(comparison);
+      }
     }),
-    vscode.commands.registerCommand('sapling.open-comparison-view-head', () => {
-      createComparisonWebviewCommand({type: ComparisonType.HeadChanges});
+    vscode.commands.registerCommand('sapling.open-comparison-view-head', async () => {
+      const comparison: Comparison = {type: ComparisonType.HeadChanges};
+      if (!(await openNativeMultiDiffEditor(comparison))) {
+        createComparisonWebviewCommand(comparison);
+      }
     }),
-    vscode.commands.registerCommand('sapling.open-comparison-view-stack', () => {
-      createComparisonWebviewCommand({type: ComparisonType.StackChanges});
+    vscode.commands.registerCommand('sapling.open-comparison-view-stack', async () => {
+      const comparison: Comparison = {type: ComparisonType.StackChanges};
+      if (!(await openNativeMultiDiffEditor(comparison))) {
+        createComparisonWebviewCommand(comparison);
+      }
     }),
     /** Command that opens the provided Comparison argument. Intended to be used programmatically. */
-    vscode.commands.registerCommand('sapling.open-comparison-view', (comparison: unknown) => {
-      if (!isComparison(comparison)) {
-        return;
-      }
-      createComparisonWebviewCommand(comparison);
-    }),
+    vscode.commands.registerCommand(
+      'sapling.open-comparison-view',
+      async (comparison: unknown, repoRoot?: string) => {
+        if (!isComparison(comparison)) {
+          return;
+        }
+        if (!(await openNativeMultiDiffEditor(comparison, repoRoot))) {
+          createComparisonWebviewCommand(comparison);
+        }
+      },
+    ),
     registerDeserializer(context, platform, logger),
     vscode.window.registerWebviewViewProvider(islViewType, webviewViewProvider, {
       webviewOptions: {
@@ -357,13 +435,33 @@ export function registerISLCommands(
       },
     }),
     vscode.workspace.onDidChangeConfiguration(e => {
-      // if we start using ISL as a view, dispose the panel
       if (e.affectsConfiguration('sapling.isl.showInSidebar')) {
-        if (islPanelOrViewResult && isPanel(islPanelOrViewResult.panel) && shouldUseWebviewView()) {
-          islPanelOrViewResult.panel.dispose();
+        if (shouldUseWebviewView()) {
+          // Switching to sidebar mode: dispose the panel if it exists
+          if (islPanelOrViewResult && isPanel(islPanelOrViewResult.panel)) {
+            islPanelOrViewResult.panel.dispose();
+          }
+          executeVSCodeCommand('sapling.isl.focus');
+        } else {
+          // Switching to panel mode: clear the view reference so a new panel can be created
+          if (islPanelOrViewResult && !isPanel(islPanelOrViewResult.panel)) {
+            islPanelOrViewResult = undefined;
+          }
+          createOrFocusISLWebview(context, platform, logger);
         }
       }
     }),
+    Internal.basecampOnDidChangeFocusedEnvironment?.(
+      (env?: {folderPaths: ReadonlyArray<string>}) => {
+        if (env?.folderPaths?.[0]) {
+          postMessageToISLWebview({
+            type: 'changeActiveRepo',
+            cwd: env.folderPaths[0],
+            focusDotCommit: true,
+          });
+        }
+      },
+    ) ?? new vscode.Disposable(() => {}),
   );
 }
 
@@ -443,18 +541,16 @@ function populateAndSetISLWebview<W extends vscode.WebviewPanel | vscode.Webview
     islPanelOrViewResult = {panel: panelOrView, readySignal};
   }
   if (isPanel(panelOrView)) {
-    panelOrView.iconPath = vscode.Uri.joinPath(
-      context.extensionUri,
-      'resources',
-      'Sapling_favicon-light-green-transparent.svg',
-    );
+    panelOrView.iconPath = {
+      light: vscode.Uri.joinPath(context.extensionUri, 'resources', 'Sapling-light.svg'),
+      dark: vscode.Uri.joinPath(context.extensionUri, 'resources', 'Sapling-dark.svg'),
+    };
   }
-  panelOrView.webview.html = htmlForWebview({
+  assignWebviewHtml({
     context,
     extensionRelativeBase: 'dist/webview',
     entryPointFile: 'webview.js',
     cssEntryPointFile: 'res/style.css', // TODO: this is global to all webviews, but should instead be per webview
-    devModeScripts: ['/webview/islWebviewEntry.tsx'],
     title: t('isl.title'),
     rootClass: `webview-${isPanel(panelOrView) ? 'panel' : 'view'}`,
     webview: panelOrView.webview,
@@ -469,6 +565,13 @@ function populateAndSetISLWebview<W extends vscode.WebviewPanel | vscode.Webview
   });
   const updatedPlatform = {...platform, panelOrView} as VSCodeServerPlatform as ServerPlatform;
 
+  const focusedEnv = Internal.basecampGetFocusedEnvironment?.();
+  const initialCwd =
+    focusedEnv?.folderPaths?.[0] ??
+    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ??
+    process.cwd();
+  mostRecentISLCwd = initialCwd;
+
   const disposeConnection = onClientConnection({
     postMessage(message: string) {
       return panelOrView.webview.postMessage(message) as Promise<boolean>;
@@ -479,7 +582,10 @@ function populateAndSetISLWebview<W extends vscode.WebviewPanel | vscode.Webview
         handler(m, isBinary);
       });
     },
-    cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(), // TODO
+    cwd: initialCwd,
+    onChangeCwd: cwd => {
+      mostRecentISLCwd = cwd;
+    },
     platform: updatedPlatform,
     appMode: mode,
     logger,
@@ -491,7 +597,9 @@ function populateAndSetISLWebview<W extends vscode.WebviewPanel | vscode.Webview
   panelOrView.onDidDispose(() => {
     if (isPanel(panelOrView)) {
       logger.info('Disposing ISL panel');
-      islPanelOrViewResult = undefined;
+      if (islPanelOrViewResult?.panel === panelOrView) {
+        islPanelOrViewResult = undefined;
+      }
     } else {
       logger.info('Disposing ISL view');
     }
@@ -499,6 +607,18 @@ function populateAndSetISLWebview<W extends vscode.WebviewPanel | vscode.Webview
   });
 
   return {panel: panelOrView, readySignal};
+}
+
+/**
+ * Post a message to the ISL webview, if one is currently open.
+ * Returns true if the message was sent, false if no webview is open.
+ */
+export function postMessageToISLWebview(message: ServerToClientMessage): boolean {
+  if (islPanelOrViewResult == null) {
+    return false;
+  }
+  islPanelOrViewResult.panel.webview.postMessage(serializeToString(message));
+  return true;
 }
 
 export function fetchUIState(): Promise<{state: string} | undefined> {

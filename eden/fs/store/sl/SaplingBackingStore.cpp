@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -18,6 +19,7 @@
 #include <folly/Executor.h>
 #include <folly/Range.h>
 #include <folly/String.h>
+#include <folly/coro/Collect.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/task_queue/UnboundedBlockingQueue.h>
 #include <folly/executors/thread_factory/InitThreadFactory.h>
@@ -27,7 +29,6 @@
 #include <gflags/gflags.h>
 
 #include "eden/common/telemetry/RequestMetricsScope.h"
-#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/Bug.h"
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/EnumValue.h"
@@ -44,6 +45,7 @@
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/store/sl/SaplingImportRequest.h"
 #include "eden/fs/store/sl/SaplingObjectId.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/StaticAssert.h"
@@ -110,19 +112,22 @@ HgImportTraceEvent::HgImportTraceEvent(
 SaplingBackingStore::SaplingBackingStore(
     AbsolutePathPiece repository,
     AbsolutePathPiece mount,
+    AbsolutePathPiece clientDirectory,
     CaseSensitivity caseSensitive,
     EdenStatsPtr stats,
     UnboundedQueueExecutor* serverThreadPool,
     std::shared_ptr<ReloadableConfig> config,
     std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions,
-    std::shared_ptr<StructuredLogger> structuredLogger,
+    std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
+    ErrorLogger& errorLogger,
     std::unique_ptr<BackingStoreLogger> logger,
     FaultInjector* FOLLY_NONNULL faultInjector)
     : stats_(stats.copy()),
       config_(config),
       serverThreadPool_(serverThreadPool),
       queue_(std::move(config)),
-      structuredLogger_{std::move(structuredLogger)},
+      edenFsEventsLogger_{std::move(edenFsEventsLogger)},
+      errorLogger_(errorLogger),
       logger_(std::move(logger)),
       faultInjector_{*faultInjector},
       runtimeOptions_(computeRuntimeOptions(std::move(runtimeOptions))),
@@ -133,10 +138,11 @@ SaplingBackingStore::SaplingBackingStore(
           config_->getEdenConfig()->HgTraceBusCapacity.getValue())},
       store_{
           sapling::sapling_backingstore_new(
-              rust::Slice<const char>{
-                  repository.view().data(),
-                  repository.view().size()},
-              rust::Slice<const char>{mount.view().data(), mount.view().size()},
+              rust::Str{repository.view().data(), repository.view().size()},
+              rust::Str{mount.view().data(), mount.view().size()},
+              rust::Str{
+                  clientDirectory.view().data(),
+                  clientDirectory.view().size()},
               config_->getEdenConfig()->backingstoreWalkMode.getValue())
               .into_raw(),
           [](sapling::BackingStore* backingStore) {
@@ -181,19 +187,22 @@ SaplingBackingStore::SaplingBackingStore(
 SaplingBackingStore::SaplingBackingStore(
     AbsolutePathPiece repository,
     AbsolutePathPiece mount,
+    AbsolutePathPiece clientDirectory,
     CaseSensitivity caseSensitive,
     EdenStatsPtr stats,
-    folly::InlineExecutor* inlineExecutor,
+    folly::Executor* executor,
     std::shared_ptr<ReloadableConfig> config,
     std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions,
-    std::shared_ptr<StructuredLogger> structuredLogger,
+    std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
+    ErrorLogger& errorLogger,
     std::unique_ptr<BackingStoreLogger> logger,
     FaultInjector* FOLLY_NONNULL faultInjector)
     : stats_(std::move(stats)),
       config_(config),
-      serverThreadPool_(inlineExecutor),
+      serverThreadPool_(executor),
       queue_(std::move(config)),
-      structuredLogger_{std::move(structuredLogger)},
+      edenFsEventsLogger_{std::move(edenFsEventsLogger)},
+      errorLogger_(errorLogger),
       logger_(std::move(logger)),
       faultInjector_{*faultInjector},
       runtimeOptions_(std::move(runtimeOptions)),
@@ -204,10 +213,11 @@ SaplingBackingStore::SaplingBackingStore(
           config_->getEdenConfig()->HgTraceBusCapacity.getValue())},
       store_{
           sapling::sapling_backingstore_new(
-              rust::Slice<const char>{
-                  repository.view().data(),
-                  repository.view().size()},
-              rust::Slice<const char>{mount.view().data(), mount.view().size()},
+              rust::Str{repository.view().data(), repository.view().size()},
+              rust::Str{mount.view().data(), mount.view().size()},
+              rust::Str{
+                  clientDirectory.view().data(),
+                  clientDirectory.view().size()},
               config_->getEdenConfig()->backingstoreWalkMode.getValue())
               .into_raw(),
           [](sapling::BackingStore* backingStore) {
@@ -404,8 +414,8 @@ void SaplingBackingStore::getBlobBatch(
               requests.size(),
               content.exception().what().toStdString());
 
-          if (structuredLogger_) {
-            structuredLogger_->logEvent(
+          if (edenFsEventsLogger_) {
+            edenFsEventsLogger_->logEvent(
                 FetchMiss{
                     repoName_,
                     FetchMiss::Blob,
@@ -540,6 +550,11 @@ void SaplingBackingStore::getTreeBatch(
   }
 
   auto callback = [&](size_t index, folly::Try<TreePtr> content) mutable {
+    // Convert PermissionDenied errors to restricted trees, matching the
+    // single-fetch path in getNativeTree.
+    content = convertPermissionDeniedToRestrictedTree(
+        std::move(content), SaplingObjectId{requests[index].oid}.oid());
+
     if (content.hasException()) {
       XLOGF(
           DBG4,
@@ -841,8 +856,8 @@ void SaplingBackingStore::getTreeAuxDataBatch(
         }
 
         if (auxTry.hasException()) {
-          if (structuredLogger_) {
-            structuredLogger_->logEvent(
+          if (edenFsEventsLogger_) {
+            edenFsEventsLogger_->logEvent(
                 FetchMiss{
                     repoName_,
                     FetchMiss::TreeAuxData,
@@ -927,15 +942,16 @@ void SaplingBackingStore::getBlobAuxDataBatch(
         }
 
         if (auxTry.hasException()) {
-          if (structuredLogger_ &&
-              fetch_mode != sapling::FetchMode::RemoteOnly) {
-            structuredLogger_->logEvent(
-                FetchMiss{
-                    repoName_,
-                    FetchMiss::BlobAuxData,
-                    auxTry.exception().what().toStdString(),
-                    false, // isRetry
-                    dogfoodingHost()});
+          if (fetch_mode != sapling::FetchMode::RemoteOnly) {
+            if (edenFsEventsLogger_) {
+              edenFsEventsLogger_->logEvent(
+                  FetchMiss{
+                      repoName_,
+                      FetchMiss::BlobAuxData,
+                      auxTry.exception().what().toStdString(),
+                      false, // isRetry
+                      dogfoodingHost()});
+            }
           }
 
           return;
@@ -1116,10 +1132,41 @@ SaplingBackingStore::getTreeAuxData(
       .semi();
 }
 
+folly::coro::now_task<BackingStore::GetTreeAuxResult>
+SaplingBackingStore::co_getTreeAuxData(
+    const ObjectId& id,
+    const ObjectFetchContextPtr& context) {
+  // Move the DurationScope into a folly::makeGuard so the duration is
+  // recorded when the guard goes out of scope at the end of this coroutine
+  // frame (success OR exception). This is the direct coroutine port of the
+  // futures path's `.ensure([scope = std::move(scope)] {})`.
+  auto scopeGuard = folly::makeGuard(
+      [scope = DurationScope<EdenStats>{
+           stats_, &SaplingBackingStoreStats::getTreeAuxData}]() mutable {});
+
+  SlOidView slOid{id};
+
+  logBackingStoreFetch(
+      *context,
+      folly::Range{&slOid, 1},
+      ObjectFetchContext::ObjectType::TreeAuxData);
+
+  auto auxData = getLocalTreeAuxData(slOid);
+  if (auxData.hasValue() && auxData.value()) {
+    stats_->increment(&SaplingBackingStoreStats::fetchTreeAuxDataSuccess);
+    stats_->increment(&SaplingBackingStoreStats::fetchTreeAuxDataLocal);
+    co_return GetTreeAuxResult{
+        std::move(auxData.value()), ObjectFetchContext::Origin::FromDiskCache};
+  }
+
+  co_return co_await getTreeAuxDataEnqueue(slOid, context).semi();
+}
+
 ImmediateFuture<BackingStore::GetTreeAuxResult>
 SaplingBackingStore::getTreeAuxDataEnqueue(
     const SlOid& slOid,
     const ObjectFetchContextPtr& context) {
+  auto self = shared_from_this();
   auto getTreeAuxFuture = makeImmediateFutureWith([&] {
     XLOGF(DBG4, "making tree aux data import request for {}", slOid);
     auto requestContext = context.copy();
@@ -1127,9 +1174,9 @@ SaplingBackingStore::getTreeAuxDataEnqueue(
         SaplingImportRequest::makeTreeAuxImportRequest(slOid, requestContext);
     auto unique = request->getUnique();
 
-    auto importTracker =
-        std::make_unique<RequestMetricsScope>(&pendingImportTreeAuxWatches_);
-    traceBus_->publish(
+    auto importTracker = std::make_unique<RequestMetricsScope>(
+        &self->pendingImportTreeAuxWatches_);
+    self->traceBus_->publish(
         HgImportTraceEvent::queue(
             unique,
             HgImportTraceEvent::TREE_AUX,
@@ -1138,13 +1185,13 @@ SaplingBackingStore::getTreeAuxDataEnqueue(
             context->getCause(),
             context->getClientPid()));
 
-    return queue_.enqueueTreeAux(std::move(request))
-        .ensure([this,
+    return self->queue_.enqueueTreeAux(std::move(request))
+        .ensure([self,
                  unique,
                  slOid,
                  context = context.copy(),
                  importTracker = std::move(importTracker)]() {
-          traceBus_->publish(
+          self->traceBus_->publish(
               HgImportTraceEvent::finish(
                   unique,
                   HgImportTraceEvent::TREE_AUX,
@@ -1157,8 +1204,8 @@ SaplingBackingStore::getTreeAuxDataEnqueue(
   });
 
   return std::move(getTreeAuxFuture)
-      .thenTry([this, slOid](folly::Try<TreeAuxDataPtr>&& result) {
-        this->queue_.markImportAsFinished<TreeAuxDataPtr::element_type>(
+      .thenTry([self, slOid](folly::Try<TreeAuxDataPtr>&& result) {
+        self->queue_.markImportAsFinished<TreeAuxDataPtr::element_type>(
             slOid, result);
         auto treeAux = std::move(result).value();
         return GetTreeAuxResult{
@@ -1220,52 +1267,137 @@ folly::SemiFuture<BackingStore::GetTreeResult> SaplingBackingStore::getTree(
       .semi();
 }
 
+folly::coro::now_task<BackingStore::GetTreeResult>
+SaplingBackingStore::co_getTree(
+    const ObjectId& id,
+    const ObjectFetchContextPtr& context) {
+  DurationScope<EdenStats> scope{stats_, &SaplingBackingStoreStats::getTree};
+
+  SlOidView slOid{id};
+
+  logBackingStoreFetch(
+      *context, folly::Range{&slOid, 1}, ObjectFetchContext::ObjectType::Tree);
+
+  if (auto tree = getTreeLocal(slOid, context)) {
+    XLOGF(DBG5, "imported tree {} from hgcache", slOid);
+    stats_->increment(&SaplingBackingStoreStats::fetchTreeSuccess);
+    if (dogfoodingHost()) {
+      stats_->increment(&SaplingBackingStoreStats::fetchTreeSuccessDogfooding);
+    }
+    stats_->increment(&SaplingBackingStoreStats::fetchTreeLocal);
+    co_return GetTreeResult{
+        std::move(tree), ObjectFetchContext::Origin::FromDiskCache};
+  }
+  co_return co_await co_getTreeEnqueue(slOid, context);
+}
+
 ImmediateFuture<BackingStore::GetTreeResult>
 SaplingBackingStore::getTreeEnqueue(
     const SlOid& slOid,
     const ObjectFetchContextPtr& context) {
-  auto getTreeFuture = makeImmediateFutureWith([&] {
-    auto requestContext = context.copy();
-    auto request =
-        SaplingImportRequest::makeTreeImportRequest(slOid, requestContext);
-    uint64_t unique = request->getUnique();
+  auto self = shared_from_this();
+  return faultInjector_
+      .checkAsync(
+          "SaplingBackingStore::getTreeEnqueue", slOid.node().toString())
+      .thenValue(
+          [self, slOid = slOid, context = context.copy()](auto&&) mutable {
+            auto getTreeFuture = makeImmediateFutureWith([&] {
+              auto requestContext = context.copy();
+              auto request = SaplingImportRequest::makeTreeImportRequest(
+                  slOid, requestContext);
+              uint64_t unique = request->getUnique();
 
-    auto importTracker =
-        std::make_unique<RequestMetricsScope>(&pendingImportTreeWatches_);
-    traceBus_->publish(
-        HgImportTraceEvent::queue(
+              auto importTracker = std::make_unique<RequestMetricsScope>(
+                  &self->pendingImportTreeWatches_);
+              self->traceBus_->publish(
+                  HgImportTraceEvent::queue(
+                      unique,
+                      HgImportTraceEvent::TREE,
+                      slOid,
+                      context->getPriority().getClass(),
+                      context->getCause(),
+                      context->getClientPid()));
+
+              return self->queue_.enqueueTree(std::move(request))
+                  .ensure([self,
+                           unique,
+                           slOid,
+                           context = context.copy(),
+                           importTracker = std::move(importTracker)]() {
+                    self->traceBus_->publish(
+                        HgImportTraceEvent::finish(
+                            unique,
+                            HgImportTraceEvent::TREE,
+                            slOid,
+                            context->getPriority().getClass(),
+                            context->getCause(),
+                            context->getClientPid(),
+                            context->getFetchedSource()));
+                  });
+            });
+
+            return std::move(getTreeFuture)
+                .thenTry([self, slOid](folly::Try<TreePtr>&& result) {
+                  self->queue_.markImportAsFinished<TreePtr::element_type>(
+                      slOid, result);
+                  auto tree = std::move(result).value();
+                  return GetTreeResult{
+                      std::move(tree),
+                      ObjectFetchContext::Origin::FromNetworkFetch};
+                });
+          });
+}
+
+folly::coro::now_task<BackingStore::GetTreeResult>
+SaplingBackingStore::co_getTreeEnqueue(
+    const SlOid& slOid,
+    const ObjectFetchContextPtr& context) {
+  auto self = shared_from_this();
+  co_await self->faultInjector_.co_checkAsync(
+      "SaplingBackingStore::co_getTreeEnqueue", slOid.node().toString());
+  XLOGF(DBG4, "making tree import request for {}", slOid);
+  auto requestContext = context.copy();
+  auto request =
+      SaplingImportRequest::makeTreeImportRequest(slOid, requestContext);
+  uint64_t unique = request->getUnique();
+
+  auto importTracker =
+      std::make_unique<RequestMetricsScope>(&self->pendingImportTreeWatches_);
+
+  self->traceBus_->publish(
+      HgImportTraceEvent::queue(
+          unique,
+          HgImportTraceEvent::TREE,
+          slOid,
+          context->getPriority().getClass(),
+          context->getCause(),
+          context->getClientPid()));
+  auto guard = folly::makeGuard([&unique, &slOid, &context, self] {
+    self->traceBus_->publish(
+        HgImportTraceEvent::finish(
             unique,
             HgImportTraceEvent::TREE,
             slOid,
             context->getPriority().getClass(),
             context->getCause(),
-            context->getClientPid()));
-
-    return queue_.enqueueTree(std::move(request))
-        .ensure([this,
-                 unique,
-                 slOid,
-                 context = context.copy(),
-                 importTracker = std::move(importTracker)]() {
-          traceBus_->publish(
-              HgImportTraceEvent::finish(
-                  unique,
-                  HgImportTraceEvent::TREE,
-                  slOid,
-                  context->getPriority().getClass(),
-                  context->getCause(),
-                  context->getClientPid(),
-                  context->getFetchedSource()));
-        });
+            context->getClientPid(),
+            context->getFetchedSource()));
   });
 
-  return std::move(getTreeFuture)
-      .thenTry([this, slOid](folly::Try<TreePtr>&& result) {
-        this->queue_.markImportAsFinished<TreePtr::element_type>(slOid, result);
-        auto tree = std::move(result).value();
-        return GetTreeResult{
-            std::move(tree), ObjectFetchContext::Origin::FromNetworkFetch};
-      });
+  folly::Try<TreePtr> result;
+  try {
+    auto tree = co_await self->queue_.co_enqueueTree(std::move(request));
+    result = folly::Try<TreePtr>{tree};
+
+    self->queue_.markImportAsFinished<TreePtr::element_type>(slOid, result);
+
+    co_return BackingStore::GetTreeResult{
+        std::move(tree), ObjectFetchContext::Origin::FromNetworkFetch};
+  } catch (const std::exception&) {
+    result.emplaceException(std::current_exception());
+    self->queue_.markImportAsFinished<TreePtr::element_type>(slOid, result);
+    throw;
+  }
 }
 
 TreePtr SaplingBackingStore::getTreeLocal(
@@ -1289,6 +1421,27 @@ folly::Try<TreePtr> SaplingBackingStore::getTreeRemote(
       sapling::FetchMode::RemoteOnly /*, sapling::ClientRequestInfo(context)*/);
 }
 
+TreePtr SaplingBackingStore::makeRestrictedTree(ObjectId id) const {
+  XLOGF(DBG7, "Creating restricted tree for path ACL restriction: {}", id);
+  return std::make_shared<Tree>(
+      Tree::Restricted{}, Tree::container{caseSensitive_}, std::move(id));
+}
+
+folly::Try<TreePtr>
+SaplingBackingStore::convertPermissionDeniedToRestrictedTree(
+    folly::Try<TreePtr> content,
+    ObjectId id) const {
+  if (content.hasException()) {
+    if (auto* err = content.exception()
+                        .get_exception<sapling::SaplingBackingStoreError>()) {
+      if (err->kind() == sapling::BackingStoreErrorKind::PermissionDenied) {
+        return folly::Try<TreePtr>{makeRestrictedTree(std::move(id))};
+      }
+    }
+  }
+  return content;
+}
+
 folly::Try<facebook::eden::TreePtr> SaplingBackingStore::getNativeTree(
     SlOidView slOid,
     const ObjectFetchContextPtr& context,
@@ -1307,6 +1460,10 @@ folly::Try<facebook::eden::TreePtr> SaplingBackingStore::getNativeTree(
         fetch_mode);
 
     if (result.error != nullptr) {
+      if (result.error->kind() ==
+          sapling::BackingStoreErrorKind::PermissionDenied) {
+        return makeRestrictedTree(SaplingObjectId{slOid}.oid());
+      }
       throw std::move(*result.error);
     }
 
@@ -1385,6 +1542,7 @@ SaplingBackingStore::getBlobEnqueue(
     const SlOid& slOid,
     const ObjectFetchContextPtr& context,
     const SaplingImportRequest::FetchType fetch_type) {
+  auto self = shared_from_this();
   auto getBlobFuture = makeImmediateFutureWith([&] {
     XLOGF(DBG4, "making blob import request for {}", slOid);
     auto requestContext = context.copy();
@@ -1395,15 +1553,15 @@ SaplingBackingStore::getBlobEnqueue(
     std::unique_ptr<RequestMetricsScope> importTracker;
     switch (fetch_type) {
       case SaplingImportRequest::FetchType::Fetch:
-        importTracker =
-            std::make_unique<RequestMetricsScope>(&pendingImportBlobWatches_);
+        importTracker = std::make_unique<RequestMetricsScope>(
+            &self->pendingImportBlobWatches_);
         break;
       case SaplingImportRequest::FetchType::Prefetch:
         importTracker = std::make_unique<RequestMetricsScope>(
-            &pendingImportPrefetchWatches_);
+            &self->pendingImportPrefetchWatches_);
         break;
     }
-    traceBus_->publish(
+    self->traceBus_->publish(
         HgImportTraceEvent::queue(
             unique,
             HgImportTraceEvent::BLOB,
@@ -1412,13 +1570,13 @@ SaplingBackingStore::getBlobEnqueue(
             context->getCause(),
             context->getClientPid()));
 
-    return queue_.enqueueBlob(std::move(request))
-        .ensure([this,
+    return self->queue_.enqueueBlob(std::move(request))
+        .ensure([self,
                  unique,
                  slOid,
                  context = context.copy(),
                  importTracker = std::move(importTracker)]() {
-          traceBus_->publish(
+          self->traceBus_->publish(
               HgImportTraceEvent::finish(
                   unique,
                   HgImportTraceEvent::BLOB,
@@ -1431,19 +1589,20 @@ SaplingBackingStore::getBlobEnqueue(
   });
 
   return std::move(getBlobFuture)
-      .thenTry([this, slOid](folly::Try<BlobPtr>&& result) {
-        this->queue_.markImportAsFinished<BlobPtr::element_type>(slOid, result);
+      .thenTry([self, slOid](folly::Try<BlobPtr>&& result) {
+        self->queue_.markImportAsFinished<BlobPtr::element_type>(slOid, result);
         auto blob = std::move(result).value();
         return GetBlobResult{
             std::move(blob), ObjectFetchContext::Origin::FromNetworkFetch};
       });
 }
 
-folly::coro::Task<BackingStore::GetBlobResult>
+folly::coro::now_task<BackingStore::GetBlobResult>
 SaplingBackingStore::co_getBlobEnqueue(
     const SlOid& slOid,
     const ObjectFetchContextPtr& context,
     const SaplingImportRequest::FetchType fetch_type) {
+  auto self = shared_from_this();
   XLOGF(DBG4, "making blob import request for {}", slOid);
   auto requestContext = context.copy();
   auto request =
@@ -1453,16 +1612,16 @@ SaplingBackingStore::co_getBlobEnqueue(
   std::unique_ptr<RequestMetricsScope> importTracker;
   switch (fetch_type) {
     case SaplingImportRequest::FetchType::Fetch:
-      importTracker =
-          std::make_unique<RequestMetricsScope>(&pendingImportBlobWatches_);
+      importTracker = std::make_unique<RequestMetricsScope>(
+          &self->pendingImportBlobWatches_);
       break;
     case SaplingImportRequest::FetchType::Prefetch:
-      importTracker =
-          std::make_unique<RequestMetricsScope>(&pendingImportPrefetchWatches_);
+      importTracker = std::make_unique<RequestMetricsScope>(
+          &self->pendingImportPrefetchWatches_);
       break;
   }
 
-  traceBus_->publish(
+  self->traceBus_->publish(
       HgImportTraceEvent::queue(
           unique,
           HgImportTraceEvent::BLOB,
@@ -1471,8 +1630,8 @@ SaplingBackingStore::co_getBlobEnqueue(
           context->getCause(),
           context->getClientPid()));
   // Setup guard to publish 'finish' event when current scope is destroyed
-  auto guard = folly::makeGuard([&] {
-    traceBus_->publish(
+  auto guard = folly::makeGuard([&unique, &slOid, &context, self] {
+    self->traceBus_->publish(
         HgImportTraceEvent::finish(
             unique,
             HgImportTraceEvent::BLOB,
@@ -1485,16 +1644,16 @@ SaplingBackingStore::co_getBlobEnqueue(
 
   folly::Try<BlobPtr> result;
   try {
-    auto blob = co_await queue_.co_enqueueBlob(std::move(request));
+    auto blob = co_await self->queue_.co_enqueueBlob(std::move(request));
     result = folly::Try<BlobPtr>{blob};
 
-    this->queue_.markImportAsFinished<BlobPtr::element_type>(slOid, result);
+    self->queue_.markImportAsFinished<BlobPtr::element_type>(slOid, result);
 
     co_return BackingStore::GetBlobResult{
         std::move(blob), ObjectFetchContext::Origin::FromNetworkFetch};
   } catch (const std::exception&) {
     result.emplaceException(std::current_exception());
-    this->queue_.markImportAsFinished<BlobPtr::element_type>(slOid, result);
+    self->queue_.markImportAsFinished<BlobPtr::element_type>(slOid, result);
     throw;
   }
 }
@@ -1503,6 +1662,10 @@ folly::SemiFuture<BackingStore::GetBlobAuxResult>
 SaplingBackingStore::getBlobAuxData(
     const ObjectId& id,
     const ObjectFetchContextPtr& context) {
+  // DEPRECATED: use co_getBlobAuxData directly. Kept only because
+  // ObjectStore::getBlobAuxDataImpl and FilteredBackingStore::getBlobAuxData
+  // still consume ImmediateFuture chains;
+  // delete once those paths are migrated to coroutines.
   DurationScope<EdenStats> scope{
       stats_, &SaplingBackingStoreStats::getBlobAuxData};
 
@@ -1528,15 +1691,99 @@ SaplingBackingStore::getBlobAuxData(
       .semi();
 }
 
+folly::coro::now_task<BackingStore::GetBlobAuxResult>
+SaplingBackingStore::co_getBlobAuxData(
+    const ObjectId& id,
+    const ObjectFetchContextPtr& context) {
+  DurationScope<EdenStats> scope{
+      stats_, &SaplingBackingStoreStats::getBlobAuxData};
+
+  SlOidView slOid{id};
+
+  logBackingStoreFetch(
+      *context,
+      folly::Range{&slOid, 1},
+      ObjectFetchContext::ObjectType::BlobAuxData);
+
+  auto auxData = getLocalBlobAuxData(slOid);
+  if (auxData.hasValue() && auxData.value()) {
+    stats_->increment(&SaplingBackingStoreStats::fetchBlobAuxDataSuccess);
+    stats_->increment(&SaplingBackingStoreStats::fetchBlobAuxDataLocal);
+    co_return GetBlobAuxResult{
+        std::move(auxData.value()), ObjectFetchContext::Origin::FromDiskCache};
+  }
+
+  co_return co_await co_getBlobAuxDataEnqueue(slOid, context);
+}
+
+folly::coro::now_task<BackingStore::GetBlobAuxResult>
+SaplingBackingStore::co_getBlobAuxDataEnqueue(
+    const SlOid& slOid,
+    const ObjectFetchContextPtr& context) {
+  if (!config_->getEdenConfig()->fetchHgAuxMetadata.getValue()) {
+    co_return BackingStore::GetBlobAuxResult{
+        nullptr, ObjectFetchContext::Origin::NotFetched};
+  }
+
+  auto self = shared_from_this();
+  XLOGF(DBG4, "making blob meta import request for {}", slOid);
+  auto requestContext = context.copy();
+  auto request =
+      SaplingImportRequest::makeBlobAuxImportRequest(slOid, requestContext);
+  auto unique = request->getUnique();
+
+  auto importTracker = std::make_unique<RequestMetricsScope>(
+      &self->pendingImportBlobAuxWatches_);
+
+  self->traceBus_->publish(
+      HgImportTraceEvent::queue(
+          unique,
+          HgImportTraceEvent::BLOB_AUX,
+          slOid,
+          context->getPriority().getClass(),
+          context->getCause(),
+          context->getClientPid()));
+
+  auto guard = folly::makeGuard([&unique, &slOid, &context, self] {
+    self->traceBus_->publish(
+        HgImportTraceEvent::finish(
+            unique,
+            HgImportTraceEvent::BLOB_AUX,
+            slOid,
+            context->getPriority().getClass(),
+            context->getCause(),
+            context->getClientPid(),
+            context->getFetchedSource()));
+  });
+
+  auto result = co_await folly::coro::co_awaitTry(
+      self->queue_.co_enqueueBlobAux(std::move(request)));
+
+  self->queue_.markImportAsFinished<BlobAuxDataPtr::element_type>(
+      slOid, result);
+
+  if (result.hasException()) {
+    co_yield folly::coro::co_error(std::move(result).exception());
+  }
+
+  co_return BackingStore::GetBlobAuxResult{
+      std::move(result).value(), ObjectFetchContext::Origin::FromNetworkFetch};
+}
+
 ImmediateFuture<BackingStore::GetBlobAuxResult>
 SaplingBackingStore::getBlobAuxDataEnqueue(
     const SlOid& slOid,
     const ObjectFetchContextPtr& context) {
+  // DEPRECATED: use co_getBlobAuxDataEnqueue directly. Kept only because
+  // SaplingBackingStore::getBlobAuxData and EdenServiceHandler
+  // still consume ImmediateFuture chains;
+  // delete once those paths are migrated to coroutines.
   if (!config_->getEdenConfig()->fetchHgAuxMetadata.getValue()) {
     return BackingStore::GetBlobAuxResult{
         nullptr, ObjectFetchContext::Origin::NotFetched};
   }
 
+  auto self = shared_from_this();
   auto getBlobAuxFuture = makeImmediateFutureWith([&] {
     XLOGF(DBG4, "making blob meta import request for {}", slOid);
     auto requestContext = context.copy();
@@ -1544,9 +1791,9 @@ SaplingBackingStore::getBlobAuxDataEnqueue(
         SaplingImportRequest::makeBlobAuxImportRequest(slOid, requestContext);
     auto unique = request->getUnique();
 
-    auto importTracker =
-        std::make_unique<RequestMetricsScope>(&pendingImportBlobAuxWatches_);
-    traceBus_->publish(
+    auto importTracker = std::make_unique<RequestMetricsScope>(
+        &self->pendingImportBlobAuxWatches_);
+    self->traceBus_->publish(
         HgImportTraceEvent::queue(
             unique,
             HgImportTraceEvent::BLOB_AUX,
@@ -1555,13 +1802,13 @@ SaplingBackingStore::getBlobAuxDataEnqueue(
             context->getCause(),
             context->getClientPid()));
 
-    return queue_.enqueueBlobAux(std::move(request))
-        .ensure([this,
+    return self->queue_.enqueueBlobAux(std::move(request))
+        .ensure([self,
                  unique,
                  slOid,
                  context = context.copy(),
                  importTracker = std::move(importTracker)]() {
-          traceBus_->publish(
+          self->traceBus_->publish(
               HgImportTraceEvent::finish(
                   unique,
                   HgImportTraceEvent::BLOB_AUX,
@@ -1574,8 +1821,8 @@ SaplingBackingStore::getBlobAuxDataEnqueue(
   });
 
   return std::move(getBlobAuxFuture)
-      .thenTry([this, slOid](folly::Try<BlobAuxDataPtr>&& result) {
-        this->queue_.markImportAsFinished<BlobAuxDataPtr::element_type>(
+      .thenTry([self, slOid](folly::Try<BlobAuxDataPtr>&& result) {
+        self->queue_.markImportAsFinished<BlobAuxDataPtr::element_type>(
             slOid, result);
         auto blobAux = std::move(result).value();
         return GetBlobAuxResult{
@@ -1616,35 +1863,88 @@ SaplingBackingStore::getRootTree(
     const ObjectFetchContextPtr& context) {
   folly::stop_watch<std::chrono::milliseconds> watch;
   ObjectId commitId = hashFromRootId(rootId);
+  auto self = shared_from_this();
 
-  return folly::via(
-             serverThreadPool_,
-             [this, commitId] { return getManifestNode(commitId); })
-      .thenValue([this, commitId, watch, fetchContext = context.copy()](
-                     auto manifestNode) {
-        if (!manifestNode.has_value()) {
-          auto ew = folly::exception_wrapper{std::runtime_error{
-              "Manifest node could not be found for commitId"}};
-          return folly::makeFuture<BackingStore::GetRootTreeResult>(
-              std::move(ew));
-        }
-        XLOGF(
-            DBG2,
-            "commit {} has manifest node {}",
-            commitId,
-            manifestNode.value());
-
-        return importTreeManifestImpl(
-                   *std::move(manifestNode),
-                   fetchContext,
-                   ObjectFetchContext::ObjectType::RootTree)
-            .thenValue([this, watch](TreePtr rootTree) {
-              stats_->addDuration(
-                  &SaplingBackingStoreStats::getRootTree, watch.elapsed());
-              return BackingStore::GetRootTreeResult{
-                  rootTree, rootTree->getObjectId()};
-            });
+  return faultInjector_
+      .checkAsync("SaplingBackingStore::getRootTree", commitId.asHexString())
+      .thenValue([self, commitId, watch, fetchContext = context.copy()](
+                     auto&&) mutable {
+        return folly::via(
+                   self->serverThreadPool_,
+                   [self, commitId] { return self->getManifestNode(commitId); })
+            .thenValue(
+                [self, commitId, watch, fetchContext = std::move(fetchContext)](
+                    auto manifestNode) {
+                  if (!manifestNode.has_value()) {
+                    return folly::makeFuture<BackingStore::GetRootTreeResult>(
+                        folly::exception_wrapper{std::runtime_error{
+                            "Manifest node could not be found for commitId"}});
+                  }
+                  XLOGF(
+                      DBG3,
+                      "commit {} has manifest node {}",
+                      commitId,
+                      manifestNode.value());
+                  return self
+                      ->importTreeManifestImpl(
+                          *std::move(manifestNode),
+                          fetchContext,
+                          ObjectFetchContext::ObjectType::RootTree)
+                      .thenValue([self, watch](TreePtr rootTree) {
+                        self->stats_->addDuration(
+                            &SaplingBackingStoreStats::getRootTree,
+                            watch.elapsed());
+                        return BackingStore::GetRootTreeResult{
+                            rootTree, rootTree->getObjectId()};
+                      });
+                })
+            .semi();
       });
+}
+
+folly::coro::now_task<BackingStore::GetRootTreeResult>
+SaplingBackingStore::co_getRootTree(
+    const RootId& rootId,
+    const ObjectFetchContextPtr& context) {
+  // increase ref count to keep alive during eden shutdown and changing executor
+  auto self = shared_from_this();
+  folly::stop_watch<std::chrono::milliseconds> watch;
+  ObjectId commitId = hashFromRootId(rootId);
+
+  co_await faultInjector_.co_checkAsync(
+      "SaplingBackingStore::getRootTree", commitId.asHexString());
+
+  auto result = co_await co_withExecutor(
+      serverThreadPool_,
+      folly::coro::co_invoke(
+          [self, commitId, context = context.copy(), watch]()
+              -> folly::coro::Task<GetRootTreeResult> {
+            auto manifestNode = self->getManifestNode(commitId);
+
+            if (!manifestNode.has_value()) {
+              throw std::runtime_error(
+                  "Manifest node could not be found for commitId");
+            }
+
+            XLOGF(
+                DBG3,
+                "commit {} has manifest node {}",
+                commitId,
+                manifestNode.value());
+
+            auto rootTree = self->importTreeManifestSync(
+                                    *std::move(manifestNode),
+                                    context,
+                                    ObjectFetchContext::ObjectType::RootTree)
+                                .value();
+
+            self->stats_->addDuration(
+                &SaplingBackingStoreStats::getRootTree, watch.elapsed());
+
+            co_return GetRootTreeResult{rootTree, rootTree->getObjectId()};
+          }));
+
+  co_return std::move(result);
 }
 
 std::optional<Hash20> SaplingBackingStore::getManifestNode(
@@ -1669,7 +1969,7 @@ std::optional<Hash20> SaplingBackingStore::getManifestNode(
   }
 }
 
-folly::Future<TreePtr> SaplingBackingStore::importTreeManifestImpl(
+folly::Try<TreePtr> SaplingBackingStore::importTreeManifestSync(
     Hash20 manifestNode,
     const ObjectFetchContextPtr& context,
     const ObjectFetchContext::ObjectType type) {
@@ -1727,10 +2027,16 @@ folly::Future<TreePtr> SaplingBackingStore::importTreeManifestImpl(
 
   if (tree.hasValue()) {
     XLOGF(DBG4, "imported tree {}", slOid);
-    return folly::makeFuture(std::move(tree.value()));
-  } else {
-    return folly::makeFuture<TreePtr>(tree.exception());
   }
+  return tree;
+}
+
+folly::Future<TreePtr> SaplingBackingStore::importTreeManifestImpl(
+    Hash20 manifestNode,
+    const ObjectFetchContextPtr& context,
+    const ObjectFetchContext::ObjectType type) {
+  auto tree = importTreeManifestSync(manifestNode, context, type);
+  return folly::makeFuture(std::move(tree));
 }
 
 folly::Try<TreePtr> SaplingBackingStore::getTreeFromBackingStore(
@@ -1830,15 +2136,15 @@ folly::SemiFuture<folly::Unit> SaplingBackingStore::prefetchBlobs(
     // executor. This can be a large batch, and we don't want to block
     // the caller.
     return makeNotReadyImmediateFuture()
-        .thenValue([this,
+        .thenValue([self = shared_from_this(),
                     slOids = std::move(slOids),
                     requests = std::move(requests),
                     context = context.copy()](auto&&) {
           auto importTracker =
-              RequestMetricsScope{&pendingImportPrefetchWatches_};
+              RequestMetricsScope{&self->pendingImportPrefetchWatches_};
 
           auto unique = generateUniqueID();
-          traceBus_->publish(
+          self->traceBus_->publish(
               HgImportTraceEvent::start(
                   unique,
                   HgImportTraceEvent::BLOB_BATCH,
@@ -1851,7 +2157,7 @@ folly::SemiFuture<folly::Unit> SaplingBackingStore::prefetchBlobs(
           XLOGF(DBG4, "Batch fetching {} blobs from Sapling", requests.size());
 
           size_t failureCount = 0;
-          nativeGetBlobBatch(
+          self->nativeGetBlobBatch(
               folly::range(requests),
               sapling::FetchMode::AllowRemote,
               // We aren't going through the queue, so we are certain
@@ -1870,7 +2176,7 @@ folly::SemiFuture<folly::Unit> SaplingBackingStore::prefetchBlobs(
                 }
               });
 
-          traceBus_->publish(
+          self->traceBus_->publish(
               HgImportTraceEvent::finish(
                   unique,
                   HgImportTraceEvent::BLOB_BATCH,
@@ -1880,12 +2186,12 @@ folly::SemiFuture<folly::Unit> SaplingBackingStore::prefetchBlobs(
                   context->getClientPid(),
                   context->getFetchedSource()));
 
-          stats_->increment(
+          self->stats_->increment(
               &SaplingBackingStoreStats::prefetchBlobFailure, failureCount);
-          stats_->increment(
+          self->stats_->increment(
               &SaplingBackingStoreStats::prefetchBlobSuccess,
               requests.size() - failureCount);
-          stats_->addDuration(
+          self->stats_->addDuration(
               &SaplingBackingStoreStats::prefetchBlob, watch.elapsed());
         })
         .unit()
@@ -1906,6 +2212,106 @@ folly::SemiFuture<folly::Unit> SaplingBackingStore::prefetchBlobs(
 
     return collectAllSafe(std::move(futures)).unit().semi();
   }
+}
+
+folly::coro::now_task<folly::Unit> SaplingBackingStore::co_prefetchBlobs(
+    ObjectIdRange ids,
+    const ObjectFetchContextPtr& context) {
+  bool prefetchOptimizations =
+      config_->getEdenConfig()->prefetchOptimizations.getValue();
+
+  std::vector<SlOidView> slOids;
+  slOids.reserve(ids.size());
+  for (const auto& id : ids) {
+    slOids.emplace_back(id);
+  }
+
+  if (slOids.empty()) {
+    co_return folly::unit;
+  }
+
+  logBackingStoreFetch(
+      *context,
+      folly::Range{slOids.data(), slOids.size()},
+      ObjectFetchContext::ObjectType::Blob);
+
+  if (prefetchOptimizations &&
+      config_->getEdenConfig()->ignorePrefetchResult.getValue()) {
+    std::vector<sapling::SaplingRequest> requests;
+    requests.reserve(ids.size());
+    for (size_t i = 0; i < ids.size(); i++) {
+      requests.emplace_back(slOids[i], context->getCause(), context.copy());
+    }
+
+    co_await folly::coro::co_reschedule_on_current_executor;
+
+    auto importTracker = RequestMetricsScope{&pendingImportPrefetchWatches_};
+
+    auto unique = generateUniqueID();
+    traceBus_->publish(
+        HgImportTraceEvent::start(
+            unique,
+            HgImportTraceEvent::BLOB_BATCH,
+            slOids[0],
+            context->getPriority().getClass(),
+            context->getCause(),
+            context->getClientPid()));
+
+    folly::stop_watch<std::chrono::milliseconds> watch;
+    XLOGF(DBG4, "Batch fetching {} blobs from Sapling", requests.size());
+
+    size_t failureCount = 0;
+    nativeGetBlobBatch(
+        folly::range(requests),
+        sapling::FetchMode::AllowRemote,
+        true,
+        [&](size_t index, folly::Try<std::unique_ptr<folly::IOBuf>> content) {
+          if (content.hasException()) {
+            failureCount++;
+            XLOGF(
+                ERR,
+                "Failed to batch import {} from Sapling: {}",
+                requests[index].oid,
+                content.exception().what().toStdString());
+          }
+        });
+
+    traceBus_->publish(
+        HgImportTraceEvent::finish(
+            unique,
+            HgImportTraceEvent::BLOB_BATCH,
+            slOids[0],
+            context->getPriority().getClass(),
+            context->getCause(),
+            context->getClientPid(),
+            context->getFetchedSource()));
+
+    stats_->increment(
+        &SaplingBackingStoreStats::prefetchBlobFailure, failureCount);
+    stats_->increment(
+        &SaplingBackingStoreStats::prefetchBlobSuccess,
+        requests.size() - failureCount);
+    stats_->addDuration(
+        &SaplingBackingStoreStats::prefetchBlob, watch.elapsed());
+  } else {
+    std::vector<folly::coro::Task<GetBlobResult>> tasks;
+    tasks.reserve(ids.size());
+
+    for (size_t i = 0; i < ids.size(); i++) {
+      tasks.emplace_back(
+          folly::coro::co_invoke(
+              [this](SlOid slOid, ObjectFetchContextPtr ctx)
+                  -> folly::coro::Task<GetBlobResult> {
+                co_return co_await co_getBlobEnqueue(
+                    slOid, ctx, SaplingImportRequest::FetchType::Prefetch);
+              },
+              SlOid{slOids[i]},
+              context.copy()));
+    }
+
+    co_await folly::coro::collectAllRange(std::move(tasks));
+  }
+  co_return folly::unit;
 }
 
 void SaplingBackingStore::nativeGetBlobBatch(
@@ -1999,6 +2405,60 @@ SaplingBackingStore::getGlobFiles(
   stats_->increment(&SaplingBackingStoreStats::fetchGlobFilesSuccess);
 
   return GetGlobFilesResult{BackingStore::GetGlobFilesResult{files, id}};
+}
+
+folly::coro::now_task<BackingStore::GetGlobFilesResult>
+SaplingBackingStore::co_getGlobFiles(
+    const RootId& id,
+    const std::vector<std::string>& suffixes,
+    const std::vector<std::string>& prefixes) {
+  folly::stop_watch<std::chrono::milliseconds> watch;
+
+  rust::Vec<rust::String> rust_suffixes;
+  rust::Vec<rust::String> rust_prefixes;
+  std::copy(
+      suffixes.begin(), suffixes.end(), std::back_inserter(rust_suffixes));
+  std::copy(
+      prefixes.begin(), prefixes.end(), std::back_inserter(rust_prefixes));
+
+  auto br = folly::ByteRange(id.value());
+  auto result = sapling_backingstore_get_glob_files(
+      *store_.get(),
+      rust::Slice<const uint8_t>{br.data(), br.size()},
+      rust_suffixes,
+      rust_prefixes);
+
+  if (result.error != nullptr) {
+    stats_->increment(&SaplingBackingStoreStats::fetchGlobFilesFailure);
+    throw std::move(*result.error);
+  }
+
+  XCHECK(
+      result.data.get(),
+      "sapling_backingstore_get_glob_files returned a nullptr as data result, but did not return an error.");
+
+  std::vector<std::string> files;
+  files.reserve(result.data->files.size());
+  for (auto& file : result.data->files) {
+    files.emplace_back(file);
+  }
+  stats_->addDuration(
+      &SaplingBackingStoreStats::fetchGlobFiles, watch.elapsed());
+  stats_->increment(&SaplingBackingStoreStats::fetchGlobFilesSuccess);
+
+  co_return BackingStore::GetGlobFilesResult{std::move(files), id};
+}
+
+ImmediateFuture<bool> SaplingBackingStore::checkPermission(
+    const ObjectId& manifestId) {
+  auto hgId = SlOidView{manifestId}.node().getBytes();
+  auto result = sapling_backingstore_check_permission(
+      *store_.get(), rust::Slice<const uint8_t>{hgId.data(), hgId.size()});
+
+  if (result.error != nullptr) {
+    return makeImmediateFuture<bool>(std::runtime_error(result.error->what()));
+  }
+  return result.has_access;
 }
 
 void SaplingBackingStore::logBackingStoreFetch(
@@ -2158,14 +2618,15 @@ ImmediateFuture<folly::Unit> SaplingBackingStore::importManifestForRoot(
              manifestId,
              context,
              ObjectFetchContext::ObjectType::ManifestForRoot)
-      .thenValue([this, commitId, manifestId, watch](TreePtr rootTree) {
+      .thenValue([self = shared_from_this(), commitId, manifestId, watch](
+                     TreePtr rootTree) {
         XLOGF(
             DBG3,
             "imported mercurial commit {} with manifest {} as tree {}",
             commitId,
             manifestId,
             rootTree->getObjectId());
-        stats_->addDuration(
+        self->stats_->addDuration(
             &SaplingBackingStoreStats::importManifestForRoot, watch.elapsed());
       });
 }

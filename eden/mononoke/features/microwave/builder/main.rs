@@ -143,11 +143,10 @@ async fn cache_warmup_target(
             Ok(CacheWarmupTarget::Changeset(cs_id))
         }
         LatestDerivedBookmarkEntry::Found(None) => {
-            Err(format_err!("Bookmark {} has no derived data", bookmark))
+            Err(format_err!("Bookmark {bookmark} has no derived data"))
         }
         LatestDerivedBookmarkEntry::NotFound => Err(format_err!(
-            "Bookmark {} has too many underived commits",
-            bookmark
+            "Bookmark {bookmark} has too many underived commits"
         )),
     }
 }
@@ -159,7 +158,12 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
     let repo_factory = Arc::clone(app.repo_factory());
     let scuba = env.scuba_sample_builder.clone();
 
-    let repos = app.repo_configs().repos.clone();
+    // Enumerate via `load_all_repo_configs` so split-loaded repos
+    // (only present in the per-tier RepoSpec manifest) also get a
+    // microwave snapshot — iterating `repo_configs.repos` would
+    // silently skip them and their cache warmup would have no
+    // microwave preload, increasing cold-start latency.
+    let repos = app.configs().load_all_repo_configs()?;
 
     let location = match &args.command {
         Commands::LocalPath(local_path_args) => {

@@ -86,7 +86,6 @@ pub struct SourceAndMovedChangesets {
 }
 
 const MAX_BOOKMARK_MOVE_ATTEMPTS: usize = 5;
-const DEFAULT_NUM_HEADS_TO_DERIVE_AT_ONCE: usize = 10;
 
 #[async_trait]
 pub trait MegarepoOp<R> {
@@ -106,7 +105,7 @@ pub trait MegarepoOp<R> {
             .repo_by_id(ctx.clone(), target_repo_id)
             .await
             .map_err(MegarepoError::internal)?
-            .ok_or_else(|| MegarepoError::request(anyhow!("repo not found {}", target_repo_id)))?
+            .ok_or_else(|| MegarepoError::request(anyhow!("repo not found {target_repo_id}")))?
             .with_authorization_context(AuthorizationContext::new_bypass_access_control())
             .build()
             .await
@@ -307,7 +306,7 @@ pub trait MegarepoOp<R> {
             .collect();
         let message = match new_version {
             Some(new_version) => {
-                format!("deletion commit for {}", new_version)
+                format!("deletion commit for {new_version}")
             }
             None => "deletion commit".to_string(),
         };
@@ -337,7 +336,7 @@ pub trait MegarepoOp<R> {
         let p1 = repo
             .changeset(p1)
             .await?
-            .ok_or_else(|| anyhow!("p1 commit {} not found", p1))?;
+            .ok_or_else(|| anyhow!("p1 commit {p1} not found"))?;
 
         // First find if any of the files from additions merge conflict
         // with a file or a directory from the target - if target commit
@@ -415,7 +414,7 @@ pub trait MegarepoOp<R> {
     where
         R: Repo,
     {
-        let root_id: ContentManifestId = if let Ok(true) = justknobs::eval(
+        let root_id: ContentManifestId = if justknobs::eval(
             "scm/mononoke:derived_data_use_content_manifests",
             None,
             Some(repo.repo_identity().name()),
@@ -750,7 +749,7 @@ pub trait MegarepoOp<R> {
     where
         R: Repo,
     {
-        let linkfiles = stream::iter(links.into_iter())
+        let linkfiles = stream::iter(links)
             .map(Ok)
             .map_ok(|(path, content)| async {
                 let ((content_id, size), fut) = filestore::store_bytes(
@@ -1061,23 +1060,20 @@ pub trait MegarepoOp<R> {
                 match entry {
                     EitherOrBoth::Left((key, value)) => {
                         error = Some(format!(
-                            "{} -> {} is not present in the state file, but present in request",
-                            key, value,
+                            "{key} -> {value} is not present in the state file, but present in request",
                         ));
                         break;
                     }
                     EitherOrBoth::Right((key, value)) => {
                         error = Some(format!(
-                            "{} -> {} is present in the state file, but not present in request",
-                            key, value,
+                            "{key} -> {value} is present in the state file, but not present in request",
                         ));
                         break;
                     }
                     EitherOrBoth::Both(request, state) => {
                         if request != state {
                             error = Some(format!(
-                                "{:?} is present in request, but {:?} in state file",
-                                request, state
+                                "{request:?} is present in request, but {state:?} in state file"
                             ));
                             break;
                         }
@@ -1110,7 +1106,7 @@ pub trait MegarepoOp<R> {
             .map_err(MegarepoError::request)?;
 
         maybe_state.ok_or_else(|| {
-            MegarepoError::request(anyhow!("no remapping state file exist for {}", cs_id))
+            MegarepoError::request(anyhow!("no remapping state file exist for {cs_id}"))
         })
     }
 }
@@ -1128,7 +1124,7 @@ pub async fn find_bookmark_and_value<R: MononokeRepo>(
         .get(ctx.clone(), &bookmark, bookmarks::Freshness::MostRecent)
         .map_err(MegarepoError::internal)
         .await?
-        .ok_or_else(|| MegarepoError::request(anyhow!("bookmark {} not found", bookmark)))?;
+        .ok_or_else(|| MegarepoError::request(anyhow!("bookmark {bookmark} not found")))?;
 
     Ok((bookmark, cs_id))
 }
@@ -1140,9 +1136,7 @@ fn create_relative_symlink(path: &NonRootMPath, base: &NonRootMPath) -> Result<B
 
     if path_no_prefix.is_empty() || base_no_prefix.is_empty() {
         return Err(anyhow!(
-            "Can't create symlink for {} and {}: one path is a parent of another",
-            path,
-            base,
+            "Can't create symlink for {path} and {base}: one path is a parent of another",
         ));
     }
 
@@ -1239,7 +1233,7 @@ pub fn find_source_config<'a, 'b>(
         }
     }
     let source_config = maybe_source_config.ok_or_else(|| {
-        MegarepoError::request(anyhow!("config for source {} not found", source_name))
+        MegarepoError::request(anyhow!("config for source {source_name} not found"))
     })?;
 
     Ok(source_config)
@@ -1268,14 +1262,6 @@ pub async fn save_sync_target_config_in_changeset(
     config: &SyncTargetConfig,
     bcs: &mut BonsaiChangesetMut,
 ) -> Result<(), Error> {
-    if let Ok(false) = justknobs::eval(
-        "scm/mononoke:megarepo_serialize_target_config_into_working_copy",
-        None,
-        Some(repo.repo_identity().name()),
-    ) {
-        return Ok(());
-    }
-
     let bytes = serde_json::to_vec_pretty(&config).map_err(Error::from)?;
 
     let ((content_id, size), fut) = filestore::store_bytes(
@@ -1298,8 +1284,7 @@ pub async fn save_sync_target_config_in_changeset(
     );
     if bcs.file_changes.insert(path, fc).is_some() {
         return Err(anyhow!(
-            "New bonsai changeset already has {} file",
-            SYNC_TARGET_CONFIG_FILE,
+            "New bonsai changeset already has {SYNC_TARGET_CONFIG_FILE} file",
         ));
     }
 
@@ -1316,13 +1301,11 @@ pub(crate) async fn derive_all_types_locally(
         "scm/mononoke:megarepo_override_num_heads_to_derive_at_once",
         None,
     )
-    .map(|jk| jk.max(1) as usize)
-    .unwrap_or(DEFAULT_NUM_HEADS_TO_DERIVE_AT_ONCE);
+    .max(1) as usize;
 
-    let override_batch_size =
-        justknobs::get("scm/mononoke:megarepo_override_derivation_batch_size", None)
-            .map(|jk| jk.max(1) as u64)
-            .ok();
+    let override_batch_size = Some(
+        justknobs::get("scm/mononoke:megarepo_override_derivation_batch_size", None).max(1) as u64,
+    );
 
     for chunk in csids.chunks(num_heads_to_derive_at_once) {
         retry(
@@ -1364,15 +1347,15 @@ pub(crate) async fn derive_all_types_remotely(
         "scm/mononoke:megarepo_override_num_heads_to_derive_at_once",
         None,
     )
-    .map(|jk| jk.max(1) as usize)
-    .unwrap_or(DEFAULT_NUM_HEADS_TO_DERIVE_AT_ONCE);
+    .max(1) as usize;
 
-    let override_concurrency = justknobs::get(
-        "scm/mononoke:megarepo_override_remote_derivation_concurrency",
-        None,
-    )
-    .map(|jk| jk.max(1) as usize)
-    .ok();
+    let override_concurrency = Some(
+        justknobs::get(
+            "scm/mononoke:megarepo_override_remote_derivation_concurrency",
+            None,
+        )
+        .max(1) as usize,
+    );
 
     let manager = repo
         .repo_derived_data()
@@ -1412,8 +1395,7 @@ pub(crate) async fn derive_all_types(
     repo: &impl Repo,
     csids: &[ChangesetId],
 ) -> Result<(), Error> {
-    let derive_remotely =
-        justknobs::eval("scm/mononoke:megarepo_derive_remotely", None, None).unwrap_or(false);
+    let derive_remotely = justknobs::eval("scm/mononoke:megarepo_derive_remotely", None, None);
 
     let derived_data_types = repo
         .repo_derived_data()

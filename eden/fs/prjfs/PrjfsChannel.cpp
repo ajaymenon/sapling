@@ -9,9 +9,10 @@
 
 #include "eden/fs/prjfs/PrjfsChannel.h"
 #include <fmt/format.h>
+#include <folly/coro/Invoke.h>
+#include <folly/coro/safe/NowTask.h>
 #include <folly/logging/xlog.h>
 
-#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/Bug.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/Guid.h"
@@ -23,6 +24,7 @@
 #include "eden/fs/notifications/Notifier.h"
 #include "eden/fs/prjfs/PrjfsDispatcher.h"
 #include "eden/fs/prjfs/PrjfsRequestContext.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/NotImplemented.h"
@@ -338,7 +340,7 @@ void detachAndCompleteCallback(
 PrjfsChannelInner::PrjfsChannelInner(
     std::unique_ptr<PrjfsDispatcher> dispatcher,
     const folly::Logger* straceLogger,
-    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
     FaultInjector& faultInjector,
     ProcessAccessLog& processAccessLog,
     std::shared_ptr<ReloadableConfig>& config,
@@ -348,7 +350,7 @@ PrjfsChannelInner::PrjfsChannelInner(
     const std::shared_ptr<folly::Executor>& invalidationThreadPool)
     : dispatcher_(std::move(dispatcher)),
       straceLogger_(straceLogger),
-      structuredLogger_(structuredLogger),
+      edenFsEventsLogger_(edenFsEventsLogger),
       faultInjector_(faultInjector),
       invalidationThreadPool_(invalidationThreadPool),
       lastTornReadLog_(
@@ -358,7 +360,7 @@ PrjfsChannelInner::PrjfsChannelInner(
       processAccessLog_(processAccessLog),
       config_(config),
       deletedPromise_(std::move(deletedPromise)),
-      traceDetailedArguments_(std::atomic<size_t>(0)),
+      traceDetailedArguments_(std::make_shared<std::atomic<size_t>>(0)),
       traceBus_(
           TraceBus<PrjfsTraceEvent>::create(
               "PrjfsTrace",
@@ -394,6 +396,11 @@ PrjfsChannelInner::~PrjfsChannelInner() {
 
 ImmediateFuture<folly::Unit> PrjfsChannelInner::waitForPendingNotifications() {
   return dispatcher_->waitForPendingNotifications();
+}
+
+folly::coro::now_task<folly::Unit>
+PrjfsChannelInner::co_waitForPendingNotifications() {
+  co_return co_await dispatcher_->co_waitForPendingNotifications();
 }
 
 HRESULT PrjfsChannelInner::startEnumeration(
@@ -872,7 +879,7 @@ HRESULT PrjfsChannelInner::getFileData(
                     byteOffset = byteOffset,
                     length = length,
                     path,
-                    structuredLogger = structuredLogger_,
+                    edenFsEventsLogger = edenFsEventsLogger_,
                     clientProcessName = std::move(clientProcessName),
                     lastTornReadLog = lastTornReadLog_,
                     config = config_,
@@ -908,7 +915,7 @@ HRESULT PrjfsChannelInner::getFileData(
                   path,
                   content.length(),
                   client);
-              structuredLogger->logEvent(
+              edenFsEventsLogger->logEvent(
                   PrjFSCheckoutReadRace{std::move(client)});
             }
 
@@ -1109,17 +1116,13 @@ PrjfsChannelInner::getOutstandingRequests() {
 }
 
 TraceDetailedArgumentsHandle PrjfsChannelInner::traceDetailedArguments() {
-  // We could implement something fancier here that just copies the shared_ptr
-  // into a handle struct that increments upon taking ownership and decrements
-  // on destruction, but this code path is quite rare, so do the expedient
-  // thing.
-  auto handle =
-      std::shared_ptr<void>(nullptr, [&copy = traceDetailedArguments_](void*) {
-        copy.fetch_sub(1, std::memory_order_acq_rel);
-      });
-  traceDetailedArguments_.fetch_add(1, std::memory_order_acq_rel);
+  auto counter = traceDetailedArguments_;
+  auto handle = std::shared_ptr<void>(nullptr, [counter](void*) {
+    counter->fetch_sub(1, std::memory_order_acq_rel);
+  });
+  traceDetailedArguments_->fetch_add(1, std::memory_order_acq_rel);
   return handle;
-};
+}
 
 namespace {
 typedef ImmediateFuture<folly::Unit> (PrjfsChannelInner::*NotificationHandler)(
@@ -1507,7 +1510,7 @@ PrjfsChannel::PrjfsChannel(
     std::unique_ptr<PrjfsDispatcher> dispatcher,
     std::shared_ptr<ReloadableConfig> config,
     const folly::Logger* straceLogger,
-    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
     FaultInjector& faultInjector,
     std::shared_ptr<ProcessInfoCache> processInfoCache,
     Guid guid,
@@ -1526,7 +1529,7 @@ PrjfsChannel::PrjfsChannel(
       std::make_shared<PrjfsChannelInner>(
           std::move(dispatcher),
           straceLogger,
-          structuredLogger,
+          edenFsEventsLogger,
           faultInjector,
           processAccessLog_,
           config_,
@@ -1627,14 +1630,25 @@ folly::Future<FsChannel::StopFuture> PrjfsChannel::initialize() {
 }
 
 ImmediateFuture<folly::Unit> PrjfsChannel::waitForPendingWrites() {
+  // DEPRECATED: use co_waitForPendingWrites directly. Kept only because
+  // FsChannel still declares the ImmediateFuture virtual; delete once
+  // EdenMount::waitForPendingWrites is fully migrated to coroutines.
+  // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+  return ImmediateFuture{
+      folly::coro::co_invoke([this]() -> folly::coro::Task<folly::Unit> {
+        co_return co_await co_waitForPendingWrites();
+      }).semi()};
+}
+
+folly::coro::now_task<folly::Unit> PrjfsChannel::co_waitForPendingWrites() {
   auto inner = getInner();
   if (!inner) {
-    return makeImmediateFuture<folly::Unit>(std::runtime_error(
+    throw std::runtime_error(
         fmt::format(
-            FMT_STRING("The mount at {} has been stopped"), mountPath_)));
+            FMT_STRING("The mount at {} has been stopped"), mountPath_));
   }
-  return inner->waitForPendingNotifications().ensure(
-      [inner = std::move(inner)] {});
+  co_await inner->co_waitForPendingNotifications();
+  co_return folly::unit;
 }
 
 ImmediateFuture<folly::Unit> PrjfsChannel::matchEdenViewOfFileToFS(

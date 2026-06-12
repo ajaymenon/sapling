@@ -29,6 +29,7 @@ class exception_wrapper;
 
 namespace facebook::eden {
 
+class EdenFsEventsLogger;
 class EdenMount;
 class FileInode;
 class InodeBase;
@@ -107,7 +108,7 @@ class InodeMap {
       EdenMount* mount,
       std::shared_ptr<ReloadableConfig> config,
       EdenStatsPtr stats,
-      std::shared_ptr<StructuredLogger> logger);
+      std::shared_ptr<EdenFsEventsLogger> logger);
   virtual ~InodeMap();
 
   InodeMap(InodeMap&&) = delete;
@@ -424,6 +425,14 @@ class InodeMap {
   InodeCounts getInodeCounts() const;
 
   /**
+   * Get the total number of inodes (loaded + unloaded) without acquiring the
+   * data_ lock. This is suitable for hot paths like computing FUSE TTLs.
+   */
+  size_t getTotalInodeCountFast() const {
+    return totalInodeCount_.load(std::memory_order_relaxed);
+  }
+
+  /**
    * Returns whether lazy inode persistence is enabled.
    *
    * Lazy inode persistence means we delay persisting inodes to the overlay
@@ -717,6 +726,19 @@ class InodeMap {
       const folly::Synchronized<Members>::LockedPtr& data,
       InodeBase* inode);
 
+  void eraseLoadedInode(
+      const folly::Synchronized<Members>::LockedPtr& data,
+      InodeBase* inode);
+
+  UnloadedInode& insertUnloadedInode(
+      const folly::Synchronized<Members>::LockedPtr& data,
+      InodeNumber ino,
+      UnloadedInode&& unloadedInode);
+
+  void eraseUnloadedInode(
+      const folly::Synchronized<Members>::LockedPtr& data,
+      std::unordered_map<InodeNumber, UnloadedInode>::iterator iter);
+
   /**
    * Verify the InodeMap precondition and initialize the root_ member.
    */
@@ -728,7 +750,7 @@ class InodeMap {
    * Construct an UnloadedInode and insert it onto the unloadedInodes_ map.
    *
    * Will throw a std::runtime_error if the passed in InodeNumber is already
-   * known by the the InodeMap.
+   * known by the InodeMap.
    *
    * The argument list will be directly passed in to the UnloadedInode
    * constructor.
@@ -760,7 +782,7 @@ class InodeMap {
 
   std::shared_ptr<ReloadableConfig> config_;
   EdenStatsPtr stats_;
-  std::shared_ptr<StructuredLogger> structuredLogger_;
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
 
   /**
    * The root inode.
@@ -781,6 +803,14 @@ class InodeMap {
    * the InodeMap while holding their own lock.)
    */
   folly::Synchronized<Members> data_;
+
+  /**
+   * Total number of inodes tracked by this InodeMap (loaded + unloaded).
+   * Maintained outside data_ to allow lock-free reads on hot paths.
+   * Updated by insertLoadedInode/eraseLoadedInode and
+   * insertUnloadedInode/eraseUnloadedInode.
+   */
+  std::atomic<size_t> totalInodeCount_{0};
 
   /**
    * The number of inodes that we have unloaded with our periodic

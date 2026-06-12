@@ -11,12 +11,12 @@ flag should probably live in somewhere else)
 
   $ rebasewithdag() {
   >   N=$((N+1))
-  >   hg init repo$N && cd repo$N
-  >   hg debugdrawdag
-  >   hg rebase "$@" > _rebasetmp
+  >   sl init repo$N && cd repo$N
+  >   sl debugdrawdag
+  >   sl rebase "$@" > _rebasetmp
   >   r=$?
   >   grep -v 'saved backup bundle' _rebasetmp
-  >   hg book -d `hg book -T '{bookmark} '`
+  >   sl book -d `sl book -T '{bookmark} '`
   >   [ $r -eq 0 ] && tglog
   >   cd ..
   >   return $r

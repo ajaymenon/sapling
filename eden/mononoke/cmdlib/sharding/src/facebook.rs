@@ -10,7 +10,6 @@ use std::env;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -30,7 +29,6 @@ use stats::prelude::*;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot::Receiver;
-use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::error;
@@ -49,8 +47,7 @@ define_stats! {
     restored_connection_to_shardmanager: timeseries(Rate, Sum),
     lost_connection_to_shardmanager: timeseries(Rate, Sum),
     shard_setup_failures: timeseries(Rate, Sum),
-    manual_shard_eviction_by_timeout: timeseries(Rate, Sum),
-    manual_shard_eviction_by_repomap: timeseries(Rate, Sum),
+    concurrent_shard_setups: singleton_counter(),
 }
 
 /// Enum representing the states in which the repo-add
@@ -97,6 +94,24 @@ impl RepoProcess {
         }
     }
 }
+
+struct ConcurrentSetupGuard {
+    fb: FacebookInit,
+}
+
+impl ConcurrentSetupGuard {
+    fn new(fb: FacebookInit) -> Self {
+        STATS::concurrent_shard_setups.increment_value(fb, 1);
+        Self { fb }
+    }
+}
+
+impl Drop for ConcurrentSetupGuard {
+    fn drop(&mut self) {
+        STATS::concurrent_shard_setups.increment_value(self.fb, -1);
+    }
+}
+
 /// Struct representing the setup of the underlying process
 /// over a specific repo and the shard associated with it.
 pub(crate) struct RepoSetupProcess {
@@ -108,6 +123,7 @@ pub(crate) struct RepoSetupProcess {
 impl RepoSetupProcess {
     /// Initiate the setup process with necessary signals to identify setup completion.
     fn new(
+        fb: FacebookInit,
         shard: smtypes::Shard,
         repo_shard: RepoShard,
         setup_job: Arc<dyn RepoShardedProcess>,
@@ -116,7 +132,12 @@ impl RepoSetupProcess {
         Self {
             setup_handle: runtime_handle.spawn({
                 let repo_shard = repo_shard.clone();
-                async move { setup_job.setup(&repo_shard).await }
+                async move {
+                    // Create guard that will decrement counter on drop
+                    let _guard = ConcurrentSetupGuard::new(fb);
+
+                    setup_job.setup(&repo_shard).await
+                }
             }),
             shard,
             repo_shard,
@@ -363,6 +384,8 @@ impl RepoCleanupProcess {
 }
 
 pub struct ShardedProcessHandler {
+    /// FacebookInit handle for stats reporting.
+    fb: FacebookInit,
     /// The name of the *Shard_Manager* job that was created for the current process.
     /// This value should be the same as the service_name value provided in the
     /// ShardManager spec.
@@ -374,6 +397,9 @@ pub struct ShardedProcessHandler {
     runtime_handle: Handle,
     /// Health tracker for the current process when talking to ShardManager.
     healthy: AtomicBool,
+    /// Optional custom health check function. When set, health_check() returns
+    /// the AND of `healthy` and this function's result.
+    health_check_fn: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Thread-safe map between the repository currently being
     /// setup / executed / cleaned-up for the underlying process and the
     /// corresponding tokio handle for that execution.
@@ -388,19 +414,23 @@ pub struct ShardedProcessHandler {
 
 impl ShardedProcessHandler {
     pub fn new(
+        fb: FacebookInit,
         service_name: &'static str,
         runtime_handle: Handle,
         timeout_secs: u64,
         setup_job: Arc<dyn RepoShardedProcess>,
         shard_healing: bool,
+        health_check_fn: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Self {
         Self {
+            fb,
             service_name,
             runtime_handle,
             setup_job,
             timeout_secs,
             shard_healing,
             healthy: AtomicBool::new(true),
+            health_check_fn,
             repo_map: RwLock::new(HashMap::new()),
         }
     }
@@ -451,11 +481,10 @@ impl ShardedProcessHandler {
                             result => {
                                 result.with_context(|| {
                                     format!(
-                                        "Failed to cancel setup for shard {} due to Tokio JoinError",
-                                        old_repo_name
+                                        "Failed to cancel setup for shard {old_repo_name} due to Tokio JoinError"
                                     )
                                 })?.with_context(|| {
-                                    format!("Error during cancelled setup for shard {}", old_repo_name)
+                                    format!("Error during cancelled setup for shard {old_repo_name}")
                                 })?;
                             }
                         };
@@ -473,7 +502,7 @@ impl ShardedProcessHandler {
                     // to this replice. Finish the cleanup.
                     Cleanup(old_repo_cleanup_process) => {
                         old_repo_cleanup_process.close().await.with_context(|| {
-                            format!("Failed to execute cleanup for shard {}", old_repo_name)
+                            format!("Failed to execute cleanup for shard {old_repo_name}")
                         })?;
                     }
                 }
@@ -493,6 +522,7 @@ impl ShardedProcessHandler {
                                 "Failure in setting up shard/repo so skipping it. Error: {:?}",
                                 e
                             );
+                            STATS::shard_setup_failures.add_value(1);
                             continue;
                         }
                         err => err?,
@@ -505,6 +535,7 @@ impl ShardedProcessHandler {
                 }
                 if !guarded_repo_map.contains_key(&new_repo) {
                     let setup_process = RepoSetupProcess::new(
+                        self.fb,
                         new_shard,
                         new_repo.clone(),
                         Arc::clone(&self.setup_job),
@@ -538,7 +569,7 @@ impl ShardedProcessHandler {
                         STATS::shard_setup_failures.add_value(1);
                         continue;
                     }
-                    Err(e) => anyhow::bail!("Error while setting up shard: {:?}", e),
+                    Err(e) => anyhow::bail!("Error while setting up shard: {e:?}"),
                 }
             }
             if shard_setup_count == 0 && input_shard_count > 0 {
@@ -671,6 +702,7 @@ impl ShardedProcessHandler {
             else {
                 let details = format!("Initiating setup. Adding shard {} is in progress", &key);
                 let repo_setup_process = RepoSetupProcess::new(
+                    self.fb,
                     shard,
                     key.clone(),
                     Arc::clone(&self.setup_job),
@@ -711,7 +743,7 @@ impl ShardedProcessHandler {
                     // by creating the corresponding RepoCleanupProcess.
                     Execution(repo_execution_process) => {
                         info!("Initiating drop of shard '{}'", key,);
-                        let details = format!("Dropping shard {} in progress", key);
+                        let details = format!("Dropping shard {key} in progress");
                         // SM requires the drop shard callback to be near-instantaneous.
                         // Since the unloading of a repo can take time, the cleanup is
                         // offloaded to tokio runtime returning an InProgress status to SM.
@@ -733,13 +765,12 @@ impl ShardedProcessHandler {
                             // process and drop repo.
                             Ok(Some(_)) => {
                                 info!("Dropped shard '{}'", key);
-                                RepoState::Completed(format!("Dropped shard {} successfully", key))
+                                RepoState::Completed(format!("Dropped shard {key} successfully"))
                             }
                             // Repo clean-up process is still underway. Return in-progress
                             // status. Added the cleanup process back to the map.
                             Ok(None) => {
-                                let details =
-                                    format!("Dropping shard {} in still in-progress", key);
+                                let details = format!("Dropping shard {key} in still in-progress");
                                 guarded_repo_map
                                     .insert(key, RepoProcess::Cleanup(repo_cleanup_process));
                                 RepoState::InProgress(details)
@@ -758,8 +789,7 @@ impl ShardedProcessHandler {
                             Err(e) => {
                                 error!("Failure in dropping shard '{}'. Error: {:#}", key, e);
                                 RepoState::Failed(format!(
-                                    "Dropping shard {} failed due to error in cleanup. Error: {:#}",
-                                    key, e
+                                    "Dropping shard {key} failed due to error in cleanup. Error: {e:#}"
                                 ))
                             }
                         }
@@ -797,8 +827,7 @@ impl ShardedProcessHandler {
                                 );
                                 error!("{}", &details);
                                 RepoState::Completed(format!(
-                                    "Shard {} was dropped after setup failure",
-                                    key
+                                    "Shard {key} was dropped after setup failure"
                                 ))
                             }
                         }
@@ -808,7 +837,7 @@ impl ShardedProcessHandler {
             // deleted it and this is a duplicate request. Log the anomaly but return success.
             } else {
                 error!("Couldn't find shard {} in repo_map for removal", key);
-                RepoState::Completed(format!("Shard {} was already dropped", key))
+                RepoState::Completed(format!("Shard {key} was already dropped"))
             }
         }
     }
@@ -847,10 +876,6 @@ impl ShardedProcessHandler {
             })
         }
     }
-
-    pub async fn repo_map_len(&self) -> usize {
-        self.repo_map.read().await.len()
-    }
 }
 
 impl sm::ShardManagerHandler for ShardedProcessHandler {
@@ -859,7 +884,9 @@ impl sm::ShardManagerHandler for ShardedProcessHandler {
     }
 
     fn health_check(&self) -> sm::Result<bool> {
-        Ok(self.healthy.load(Ordering::SeqCst))
+        let base_healthy = self.healthy.load(Ordering::SeqCst);
+        let custom_healthy = self.health_check_fn.as_ref().is_none_or(|f| f());
+        Ok(base_healthy && custom_healthy)
     }
 
     fn prepare_add_shard(
@@ -890,7 +917,7 @@ impl sm::ShardManagerHandler for ShardedProcessHandler {
 
         Ok(smtypes::PrepareAddShardResponse {
             status: sm::smtypes::CallbackCompletionStatus::success,
-            details: format!("Beginning repo (raw format) {} assignment", key),
+            details: format!("Beginning repo (raw format) {key} assignment"),
             ..Default::default()
         })
     }
@@ -946,7 +973,7 @@ impl sm::ShardManagerHandler for ShardedProcessHandler {
         self.on_prepare_drop_shard(&key);
         Ok(smtypes::PrepareDropShardResponse {
             status: smtypes::CallbackCompletionStatus::success,
-            details: format!("Beginning repo {} removal", key),
+            details: format!("Beginning repo {key} removal"),
             ..Default::default()
         })
     }
@@ -1073,6 +1100,7 @@ impl ShardedProcessExecutor {
         timeout_secs: u64,
         process_handle: Arc<dyn RepoShardedProcess>,
         shard_healing: bool,
+        health_check_fn: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Result<Self> {
         // Disable ShardManager log spam
         folly_logging::update_logging_config(fb, "CRITICAL");
@@ -1103,13 +1131,15 @@ impl ShardedProcessExecutor {
             .max_sm_client_init_retries(MAX_SM_CLIENT_INIT_RETRIES)
             .sm_client_init_retry_interval_secs(SM_CLIENT_INIT_RETRY_SECS)
             .build()
-            .map_err(|x| anyhow!("Error while building SM AppServerConfig: {}", x))?;
+            .map_err(|x| anyhow!("Error while building SM AppServerConfig: {x}"))?;
         let handler = Arc::new(ShardedProcessHandler::new(
+            fb,
             service_name,
             runtime_handle,
             timeout_secs,
             process_handle,
             shard_healing,
+            health_check_fn,
         ));
         Ok(Self {
             client: sm::client::ShardManagerClient::with_handler(fb, config, handler.clone())?,
@@ -1126,16 +1156,9 @@ impl ShardedProcessExecutor {
 
     /// Blocking call to begin execution of the underlying process based on the repos
     /// assigned by ShardManager
-    pub async fn block_and_execute(self, terminate_signal_receiver: Receiver<bool>) -> Result<()> {
-        self.block_and_execute_with_quiesce_timeout(terminate_signal_receiver, None, None)
-            .await
-    }
-
-    pub async fn block_and_execute_with_quiesce_timeout(
+    pub async fn block_and_execute(
         mut self,
         terminate_signal_receiver: Receiver<bool>,
-        quiesce_timeout: Option<Duration>,
-        quiesce_completion_sender: Option<Sender<bool>>,
     ) -> Result<()> {
         info!("Initiating sharded execution for service");
         let shards = self.client.get_my_shards()?;
@@ -1145,39 +1168,14 @@ impl ShardedProcessExecutor {
             .collect::<Result<Vec<_>>>()?
             .join(", ");
         info!("Got initial Shard Set: {}", shard_ids);
-        let best_effort_setup =
-            justknobs::eval("scm/mononoke:best_effort_shard_setup", None, None).unwrap_or(false);
-        self.handler.set_shards(shards, best_effort_setup).await?;
+        self.handler.set_shards(shards, true).await?;
         self.client.start_callbacks_server();
         // Keep running until the terminate signal is received. Once the signal is received,
         // exit.
         terminate_signal_receiver.await?;
         match self.client.request_failover_and_remove_handler() {
             Ok(_) => {
-                if let Some(timeout) = quiesce_timeout {
-                    let sleep = tokio::time::sleep(timeout);
-                    tokio::pin!(sleep);
-                    loop {
-                        tokio::select! {
-                            _ = &mut sleep => {
-                                info!("Wait timeout expired evicting...");
-                                STATS::manual_shard_eviction_by_timeout.add_value(1);
-                                break;
-                            }
-                            repo_count = self.handler.repo_map_len() => {
-                                if repo_count == 0 {
-                                    info!("All repos moved, evicting...");
-                                    STATS::manual_shard_eviction_by_repomap.add_value(1);
-                                    break;
-                                } else {
-                                    info!("repos present count={}, not evicting...", repo_count);
-                                    // Sleep a bit before next check to avoid busy loop
-                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                }
-                            }
-                        }
-                    }
-                }
+                info!("Successfully requested failover from shard manager");
             }
             Err(err) => {
                 error!(
@@ -1185,10 +1183,6 @@ impl ShardedProcessExecutor {
                     err
                 );
             }
-        }
-
-        if let Some(quiesce_completion_sender) = quiesce_completion_sender {
-            let _ = quiesce_completion_sender.send(true);
         }
         Ok(())
     }

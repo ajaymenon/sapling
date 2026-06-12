@@ -33,7 +33,6 @@ use futures::stream::TryStreamExt;
 use metaconfig_types::MultiplexId;
 use mononoke_macros::mononoke;
 use mononoke_types::Timestamp;
-use rand::Rng;
 use rendezvous::ConfigurableRendezVousController;
 use rendezvous::RendezVous;
 use rendezvous::RendezVousOptions;
@@ -200,7 +199,7 @@ impl SqlBlobstoreWal {
             mpsc::unbounded::<(oneshot::Sender<QueueResult>, BlobstoreWalEntry)>();
 
         let worker = async move {
-            let mut conn_idx = rand::rng().random_range(0..write_connections.len());
+            let mut conn_idx = rand::random_range(0..write_connections.len());
             let enqueued_writes = receiver.ready_chunks(SQL_WAL_WRITE_BUFFER_SIZE).for_each(
                 move |batch /* (Sender, BlobstoreWalEntry) */| {
                     conn_idx += 1;
@@ -358,10 +357,7 @@ impl BlobstoreWal for SqlBlobstoreWal {
             .map_err(|err| {
                 // If one of the futures fails to receive result from the sql wal,
                 // we cannot be sure that the entries were written Mysql WAL table.
-                format_err!(
-                    "Failed to receive results from the SqlBlobstoreWal: {:?}",
-                    err
-                )
+                format_err!("Failed to receive results from the SqlBlobstoreWal: {err:?}")
             })
             .await?;
 
@@ -486,7 +482,7 @@ impl SqlShardedConstruct for SqlBlobstoreWalBuilder {
         }
         let write_connections = Arc::new(write_connections);
 
-        let conn_idx = rand::rng().random_range(0..read_master_connections.len());
+        let conn_idx = rand::random_range(0..read_master_connections.len());
 
         Self {
             write_connections,

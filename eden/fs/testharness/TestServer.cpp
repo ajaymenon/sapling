@@ -7,6 +7,7 @@
 
 #include "eden/fs/testharness/TestServer.h"
 
+#include <folly/io/async/EventBase.h>
 #include <gflags/gflags.h>
 
 #include "eden/common/telemetry/SessionInfo.h"
@@ -40,21 +41,14 @@ EmptyBackingStoreFactory gEmptyBackingStoreFactory;
 
 } // namespace
 
-TestServer::TestServer() : tmpDir_(makeTempDir()) {
+TestServer::TestServer() : TestServer(Options{}) {}
+
+TestServer::TestServer(const Options& options) : tmpDir_(makeTempDir()) {
   auto startupSubscriberChannel = std::make_shared<StartupStatusChannel>();
-  server_ = createServer(getTmpDir(), startupSubscriberChannel);
-  auto prepareResult = server_->prepare(
+  server_ = createServer(getTmpDir(), startupSubscriberChannel, options);
+  prepareResult_ = server_->prepare(
       make_shared<ForegroundStartupLogger>(
           std::move(startupSubscriberChannel)));
-  // We don't care about waiting for prepareResult: it just indicates when
-  // preparation has fully completed, but the EdenServer can begin being used
-  // immediately, before prepareResult completes.
-  //
-  // Maybe in the future it would be worth storing this future in a member
-  // variable so our caller could extract if if they want to.  (It would allow
-  // the caller to schedule additional work once the thrift server is fully up
-  // and running, if the caller starts the thrift server.)
-  (void)prepareResult;
 }
 
 TestServer::~TestServer() = default;
@@ -63,9 +57,16 @@ AbsolutePath TestServer::getTmpDir() const {
   return canonicalPath(tmpDir_.path().string());
 }
 
+void TestServer::waitUntilReady() {
+  if (prepareResult_.valid()) {
+    std::move(prepareResult_).getVia(server_->getMainEventBase());
+  }
+}
+
 unique_ptr<EdenServer> TestServer::createServer(
     AbsolutePathPiece tmpDir,
-    std::shared_ptr<StartupStatusChannel> startupSubscriberChannel) {
+    std::shared_ptr<StartupStatusChannel> startupSubscriberChannel,
+    const Options& options) {
   auto edenDir = tmpDir + "eden"_pc;
   ensureDirectoryExists(edenDir);
 
@@ -89,6 +90,8 @@ unique_ptr<EdenServer> TestServer::createServer(
           std::make_shared<NullConfigSource>(ConfigSourceType::UserConfig)});
   auto privHelper = make_unique<FakePrivHelper>();
   config->edenDir.setValue(edenDir, ConfigSourceType::CommandLine);
+  config->enableNfsServer.setValue(
+      options.enableNfsServer, ConfigSourceType::CommandLine);
 #ifdef _WIN32
   config->enableEdenMenu.setValue(false, ConfigSourceType::SystemConfig);
 #endif // _WIN32

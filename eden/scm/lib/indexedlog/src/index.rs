@@ -84,6 +84,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Relaxed;
+use std::time::Instant;
 
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
@@ -102,10 +103,13 @@ use crate::config;
 use crate::errors::IoResultExt;
 use crate::errors::ResultExt;
 use crate::lock::ScopedFileLock;
+use crate::metrics::Counter;
 use crate::utils;
 use crate::utils::mmap_bytes;
 use crate::utils::xxhash;
 use crate::utils::xxhash32;
+
+static INDEX_WRITE_MS: Counter = Counter::new_counter("indexedlog.index.write_ms");
 
 /// Structures and serialization
 
@@ -279,7 +283,7 @@ impl Offset {
     #[inline]
     fn from_disk(index: impl IndexBuf, value: u64) -> crate::Result<Self> {
         if value >= DIRTY_OFFSET {
-            Err(index.corruption(format!("illegal disk offset {}", value)))
+            Err(index.corruption(format!("illegal disk offset {value}")))
         } else {
             Ok(Offset(value))
         }
@@ -304,7 +308,7 @@ impl Offset {
             // LeafOffset handles inline transparently.
             TYPE_INLINE_LEAF => Ok(TypedOffset::Leaf(LeafOffset(self))),
             TYPE_CHECKSUM => Ok(TypedOffset::Checksum(ChecksumOffset(self))),
-            _ => Err(index.corruption(format!("type {} is unsupported", type_int))),
+            _ => Err(index.corruption(format!("type {type_int} is unsupported"))),
         }
     }
 
@@ -383,7 +387,7 @@ trait TypedOffsetMethods: Sized {
             if type_int == Self::type_int() {
                 Ok(Self::from_offset_unchecked(offset))
             } else {
-                Err(index.corruption(format!("inconsistent type at {:?}", offset)))
+                Err(index.corruption(format!("inconsistent type at {offset:?}")))
             }
         }
     }
@@ -559,7 +563,7 @@ impl RadixOffset {
             .ok_or_else(|| {
                 crate::Error::corruption(
                     &index.path,
-                    format!("cannot read radix bitmap at {}", bitmap_offset),
+                    format!("cannot read radix bitmap at {bitmap_offset}"),
                 )
             })
     }
@@ -578,7 +582,7 @@ impl RadixOffset {
         result.ok_or_else(|| {
             crate::Error::corruption(
                 &index.path,
-                format!("cannot read {}-byte int at {}", int_size, offset),
+                format!("cannot read {int_size}-byte int at {offset}"),
             )
         })
     }
@@ -1022,8 +1026,7 @@ impl ExtKeyOffset {
             Some(k) => k,
             None => {
                 return Err(index.corruption(format!(
-                    "key buffer is invalid when reading referred keys at {}",
-                    start
+                    "key buffer is invalid when reading referred keys at {start}"
                 )));
             }
         };
@@ -1056,8 +1059,7 @@ fn check_type(index: impl IndexBuf, offset: usize, expected: u8) -> crate::Resul
         .ok_or_else(|| index.range_error(offset, 1))?);
     if typeint != expected {
         Err(index.corruption(format!(
-            "type mismatch at offset {} expected {} but got {}",
-            offset, expected, typeint
+            "type mismatch at offset {offset} expected {expected} but got {typeint}"
         )))
     } else {
         Ok(())
@@ -1515,10 +1517,7 @@ impl MemChecksum {
             if chunk_size_logarithm > 31 {
                 return Err(crate::Error::corruption(
                     index.path(),
-                    format!(
-                        "invalid chunk_size_logarithm {} at {}",
-                        chunk_size_logarithm, cur
-                    ),
+                    format!("invalid chunk_size_logarithm {chunk_size_logarithm} at {cur}"),
                 ));
             }
             cur += vlq_len;
@@ -1536,7 +1535,7 @@ impl MemChecksum {
                 result.start = previous_offset;
                 result.end = offset as u64;
 
-                let checked_needed = (result.xxhash_list.len() + 63) / 64;
+                let checked_needed = result.xxhash_list.len().div_ceil(64);
                 result.checked.resize_with(checked_needed, Default::default);
             }
             result.chain_len = result.chain_len.saturating_add(1);
@@ -1574,8 +1573,7 @@ impl MemChecksum {
                 return Err(crate::Error::corruption(
                     index.path(),
                     format!(
-                        "checksum at {} fails integrity check ({} != {})",
-                        offset, xx32_read, xx32_self
+                        "checksum at {offset} fails integrity check ({xx32_read} != {xx32_self})"
                     ),
                 ));
             }
@@ -2256,7 +2254,7 @@ impl OpenOptions {
 
             Ok(index)
         })();
-        result.context(|| format!("in index::OpenOptions::open({:?})", path))
+        result.context(|| format!("in index::OpenOptions::open({path:?})"))
     }
 
     /// Create an in-memory [`Index`] that skips flushing to disk.
@@ -2324,10 +2322,7 @@ fn read_root_checksum_at_end(
     if end < root_checksum_size as usize + vlq_size {
         return Err(crate::Error::corruption(
             path,
-            format!(
-                "data corrupted at {} (invalid size: {})",
-                end, root_checksum_size
-            ),
+            format!("data corrupted at {end} (invalid size: {root_checksum_size})"),
         ));
     }
 
@@ -2374,7 +2369,7 @@ impl fmt::Debug for OpenOptions {
             Some(ref _buf) => "Some(_)",
             None => "None",
         };
-        write!(f, "key_buf: {} }}", key_buf_desc)?;
+        write!(f, "key_buf: {key_buf_desc} }}")?;
         Ok(())
     }
 }
@@ -2629,25 +2624,23 @@ impl Index {
             {
                 let mut offset_map = OffsetMap::empty_for_index(self);
                 let estimated_dirty_bytes = self.dirty_links.len() * 50;
-                let path = self.path.clone(); // for error messages; and make the borrowck happy.
                 let mut lock = ScopedFileLock::new(self.file.as_mut().unwrap(), true)
-                    .context(&path, "cannot lock")?;
+                    .context(&self.path, "cannot lock")?;
                 let len = lock
                     .as_mut()
                     .seek(SeekFrom::End(0))
-                    .context(&path, "cannot seek to end")?;
+                    .context(&self.path, "cannot seek to end")?;
 
                 test_only_fail_point!(self.fail_on_flush == 1);
                 if len < old_len {
                     let message = format!(
-                        "on-disk index is unexpectedly smaller ({} bytes) than its previous version ({} bytes)",
-                        len, old_len
+                        "on-disk index is unexpectedly smaller ({len} bytes) than its previous version ({old_len} bytes)"
                     );
                     // This is not a "corruption" - something has truncated the
                     // file, potentially recreating it. We haven't checked the
                     // new content, so it's not considered as "data corruption".
                     // TODO: Review this decision.
-                    let err = crate::Error::path(&path, message);
+                    let err = crate::Error::path(&self.path, message);
                     return Err(err);
                 }
 
@@ -2735,7 +2728,7 @@ impl Index {
                 let checksum_len = if self.checksum_enabled {
                     new_checksum
                         .update(&self.buf, lock.as_mut(), len, &buf)
-                        .context(&path, "cannot read and update checksum")?;
+                        .context(&self.path, "cannot read and update checksum")?;
                     // Optionally merge the checksum entry for optimization.
                     if self.checksum_max_chain_len > 0
                         && new_checksum.chain_len >= self.checksum_max_chain_len
@@ -2752,29 +2745,29 @@ impl Index {
                 new_len = buf.len() as u64 + len;
 
                 test_only_fail_point!(self.fail_on_flush == 3);
+                let start = Instant::now();
                 lock.as_mut()
                     .seek(SeekFrom::Start(len))
-                    .context(&path, "cannot seek")?;
+                    .context(&self.path, "cannot seek")?;
 
                 test_only_fail_point!(self.fail_on_flush == 4);
                 lock.as_mut()
                     .write_all(&buf)
-                    .context(&path, "cannot write new data to index")?;
+                    .context(&self.path, "cannot write new data to index")?;
 
                 test_only_fail_point!(self.fail_on_flush == 5);
                 if self.fsync || config::get_global_fsync() {
-                    lock.as_mut().sync_all().context(&path, "cannot sync")?;
+                    lock.as_mut()
+                        .sync_all()
+                        .context(&self.path, "cannot sync")?;
                 }
+                INDEX_WRITE_MS.add(start.elapsed().as_millis() as usize);
 
                 // Remap and update root since length has changed
                 test_only_fail_point!(self.fail_on_flush == 6);
-                let bytes = mmap_bytes(lock.as_ref(), None).context(&path, "cannot mmap")?;
+                let bytes = mmap_bytes(lock.as_ref(), None).context(&self.path, "cannot mmap")?;
 
-                // 'path' should not have changed.
-                debug_assert_eq!(&self.path, &path);
-
-                // This is to workaround the borrow checker.
-                let this = SimpleIndexBuf(&bytes, &path);
+                let this = SimpleIndexBuf(&bytes, &self.path);
 
                 // Sanity check - the length should be expected. Otherwise, the lock
                 // is somehow ineffective.
@@ -2785,7 +2778,8 @@ impl Index {
 
                 // Reload root and checksum.
                 test_only_fail_point!(self.fail_on_flush == 8);
-                let (root, checksum) = read_root_checksum_at_end(&path, &bytes, new_len as usize)?;
+                let (root, checksum) =
+                    read_root_checksum_at_end(&self.path, &bytes, new_len as usize)?;
 
                 // Only mutate `self` when everything is ready, without possible IO errors
                 // in remaining operations. This avoids "partial updated, inconsistent"
@@ -2988,7 +2982,7 @@ impl Index {
         // require O(5) jumps looking up "abcde".
         let key = key.as_ref();
         self.insert_advanced(InsertKey::Embed(key), InsertValue::Tombstone)
-            .context(|| format!("in Index::remove(key={:?})", key))
+            .context(|| format!("in Index::remove(key={key:?})"))
             .context(|| format!("  Index.path = {:?}", self.path))
     }
 
@@ -2998,7 +2992,7 @@ impl Index {
         // for space or lookup performance.
         let prefix = prefix.as_ref();
         self.insert_advanced(InsertKey::Embed(prefix), InsertValue::TombstonePrefix)
-            .context(|| format!("in Index::remove_prefix(prefix={:?})", prefix))
+            .context(|| format!("in Index::remove_prefix(prefix={prefix:?})"))
             .context(|| format!("  Index.path = {:?}", self.path))
     }
 
@@ -3423,7 +3417,7 @@ impl Debug for MemRadix {
         write!(f, "Radix {{ link: {:?}", self.link_offset)?;
         for (i, v) in self.offsets.iter().cloned().enumerate() {
             if !v.is_null() {
-                write!(f, ", {}: {:?}", i, v)?;
+                write!(f, ", {i}: {v:?}")?;
             }
         }
         write!(f, " }}")
@@ -3461,7 +3455,7 @@ impl Debug for MemKey {
         } else {
             write!(f, "Key {{ key:")?;
             for byte in self.key.iter() {
-                write!(f, " {:X}", byte)?;
+                write!(f, " {byte:X}")?;
             }
             write!(f, " }}")
         }
@@ -3523,40 +3517,40 @@ impl Debug for Index {
             if i >= self.buf.len() {
                 break;
             }
-            write!(f, "Disk[{}]: ", i)?;
+            write!(f, "Disk[{i}]: ")?;
             let type_int = self.buf[i];
             let i = i as u64;
             match type_int {
                 TYPE_RADIX => {
                     let e = MemRadix::read_from(self, i).expect("read");
                     e.write_to(&mut buf, &offset_map).expect("write");
-                    writeln!(f, "{:?}", e)?;
+                    writeln!(f, "{e:?}")?;
                 }
                 TYPE_LEAF => {
                     let e = MemLeaf::read_from(self, i).expect("read");
                     e.write_noninline_to(&mut buf, &offset_map).expect("write");
-                    writeln!(f, "{:?}", e)?;
+                    writeln!(f, "{e:?}")?;
                 }
                 TYPE_INLINE_LEAF => {
                     let e = MemLeaf::read_from(self, i).expect("read");
-                    writeln!(f, "Inline{:?}", e)?;
+                    writeln!(f, "Inline{e:?}")?;
                     // Just skip the type int byte so we can parse inlined structures.
                     buf.push(TYPE_INLINE_LEAF);
                 }
                 TYPE_LINK => {
                     let e = MemLink::read_from(self, i).unwrap();
                     e.write_to(&mut buf, &offset_map).expect("write");
-                    writeln!(f, "{:?}", e)?;
+                    writeln!(f, "{e:?}")?;
                 }
                 TYPE_KEY => {
                     let e = MemKey::read_from(self, i).expect("read");
                     e.write_to(&mut buf, &offset_map).expect("write");
-                    writeln!(f, "{:?}", e)?;
+                    writeln!(f, "{e:?}")?;
                 }
                 TYPE_EXT_KEY => {
                     let e = MemExtKey::read_from(self, i).expect("read");
                     e.write_to(&mut buf, &offset_map).expect("write");
-                    writeln!(f, "{:?}", e)?;
+                    writeln!(f, "{e:?}")?;
                 }
                 TYPE_ROOT => {
                     root_offset = i as usize;
@@ -3571,7 +3565,7 @@ impl Debug for Index {
                         let root_len = buf.len() - root_offset;
                         write_reversed_vlq(&mut buf, root_len).expect("write");
                     }
-                    writeln!(f, "{:?}", e)?;
+                    writeln!(f, "{e:?}")?;
                 }
                 TYPE_CHECKSUM => {
                     let e = MemChecksum::read_from(&self, i).expect("read").0;
@@ -3583,10 +3577,9 @@ impl Debug for Index {
                     debug_assert_eq!(
                         &buf[vlq_start..vlq_end],
                         &self.buf[vlq_start..vlq_end],
-                        "reversed vlq should match (root+checksum len: {})",
-                        root_checksum_len
+                        "reversed vlq should match (root+checksum len: {root_checksum_len})"
                     );
-                    writeln!(f, "{:?}", e)?;
+                    writeln!(f, "{e:?}")?;
                 }
                 _ => {
                     writeln!(f, "Broken Data!")?;
@@ -3602,27 +3595,27 @@ impl Debug for Index {
 
         // In-memory entries
         for (i, e) in self.dirty_radixes.iter().enumerate() {
-            write!(f, "Radix[{}]: ", i)?;
-            writeln!(f, "{:?}", e)?;
+            write!(f, "Radix[{i}]: ")?;
+            writeln!(f, "{e:?}")?;
         }
 
         for (i, e) in self.dirty_leafs.iter().enumerate() {
-            write!(f, "Leaf[{}]: ", i)?;
-            writeln!(f, "{:?}", e)?;
+            write!(f, "Leaf[{i}]: ")?;
+            writeln!(f, "{e:?}")?;
         }
 
         for (i, e) in self.dirty_links.iter().enumerate() {
-            write!(f, "Link[{}]: ", i)?;
-            writeln!(f, "{:?}", e)?;
+            write!(f, "Link[{i}]: ")?;
+            writeln!(f, "{e:?}")?;
         }
 
         for (i, e) in self.dirty_keys.iter().enumerate() {
-            write!(f, "Key[{}]: ", i)?;
-            writeln!(f, "{:?}", e)?;
+            write!(f, "Key[{i}]: ")?;
+            writeln!(f, "{e:?}")?;
         }
 
         for (i, e) in self.dirty_ext_keys.iter().enumerate() {
-            writeln!(f, "ExtKey[{}]: {:?}", i, e)?;
+            writeln!(f, "ExtKey[{i}]: {e:?}")?;
         }
 
         Ok(())
@@ -3776,14 +3769,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut index = open_opts().open(dir.path().join("a")).expect("open");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             "Index { len: 0, root: Radix[0] }\n\
              Radix[0]: Radix { link: None }\n"
         );
 
         index.insert(&[], 55).expect("update");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 0, root: Radix[0] }
 Radix[0]: Radix { link: Link[0] }
 Link[0]: Link { value: 55, next: None }
@@ -3792,7 +3785,7 @@ Link[0]: Link { value: 55, next: None }
 
         index.insert(&[0x12], 77).expect("update");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 0, root: Radix[0] }
 Radix[0]: Radix { link: Link[0], 1: Leaf[0] }
 Leaf[0]: Leaf { key: Key[0], link: Link[1] }
@@ -3807,7 +3800,7 @@ Key[0]: Key { key: 12 }
             .insert_advanced(InsertKey::Embed(&[0x34]), PrependReplace(99, link))
             .expect("update");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 0, root: Radix[0] }
 Radix[0]: Radix { link: Link[0], 1: Leaf[0], 3: Leaf[1] }
 Leaf[0]: Leaf { key: Key[0], link: Link[1] }
@@ -3829,7 +3822,7 @@ Key[1]: Key { key: 34 }
         // 1st flush.
         assert_eq!(index.flush().expect("flush"), 24);
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 24, root: Disk[1] }
 Disk[1]: Radix { link: None }
 Disk[5]: Root { radix: Disk[1] }
@@ -3841,7 +3834,7 @@ Disk[8]: Checksum { start: 0, end: 8, chunk_size_logarithm: 4, checksums.len(): 
         index.insert(&[], 55).expect("update");
         index.insert(&[0x12], 77).expect("update");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 24, root: Radix[0] }
 Disk[1]: Radix { link: None }
 Disk[5]: Root { radix: Disk[1] }
@@ -3861,7 +3854,7 @@ Key[0]: Key { key: 12 }
             .expect("update");
         index.flush().expect("flush");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 104, root: Disk[45] }
 Disk[1]: Radix { link: None }
 Disk[5]: Root { radix: Disk[1] }
@@ -3888,7 +3881,7 @@ Disk[64]: Checksum { start: 0, end: 64, chunk_size_logarithm: 4, checksums.len()
         // Example 1: two keys are not prefixes of each other
         index.insert(&[0x12, 0x34], 5).expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 0, root: Radix[0] }
 Radix[0]: Radix { link: None, 1: Leaf[0] }
 Leaf[0]: Leaf { key: Key[0], link: Link[0] }
@@ -3898,7 +3891,7 @@ Key[0]: Key { key: 12 34 }
         );
         index.insert(&[0x12, 0x78], 7).expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 0, root: Radix[0] }
 Radix[0]: Radix { link: None, 1: Radix[1] }
 Radix[1]: Radix { link: None, 2: Radix[2] }
@@ -3917,7 +3910,7 @@ Key[1]: Key { key: 12 78 }
         index.insert(&[0x12, 0x34], 5).expect("insert");
         index.insert(&[0x12], 7).expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 0, root: Radix[0] }
 Radix[0]: Radix { link: None, 1: Radix[1] }
 Radix[1]: Radix { link: None, 2: Radix[2] }
@@ -3934,7 +3927,7 @@ Key[0]: Key { key: 12 34 }
         index.insert(&[0x12], 5).expect("insert");
         index.insert(&[0x12, 0x78], 7).expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 0, root: Radix[0] }
 Radix[0]: Radix { link: None, 1: Radix[1] }
 Radix[1]: Radix { link: None, 2: Radix[2] }
@@ -3953,7 +3946,7 @@ Key[1]: Key { key: 12 78 }
         index.insert(&[0x12], 5).expect("insert");
         index.insert(&[0x12], 7).expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 0, root: Radix[0] }
 Radix[0]: Radix { link: None, 1: Leaf[0] }
 Leaf[0]: Leaf { key: Key[0], link: Link[1] }
@@ -3975,7 +3968,7 @@ Key[0]: Key { key: 12 }
         index.insert(&[0x12, 0x34], 5).expect("insert");
         index.flush().expect("flush");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 46, root: Disk[11] }
 Disk[1]: Key { key: 12 34 }
 Disk[5]: Link { value: 5, next: None }
@@ -3987,7 +3980,7 @@ Disk[22]: Checksum { start: 0, end: 22, chunk_size_logarithm: 4, checksums.len()
         );
         index.insert(&[0x12, 0x78], 7).expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 46, root: Radix[0] }
 Disk[1]: Key { key: 12 34 }
 Disk[5]: Link { value: 5, next: None }
@@ -4010,7 +4003,7 @@ Key[0]: Key { key: 12 78 }
         index.flush().expect("flush");
         index.insert(&[0x12], 7).expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 46, root: Radix[0] }
 Disk[1]: Key { key: 12 34 }
 Disk[5]: Link { value: 5, next: None }
@@ -4032,7 +4025,7 @@ Link[0]: Link { value: 7, next: None }
         index.insert(&[0x12, 0x78], 7).expect("insert");
         index.flush().expect("flush");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 77, root: Disk[34] }
 Disk[1]: Key { key: 12 78 }
 Disk[5]: Link { value: 5, next: None }
@@ -4052,7 +4045,7 @@ Disk[45]: Checksum { start: 0, end: 45, chunk_size_logarithm: 4, checksums.len()
         index.flush().expect("flush");
         index.insert(&[0x12, 0x78], 7).expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 45, root: Radix[0] }
 Disk[1]: Key { key: 12 }
 Disk[4]: Link { value: 5, next: None }
@@ -4075,7 +4068,7 @@ Key[0]: Key { key: 12 78 }
         index.flush().expect("flush");
         index.insert(&[0x12], 7).expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 45, root: Radix[0] }
 Disk[1]: Key { key: 12 }
 Disk[4]: Link { value: 5, next: None }
@@ -4106,7 +4099,7 @@ Link[0]: Link { value: 7, next: Disk[4] }
             .insert_advanced(InsertKey::Reference((1, 3)), InsertValue::Prepend(77))
             .expect("insert");
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 43, root: Radix[0] }
 Disk[1]: InlineLeaf { key: Disk[2], link: Disk[5] }
 Disk[2]: ExtKey { start: 1, len: 2 }
@@ -4164,7 +4157,7 @@ ExtKey[0]: ExtKey { start: 1, len: 3 }
         index.flush().expect("flush");
 
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 257, root: Disk[181] }
 Disk[1]: InlineLeaf { key: Disk[2], link: Disk[5] }
 Disk[2]: ExtKey { start: 1, len: 1 }
@@ -4216,12 +4209,12 @@ Disk[201]: Checksum { start: 126, end: 201, chunk_size_logarithm: 4, checksums.l
         index.insert(&[0x15], 99).expect("insert");
 
         let mut index2 = index.try_clone().expect("clone");
-        assert_eq!(format!("{:?}", index), format!("{:?}", index2));
+        assert_eq!(format!("{index:?}"), format!("{:?}", index2));
 
         // Test clone without in-memory part
         let index2clean = index.try_clone_without_dirty().unwrap();
         index2.clear_dirty();
-        assert_eq!(format!("{:?}", index2), format!("{:?}", index2clean));
+        assert_eq!(format!("{index2:?}"), format!("{:?}", index2clean));
 
         // Test in-memory Index
         let mut index3 = open_opts()
@@ -4229,11 +4222,11 @@ Disk[201]: Checksum { start: 126, end: 201, chunk_size_logarithm: 4, checksums.l
             .create_in_memory()
             .unwrap();
         let index4 = index3.try_clone().unwrap();
-        assert_eq!(format!("{:?}", index3), format!("{:?}", index4));
+        assert_eq!(format!("{index3:?}"), format!("{:?}", index4));
 
         index3.insert(&[0x15], 99).expect("insert");
         let index4 = index3.try_clone().unwrap();
-        assert_eq!(format!("{:?}", index3), format!("{:?}", index4));
+        assert_eq!(format!("{index3:?}"), format!("{:?}", index4));
     }
 
     #[test]
@@ -4432,7 +4425,7 @@ Disk[201]: Checksum { start: 126, end: 201, chunk_size_logarithm: 4, checksums.l
         index.flush().unwrap();
 
         assert_eq!(
-            format!("{:?}", index),
+            format!("{index:?}"),
             r#"Index { len: 415, root: Disk[402] }
 Disk[1]: Key { key: 61 62 63 64 65 66 67 }
 Disk[10]: Link { value: 4660, next: None }
@@ -4476,12 +4469,12 @@ Disk[410]: Root { radix: Disk[402] }
     }
 
     fn show_checksums(index: &Index) -> String {
-        let debug_str = format!("{:?}", index);
+        let debug_str = format!("{index:?}");
         debug_str
             .lines()
             .filter_map(|l| {
                 if l.contains("Checksum") {
-                    Some(format!("\n                {}", l))
+                    Some(format!("\n                {l}"))
                 } else {
                     None
                 }

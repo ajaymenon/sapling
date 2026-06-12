@@ -7,15 +7,17 @@
 
 import {Banner, BannerKind} from 'isl-components/Banner';
 import {Button} from 'isl-components/Button';
+import {ButtonDropdown} from 'isl-components/ButtonDropdown';
 import {Icon} from 'isl-components/Icon';
-import {useAtom, useAtomValue} from 'jotai';
-import clientToServerAPI from '../ClientToServerAPI';
-import {T} from '../i18n';
-import {latestHeadCommit} from '../serverAPIState';
-import {codeReviewStatusAtom} from './firstPassCodeReviewAtoms';
-
 import {Tooltip} from 'isl-components/Tooltip';
-import {useEffect, useState} from 'react';
+import {useAtom, useAtomValue, useSetAtom} from 'jotai';
+import clientToServerAPI from '../ClientToServerAPI';
+import {latestHeadCommit} from '../serverAPIState';
+import type {CodeReviewScope} from '../types';
+import {codeReviewStatusAtom, lastSelectedReviewOptionIdAtom} from './firstPassCodeReviewAtoms';
+
+import type {JSX} from 'react';
+import {useCallback, useEffect, useState} from 'react';
 import {tracker} from '../analytics';
 import {useFeatureFlagSync} from '../featureFlags';
 import {Internal} from '../Internal';
@@ -36,6 +38,45 @@ export function AICodeReviewUpsell({
     Internal.featureFlags?.AIFirstPassCodeReview,
   );
 
+  const allReviewOptions: Array<{label: string; id: string; featureFlag?: string}> =
+    Internal.aiCodeReview?.reviewOptions ?? [];
+  const flagResults = allReviewOptions.map(opt =>
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    useFeatureFlagSync(
+      opt.featureFlag
+        ? Internal.featureFlags?.[opt.featureFlag as keyof typeof Internal.featureFlags]
+        : undefined,
+    ),
+  );
+  const reviewOptions = allReviewOptions.filter((opt, i) => !opt.featureFlag || flagResults[i]);
+
+  const reviewScope: CodeReviewScope = isCommitMode
+    ? 'uncommitted changes'
+    : hasUncommittedChanges
+      ? 'current commit and uncommitted changes'
+      : 'current commit';
+
+  const startReview = useCallback(
+    (agentBackend: string) => {
+      setStatus('running');
+      setHidden(true);
+      clientToServerAPI.postMessage({
+        type: 'platform/runAICodeReviewChat',
+        reviewScope,
+        source: 'commitInfoView',
+        agentBackend: agentBackend as 'devmate' | 'claude',
+      });
+      tracker.track('AICodeReviewInitiatedFromISL', {
+        extras: {agentBackend},
+      });
+    },
+    [setStatus, reviewScope],
+  );
+
+  const lastSelectedId = useAtomValue(lastSelectedReviewOptionIdAtom);
+  const setLastSelectedId = useSetAtom(lastSelectedReviewOptionIdAtom);
+  const selectedOption = reviewOptions.find(opt => opt.id === lastSelectedId) ?? reviewOptions[0];
+
   useEffect(() => {
     setHidden(false);
   }, [headCommit]);
@@ -45,16 +86,11 @@ export function AICodeReviewUpsell({
     return null;
   }
 
-  if (hidden) {
+  if (hidden || reviewOptions.length === 0) {
     return null;
   }
 
-  const codeReviewProvider = Internal.aiCodeReview?.provider ?? 'AI';
-  const bannerText = isCommitMode
-    ? `Use ${codeReviewProvider} to review your uncommitted changes`
-    : hasUncommittedChanges
-      ? `Use ${codeReviewProvider} to review this commit and your uncommitted changes`
-      : `Use ${codeReviewProvider} to review this commit`;
+  const bannerText = 'Get AI feedback before submitting';
 
   const isReviewInProgress = aiFirstPassCodeReviewEnabled && status === 'running';
   const noUncommittedChanges = isCommitMode && !hasUncommittedChanges;
@@ -65,39 +101,45 @@ export function AICodeReviewUpsell({
       ? 'No uncommitted changes'
       : null;
 
-  const button = (
-    <Button // TODO: Replace with dropdown to choose between quick/thorough review
-      onClick={() => {
-        setStatus('running');
-        setHidden(true);
-        clientToServerAPI.postMessage({
-          type: 'platform/runAICodeReviewChat',
-          reviewScope: isCommitMode
-            ? 'uncommitted changes'
-            : hasUncommittedChanges
-              ? 'current commit and uncommitted changes'
-              : 'current commit',
-          source: 'commitInfoView',
-        });
-        tracker.track('AICodeReviewInitiatedFromISL');
-      }}
-      disabled={shouldDisableButton}>
-      {<T>Start review</T>}
-    </Button>
-  );
+  const reviewButton =
+    reviewOptions.length === 1 ? (
+      shouldDisableButton && disabledReason ? (
+        <Tooltip title={disabledReason}>
+          <Button data-testid="start-review-button" disabled={true}>
+            Start review
+          </Button>
+        </Tooltip>
+      ) : (
+        <Button
+          data-testid="start-review-button"
+          disabled={shouldDisableButton}
+          onClick={() => startReview(reviewOptions[0].id)}>
+          Start review
+        </Button>
+      )
+    ) : (
+      <ButtonDropdown
+        data-testid="start-review-button"
+        options={reviewOptions}
+        selected={selectedOption}
+        onChangeSelected={option => {
+          setLastSelectedId(option.id);
+          startReview(option.id);
+        }}
+        onClick={selected => startReview(selected.id)}
+        buttonDisabled={shouldDisableButton}
+        pickerDisabled={shouldDisableButton}
+        primaryTooltip={shouldDisableButton && disabledReason ? {title: disabledReason} : undefined}
+      />
+    );
 
   return (
-    <Banner kind={BannerKind.default}>
+    <Banner kind={BannerKind.default} buttons={reviewButton} alwaysShowButtons>
       <div className="code-review-upsell-inner">
         <div className="code-review-upsell-icon-text">
           <Icon icon="sparkle" />
           {bannerText}
         </div>
-        {shouldDisableButton && disabledReason ? (
-          <Tooltip title={disabledReason}>{button}</Tooltip>
-        ) : (
-          button
-        )}
       </div>
     </Banner>
   );

@@ -65,7 +65,7 @@ pub async fn is_admin_bypass(
     };
 
     let block_agent_bypass =
-        justknobs::eval("scm/mononoke:block_hook_bypass_for_agents", None, None)?;
+        justknobs::eval("scm/mononoke:block_hook_bypass_for_agents", None, None);
     if block_agent_bypass && ctx.metadata().likely_an_agent() {
         return Err(AdminBypassError::AgentBypassNotAllowed);
     }
@@ -95,7 +95,7 @@ pub async fn run_bookmark_hooks(
             "scm/mononoke:disable_running_hooks_in_pushredirected_repo",
             None,
             None,
-        )?;
+        );
 
         if disable_running_hooks_in_pushredirected_repo {
             ctx.scuba()
@@ -121,7 +121,7 @@ pub async fn run_bookmark_hooks(
                 "pushvars",
                 pushvars
                     .iter()
-                    .map(|(key, val)| format!("{}={:?}", key, val))
+                    .map(|(key, val)| format!("{key}={val:?}"))
                     .collect::<Vec<_>>(),
             );
         }
@@ -148,7 +148,7 @@ pub async fn run_bookmark_hooks(
         )
         .timed()
         .await;
-    let outcomes = outcomes.with_context(|| format!("Failed to run hooks for {}", bookmark))?;
+    let outcomes = outcomes.with_context(|| format!("Failed to run hooks for {bookmark}"))?;
 
     let rejections: Vec<_> = outcomes
         .into_iter()
@@ -182,7 +182,7 @@ pub async fn run_changeset_hooks(
             "scm/mononoke:disable_running_hooks_in_pushredirected_repo",
             None,
             None,
-        )?;
+        );
 
         if disable_running_hooks_in_pushredirected_repo {
             let cs_ids = take_n_changeset_ids(changesets, 10);
@@ -210,7 +210,7 @@ pub async fn run_changeset_hooks(
                 "pushvars",
                 pushvars
                     .iter()
-                    .map(|(key, val)| format!("{}={:?}", key, val))
+                    .map(|(key, val)| format!("{key}={val:?}"))
                     .collect::<Vec<_>>(),
             );
         }
@@ -231,7 +231,7 @@ pub async fn run_changeset_hooks(
         )
         .timed()
         .await;
-    let outcomes = outcomes.with_context(|| format!("Failed to run hooks for {}", bookmark))?;
+    let outcomes = outcomes.with_context(|| format!("Failed to run hooks for {bookmark}"))?;
 
     let rejections: Vec<_> = outcomes
         .into_iter()

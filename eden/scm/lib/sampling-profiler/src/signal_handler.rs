@@ -12,32 +12,33 @@ use backtrace_ext::trace_unsynchronized;
 
 use crate::frame_handler::FramePayload;
 use crate::frame_handler::MaybeFrame;
+use crate::frame_handler::RING_BUF_SIZE;
+use crate::ring_buffer::RingBufWriter;
 
-/// The signal handler is called every second on the main thread. It should
-/// collect minimal stack info while the main logic of the main thread is
-/// paused, and pass the info over pipe for further processing.
-/// Native function symbolization can be done in other threads. Python function
-/// symbolization must be partially done now, since the PyFrame objects might be
-/// deallocated soon.
+/// State shared between the profiler and the signal handler.
+/// Must remain at a stable address (the signal handler receives a raw pointer).
+pub struct SignalState {
+    pub writer: RingBufWriter<FramePayload, RING_BUF_SIZE>,
+}
+
+/// Signal handler: capture a backtrace and push frames to the ring buffer.
+///
+/// Uses only async-signal-safe operations (atomic loads/stores, ptr::write).
+/// No syscalls, no allocations, no errno clobbering.
 pub extern "C" fn signal_handler(
     sig: libc::c_int,
-    info: *const libc::siginfo_t,
+    _info: *const libc::siginfo_t,
     _data: *const libc::c_void,
 ) {
-    if info.is_null() || sig != libc::SIGPROF {
+    if sig != libc::SIGPROF {
         return;
     }
 
-    let write_fd = {
-        let write_fd: isize = unsafe {
-            let sigev = (*info).si_value();
-            std::mem::transmute(sigev)
-        };
-        if write_fd < 0 {
-            return;
-        }
-        write_fd as i32
-    };
+    let state_ptr = crate::osutil::SIGNAL_PAYLOAD.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    if state_ptr.is_null() {
+        return;
+    }
+    let writer = unsafe { &(*state_ptr).writer };
 
     let backtrace_id: usize = {
         static BACKTRACE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -45,20 +46,29 @@ pub extern "C" fn signal_handler(
     };
     let mut depth = 0;
 
-    // Skip the first 2 frames:
-    // - This signal handler frame.
-    // - __sigaction
-    const SKIP_FRAMES: usize = 2;
+    // Skip the first frames.
+    const SKIP_FRAMES: usize = if cfg!(target_os = "linux") {
+        // - signal_handler (this function)
+        // - __sigaction
+        2
+    } else if cfg!(target_os = "macos") {
+        // - backtrace::trace_unsynchronized
+        // - signal_handler (this function)
+        // - __sigtramp
+        3
+    } else {
+        // Guess
+        2
+    };
     trace_unsynchronized!(|frame| {
         if depth >= SKIP_FRAMES {
-            let maybe_frame = MaybeFrame::Present(frame);
             let payload = FramePayload {
                 backtrace_id,
                 depth: depth.saturating_sub(SKIP_FRAMES),
-                frame: maybe_frame,
+                frame: MaybeFrame::Present(frame),
             };
-            if write_frame(&payload, write_fd) != 0 {
-                // Poison `depth` so this "incomplete" backtrace gets dropped.
+            if !writer.push(payload) {
+                // Poison depth so this incomplete backtrace gets dropped.
                 depth += 2;
                 return false;
             }
@@ -67,54 +77,11 @@ pub extern "C" fn signal_handler(
         true
     });
 
-    // Write a placeholder frame to mark an end of the current backtrace.
-    let end_frame = MaybeFrame::EndOfBacktrace;
+    // Mark end of backtrace.
     let payload = FramePayload {
         backtrace_id,
         depth: depth.saturating_sub(SKIP_FRAMES),
-        frame: end_frame,
+        frame: MaybeFrame::EndOfBacktrace,
     };
-    let _ = write_frame(&payload, write_fd);
-}
-
-/// Write a `MaybeFrame`. Handles EINTR.
-/// Return 0 on success. Return errno otherwise.
-///
-/// This function is to be called from a signal handler, and intentionally
-/// avoids high-level Rust types like `io::Result`. So its easier to audit
-/// async-signal-safety.
-fn write_frame(frame: &FramePayload, fd: libc::c_int) -> libc::c_int {
-    let size = std::mem::size_of::<FramePayload>();
-    let pos = frame as *const FramePayload as *const libc::c_void;
-    loop {
-        // safety: FramePayload is `repr(C)` and contains only `usize` fields.
-        // It is okay to write its raw bytes to "serialize" within the same process.
-        let written_bytes = unsafe { libc::write(fd, pos, size) };
-        if written_bytes < 0 {
-            let errno = {
-                #[cfg(target_os = "macos")]
-                unsafe {
-                    *libc::__error()
-                }
-
-                #[cfg(target_os = "linux")]
-                unsafe {
-                    *libc::__errno_location()
-                }
-
-                #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
-                libc::EINVAL
-            };
-            if errno == libc::EINTR {
-                // Retry
-                continue;
-            } else {
-                return errno;
-            }
-        } else if written_bytes as usize == size {
-            return 0;
-        } else {
-            return libc::EINVAL;
-        }
-    }
+    let _ = writer.push(payload);
 }

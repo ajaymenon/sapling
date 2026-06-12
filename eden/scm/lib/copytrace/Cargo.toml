@@ -13,11 +13,11 @@ license = "MIT"
 name = "copytrace"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
-bytecount = "0.6.8"
+bytecount = "0.6.9"
 lru-cache = "0.1.2"
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
 sapling-configmodel = { version = "0.1.0", path = "../config/model" }
 sapling-dag = { version = "0.1.0", path = "../dag" }
@@ -35,5 +35,5 @@ tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
 sapling-manifest-tree = { version = "0.1.0", path = "../manifest-tree", features = ["for-tests"] }
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
-tracing-test = { version = "0.2.3", features = ["no-env-filter"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }

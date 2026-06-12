@@ -36,6 +36,7 @@ use types::FetchContext;
 use types::HgId;
 use types::Key;
 use types::RepoPathBuf;
+use vfs::RemoveOptions;
 use vfs::UpdateFlag;
 use vfs::VFS;
 
@@ -223,7 +224,7 @@ py_class!(class writerworker |py| {
             "x" => UpdateFlag::Executable,
             "" => UpdateFlag::Regular,
             _ => {
-                return Err(format_err!("Unknown flags: {}", flags)).map_pyerr(py);
+                return Err(format_err!("Unknown flags: {flags}")).map_pyerr(py);
             }
         };
 
@@ -264,7 +265,7 @@ fn threaded_remover(state: RemoverState, chan: Receiver<Vec<RepoPathBuf>>) -> Ve
 
     while let Ok(vec) = chan.recv() {
         for path in vec.into_iter() {
-            if let Err(e) = state.working_copy.remove(&path) {
+            if let Err(e) = state.working_copy.remove(&path, remove_options()) {
                 tracing::warn!("{:?}", e);
                 failures.push(path);
             }
@@ -272,6 +273,12 @@ fn threaded_remover(state: RemoverState, chan: Receiver<Vec<RepoPathBuf>>) -> Ve
     }
 
     failures
+}
+
+fn remove_options() -> RemoveOptions {
+    RemoveOptions::IGNORE_MISSING_PATH
+        | RemoveOptions::IGNORE_NON_FILE_OR_SYMLINK
+        | RemoveOptions::PRUNE_EMPTY_PARENTS
 }
 
 #[derive(Clone)]
@@ -441,11 +448,7 @@ mod tests {
 
         let file_type = symlink_metadata(&file)?.file_type();
 
-        if cfg!(windows) {
-            assert!(file_type.is_file());
-        } else {
-            assert!(file_type.is_symlink());
-        }
+        assert!(file_type.is_symlink());
 
         Ok(())
     }
@@ -601,7 +604,9 @@ mod tests {
         File::create(&path)?;
 
         let state = RemoverState::new(root)?;
-        state.working_copy.remove(RepoPath::from_str("TEST")?)?;
+        state
+            .working_copy
+            .remove(RepoPath::from_str("TEST")?, remove_options())?;
 
         assert_eq!(read_dir(&workingdir)?.count(), 0);
 
@@ -621,9 +626,10 @@ mod tests {
         File::create(&path)?;
 
         let state = RemoverState::new(root)?;
-        state
-            .working_copy
-            .remove(RepoPath::from_str("THESE/ARE/DIRECTORIES/FILE")?)?;
+        state.working_copy.remove(
+            RepoPath::from_str("THESE/ARE/DIRECTORIES/FILE")?,
+            remove_options(),
+        )?;
         assert_eq!(read_dir(&workingdir)?.count(), 0);
 
         Ok(())
@@ -649,9 +655,10 @@ mod tests {
         File::create(&path)?;
 
         let state = RemoverState::new(root)?;
-        state
-            .working_copy
-            .remove(RepoPath::from_str("THESE/ARE/DIRECTORIES/FILE")?)?;
+        state.working_copy.remove(
+            RepoPath::from_str("THESE/ARE/DIRECTORIES/FILE")?,
+            remove_options(),
+        )?;
         assert_eq!(read_dir(&workingdir)?.count(), 1);
 
         Ok(())
@@ -667,7 +674,9 @@ mod tests {
         let f = File::create(path)?;
 
         let state = RemoverState::new(root)?;
-        state.working_copy.remove(RepoPath::from_str("TEST")?)?;
+        state
+            .working_copy
+            .remove(RepoPath::from_str("TEST")?, remove_options())?;
 
         drop(f);
 
@@ -688,7 +697,9 @@ mod tests {
         let map = unsafe { MmapOptions::new().map(&f)? };
 
         let state = RemoverState::new(root)?;
-        state.working_copy.remove(RepoPath::from_str("TEST")?)?;
+        state
+            .working_copy
+            .remove(RepoPath::from_str("TEST")?, remove_options())?;
 
         drop(map);
 
@@ -753,7 +764,7 @@ mod tests {
 
             let mut expected_size = 0;
             for key in keys.iter() {
-                let data = Bytes::from(format!("{}", key));
+                let data = Bytes::from(format!("{key}"));
                 expected_size += data.len();
                 let delta = Delta {
                     data,
@@ -777,8 +788,8 @@ mod tests {
                 fullpath.push(key.path.as_str());
 
                 let ondisk = read_to_string(&fullpath)?;
-                let expected = format!("{}", key);
-                ensure!(ondisk == expected, format!("Got: {}, expected: {}", ondisk, expected));
+                let expected = format!("{key}");
+                ensure!(ondisk == expected, format!("Got: {ondisk}, expected: {expected}"));
             }
 
             Ok(TestResult::from_bool(expected_size == written_size))
@@ -802,7 +813,7 @@ mod tests {
             let root = workingdir.as_ref().to_path_buf();
             let state = RemoverState::new(root)?;
             for path in paths.iter() {
-                state.working_copy.remove(path)?;
+                state.working_copy.remove(path, remove_options())?;
             }
 
             Ok(TestResult::from_bool(read_dir(&workingdir)?.count() == 0))
@@ -821,7 +832,7 @@ mod tests {
 
             for key in keys.iter() {
                 let delta = Delta {
-                    data: Bytes::from(format!("{}", key)),
+                    data: Bytes::from(format!("{key}")),
                     base: None,
                     key: key.clone(),
                 };
@@ -839,7 +850,7 @@ mod tests {
             let root = workingdir.as_ref().to_path_buf();
             let state = RemoverState::new(root)?;
             for key in keys.iter() {
-                state.working_copy.remove(&key.path)?;
+                state.working_copy.remove(&key.path, remove_options())?;
             }
 
             Ok(TestResult::from_bool(read_dir(&workingdir)?.count() == 0))

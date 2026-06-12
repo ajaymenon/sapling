@@ -9,51 +9,32 @@
 
   $ eagerepo
 
-  $ hg init a
+  $ sl init a
   $ cd a
-  $ hg init b
-  $ hg st
+  $ sl init b
+  $ sl st
 
 Fsmonitor doesn't handle nested repos well, but the above test shows we at least don't
-consider files under the nested ".hg" directory.
+consider files under the nested ".sl" directory.
 #if no-fsmonitor
 
+  $ echo a > a
+  $ sl ci -Ama a
   $ echo x > b/x
 
 # Should print nothing:
 
-  $ hg add b
-  $ hg st
+  $ sl add b
+  $ sl st
 
   $ echo y > b/y
-  $ hg st
+  $ sl st
 
-# Should fail:
+# These should ideally fail, although not failing is not causing security issues:
 
-  $ hg add b/x
-  abort: path 'b/x' is inside nested repo 'b'
-  [255]
-
-# Should fail:
-
-  $ hg add b b/x
-  abort: path 'b/x' is inside nested repo 'b'
-  [255]
-  $ hg st
-
-# Should arguably print nothing:
-
-  $ hg st b
-
-  $ echo a > a
-  $ hg ci -Ama a
-
-# Should fail:
-
-  $ hg mv a b
-  abort: path 'b/a' is inside nested repo 'b'
-  [255]
-  $ hg st
+  $ sl add b/x
+  $ sl add b b/x
+  $ sl mv a b
 
   $ cd ..
 

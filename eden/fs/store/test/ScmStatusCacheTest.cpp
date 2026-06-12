@@ -148,7 +148,7 @@ TEST_F(ScmStatusCacheTest, evict_on_update) {
 
   auto v = std::make_shared<SeqStatusPair>(1, statusWithManyEntries);
 
-  // this should evict the the cache size to be maxItemCnt-1
+  // this should evict the cache size to be maxItemCnt-1
   cache->insert(keys.front(), 1, statusWithManyEntries);
   EXPECT_EQ(maxItemCnt - 1, cache->getObjectCount());
 }
@@ -252,7 +252,7 @@ TEST_F(ScmStatusCacheTest, check_sequence_range_validity) {
   journal->recordChanged("test.txt"_relpath, dtype_t::Regular);
 
   // Sanity check that the latest information matches.
-  auto latest = journal->getLatest();
+  auto latest = journal->peekLatest();
   ASSERT_TRUE(latest);
   EXPECT_EQ(2, latest->sequenceID);
 
@@ -264,7 +264,7 @@ TEST_F(ScmStatusCacheTest, check_sequence_range_validity) {
   journal->recordCreated("test1.txt"_relpath, dtype_t::Regular);
   journal->recordChanged("test1.txt"_relpath, dtype_t::Regular);
 
-  currentSeq = journal->getLatest()->sequenceID;
+  currentSeq = journal->peekLatest()->sequenceID;
   EXPECT_FALSE(cache->isSequenceValid(currentSeq, cachedSeq));
 
   // reset cached sequence id
@@ -275,12 +275,12 @@ TEST_F(ScmStatusCacheTest, check_sequence_range_validity) {
   journal->recordChanged(".hg/is"_relpath, dtype_t::Regular);
   journal->recordChanged(".hg/this"_relpath, dtype_t::Regular);
 
-  currentSeq = journal->getLatest()->sequenceID;
+  currentSeq = journal->peekLatest()->sequenceID;
   EXPECT_TRUE(cache->isSequenceValid(currentSeq, cachedSeq));
 
   // working directory changes
   journal->recordRootUpdate(id1);
-  currentSeq = journal->getLatest()->sequenceID;
+  currentSeq = journal->peekLatest()->sequenceID;
   EXPECT_FALSE(cache->isSequenceValid(currentSeq, cachedSeq));
 }
 

@@ -122,6 +122,8 @@ export interface SubscriptionOptions {
   excludedSuffixes?: string[];
   /** States to wait for deassertion */
   deferredStates?: string[];
+  /** Unpack commit transitions into individual file changes */
+  unpackCommitTransitions?: boolean;
   /** Path to eden binary */
   edenBinaryPath?: string;
 }
@@ -369,6 +371,13 @@ export class EdenFSUtils {
    * Extract file paths from changes
    */
   static extractPaths(changes: Change[]): string[];
+
+  /**
+   * Get file type from a SmallChange object
+   * @param smallChange - SmallChange object
+   * @returns File type string
+   */
+  static getFileType(smallChange: SmallChange): string;
 
   /**
    * Get change type from a change object

@@ -12,16 +12,16 @@ name = "bonsai_verify"
 test = false
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 blobrepo_override = { version = "0.1.0", path = "../../blobrepo/override" }
 blobrepo_utils = { version = "0.1.0", path = "../../blobrepo_utils" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bonsai_hg_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_hg_mapping" }
-clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 commit_graph = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
-facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 lock_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -34,6 +34,6 @@ repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_deri
 restricted_paths = { version = "0.1.0", path = "../../repo_attributes/restricted_paths" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_derive = "1.0.185"
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
-toml = { version = "0.9.11", features = ["preserve_order"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
+toml = { version = "1.1.2", features = ["preserve_order"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

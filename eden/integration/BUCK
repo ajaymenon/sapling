@@ -11,6 +11,7 @@ python_integration_test(
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
+        "fbsource//third-party/pypi/parameterized:parameterized",
         "//eden/integration/lib:lib",
     ],
 )
@@ -82,7 +83,17 @@ python_integration_test(
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
-        "//eden/fs/service:thrift-py-deprecated",
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
+    name = "wal",
+    srcs = ["wal_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
         "//eden/integration/lib:lib",
     ],
 )
@@ -184,6 +195,16 @@ python_integration_test(
 )
 
 python_integration_test(
+    name = "cli_smoke",
+    srcs = ["eden_cli_smoke_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
     name = "info",
     srcs = ["info_test.py"],
     env = artifacts["env"],
@@ -205,6 +226,16 @@ python_integration_test(
 )
 
 python_integration_test(
+    name = "pressure_gc",
+    srcs = ["pressure_gc_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
     name = "legacyephemeral_cleanup",
     srcs = ["legacyephemeral_cleanup_test.py"],
     compatible_with = [
@@ -215,6 +246,17 @@ python_integration_test(
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
+    name = "list",
+    srcs = ["list_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/pypi/parameterized:parameterized",
         "//eden/integration/lib:lib",
     ],
 )
@@ -263,7 +305,7 @@ python_integration_test(
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
-        "//eden/fs/service:thrift-py-deprecated",
+        "//eden/fs/service:thrift-python-types",
         "//eden/integration/lib:lib",
     ],
 )
@@ -287,8 +329,8 @@ python_integration_test(
         "//eden/fs/cli:lib",
         "//eden/integration/lib:lib",
         "//fb303/thrift:fb303_core-python-types",
-        "//thrift/lib/py:base",
         "//thrift/lib/python:types",
+        "//thrift/lib/python:types/exceptions",
     ],
 )
 
@@ -488,7 +530,7 @@ python_integration_test(
         "fbsource//third-party/pypi/psutil:psutil",
         "//eden/fs/cli:lib",
         "//eden/integration/lib:lib",
-        "//fb303/thrift:fb303_core-py-deprecated",
+        "//fb303/thrift:fb303_core-python-types",
     ],
 )
 
@@ -673,6 +715,17 @@ python_integration_test(
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
+    name = "remove_test",
+    srcs = ["remove_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/pypi/parameterized:parameterized",
         "//eden/integration/lib:lib",
     ],
 )

@@ -15,7 +15,7 @@ doctest = false
 doc = false
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 codegen_includer_proc_macro = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 config_thrift = { version = "0.1.0", path = "../config" }
 cpp = { version = "0.0.1+unstable", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
@@ -24,7 +24,7 @@ fbthrift = { version = "0.0.1+unstable", git = "https://github.com/facebook/fbth
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 ref-cast = "1.0.18"
 rust = { version = "0.0.1+unstable", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
-sorted_vector_map = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 thiserror = "2.0.18"
 thrift = { version = "0.0.1+unstable", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 

@@ -38,7 +38,7 @@ impl RootTestManifestDirectory {
 pub fn format_key(derivation_ctx: &DerivationContext, changeset_id: ChangesetId) -> String {
     let root_prefix = "derived_root_testmanifest.";
     let key_prefix = derivation_ctx.mapping_key_prefix::<RootTestManifestDirectory>();
-    format!("{}{}{}", root_prefix, key_prefix, changeset_id)
+    format!("{root_prefix}{key_prefix}{changeset_id}")
 }
 
 impl TryFrom<BlobstoreBytes> for RootTestManifestDirectory {
@@ -66,7 +66,6 @@ impl BonsaiDerivable for RootTestManifestDirectory {
     const VARIANT: DerivableType = DerivableType::TestManifests;
 
     type Dependencies = dependencies![];
-    type PredecessorDependencies = dependencies![];
 
     async fn derive_single(
         ctx: &CoreContext,

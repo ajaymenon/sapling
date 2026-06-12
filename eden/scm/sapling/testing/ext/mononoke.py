@@ -15,7 +15,7 @@ from ..sh.bufio import BufIO
 from ..sh.interp import interpcode
 from ..sh.types import Env, ShellFS
 from ..t.runtime import TestTmp
-from .hg import hg as hgcmd
+from .sl import hg as hgcmd
 
 
 def testsetup(t: TestTmp):
@@ -474,6 +474,25 @@ def setup_configerator_configs(fs: ShellFS, env: Env) -> int:
             with fs.open(f"{replication_lag_conf}/{conf}", "w") as f:
                 f.write(b"{}")
 
+    # Setup Shadow Traffic Config
+    shadow_traffic_conf = f"{local_configerator_path}/scm/mononoke/shadow_traffic"
+    env.setenv("SHADOW_TRAFFIC_CONF", shadow_traffic_conf)
+    fs.mkdir(shadow_traffic_conf)
+    default_shadow_config = b"""{
+  "enabled": false,
+  "sample_ratio": 0,
+  "path_include": "",
+  "path_exclude": "/upload/|/land/|/set_bookmark",
+  "target_url": "",
+  "semaphore_permits": 100,
+  "shadow_first_timeout_ms": 5000,
+  "shadow_first": false
+}"""
+    for conf in ["slapi", "git"]:
+        if not fs.exists(f"{shadow_traffic_conf}/{conf}"):
+            with fs.open(f"{shadow_traffic_conf}/{conf}", "w") as f:
+                f.write(default_shadow_config)
+
     return 0
 
 
@@ -573,20 +592,22 @@ def setup_mononoke_config(
     fs.chdir("mononoke-config")
     fs.mkdir("common")
     with fs.open("common/common.toml", "w") as f:
-        f.write(b"")
-    with fs.open("common/commitsyncmap.toml", "w") as f:
-        f.write(b"")
-
-    scuba_censored_logging_path = env.getenv("SCUBA_CENSORED_LOGGING_PATH")
-    if scuba_censored_logging_path:
-        with fs.open("common/common.toml", "w") as f:
+        # Write top-level config keys first, before any TOML table sections,
+        # to avoid the parser assigning keys to the wrong table.
+        scuba_censored_logging_path = env.getenv("SCUBA_CENSORED_LOGGING_PATH")
+        if scuba_censored_logging_path:
             f.write(
                 f'scuba_local_path_censored="{scuba_censored_logging_path}"\n'.encode()
             )
-
-    if not env.getenv("DISABLE_HTTP_CONTROL_API"):
-        with fs.open("common/common.toml", "a") as f:
+        if not env.getenv("DISABLE_HTTP_CONTROL_API"):
             f.write(b"enable_http_control_api=true\n")
+        # Write additional config after top-level keys. This may contain
+        # table sections (e.g., [[global_allowlist]]) or top-level keys.
+        additional = env.getenv("ADDITIONAL_MONONOKE_COMMON_CONFIG")
+        if additional:
+            f.write(f"{additional}\n".encode())
+    with fs.open("common/commitsyncmap.toml", "w") as f:
+        f.write(b"")
 
     with fs.open("common/common.toml", "a") as f:
         f.write(
@@ -623,11 +644,6 @@ identity_data = "{env.getenv("PROXY_ID_DATA")}"
 }
 """
             )
-
-    additional_mononoke_common_config = env.getenv("ADDITIONAL_MONONOKE_COMMON_CONFIG")
-    if additional_mononoke_common_config:
-        with fs.open("common/common.toml", "a") as f:
-            f.write(f"{additional_mononoke_common_config}\n".encode())
 
     with fs.open("common/storage.toml", "w") as f:
         f.write(b"# Start new config\n")
@@ -742,6 +758,9 @@ def setup_mononoke_repo_config(
             "test_manifests",
             "test_sharded_manifests",
             "inferred_copy_from",
+            "acl_manifests",
+            "content_manifests",
+            "history_manifests",
         ]
 
     if additional_derived_data := env.getenv("ADDITIONAL_DERIVED_DATA"):
@@ -923,6 +942,11 @@ forbid_p2_root_rebases=false
     if env.getenv("ALLOW_CHANGE_XREPO_MAPPING_EXTRA"):
         append_config("allow_change_xrepo_mapping_extra=true")
 
+    if env.getenv("PUSHREBASE_PESSIMISTIC_LOCKING_BOOKMARKS"):
+        bookmarks = env.getenv("PUSHREBASE_PESSIMISTIC_LOCKING_BOOKMARKS").split()
+        toml_list = ", ".join(f'"{b}"' for b in bookmarks)
+        append_config(f"pessimistic_locking_bookmarks = [{toml_list}]")
+
     append_config(
         """
 [hook_manager_params]
@@ -999,6 +1023,8 @@ git_delta_manifest_v3_config.max_inlined_object_size = 20
 git_delta_manifest_v3_config.max_inlined_delta_size = 20
 git_delta_manifest_v3_config.delta_chunk_size = 1000
 git_delta_manifest_v3_config.entry_chunk_size = 1000
+xdb_mapping_shard_ids.history_manifests = 0
+xdb_mapping_shard_ids.blame_v3 = 0
 """
     )
 
@@ -1347,6 +1373,7 @@ mutation = {{ db_address = "{db_shard_name}" }}
 commit_cloud = {{ db_address = "{db_shard_name}" }}
 git_bundles = {{ db_address = "{db_shard_name}" }}
 restricted_paths = {{ db_address = "{db_shard_name}" }}
+derived_data_mapping = {{ unsharded = {{ db_address = "{db_shard_name}" }} }}
 """
     else:
         return f"""[{blobstore_name}.metadata.local]
@@ -1442,13 +1469,13 @@ def setup_environment_variables(stderr: BinaryIO, fs: ShellFS, env: Env) -> int:
     if db_shard_name:
         env.setenv("MONONOKE_DEFAULT_START_TIMEOUT", "600")
         env.setenv("MONONOKE_LFS_DEFAULT_START_TIMEOUT", "60")
-        env.setenv("MONONOKE_GIT_SERVICE_DEFAULT_START_TIMEOUT", "60")
+        env.setenv("MONONOKE_GIT_SERVICE_DEFAULT_START_TIMEOUT", "120")
         env.setenv("MONONOKE_SCS_DEFAULT_START_TIMEOUT", "300")
         env.setenv("MONONOKE_LAND_SERVICE_DEFAULT_START_TIMEOUT", "120")
     else:
         env.setenv("MONONOKE_DEFAULT_START_TIMEOUT", "60")
         env.setenv("MONONOKE_LFS_DEFAULT_START_TIMEOUT", "60")
-        env.setenv("MONONOKE_GIT_SERVICE_DEFAULT_START_TIMEOUT", "60")
+        env.setenv("MONONOKE_GIT_SERVICE_DEFAULT_START_TIMEOUT", "120")
         env.setenv("MONONOKE_SCS_DEFAULT_START_TIMEOUT", "300")
         env.setenv("MONONOKE_LAND_SERVICE_DEFAULT_START_TIMEOUT", "120")
         env.setenv("MONONOKE_DDS_DEFAULT_START_TIMEOUT", "120")
@@ -1480,7 +1507,7 @@ def setup_environment_variables(stderr: BinaryIO, fs: ShellFS, env: Env) -> int:
     mononoke_just_knobs_overrides_path = f"{local_configerator_path}/just_knobs.json"
     env.setenv("MONONOKE_JUST_KNOBS_OVERRIDES_PATH", mononoke_just_knobs_overrides_path)
     fs.cp(
-        f"{just_knobs_defaults}/just_knobs_defaults/just_knobs.json",
+        f"{just_knobs_defaults}/test_just_knobs/just_knobs.json",
         mononoke_just_knobs_overrides_path,
     )
 

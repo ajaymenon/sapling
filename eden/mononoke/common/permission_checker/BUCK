@@ -1,7 +1,7 @@
 load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "permission_checker",
@@ -9,9 +9,14 @@ rust_library(
     test_deps = [
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
-    ] + ([] if rust_oss.is_oss_build() else [
-        "fbsource//third-party/rust:percent-encoding",
-    ]),
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "fbsource//third-party/rust:percent-encoding",
+        ]
+    ),
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
@@ -20,17 +25,28 @@ rust_library(
         "fbsource//third-party/rust:openssl",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:tracing",
         "//common/rust/aclchecker:aclchecker",
         "//common/rust/identity:identity_ext",
         "//common/rust/shed/fbinit:fbinit",
-    ] + ([] if rust_oss.is_oss_build() else [
-        "//access/if:authenticated_identity_thrift-rust",
-        "//common/rust/shed/justknobs_stub:justknobs",
-        "//configerator/structs/infrasec/if:acl-rust",
-        "fbsource//third-party/rust:maplit",
-        "fbsource//third-party/rust:tokio",
-        "//configerator/structs/infrasec/if:acl-rust",
-        "//infrasec/authorization/if:if-service-rust",
-        "//infrasec/authorization/if:if-service-rust-srclients",
-    ]),
+        "//common/rust/shed/scuba_stub:scuba",
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "fbsource//third-party/rust:base64",
+            "//access/if:access_config_thrift-rust",
+            "//access/if:authenticated_identity_thrift-rust",
+            "//access/lib/polyglot:authenticated_identity_serializer-rs_bindings",
+            "//access/lib/polyglot/proxy/rs:ligen_access_checker-rs_bindings",
+            "//configerator/structs/infrasec/if:acl-rust",
+            "fbsource//third-party/rust:maplit",
+            "fbsource//third-party/rust:tokio",
+            "//configerator/structs/infrasec/if:acl-rust",
+            "//infrasec/authorization/if:if-service-rust",
+            "//infrasec/authorization/if:if-service-rust-srclients",
+            "//thrift/lib/rust:fbthrift",
+        ]
+    ),
 )

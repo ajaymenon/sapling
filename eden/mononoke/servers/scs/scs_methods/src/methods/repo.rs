@@ -15,6 +15,8 @@ use chrono::FixedOffset;
 use context::CoreContext;
 use derived_data_manager::DerivableType;
 use futures::future::try_join_all;
+use futures::stream;
+use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
 use futures_watchdog::WatchdogExt;
@@ -47,6 +49,9 @@ use crate::into_response::AsyncIntoResponseWith;
 use crate::source_control_impl::SourceControlServiceImpl;
 use crate::specifiers::SpecifierExt;
 
+// Cap concurrent in-flight requests when resolving stacks of thousands of commits.
+const CONCURRENCY_LIMIT: usize = 100;
+
 mod create_commit;
 mod land_stack;
 
@@ -61,11 +66,12 @@ impl SourceControlServiceImpl {
         _params: thrift::RepoInfoParams,
     ) -> Result<thrift::RepoInfo, scs_errors::ServiceError> {
         let authz = AuthorizationContext::new_bypass_access_control();
-        let repo_configs = self.configs.repo_configs();
-        let repo_config = repo_configs
-            .repos
-            .get(repo.name.as_str())
-            .ok_or_else(|| scs_errors::repo_not_found(repo.description()))?;
+        // Route through `get_or_load_repo_config` so split-loaded repos
+        // (only present in the per-tier RepoSpec manifest) resolve correctly.
+        let repo_config = self
+            .configs
+            .get_or_load_repo_config(repo.name.as_str())
+            .map_err(|_| scs_errors::repo_not_found(repo.description()))?;
         let repo_name = repo.name.to_string();
         let default_commit_identity_scheme_conf = &repo_config.default_commit_identity_scheme;
 
@@ -75,16 +81,22 @@ impl SourceControlServiceImpl {
             CommitIdentityScheme::BONSAI => thrift::CommitIdentityScheme::BONSAI,
             CommitIdentityScheme::UNKNOWN => thrift::CommitIdentityScheme::UNKNOWN,
         };
+        // Repo might not be found due to deep sharding. However all push_redirected repos are shallow sharded, so this should be safe because
+        // 1. If the repo is push-redirected, we are forced to have it on every server cause we can't predict where the request might land
+        // 2. If the repo is not push-redirected, then the answer here would anyway be none
         let push_redirected_to = match self
             .repo_impl(ctx, &repo, authz, |_| async { Ok(None) })
             .await
         {
-            Ok(repo) => repo
+            Ok(repo) => match repo
                 .push_redirector()
-                .map(|prd| prd.repo.repo_identity().name().to_string()),
-            // Repo might not be found due to deep sharding. However all push_redirected repos are shallow sharded, so this should be safe because
-            // 1. If the repo is push-redirected, we are forced to have it on every server cause we can't predict where the request might land
-            // 2. If the repo is not push-redirected, then the answer here would anyway be none
+                .await
+                .map_err(scs_errors::ServiceError::from)
+            {
+                Ok(prd) => prd.map(|prd| prd.repo.repo_identity().name().to_string()),
+                Err(e) if e.repo_not_found() => None,
+                Err(e) => return Err(e),
+            },
             Err(e) if e.repo_not_found() => None,
             // However, if there is any other form of error, let's surface that to the user
             Err(e) => return Err(e),
@@ -94,6 +106,7 @@ impl SourceControlServiceImpl {
             name: repo_name.to_string(),
             default_commit_identity_scheme,
             push_redirected_to,
+            acl_name: repo_config.hipster_acl.clone(),
             ..Default::default()
         })
     }
@@ -368,70 +381,54 @@ impl SourceControlServiceImpl {
         // get stack
         let stack = repo.stack(heads_ids, limit).await?;
 
-        // resolve draft changesets & public changesets
-        let (draft_commits, public_parents, leftover_heads) = try_join!(
-            try_join_all(
-                stack
-                    .draft
-                    .into_iter()
-                    .map(|cs_id| repo.changeset(ChangesetSpecifier::Bonsai(cs_id))),
-            ),
-            try_join_all(
-                stack
-                    .public
-                    .into_iter()
-                    .map(|cs_id| repo.changeset(ChangesetSpecifier::Bonsai(cs_id))),
-            ),
-            try_join_all(
-                stack
-                    .leftover_heads
-                    .into_iter()
-                    .map(|cs_id| repo.changeset(ChangesetSpecifier::Bonsai(cs_id))),
-            ),
-        )?;
+        // The ids in `stack` were just produced by walking the commit graph in
+        // `repo.stack`, so they are guaranteed to exist. Skip the redundant
+        // existence check that `repo.changeset(Bonsai(_))` would do.
+        let draft_commits: Vec<_> = stack
+            .draft
+            .into_iter()
+            .map(|cs_id| repo.changeset_from_existing_id(cs_id))
+            .collect();
+        let public_parents: Vec<_> = stack
+            .public
+            .into_iter()
+            .map(|cs_id| repo.changeset_from_existing_id(cs_id))
+            .collect();
+        let leftover_heads: Vec<_> = stack
+            .leftover_heads
+            .into_iter()
+            .map(|cs_id| repo.changeset_from_existing_id(cs_id))
+            .collect();
 
         if draft_commits.len() <= params.heads.len() && !leftover_heads.is_empty() {
             Err(scs_errors::limit_too_low(limit))?;
         }
 
         // generate response
-        match (
-            draft_commits.into_iter().collect::<Option<Vec<_>>>(),
-            public_parents.into_iter().collect::<Option<Vec<_>>>(),
-            leftover_heads.into_iter().collect::<Option<Vec<_>>>(),
-        ) {
-            (Some(draft_commits), Some(public_parents), Some(leftover_heads)) => {
-                let (mut draft_commits, public_parents, leftover_heads) = try_join!(
-                    try_join_all(
-                        draft_commits
-                            .into_iter()
-                            .map(|cs| cs.into_response_with(&params.identity_schemes)),
-                    ),
-                    try_join_all(
-                        public_parents
-                            .into_iter()
-                            .map(|cs| cs.into_response_with(&params.identity_schemes)),
-                    ),
-                    leftover_heads.into_response_with(&params.identity_schemes),
-                )?;
+        let schemes = &params.identity_schemes;
+        let (mut draft_commits, public_parents, leftover_heads) = try_join!(
+            stream::iter(draft_commits)
+                .map(|cs| cs.into_response_with(schemes))
+                .buffer_unordered(CONCURRENCY_LIMIT)
+                .try_collect::<Vec<_>>(),
+            stream::iter(public_parents)
+                .map(|cs| cs.into_response_with(schemes))
+                .buffer_unordered(CONCURRENCY_LIMIT)
+                .try_collect::<Vec<_>>(),
+            leftover_heads.into_response_with(schemes),
+        )?;
 
-                // Need to return the draft commits in topological order to meet the API definition
-                // at https://fburl.com/code/a017qoam.
-                draft_commits.sort_by_key(|commit| commit.generation);
-                draft_commits.reverse();
+        // Need to return the draft commits in topological order to meet the API definition
+        // at https://fburl.com/code/a017qoam.
+        draft_commits.sort_by_key(|commit| commit.generation);
+        draft_commits.reverse();
 
-                Ok(thrift::RepoStackInfoResponse {
-                    draft_commits,
-                    public_parents,
-                    leftover_heads,
-                    ..Default::default()
-                })
-            }
-            _ => Err(scs_errors::internal_error(
-                "unexpected failure to resolve an existing commit",
-            )
-            .into()),
-        }
+        Ok(thrift::RepoStackInfoResponse {
+            draft_commits,
+            public_parents,
+            leftover_heads,
+            ..Default::default()
+        })
     }
 
     pub(crate) async fn repo_create_bookmark(
@@ -634,8 +631,7 @@ impl SourceControlServiceImpl {
             .await?
             .ok_or_else(|| {
                 MononokeError::InvalidRequest(format!(
-                    "unknown commit specifier {}",
-                    base_cs_specifier
+                    "unknown commit specifier {base_cs_specifier}"
                 ))
             })?;
         let submodule_expansion_path =

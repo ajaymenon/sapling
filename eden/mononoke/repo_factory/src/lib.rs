@@ -78,12 +78,18 @@ use clientinfo::ClientInfo;
 use commit_cloud::ArcCommitCloud;
 use commit_cloud::CommitCloud;
 use commit_cloud::sql::builder::SqlCommitCloudBuilder;
+use commit_derived_data_mapping::ArcCommitDerivedDataMapping;
+use commit_derived_data_mapping::CommitDerivedDataMapping;
+use commit_derived_data_mapping::SqlCommitDerivedDataMapping;
 use commit_graph::ArcCommitGraph;
 use commit_graph::ArcCommitGraphWriter;
 use commit_graph::BaseCommitGraphWriter;
 use commit_graph::CommitGraph;
 use commit_graph::LoggingCommitGraphWriter;
 use commit_graph_types::storage::CommitGraphStorage;
+use commit_rate_limit_config::ArcCommitRateLimit;
+use commit_rate_limit_config::CommitRateLimit;
+use commit_rate_limit_config::build_commit_rate_limit;
 use context::CoreContext;
 use context::SessionContainer;
 use cross_repo_sync::create_commit_syncer_lease;
@@ -137,6 +143,7 @@ use mercurial_mutation::SqlHgMutationStoreBuilder;
 use metaconfig_types::ArcCommonConfig;
 use metaconfig_types::ArcRepoConfig;
 use metaconfig_types::BlobConfig;
+use metaconfig_types::CommitIdentityScheme;
 use metaconfig_types::CommonConfig;
 use metaconfig_types::MetadataCacheConfig;
 use metaconfig_types::MetadataDatabaseConfig;
@@ -197,8 +204,10 @@ use repo_sparse_profiles::SqlSparseProfilesSizes;
 use repo_stats_logger::ArcRepoStatsLogger;
 use repo_stats_logger::RepoStatsLogger;
 use restricted_paths::ArcRestrictedPaths;
+use restricted_paths::ArcRestrictedPathsConfigBased;
 use restricted_paths::ArcRestrictedPathsManifestIdStore;
 use restricted_paths::RestrictedPaths;
+use restricted_paths::RestrictedPathsConfigBased;
 use restricted_paths::RestrictedPathsManifestIdCacheBuilder;
 use restricted_paths::SqlRestrictedPathsManifestIdStoreBuilder;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -218,7 +227,6 @@ use synced_commit_mapping::ArcSyncedCommitMapping;
 use synced_commit_mapping::CachingSyncedCommitMapping;
 use synced_commit_mapping::SqlSyncedCommitMappingBuilder;
 use thiserror::Error;
-use tracing::debug;
 use tracing::error;
 use virtually_sharded_blobstore::VirtuallyShardedBlobstore;
 use warm_bookmarks_cache::NoopBookmarksCache;
@@ -419,13 +427,6 @@ impl RepoFactory {
                 })
                 .context("initializing DB connection")?;
 
-                if justknobs::eval("scm/mononoke:log_sql_factory_init", None, None).unwrap_or(false)
-                {
-                    debug!(
-                        "initializing DB connection succeeded for config: {:?}",
-                        config
-                    )
-                }
                 Ok(Arc::new(sql_factory))
             })
             .await
@@ -574,18 +575,19 @@ impl RepoFactory {
                     ZelosConfig::Local { port } => {
                         ZeusCppClient::zelos_client_for_local_ensemble_reconnecting(*port)
                             .with_context(|| {
-                                format!("Error creating Local Zeus client on port {}", port)
+                                format!("Error creating Local Zeus client on port {port}")
                             })?
                     }
-                    ZelosConfig::Remote { tier } => {
-                        ZeusCppClient::new_reconnecting(self.env.fb, ZEUS_CLIENT_ID, tier)
-                            .with_context(|| {
-                                format!(
-                                    "Error creating Zeus client to {} with client id {}",
-                                    tier, ZEUS_CLIENT_ID
-                                )
-                            })?
-                    }
+                    ZelosConfig::Remote { tier } => ZeusCppClient::new_reconnecting(
+                        self.env.fb,
+                        ZEUS_CLIENT_ID,
+                        tier,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Error creating Zeus client to {tier} with client id {ZEUS_CLIENT_ID}"
+                        )
+                    })?,
                 };
                 let zelos_client: Arc<dyn ZeusClient> = Arc::new(zelos_client);
                 Ok(zelos_client)
@@ -816,6 +818,9 @@ pub enum RepoFactoryError {
     #[error("Error opening bonsai blob mapping DB")]
     BonsaiBlobMapping,
 
+    #[error("Error opening commit derived data mapping DB")]
+    CommitDerivedDataMapping,
+
     #[error("Error opening deletion log DB")]
     SqlDeletionLog,
 
@@ -1022,9 +1027,7 @@ impl RepoFactory {
             "scm/mononoke:enable_bonsai_tag_mapping_caching",
             None,
             Some(repo_name),
-        )
-        .unwrap_or(false)
-        {
+        ) {
             match repo_event_publisher.subscribe_for_tag_updates(&repo_name.to_string()) {
                 Ok(update_notification_receiver) => {
                     let cached_bonsai_tag_mapping = CachedBonsaiTagMapping::new(
@@ -1056,29 +1059,19 @@ impl RepoFactory {
             .context(RepoFactoryError::GitRefContentMapping)?
             .build(repo_identity.id());
         let repo_name = repo_identity.name();
-        if justknobs::eval(
-            "scm/mononoke:enable_git_ref_content_mapping_caching",
-            None,
-            Some(repo_name),
-        )
-        .unwrap_or(false)
-        {
-            match repo_event_publisher.subscribe_for_content_refs_updates(&repo_name.to_string()) {
-                Ok(update_notification_receiver) => {
-                    let cached_git_ref_content_mapping = CachedGitRefContentMapping::new(
-                        &self.ctx(),
-                        Arc::new(git_ref_content_mapping),
-                        update_notification_receiver,
-                    )
-                    .await?;
-                    Ok(Arc::new(cached_git_ref_content_mapping))
-                }
-                // The scribe configuration does not exist for content ref updates for this repo, so use the non-cached
-                // version of git_ref_content_mapping
-                Err(_) => Ok(Arc::new(git_ref_content_mapping)),
+        match repo_event_publisher.subscribe_for_content_refs_updates(&repo_name.to_string()) {
+            Ok(update_notification_receiver) => {
+                let cached_git_ref_content_mapping = CachedGitRefContentMapping::new(
+                    &self.ctx(),
+                    Arc::new(git_ref_content_mapping),
+                    update_notification_receiver,
+                )
+                .await?;
+                Ok(Arc::new(cached_git_ref_content_mapping))
             }
-        } else {
-            Ok(Arc::new(git_ref_content_mapping))
+            // The scribe configuration does not exist for content ref updates for this repo, so use the non-cached
+            // version of git_ref_content_mapping
+            Err(_) => Ok(Arc::new(git_ref_content_mapping)),
         }
     }
 
@@ -1122,9 +1115,7 @@ impl RepoFactory {
             "scm/mononoke:disable_git_symbolic_refs_caching",
             None,
             Some(repo_name),
-        )
-        .unwrap_or(false)
-        {
+        ) {
             Ok(Arc::new(git_symbolic_refs))
         } else {
             let cached_git_symbolic_refs =
@@ -1234,12 +1225,11 @@ impl RepoFactory {
             .open_sql::<SqlHgMutationStoreBuilder>(repo_config)
             .await
             .context(RepoFactoryError::HgMutationStore)?;
-        if let Ok(mutation_limit) = justknobs::get_as::<usize>(
+        let mutation_limit = justknobs::get_as::<usize>(
             "scm/mononoke:mutation_chain_length_limit",
             Some(repo_identity.name()),
-        ) {
-            builder = builder.with_mutation_limit(mutation_limit);
-        }
+        );
+        builder = builder.with_mutation_limit(mutation_limit);
         let hg_mutation_store = builder.with_repo_id(repo_identity.id());
 
         if let Some(cache_handler_factory) = self.cache_handler_factory("hg_mutation_store")? {
@@ -1262,7 +1252,8 @@ impl RepoFactory {
         filenodes: &ArcFilenodes,
         repo_blobstore: &ArcRepoBlobstore,
         filestore_config: &ArcFilestoreConfig,
-        restricted_paths: &ArcRestrictedPaths,
+        restricted_paths_config_based: &ArcRestrictedPathsConfigBased,
+        commit_derived_data_mapping: &ArcCommitDerivedDataMapping,
     ) -> Result<ArcRepoDerivedData> {
         let config = repo_config.derived_data_config.clone();
         let scuba_table = self
@@ -1289,7 +1280,8 @@ impl RepoFactory {
             scuba,
             config,
             derivation_service_client,
-            restricted_paths.clone(),
+            restricted_paths_config_based.clone(),
+            commit_derived_data_mapping.clone(),
         )?))
     }
 
@@ -1387,19 +1379,18 @@ impl RepoFactory {
         )?))
     }
 
-    /// Restricted paths
-    pub async fn restricted_paths(
+    /// Build config-based restricted paths (shared with derived-data crates).
+    pub async fn restricted_paths_config_based(
         &self,
         repo_config: &ArcRepoConfig,
         restricted_paths_manifest_id_store: &ArcRestrictedPathsManifestIdStore,
-    ) -> Result<ArcRestrictedPaths> {
+    ) -> Result<ArcRestrictedPathsConfigBased> {
         let ctx = self.ctx().clone();
         let restricted_paths_config = repo_config.restricted_paths_config.clone();
 
         let manifest_id_cache = if !restricted_paths_config.is_empty()
             && restricted_paths_config.use_manifest_id_cache
         {
-            // Build the manifest id cache with the specified refresh interval
             let cache = RestrictedPathsManifestIdCacheBuilder::new(
                 ctx.clone(),
                 restricted_paths_manifest_id_store.clone(),
@@ -1415,6 +1406,20 @@ impl RepoFactory {
             None
         };
 
+        Ok(Arc::new(RestrictedPathsConfigBased::new(
+            restricted_paths_config,
+            restricted_paths_manifest_id_store.clone(),
+            manifest_id_cache,
+        )))
+    }
+
+    /// Restricted paths
+    pub fn restricted_paths(
+        &self,
+        _repo_identity: &ArcRepoIdentity,
+        restricted_paths_config_based: &ArcRestrictedPathsConfigBased,
+        repo_derived_data: &ArcRepoDerivedData,
+    ) -> Result<ArcRestrictedPaths> {
         // Construct scuba builder for logging access to restricted paths.
         // Check for environment variable override for integration tests.
         let scuba_builder = if let Ok(scuba_file_path) = std::env::var("ACCESS_LOG_SCUBA_FILE_PATH")
@@ -1425,14 +1430,26 @@ impl RepoFactory {
         };
 
         let restricted_paths = RestrictedPaths::new(
-            repo_config.restricted_paths_config.clone(),
-            restricted_paths_manifest_id_store.clone(),
+            restricted_paths_config_based.clone(),
             self.env.acl_provider.clone(),
-            manifest_id_cache,
             scuba_builder,
-        );
+            repo_derived_data.clone(),
+        )?;
 
         Ok(Arc::new(restricted_paths))
+    }
+
+    /// Commit rate limit configuration facet.
+    pub fn commit_rate_limit(
+        &self,
+        repo_identity: &ArcRepoIdentity,
+        repo_config: &ArcRepoConfig,
+    ) -> Result<ArcCommitRateLimit> {
+        let commit_rate_limit = match &repo_config.commit_rate_limit_config {
+            Some(config) => build_commit_rate_limit(config, repo_identity.name())?,
+            None => CommitRateLimit::empty(),
+        };
+        Ok(Arc::new(commit_rate_limit))
     }
 
     /// Restricted paths root ids store
@@ -1462,13 +1479,19 @@ impl RepoFactory {
         }
         #[cfg(fbcode_build)]
         {
-            let zelos_config = repo_config.zelos_config.as_ref().ok_or_else(|| {
+            let zelos_config = if self.env.use_pipeline_zelos_config {
+                repo_config.pipeline_zelos_config.as_ref()
+            } else {
+                repo_config.zelos_config.as_ref()
+            }
+            .ok_or_else(|| {
                 anyhow!("Missing zelos config while trying to construct repo_derivation_queues")
             })?;
             let zelos_client = self.zelos_client(zelos_config).await?;
 
+            let namespace = self.env.derivation_queue_namespace.clone();
             anyhow::Ok(Arc::new(
-                zelos_derivation_queues(repo_derived_data.clone(), zelos_client).await?,
+                zelos_derivation_queues(repo_derived_data.clone(), zelos_client, namespace).await?,
             ))
         }
     }
@@ -1552,6 +1575,7 @@ impl RepoFactory {
         repo_cross_repo: &ArcRepoCrossRepo,
         commit_graph: &ArcCommitGraph,
         restricted_paths: &ArcRestrictedPaths,
+        commit_rate_limit: &ArcCommitRateLimit,
     ) -> Result<ArcHookManager> {
         let name = repo_identity.name();
 
@@ -1587,6 +1611,7 @@ impl RepoFactory {
                 repo_cross_repo: repo_cross_repo.clone(),
                 commit_graph: commit_graph.clone(),
                 restricted_paths: restricted_paths.clone(),
+                commit_rate_limit: commit_rate_limit.clone(),
             };
 
             let mut hook_manager = HookManager::new(
@@ -1688,6 +1713,7 @@ impl RepoFactory {
         repo_derived_data: &ArcRepoDerivedData,
         repo_event_publisher: &ArcRepoEventPublisher,
         phases: &ArcPhases,
+        repo_config: &ArcRepoConfig,
     ) -> Result<ArcBookmarksCache> {
         let cache = self
             .build_bookmarks_cache_impl(
@@ -1697,9 +1723,40 @@ impl RepoFactory {
                 repo_derived_data,
                 repo_event_publisher,
                 phases,
+                repo_config,
             )
             .await?;
         Ok(cache as ArcBookmarksCache)
+    }
+
+    /// Resolve the effective bookmark cache options for a repo.
+    /// For Git repos (when the JustKnob is enabled), use local WBC
+    /// instead of the process-level default (Remote), while preserving
+    /// the configured derived data scope.
+    fn effective_bookmark_cache_options(
+        &self,
+        repo_identity: &ArcRepoIdentity,
+        repo_config: &ArcRepoConfig,
+    ) -> Result<(BookmarkCacheKind, BookmarkCacheDerivedData)> {
+        let use_local_for_git = justknobs::eval(
+            "scm/mononoke:use_local_wbc_for_git_repos",
+            None,
+            Some(repo_identity.name()),
+        );
+
+        if use_local_for_git
+            && repo_config.default_commit_identity_scheme == CommitIdentityScheme::GIT
+        {
+            Ok((
+                BookmarkCacheKind::Local,
+                self.env.bookmark_cache_options.derived_data.clone(),
+            ))
+        } else {
+            Ok((
+                self.env.bookmark_cache_options.cache_kind.clone(),
+                self.env.bookmark_cache_options.derived_data.clone(),
+            ))
+        }
     }
 
     async fn build_bookmarks_cache_impl(
@@ -1710,11 +1767,13 @@ impl RepoFactory {
         repo_derived_data: &ArcRepoDerivedData,
         repo_event_publisher: &ArcRepoEventPublisher,
         phases: &ArcPhases,
+        repo_config: &ArcRepoConfig,
     ) -> Result<Arc<dyn CombinedBookmarksCache + Send + Sync>> {
-        let warmer_requirement: WarmerRequirement =
-            (&self.env.bookmark_cache_options.derived_data).into();
+        let (effective_cache_kind, effective_derived_data) =
+            self.effective_bookmark_cache_options(repo_identity, repo_config)?;
+        let warmer_requirement: WarmerRequirement = (&effective_derived_data).into();
 
-        match &self.env.bookmark_cache_options.cache_kind {
+        match &effective_cache_kind {
             BookmarkCacheKind::Local => {
                 let scuba_sample_builder =
                     self.env.warm_bookmarks_cache_scuba_sample_builder.clone();
@@ -1731,7 +1790,7 @@ impl RepoFactory {
                     warmer_requirement,
                 );
 
-                match self.env.bookmark_cache_options.derived_data {
+                match effective_derived_data {
                     BookmarkCacheDerivedData::HgOnly => {
                         wbc_builder.add_hg_warmers(repo_derived_data, phases)?;
                     }
@@ -1756,7 +1815,7 @@ impl RepoFactory {
             }
             #[cfg(fbcode_build)]
             BookmarkCacheKind::Remote(address) => {
-                match self.env.bookmark_cache_options.derived_data {
+                match effective_derived_data {
                     BookmarkCacheDerivedData::SpecificTypes(_) => {
                         anyhow::bail!("Remote bookmarks for 'SpecificTypes' is not supported");
                     }
@@ -1812,6 +1871,7 @@ impl RepoFactory {
         repo_derived_data: &ArcRepoDerivedData,
         repo_event_publisher: &ArcRepoEventPublisher,
         phases: &ArcPhases,
+        repo_config: &ArcRepoConfig,
     ) -> Result<ArcScopedBookmarksCache> {
         let cache = self
             .build_bookmarks_cache_impl(
@@ -1821,6 +1881,7 @@ impl RepoFactory {
                 repo_derived_data,
                 repo_event_publisher,
                 phases,
+                repo_config,
             )
             .await?;
         Ok(cache as ArcScopedBookmarksCache)
@@ -1871,12 +1932,11 @@ impl RepoFactory {
 
     pub async fn repo_handler_base(
         &self,
-        repo_config: &ArcRepoConfig,
+        _repo_config: &ArcRepoConfig,
         push_redirector_mode: &ArcPushRedirectorMode,
     ) -> Result<ArcRepoHandlerBase> {
         let ctx = self.ctx();
         let scuba = ctx.scuba().clone();
-        let repo_client_knobs = repo_config.repo_client_knobs.clone();
         let maybe_push_redirector_base = match **push_redirector_mode {
             Enabled(ref push_redirector_base) => Some(Arc::clone(push_redirector_base)),
             PushRedirectorMode::Disabled => None,
@@ -1884,7 +1944,6 @@ impl RepoFactory {
         Ok(Arc::new(RepoHandlerBase {
             scuba,
             maybe_push_redirector_base,
-            repo_client_knobs,
         }))
     }
 
@@ -1892,7 +1951,7 @@ impl RepoFactory {
         let caching = if let Some(cache_handler_factory) = self.cache_handler_factory("sql")? {
             const KEY_PREFIX: &str = "scm.mononoke.sql";
             const MC_CODEVER: u32 = 0;
-            let sitever = justknobs::get_as::<u32>("scm/mononoke_memcache_sitevers:sql", None)?;
+            let sitever = justknobs::get_as::<u32>("scm/mononoke_memcache_sitevers:sql", None);
             Some(sql_query_config::CachingConfig {
                 keygen: KeyGen::new(KEY_PREFIX, MC_CODEVER, sitever),
                 cache_handler_factory,
@@ -2029,6 +2088,17 @@ impl RepoFactory {
         Ok(Arc::new(BonsaiBlobMapping {
             sql_bonsai_blob_mapping,
         }))
+    }
+
+    pub async fn commit_derived_data_mapping(
+        &self,
+        repo_config: &ArcRepoConfig,
+    ) -> Result<ArcCommitDerivedDataMapping> {
+        let (_, sql) = self
+            .open_sql_shardable::<SqlCommitDerivedDataMapping>(repo_config)
+            .await
+            .context(RepoFactoryError::CommitDerivedDataMapping)?;
+        Ok(Arc::new(CommitDerivedDataMapping { sql }))
     }
 
     pub async fn repo_event_publisher(

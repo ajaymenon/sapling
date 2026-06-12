@@ -25,6 +25,16 @@ pub(crate) struct Hooks {
     fail: Vec<hook::Hooks>,
 }
 
+impl std::fmt::Debug for Hooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hooks")
+            .field("pre", &self.pre)
+            .field("post", &self.post)
+            .field("fail", &self.fail)
+            .finish()
+    }
+}
+
 impl Hooks {
     // Initialize pre, post, and fail hooks for this command.
     // May raise FallbackToPython error if Python hooks are configured.
@@ -110,13 +120,12 @@ impl Hooks {
         // we need to either fall back to Python, or warn that we aren't running the
         // hooks.
         if !python_names.is_empty() {
-            if CAN_FALLBACK_TO_PYTHON.iter().any(|c| *c == command) {
+            if CAN_FALLBACK_TO_PYTHON.contains(&command) {
                 fallback!("python hooks");
             } else {
                 let _ = writeln!(
                     self.io.error(),
-                    "WARNING: not running python hooks {:?}",
-                    python_names
+                    "WARNING: not running python hooks {python_names:?}"
                 );
             }
         }

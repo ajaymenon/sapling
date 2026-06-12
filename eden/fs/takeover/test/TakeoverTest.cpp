@@ -69,19 +69,23 @@ Future<TakeoverData> takeoverViaEventBase(
     EventBase* evb,
     AbsolutePathPiece socketPath,
     const std::set<int32_t>& supportedVersions,
-    const uint64_t supportedCapabilities) {
+    const uint64_t supportedCapabilities,
+    bool shouldThrowDuringTakeover = false,
+    bool shouldPing = true) {
   Promise<TakeoverData> promise;
   auto future = promise.getFuture();
   std::thread thread([path = AbsolutePath{socketPath},
-                      supportedVersions,
-                      supportedCapabilities,
+                      supportedVersions = supportedVersions,
+                      supportedCapabilities = supportedCapabilities,
+                      shouldThrowDuringTakeover = shouldThrowDuringTakeover,
+                      shouldPing = shouldPing,
                       promise = std::move(promise)]() mutable {
     promise.setWith([&] {
       return takeoverMounts(
           path,
           /*takeoverReceiveTimeout*/ std::chrono::seconds(150),
-          /*shouldThrowDuringTakeover=*/false,
-          /*shouldPing=*/true,
+          shouldThrowDuringTakeover,
+          shouldPing,
           supportedVersions,
           supportedCapabilities);
     });
@@ -160,7 +164,7 @@ folly::Try<TakeoverData> runTakeover(
     // This should generally only happen if we timed out.
     throw std::runtime_error("future is not ready");
   }
-  return std::move(future.result());
+  return std::move(future).result();
 }
 
 void checkExpectedFile(int fd, AbsolutePathPiece path) {
@@ -650,6 +654,119 @@ TEST(Takeover, error) {
       result.value(),
       std::runtime_error,
       "logic_error: purposely failing for testing");
+}
+
+TEST(Takeover, sendFailureReturnsTakeoverDataForRecovery) {
+  // The server intentionally sends takeover data to a client that has already
+  // disconnected. Ignore SIGPIPE so the failed send is surfaced as a normal
+  // socket error that the test can assert on, rather than terminating the
+  // process.
+  signal(SIGPIPE, SIG_IGN);
+
+  TemporaryDirectory tmpDir("eden_takeover_test");
+  AbsolutePath tmpDirPath = canonicalPath(tmpDir.path().string());
+  AbsolutePath socketPath = tmpDirPath + "takeover"_pc;
+
+  EventBase evb;
+  FaultInjector faultInjector{/*enabled=*/true};
+  // Pause the server after it sends the readiness ping so the client can reply
+  // and then exit before takeover data transfer begins.
+  faultInjector.injectBlock("takeover", "ping_receive");
+
+  // Build a minimal takeover payload with the FDs the old daemon would need in
+  // order to recover if the handoff fails.
+  TakeoverData serverData;
+
+  auto lockFilePath = tmpDirPath + "lock"_pc;
+  serverData.lockFile = folly::File{lockFilePath.view(), O_RDWR | O_CREAT};
+
+  auto thriftSocketPath = tmpDirPath + "thrift"_pc;
+  serverData.thriftSocket =
+      folly::File{thriftSocketPath.view(), O_RDWR | O_CREAT};
+
+  auto mountdSocketPath = tmpDirPath + "mountd"_pc;
+  serverData.mountdServerSocket =
+      folly::File{mountdSocketPath.view(), O_RDWR | O_CREAT};
+
+  auto mountPath =
+      tmpDirPath + RelativePathPiece{folly::to<string>("mounts/foo/test")};
+  auto clientPath = tmpDirPath + RelativePathPiece{folly::to<string>("client")};
+  auto fusePath = tmpDirPath + PathComponentPiece{folly::to<string>("fuse")};
+  serverData.mountPoints.emplace_back(
+      mountPath,
+      clientPath,
+      FuseChannelData{
+          folly::File{fusePath.view(), O_RDWR | O_CREAT}, fuse_init_out{}},
+      SerializedInodeMap{});
+
+  auto serverSendFuture = serverData.takeoverComplete.getFuture();
+  TestHandler handler{std::move(serverData)};
+  TakeoverServer server(
+      &evb,
+      socketPath,
+      &handler,
+      &faultInjector,
+      kSupportedTakeoverVersions,
+      kSupportedCapabilities);
+
+  // Have the new process reply to the readiness ping and then fail before it
+  // starts receiving takeover data.
+  auto clientFuture = takeoverViaEventBase(
+                          &evb,
+                          socketPath,
+                          kSupportedTakeoverVersions,
+                          kSupportedCapabilities,
+                          /*shouldThrowDuringTakeover=*/true)
+                          .ensure([&] { evb.terminateLoopSoon(); });
+  loopWithTimeout(&evb);
+  // The client-side failure should have completed before we inspect it.
+  ASSERT_TRUE(clientFuture.isReady());
+
+  EXPECT_THROW_RE(
+      std::move(clientFuture).get(),
+      std::runtime_error,
+      "simulated takeover error");
+
+  // Wait until the server is blocked at the injected pause before letting it
+  // continue into the send path.
+  ASSERT_TRUE(faultInjector.waitUntilBlocked("takeover", 1s));
+
+  faultInjector.removeFault("takeover", "ping_receive");
+  faultInjector.unblock("takeover", "ping_receive");
+
+  // Now the old daemon attempts to send takeover data to a client that has
+  // already gone away.  takeoverComplete should return the original
+  // TakeoverData for recovery rather than surfacing the send error.
+  auto serverResultFuture = std::move(serverSendFuture).via(&evb).ensure([&] {
+    evb.terminateLoopSoon();
+  });
+  loopWithTimeout(&evb);
+  // The event loop should only exit once the server has resolved
+  // takeoverComplete with its recovery result.
+  ASSERT_TRUE(serverResultFuture.isReady());
+
+  auto serverResult = std::move(serverResultFuture).getTry();
+  ASSERT_TRUE(serverResult.hasValue());
+  ASSERT_TRUE(serverResult->has_value());
+
+  auto recoveryData = std::move(serverResult).value().value();
+  // Check that the old daemon got back the metadata it needs to rebuild the
+  // mount and that the serialized mount list itself is intact.
+  ASSERT_TRUE(recoveryData.mountdServerSocket.has_value());
+  ASSERT_EQ(recoveryData.mountPoints.size(), 1);
+  EXPECT_EQ(recoveryData.mountPoints[0].mountPath, mountPath);
+  EXPECT_EQ(recoveryData.mountPoints[0].stateDirectory, clientPath);
+
+  // The recovery payload must also preserve the original FDs rather than
+  // leaving them moved into the failed send attempt.
+  checkExpectedFile(recoveryData.lockFile.fd(), lockFilePath);
+  checkExpectedFile(recoveryData.thriftSocket.fd(), thriftSocketPath);
+  checkExpectedFile(recoveryData.mountdServerSocket->fd(), mountdSocketPath);
+
+  auto* fuseData =
+      std::get_if<FuseChannelData>(&recoveryData.mountPoints[0].channelInfo);
+  ASSERT_NE(fuseData, nullptr);
+  checkExpectedFile(fuseData->fd.fd(), fusePath);
 }
 
 TEST(Takeover, computeCompatibleVersion) {

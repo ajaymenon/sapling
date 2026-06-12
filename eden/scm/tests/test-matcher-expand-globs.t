@@ -4,6 +4,6 @@ We only expand globs on Windows.
 
   $ newclientrepo
   $ touch foo foo2 bar
-  $ hg st 'foo*'
+  $ sl st 'foo*'
   ? foo
   ? foo2

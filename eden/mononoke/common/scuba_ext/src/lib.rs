@@ -21,11 +21,9 @@ use futures_stats::StreamStats;
 use futures_stats::TryStreamStats;
 use memory::MemoryStats;
 use metadata::Metadata;
-use nonzero_ext::nonzero;
 use observability::ObservabilityContext;
 use observability::ScubaLoggingDecisionFields;
 pub use observability::ScubaVerbosityLevel;
-use permission_checker::MononokeIdentitySetExt;
 pub use sampling::Sampling;
 #[cfg(fbcode_build)]
 pub use schematized_logging::CommonMetadata;
@@ -146,6 +144,19 @@ impl MononokeScubaSampleBuilder {
             consistent_hashing: Option<&'a str>,
         }
 
+        let path_acls_switches = vec![
+            "hg_manifest_write",
+            "hg_tree_context_new_check_exists",
+            "hg_tree_context_new_check_exists",
+            "changeset_path_context_new",
+            "changeset_path_content_context_new",
+            "changeset_path_history_context_new",
+            "hg_augmented_manifest_write",
+            "hg_augmented_tree_context_new_check_exists",
+            "fsnodes_write",
+            "fsnodes_new_check_exists",
+        ];
+
         // Add all the JKs (with their switches) that are hashed consistently
         // against client correlator, so all Scuba logs can be split by
         // feature being enabled or disabled.
@@ -175,13 +186,18 @@ impl MononokeScubaSampleBuilder {
                 consistent_hashing: Some(client_info.correlator.as_str()),
             },
             ExperimentJKData {
-                jk_name: "scm/mononoke:disable_bonsai_mapping_read_fallback_to_primary",
-                switch_values: vec!["git"],
+                jk_name: "scm/mononoke:remote_diff",
+                switch_values: vec!["instagram-server", "www", "fbsource"],
                 consistent_hashing: Some(client_info.correlator.as_str()),
             },
             ExperimentJKData {
-                jk_name: "scm/mononoke:remote_diff",
-                switch_values: vec!["instagram-server", "www", "fbcode"],
+                jk_name: "scm/mononoke:remote_diff_unary",
+                switch_values: vec!["instagram-server", "www", "fbsource"],
+                consistent_hashing: Some(client_info.correlator.as_str()),
+            },
+            ExperimentJKData {
+                jk_name: "scm/mononoke:remote_commit_compare",
+                switch_values: vec!["instagram-server", "www", "fbsource"],
                 consistent_hashing: Some(client_info.correlator.as_str()),
             },
             ExperimentJKData {
@@ -195,18 +211,13 @@ impl MononokeScubaSampleBuilder {
             },
             ExperimentJKData {
                 jk_name: "scm/mononoke:enabled_restricted_paths_access_logging",
-                switch_values: vec![
-                    "hg_manifest_write",
-                    "hg_tree_context_new_check_exists",
-                    "changeset_path_context_new",
-                    "changeset_path_content_context_new",
-                    "changeset_path_history_context_new",
-                    "hg_augmented_manifest_write",
-                    "hg_augmented_tree_context_new_check_exists",
-                    "fsnodes_write",
-                    "fsnodes_new_check_exists",
-                ],
+                switch_values: path_acls_switches,
                 consistent_hashing: Some(client_info.correlator.as_str()),
+            },
+            ExperimentJKData {
+                jk_name: "scm/mononoke:use_restricted_paths_for_augmented_tree_acl_metadata",
+                switch_values: vec!["xrepo_test_small", "notes", "fbsource"],
+                consistent_hashing: None,
             },
             ExperimentJKData {
                 jk_name: "scm/mononoke:rendezvous_bonsai_git_mapping",
@@ -235,8 +246,7 @@ impl MononokeScubaSampleBuilder {
                         .chain(vec![(None)])
                         .filter_map(move |opt_switch| {
                             let enabled =
-                                justknobs::eval(jk_name, consistent_hashing, opt_switch.clone())
-                                    .unwrap_or(false);
+                                justknobs::eval(jk_name, consistent_hashing, opt_switch.clone());
                             // If it's enabled, log either the JK name (no switch)
                             // or `<JK>::<switch>`
                             enabled.then(|| {
@@ -285,9 +295,13 @@ impl MononokeScubaSampleBuilder {
                 .collect::<Vec<_>>(),
         );
 
-        self.inner.add_opt(
-            "client_identity_variant",
-            metadata.identities().first().map(|i| i.variant()),
+        self.inner.add(
+            "client_identities_typed",
+            metadata
+                .identities()
+                .iter()
+                .map(|i| i.to_typed_string())
+                .collect::<Vec<_>>(),
         );
 
         if let Some(client_hostname) = metadata.client_hostname() {
@@ -322,6 +336,8 @@ impl MononokeScubaSampleBuilder {
             .add_opt("client_atlas", metadata.clientinfo_atlas());
         self.inner
             .add_opt("client_atlas_env_id", metadata.clientinfo_atlas_env_id());
+        self.inner
+            .add_opt("client_atlas_rl", metadata.clientinfo_atlas_rl());
 
         self.inner.add_opt("fetch_cause", metadata.fetch_cause());
         self.inner.add(
@@ -343,15 +359,6 @@ impl MononokeScubaSampleBuilder {
         self.inner
             .add("fetch_from_cas_attempted", fetch_from_cas_attempted);
         self
-    }
-
-    pub fn sample_for_identities(&mut self, identities: &impl MononokeIdentitySetExt) {
-        // Details of quicksand traffic aren't particularly interesting because all Quicksand tasks are
-        // doing effectively the same thing at the same time. If we need real-time debugging, we can
-        // always rely on updating the verbosity in real time.
-        if identities.is_quicksand() {
-            self.sampled_unless_verbose(nonzero!(100u64));
-        }
     }
 
     pub fn log_with_msg<S: Into<Option<String>>>(&mut self, log_tag: &str, msg: S) {

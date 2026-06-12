@@ -7,9 +7,12 @@
 
 #include "eden/fs/inodes/GlobNode.h"
 #include <eden/fs/inodes/InodePtrFwd.h>
+#include <folly/coro/Invoke.h>
 #include <iomanip>
 #include <iostream>
+#include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/TreeInode.h"
+#include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/telemetry/TaskTrace.h"
 
 using folly::StringPiece;
@@ -36,8 +39,8 @@ struct TreeInodePtrRoot {
   explicit TreeInodePtrRoot(TreeInodePtr root) : root(std::move(root)) {}
 
   /** Return an object that holds a lock over the children */
-  folly::Synchronized<TreeInodeState>::RLockedPtr lockContents() {
-    return root->getContents().rlock();
+  folly::Synchronized<TreeInodeState>::ConstLockedPtr lockContents() {
+    return root->lockContentsRead();
   }
 
   /** Given the return value from lockContents and a name,
@@ -59,7 +62,8 @@ struct TreeInodePtrRoot {
    * The returned iterator yields ENTRY elements that can be
    * used with the entryXXX methods below. */
   const DirContents& iterate(
-      const folly::Synchronized<TreeInodeState>::RLockedPtr& contents) const {
+      const folly::Synchronized<TreeInodeState>::ConstLockedPtr& contents)
+      const {
     return contents->entries;
   }
 
@@ -68,6 +72,12 @@ struct TreeInodePtrRoot {
       PathComponentPiece name,
       const ObjectFetchContextPtr& context) {
     return root->getOrLoadChildTree(name, context);
+  }
+
+  folly::coro::now_task<TreeInodePtr> co_getOrLoadChildTree(
+      PathComponentPiece name,
+      const ObjectFetchContextPtr& context) {
+    co_return co_await root->co_getOrLoadChildTree(name, context);
   }
   /** Returns true if we should call getOrLoadChildTree() for the given
    * ENTRY.  We only do this if the child is already materialized */
@@ -78,6 +88,11 @@ struct TreeInodePtrRoot {
   /** Returns true if the given entry is a tree */
   bool entryIsTree(const DirEntry* entry) {
     return entry->isDirectory();
+  }
+
+  /** Returns true if the given entry is restricted */
+  bool entryIsRestricted(const DirEntry* entry) {
+    return entry->isRestricted();
   }
 
   /** Returns true if we should prefetch the blob content for the entry.
@@ -106,6 +121,24 @@ ImmediateFuture<folly::Unit> GlobNode::evaluate(
              originRootId)
       // Make sure the store stays alive for the duration of globbing.
       .ensure([store] {});
+}
+
+folly::coro::now_task<folly::Unit> GlobNode::co_evaluate(
+    std::shared_ptr<ObjectStore> store,
+    const ObjectFetchContextPtr& context,
+    RelativePathPiece rootPath,
+    TreeInodePtr root,
+    PrefetchList* fileBlobsToPrefetch,
+    ResultList* globResult,
+    const RootId& originRootId) const {
+  co_return co_await co_evaluateImpl<TreeInodePtrRoot, TreeInodePtr>(
+      store.get(),
+      context,
+      rootPath,
+      TreeInodePtrRoot(std::move(root)),
+      fileBlobsToPrefetch,
+      globResult,
+      originRootId);
 }
 
 } // namespace facebook::eden

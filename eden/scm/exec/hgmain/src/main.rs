@@ -23,7 +23,6 @@ use windows::disable_standard_handle_inheritability;
 #[cfg(windows)]
 use windows::is_edenfs_stopped;
 
-#[cfg_attr(fbcode_build, fbinit::main)]
 fn main() {
     // Meta's Python 3.12 version has the built-in lazy_imports feature,
     // which can be enabled with `PYTHONLAZYIMPORTSALL=1` env variable.
@@ -123,10 +122,6 @@ fn main() {
     #[cfg(windows)]
     windows::enable_vt_processing().unwrap();
 
-    // Disable potentially noisy C++ logs.
-    #[cfg(fbcode_build)]
-    cpp_log_spew::disable(fbinit::expect_init());
-
     configloader::hg::IS_SAPLING_BINARY.store(true, Ordering::Relaxed);
 
     let mut io = clidispatch::io::IO::stdio();
@@ -165,7 +160,7 @@ pub fn drop_root(user: &str, group: &str) {
     let cgroup = CString::new(group.as_bytes()).unwrap();
     let libc_group = unsafe { libc::getgrnam(cgroup.as_ptr()) };
     if libc_group.is_null() {
-        panic!("bad group '{}'", group);
+        panic!("bad group '{group}'");
     }
     if unsafe { libc::setgid((*libc_group).gr_gid) } != 0 {
         panic!(
@@ -178,7 +173,7 @@ pub fn drop_root(user: &str, group: &str) {
     let cuser = CString::new(user.as_bytes()).unwrap();
     let libc_user = unsafe { libc::getpwnam(cuser.as_ptr()) };
     if libc_user.is_null() {
-        panic!("bad user '{}'", user);
+        panic!("bad user '{user}'");
     }
     if unsafe { libc::setuid((*libc_user).pw_uid) } != 0 {
         panic!(
@@ -197,5 +192,5 @@ pub fn drop_root(user: &str, group: &str) {
     // TODO: Audit that the environment access only happens in single-threaded code.
     unsafe { std::env::set_var("USER", user) };
 
-    eprintln!("switched user/group to {}/{}", user, group);
+    eprintln!("switched user/group to {user}/{group}");
 }

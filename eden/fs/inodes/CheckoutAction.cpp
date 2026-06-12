@@ -253,6 +253,14 @@ ImmediateFuture<bool> CheckoutAction::hasConflict() {
 
     // TODO: check for permissions changes
 
+    const auto newRestricted = (newTree_ && newTree_->isRestricted()) ||
+        (newScmEntry_ && newScmEntry_->second.isRestricted());
+    if (!treeInode->isRestricted() && newRestricted &&
+        treeInode->isMaterialized()) {
+      ctx_->addConflict(ConflictType::MODIFIED_MODIFIED, inode_.get());
+      return true;
+    }
+
     // We don't check if this tree is unmodified from the old tree or not here.
     // We simply apply the checkout to the tree in this case, so that we report
     // conflicts for individual leaf inodes that were modified, and not for the
@@ -271,9 +279,7 @@ ImmediateFuture<bool> CheckoutAction::hasConflict() {
         ->isSameAs(
             oldScmEntry_.value().second.getObjectId(),
             oldBlobSha1_.value(),
-            filteredEntryType(
-                oldScmEntry_.value().second.getType(),
-                ctx_->getWindowsSymlinksEnabled()),
+            oldScmEntry_.value().second.getType(),
             ctx_->getFetchContext())
         .thenValue([self = shared_from_this()](bool isSame) {
           if (isSame) {
@@ -302,18 +308,10 @@ ImmediateFuture<bool> CheckoutAction::hasConflict() {
 
   auto localIsFile = inode_.asFilePtrOrNull() != nullptr;
   if (localIsFile) {
-    auto remoteIsFile = !newScmEntry_->second.isTree();
-    if (remoteIsFile) {
-      // This entry is a file that did not exist in the old source control tree,
-      // but it exists as a tracked file in the new tree.
-      ctx_->addConflict(ConflictType::UNTRACKED_ADDED, inode_.get());
-      return true;
-    } else {
-      // This entry is a file that did not exist in the old source control tree,
-      // but it exists as a tracked directory in the new tree.
-      ctx_->addConflict(ConflictType::MODIFIED_MODIFIED, inode_.get());
-      return true;
-    }
+    // This entry is a file that did not exist in the old source control tree,
+    // but it exists as a tracked file or directory in the new tree.
+    ctx_->addConflict(ConflictType::UNTRACKED_ADDED, inode_.get());
+    return true;
   } else {
     // This entry is a directory that did not exist in the old source control
     // tree. We must traverse the directory for UNTRACKED_ADDED and

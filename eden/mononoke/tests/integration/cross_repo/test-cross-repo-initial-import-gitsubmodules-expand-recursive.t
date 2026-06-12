@@ -17,6 +17,7 @@
 # one more time.
 
   $ export ENABLE_BOOKMARK_CACHE=1
+  $ export DISABLED_DERIVED_DATA="filenodes"
 
   $ . "${TEST_FIXTURES}/library.sh"
   $ . "${TEST_FIXTURES}/library-push-redirector.sh"
@@ -39,10 +40,11 @@ Run the x-repo with submodules setup
   heads/master_bookmark
 
 
-  $ QUIET_LOGGING_LOG_FILE="$TESTTMP/xrepo_sync_last_logs.out" wait_for_xrepo_sync 2
+  $ QUIET_LOGGING_LOG_FILE="$TESTTMP/xrepo_sync_last_logs.out" wait_for_xrepo_sync 2 "$SUBMODULE_REPO_ID"
 
   $ cd "$TESTTMP/$LARGE_REPO_NAME"
   $ wait_for_bookmark_move_away_edenapi large_repo master_bookmark $(hg whereami)
+  $ sync_mononoke_warm_bookmarks_cache
   $ hg pull -q
   $ hg co -q master_bookmark
 
@@ -247,6 +249,7 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
 -- Test backsyncing (i.e. large to small)
 
   $ cd "$TESTTMP/$LARGE_REPO_NAME" || exit
+  $ sync_mononoke_warm_bookmarks_cache
   $ hg pull -q && hg co -q master_bookmark
   $ hg status
   $ hg co -q .^ # go before the commit that corrupts submodules

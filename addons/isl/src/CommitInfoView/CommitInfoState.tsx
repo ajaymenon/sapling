@@ -8,13 +8,15 @@
 import type {Hash} from '../types';
 import type {CommitMessageFields} from './types';
 
+import {ErrorNotice} from 'isl-components/ErrorNotice';
 import {atom} from 'jotai';
+import {InternalFieldName} from 'shared/constants';
 import {firstLine} from 'shared/utils';
 import serverAPI from '../ClientToServerAPI';
 import {successionTracker} from '../SuccessionTracker';
 import {tracker} from '../analytics';
-import {latestCommitMessageFields} from '../codeReview/CodeReviewInfo';
-import {islDrawerState} from '../drawerState';
+import {effectiveSchemaForCommit, latestCommitMessageFields} from '../codeReview/CodeReviewInfo';
+import {expandCommitInfoView} from '../drawerState';
 import {atomFamilyWeak, localStorageBackedAtomFamily, readAtom, writeAtom} from '../jotaiUtils';
 import {AmendMessageOperation} from '../operations/AmendMessageOperation';
 import {AmendOperation, PartialAmendOperation} from '../operations/AmendOperation';
@@ -23,6 +25,7 @@ import {onOperationExited, queuedOperations, queuedOperationsErrorAtom} from '..
 import {dagWithPreviews} from '../previews';
 import {selectedCommitInfos, selectedCommits} from '../selection';
 import {latestHeadCommit} from '../serverAPIState';
+import {showToast} from '../toast';
 import {registerCleanup, registerDisposable} from '../utils';
 import {
   allFieldsBeingEdited,
@@ -30,12 +33,27 @@ import {
   applyEditedFields,
   commitMessageFieldsSchema,
   mergeCommitMessageFields,
+  mergeOnlyEmptyMessageFields,
   parseCommitMessageFields,
 } from './CommitMessageFields';
 
 export type EditedMessage = Partial<CommitMessageFields>;
 
 export type CommitInfoMode = 'commit' | 'amend';
+
+export function getCommitFieldAIRequestKey(
+  target: Hash | 'head',
+  field: InternalFieldName,
+): string {
+  return `${target}:${field}`;
+}
+
+export const commitFieldAIInFlight = atom(new Set<string>());
+registerCleanup(
+  commitFieldAIInFlight,
+  serverAPI.onSetup(() => writeAtom(commitFieldAIInFlight, new Set<string>())),
+  import.meta.hot,
+);
 
 export const commitMessageTemplate = atom<EditedMessage | undefined>(undefined);
 registerDisposable(
@@ -120,23 +138,75 @@ registerDisposable(
     const description = event.description;
     const mode = event.mode ?? 'commit'; // Default to 'commit' if not specified
     const hash = event.hash ?? readAtom(latestHeadCommit)?.hash ?? 'head';
+    // If a specific hash is provided, ensure the commit exists and select it
+    const commit = readAtom(dagWithPreviews).get(hash);
+    if (mode !== 'commit' && commit?.phase === 'public') {
+      showToast(
+        <ErrorNotice
+          title="Cannot update commit message"
+          error={
+            new Error(
+              `Commit ${hash} is a public commit and cannot be modified. Please select a draft commit or use commit mode instead.`,
+            )
+          }
+        />,
+        {durationMs: 8000},
+      );
+      return;
+    }
 
-    writeAtom(islDrawerState, val => ({...val, right: {...val.right, collapsed: false}}));
     const schema = readAtom(commitMessageFieldsSchema);
     const fields = parseCommitMessageFields(schema, title, description);
 
-    if (mode === 'commit') {
-      writeAtom(editedCommitMessages('head'), fields);
-    } else {
-      const currentMessage = readAtom(editedCommitMessages(hash));
-      writeAtom(
-        editedCommitMessages(hash),
-        mergeCommitMessageFields(schema, currentMessage as CommitMessageFields, fields),
+    const key = mode === 'commit' ? 'head' : hash;
+    const currentMessage = readAtom(editedCommitMessages(key));
+    // Non-empty fields replace existing values, empty fields preserve current values.
+    // By passing fields first, mergeOnlyEmptyMessageFields will prefer the new fields when non-empty.
+    writeAtom(
+      editedCommitMessages(key),
+      mergeOnlyEmptyMessageFields(schema, fields, currentMessage as CommitMessageFields),
+    );
+
+    if (event.preserveFocus !== true) {
+      expandCommitInfoView();
+      writeAtom(selectedCommits, new Set([hash]));
+      writeAtom(rawCommitMode, mode);
+    }
+  }),
+);
+
+registerDisposable(
+  serverAPI,
+  serverAPI.onMessageOfType('platform/commitFieldAIStatus', event => {
+    const requestKey = getCommitFieldAIRequestKey(event.target, event.field);
+    writeAtom(commitFieldAIInFlight, current => {
+      if (event.status === 'loading') {
+        return new Set(current).add(requestKey);
+      }
+      if (!current.has(requestKey)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.delete(requestKey);
+      return next;
+    });
+
+    if (event.status === 'error') {
+      showToast(
+        <ErrorNotice
+          title={
+            event.field === InternalFieldName.Summary
+              ? 'Failed to generate summary'
+              : 'Failed to recommend test plan'
+          }
+          error={new Error(event.error ?? 'Unknown error')}
+        />,
+        {
+          durationMs: 5000,
+          key: `commit-field-ai-error-${event.field}`,
+        },
       );
     }
-
-    writeAtom(selectedCommits, new Set([hash]));
-    writeAtom(rawCommitMode, mode);
   }),
 );
 
@@ -221,7 +291,7 @@ export const forceNextCommitToEditAllFields = atom<boolean>(false);
 export const unsavedFieldsBeingEdited = atomFamilyWeak((hashOrHead: Hash | 'head') => {
   return atom(get => {
     const edited = get(editedCommitMessages(hashOrHead));
-    const schema = get(commitMessageFieldsSchema);
+    const schema = get(effectiveSchemaForCommit(hashOrHead));
     if (hashOrHead === 'head') {
       return allFieldsBeingEdited(schema);
     }
@@ -236,7 +306,7 @@ export const hasUnsavedEditedCommitMessage = atomFamilyWeak((hashOrHead: Hash | 
       // Some fields are being edited, let's look more closely to see if anything is actually different.
       const edited = get(editedCommitMessages(hashOrHead));
       const latest = get(latestCommitMessageFields(hashOrHead));
-      const schema = get(commitMessageFieldsSchema);
+      const schema = get(effectiveSchemaForCommit(hashOrHead));
       return anyEditsMade(schema, latest, edited);
     }
     return false;
@@ -290,3 +360,54 @@ export const commitInfoViewCurrentCommits = atom(get => {
     return selected.length > 1 ? selected : [commit];
   }
 });
+
+/**
+ * Derived atom that reactively computes the parent commit context and parsed fields.
+ * Returns undefined if there is no eligible parent commit.
+ */
+export const parentCommitContextAtom = atom(get => {
+  const currentCommits = get(commitInfoViewCurrentCommits);
+  const mode = get(commitMode);
+  const commit = currentCommits?.length === 1 ? currentCommits[0] : undefined;
+  if (!commit) {
+    return undefined;
+  }
+  const isCommitMode = mode === 'commit';
+  const parentCommit = get(dagWithPreviews).get(isCommitMode ? commit.hash : commit.parents[0]);
+  if (!parentCommit || parentCommit.phase === 'public') {
+    return undefined;
+  }
+  const parentSchema = get(effectiveSchemaForCommit(parentCommit.hash));
+  const parentFields = parseCommitMessageFields(
+    parentSchema,
+    parentCommit.title,
+    parentCommit.description,
+  );
+  return {commit, isCommitMode, parentFields};
+});
+
+/**
+ * Copy a field's value from the parent commit into the current commit's edited message.
+ */
+export function copyFromParentCommit(fieldKey: string): void {
+  const ctx = readAtom(parentCommitContextAtom);
+  if (!ctx) {
+    return;
+  }
+  const {commit, isCommitMode, parentFields} = ctx;
+  const parentVal = parentFields[fieldKey];
+  if (!parentVal) {
+    return;
+  }
+
+  tracker.track('CopyCommitFieldsFromParent');
+  const hashOrHead = isCommitMode ? 'head' : commit.hash;
+  const schema = readAtom(effectiveSchemaForCommit(hashOrHead));
+  const field = schema.find(f => f.key === fieldKey);
+  const val = Array.isArray(parentVal) ? parentVal.join(',') : parentVal;
+  const newVal = field?.type === 'field' ? val + ',' : val;
+  writeAtom(editedCommitMessages(hashOrHead), prev => ({
+    ...prev,
+    [fieldKey]: field?.type === 'field' ? newVal.split(',') : newVal,
+  }));
+}

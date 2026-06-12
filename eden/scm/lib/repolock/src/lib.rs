@@ -337,7 +337,18 @@ fn lock(
 
     loop {
         match try_lock(dir, name, contents) {
-            Ok(h) => return Ok(h),
+            Ok(h) => {
+                let elapsed = start.elapsed();
+                if elapsed >= config.backoff {
+                    // If we actually waited, log how long we waited.
+                    hg_metrics::increment_counter(
+                        format!("lock_{name}"),
+                        elapsed.as_millis() as u64,
+                    );
+                }
+
+                return Ok(h);
+            }
             Err(err) => match err {
                 LockError::Contended(LockContendedError { ref contents, .. }) => {
                     // TODO: add user friendly debugging similar to Python locks.
@@ -677,7 +688,7 @@ mod tests {
             let _lock = locker.lock_store()?;
             match locker.lock_working_copy(wc_tmp.path().to_path_buf()) {
                 Err(LockError::OutOfOrder(_)) => {}
-                result => panic!("wlock should be required before lock: {:?}", result),
+                result => panic!("wlock should be required before lock: {result:?}"),
             };
         }
 

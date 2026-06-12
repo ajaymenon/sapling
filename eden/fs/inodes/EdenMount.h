@@ -12,7 +12,9 @@
 #include <folly/SharedMutex.h>
 #include <folly/Synchronized.h>
 #include <folly/ThreadLocal.h>
+#include <folly/concurrency/memory/AtomicReadMostlyMainPtr.h>
 #include <folly/concurrency/memory/ReadMostlySharedPtr.h>
+#include <folly/coro/safe/NowTask.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
 #include <folly/futures/SharedPromise.h>
@@ -35,6 +37,7 @@
 #include "eden/fs/inodes/CacheHint.h"
 #include "eden/fs/inodes/FsChannel.h"
 #include "eden/fs/inodes/InodeNumber.h"
+#include "eden/fs/inodes/InodePressurePolicy.h"
 #include "eden/fs/inodes/InodePtrFwd.h"
 #include "eden/fs/inodes/InodeTimestamps.h"
 #include "eden/fs/inodes/Overlay.h"
@@ -516,7 +519,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * Wait for all inflight notifications to complete.
    *
    * On Windows, inflight notifications are processed asynchronously and thus
-   * the on-disk state of the the repository may differ from the inode state.
+   * the on-disk state of the repository may differ from the inode state.
    * This ensures that all pending notifications have completed.
    *
    * On macOS and Linux, this immediately return.
@@ -524,6 +527,8 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * This can be called from any thread/executor.
    */
   ImmediateFuture<folly::Unit> waitForPendingWrites() const;
+
+  folly::coro::now_task<folly::Unit> co_waitForPendingWrites() const;
 
   /**
    * Test if the working copy persist on disk after this mount will be
@@ -640,6 +645,21 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
 
   folly::ReadMostlySharedPtr<const EdenConfig> getEdenConfig() const;
 
+  /**
+   * Get the current InodePressurePolicy. Lock-free read.
+   * The policy is rebuilt by updateInodePressurePolicy(), called
+   * from the periodic config reload task.
+   */
+  folly::ReadMostlySharedPtr<const InodePressurePolicy> getInodePressurePolicy()
+      const {
+    return cachedPressurePolicy_.load();
+  }
+
+  /**
+   * Rebuild the InodePressurePolicy from the current EdenConfig.
+   */
+  void updateInodePressurePolicy();
+
   const CheckoutConfig* getCheckoutConfig() const {
     return checkoutConfig_.get();
   }
@@ -675,7 +695,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   /**
    * Get the TreeInode for the root of the mount.
    *
-   * This may race with the mount being tore down and the InodeMap being
+   * This may race with the mount being torn down and the InodeMap being
    * destroyed, it is therefore unsafe to call this unless guaranteed that
    * another reference was acquired under the EdenServer::mountPoints_ lock.
    *
@@ -757,6 +777,10 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       RelativePathPiece path,
       const ObjectFetchContextPtr& context) const;
 
+  folly::coro::now_task<InodePtr> co_getInodeSlow(
+      RelativePathPiece path,
+      const ObjectFetchContextPtr& context) const;
+
   /**
    * Look up the Inode, Tree, or TreeEntry for the specified path.
    *
@@ -776,6 +800,10 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       RelativePathPiece path,
       const ObjectFetchContextPtr& context) const;
 
+  folly::coro::now_task<VirtualInode> co_getVirtualInode(
+      RelativePathPiece path,
+      const ObjectFetchContextPtr& context) const;
+
   /**
    * Check out the specified commit.
    *
@@ -789,6 +817,23 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       folly::StringPiece thriftMethodCaller,
       CheckoutMode checkoutMode = CheckoutMode::NORMAL);
 
+ private:
+  struct CheckoutInProgressGuard;
+  struct CheckoutSetup;
+
+  /**
+   * Validate parent state, mark `CheckoutInProgress`, build the
+   * `CheckoutContext`, and return the prepared state.
+   * The parent-state lock is held only while validating and updating
+   * `parentState_`.
+   */
+  folly::Try<CheckoutSetup> beginCheckout(
+      const RootId& snapshotId,
+      const ObjectFetchContextPtr& fetchContext,
+      folly::StringPiece thriftMethodCaller,
+      CheckoutMode checkoutMode);
+
+ public:
   /**
    * Chown the repository to the given uid and gid
    */
@@ -818,6 +863,14 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    *     make sure callers do not forget to wait for the operation to complete.
    */
   [[nodiscard]] ImmediateFuture<std::unique_ptr<ScmStatus>> diff(
+      TreeInodePtr rootInode,
+      const RootId& commitId,
+      folly::CancellationToken cancellation,
+      const ObjectFetchContextPtr& fetchContext,
+      bool listIgnored = false,
+      bool enforceCurrentParent = true);
+
+  [[nodiscard]] folly::coro::now_task<std::unique_ptr<ScmStatus>> co_diff(
       TreeInodePtr rootInode,
       const RootId& commitId,
       folly::CancellationToken cancellation,
@@ -924,14 +977,15 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * Take over a FUSE channel for an existing mount point.
    *
    * This spins up worker threads to service the existing FUSE channel and
-   * returns immediately, or throws an exception on error.
+   * returns a Future that completes once the channel is ready to service
+   * requests, or as soon as startup fails.
    *
    * If unmount() is called before takeoverFuse() is called, then takeoverFuse()
    * throws an EdenMountCancelled exception.
    *
    * throws a runtime_error if fuse is not supported on this platform.
    */
-  void takeoverFuse(FuseChannelData takeoverData);
+  folly::Future<folly::Unit> takeoverFuse(FuseChannelData takeoverData);
 
   /**
    * Takeover an NFSd3 channel for an existing mount point.
@@ -1156,6 +1210,12 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   friend class RenameLock;
   friend class SharedRenameLock;
   class JournalDiffCallback;
+
+  /**
+   * Convert a FsChannelPtr (unique_ptr with FsChannelDeleter) to a
+   * shared_ptr and store it in channel_.
+   */
+  void setChannel(FsChannelPtr channel);
 
   /**
    * Attempt to transition from expected -> newState.
@@ -1470,7 +1530,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   std::shared_ptr<TraceBus<InodeTraceEvent>> inodeTraceBus_;
   TraceSubscriptionHandle<InodeTraceEvent> inodeTraceHandle_;
 
-  FsChannelPtr channel_;
+  folly::AtomicReadMostlyMainPtr<FsChannel> channel_;
 
   /**
    * The clock.  This is also available as serverState_->getClock().
@@ -1480,6 +1540,12 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   std::shared_ptr<Clock> clock_;
 
   mutable folly::Synchronized<std::shared_ptr<ScmStatusCache>> scmStatusCache_;
+
+  /**
+   * Cached InodePressurePolicy, rebuilt by updateInodePressurePolicy().
+   */
+  folly::AtomicReadMostlyMainPtr<const InodePressurePolicy>
+      cachedPressurePolicy_;
 };
 
 /**

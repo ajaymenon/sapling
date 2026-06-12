@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
+use commit_derived_data_mapping::CommitDerivedDataMapping;
 use commit_graph::CommitGraph;
 use context::CoreContext;
 use derived_data_remote::DerivationClient;
@@ -21,7 +22,7 @@ use metaconfig_types::RepoConfig;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
 use repo_blobstore::RepoBlobstore;
-use restricted_paths::ArcRestrictedPaths;
+use restricted_paths_common::config_based::ArcRestrictedPathsConfigBased;
 use scuba_ext::MononokeScubaSampleBuilder;
 
 use crate::DerivationContext;
@@ -97,8 +98,23 @@ impl DerivedDataManager {
         config_name: String,
         config: DerivedDataTypesConfig,
         derivation_service_client: Option<Arc<dyn DerivationClient>>,
-        restricted_paths: ArcRestrictedPaths,
+        restricted_paths: ArcRestrictedPathsConfigBased,
+        commit_derived_data_mapping: Arc<CommitDerivedDataMapping>,
     ) -> Self {
+        let derivation_context = DerivationContext::new(
+            bonsai_hg_mapping,
+            bonsai_git_mapping,
+            filenodes,
+            repo_id,
+            repo_name.clone(),
+            config_name,
+            config,
+            repo_blobstore.boxed(),
+            filestore_config,
+            restricted_paths,
+            repo_config.derived_data_config.pipeline_config.clone(),
+            commit_derived_data_mapping,
+        );
         DerivedDataManager {
             inner: Arc::new(DerivedDataManagerInner {
                 repo_id,
@@ -110,16 +126,7 @@ impl DerivedDataManager {
                 scuba,
                 secondary: None,
                 derivation_service_client,
-                derivation_context: DerivationContext::new(
-                    bonsai_hg_mapping,
-                    bonsai_git_mapping,
-                    filenodes,
-                    config_name,
-                    config,
-                    repo_blobstore.boxed(),
-                    filestore_config,
-                    restricted_paths,
-                ),
+                derivation_context,
             }),
         }
     }

@@ -113,6 +113,8 @@ class EdenFSNotificationsClient extends EventEmitter {
         }
       } catch (e) {
         // Swallow and retry with backoff
+        // Emit a debugging msg
+        this.emit('debug', `Waiting for EdenFS to become ready: ${e.message}`);
       }
 
       // Exponential backoff (capped)
@@ -275,6 +277,7 @@ class EdenFSNotificationsClient extends EventEmitter {
    * @param {string[]} options.includedSuffixes - Included suffixes in output
    * @param {string[]} options.excludedSuffixes - Excluded suffixes in output
    * @param {string[]} options.deferredStates - States to wait for deassertion
+   * @param {boolean} options.unpackCommitTransitions - Unpack commit transitions into individual file changes
    * @param {CommandCallback} callback
    * @returns {EdenFSSubscription} Subscription object
    */
@@ -432,6 +435,10 @@ class EdenFSSubscription extends EventEmitter {
       this.options.deferredStates.forEach(state => {
         args.push('--deferred-states', state);
       });
+    }
+
+    if (this.options.unpackCommitTransitions) {
+      args.push('--unpack-commit-transitions');
     }
 
     if (mountPoint) {
@@ -594,6 +601,26 @@ class EdenFSUtils {
     });
 
     return paths;
+  }
+
+  /**
+   * Get file type from a SmallChange object
+   * @param {SmallChange} smallChange - SmallChange object
+   * @returns {string} File type string
+   */
+  static getFileType(smallChange) {
+    if (smallChange.Added) {
+      return smallChange.Added.file_type;
+    } else if (smallChange.Modified) {
+      return smallChange.Modified.file_type;
+    } else if (smallChange.Removed) {
+      return smallChange.Removed.file_type;
+    } else if (smallChange.Renamed) {
+      return smallChange.Renamed.file_type;
+    } else if (smallChange.Replaced) {
+      return smallChange.Replaced.file_type;
+    }
+    return 'Unknown';
   }
 
   /**

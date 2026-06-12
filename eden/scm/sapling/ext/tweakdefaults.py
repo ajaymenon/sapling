@@ -276,6 +276,14 @@ def pull(orig, ui, repo, *args, **opts):
         # Not using main bookmark for non-rebase pull. See D38066104 and D38066103.
         dest = bookmarks.mainbookmark(repo)
         if dest not in repo:
+            # mainbookmark() returns the first selectivepulldefault entry, which
+            # may not exist (e.g. config lists "main,master" but only "master"
+            # exists). Try each configured name before giving up.
+            for name in repo.ui.configlist("remotenames", "selectivepulldefault"):
+                if name in repo:
+                    dest = name
+                    break
+        if dest not in repo:
             raise error.Abort(_("missing rebase destination - supply --dest / -d"))
 
     if isrebase and update:
@@ -318,6 +326,11 @@ def pull(orig, ui, repo, *args, **opts):
     # NB: we use rebase and not isrebase on the next line because
     # remotenames may have already handled the rebase.
     if dest and rebase:
+        # Mark landed commits before rebase so it can skip them.
+        # The post-pull and pre-rebase hooks don't help here because
+        # post-pull fires after the entire pull command (including
+        # rebase), and pre-rebase only fires for dispatched commands.
+        _marklanded(ui, repo)
         ret = ret or rebaseorfastforward(
             rebasemodule.rebase, ui, repo, dest=dest, tool=tool
         )
@@ -325,6 +338,15 @@ def pull(orig, ui, repo, *args, **opts):
         ret = ret or commands.update(ui, repo, node=dest)
 
     return ret
+
+
+def _marklanded(ui, repo):
+    """Call debugmarklanded to mark landed commits before rebase."""
+    try:
+        fbcodereview = extensions.find("fbcodereview")
+        fbcodereview._cleanuplanded(repo)
+    except KeyError:
+        pass
 
 
 def rebaseorfastforward(orig, ui, repo, dest, **args):

@@ -16,24 +16,14 @@ import contextlib
 import errno
 import os
 import queue as queuemod
-import re
 import shutil
 import stat
 import tempfile
 import threading
 import typing
-from typing import (
-    Any,
-    BinaryIO,
-    Callable,
-    IO,
-    Iterable,
-    Iterator,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import Any, BinaryIO, Callable, IO, Iterator, List, Optional, Tuple, Union
+
+import bindings
 
 from . import error, pathutil, util
 from .i18n import _
@@ -272,10 +262,6 @@ class abstractvfs(abc.ABC):
         target = os.readlink(self.join(path))
         return target.replace("\\", "/") if os.name == "nt" else target
 
-    def removedirs(self, path: "Optional[str]" = None) -> None:
-        """Remove a leaf directory and all empty intermediate ones"""
-        return util.removedirs(self.join(path))
-
     def rmtree(
         self,
         path: "Optional[str]" = None,
@@ -304,6 +290,9 @@ class abstractvfs(abc.ABC):
             self.join(path), ignore_errors=ignore_errors, onerror=onerror
         )
 
+    def rmdir(self, path: "Optional[str]" = None) -> None:
+        return os.rmdir(self.join(path))
+
     def setflags(self, path: str, l: bool, x: bool) -> None:
         return util.setflags(self.join(path), l, x)
 
@@ -321,28 +310,6 @@ class abstractvfs(abc.ABC):
         self, path: "Optional[str]" = None, ignoremissing: bool = False
     ) -> None:
         return util.unlinkpath(self.join(path), ignoremissing=ignoremissing)
-
-    def utime(self, path=None, t=None):
-        return os.utime(self.join(path), t)
-
-    def walk(
-        self,
-        path: "Optional[str]" = None,
-        onerror: "Optional[Callable[[OSError], None]]" = None,
-    ) -> "Iterable[Tuple[str, List[str], List[str]]]":
-        """Yield (dirpath, dirs, files) tuple for each directories under path
-
-        ``dirpath`` is relative one from the root of this vfs. This
-        uses ``/`` as path separator.
-
-        "The root of this vfs" is represented as empty ``dirpath``.
-        """
-        root = os.path.normpath(self.join(None))
-        # when dirpath == root, dirpath[prefixlen:] becomes empty
-        # because len(dirpath) < prefixlen.
-        prefixlen = len(pathutil.normasprefix(root))
-        for dirpath, dirs, files in os.walk(self.join(path), onerror=onerror):
-            yield (util.pconvert(dirpath[prefixlen:]), dirs, files)
 
     @contextlib.contextmanager
     def backgroundclosing(
@@ -403,6 +370,10 @@ class vfs(abstractvfs):
             base = os.path.realpath(base)
         self.base = base
         self._audit = audit
+        # self.audit can be patched by localrepo to devel-warn locking issues.
+        # merge.py calls wvfs.audit.check (implicitly requires audit=True)
+        # rustvfs operations will audit paths, we might replace self.audit to
+        # something lighter weight.
         if audit:
             self.audit = pathutil.pathauditor(self.base, cached=cacheaudited)
         else:
@@ -413,18 +384,182 @@ class vfs(abstractvfs):
 
     @util.propertycache
     def _cansymlink(self) -> bool:
-        if self._disablesymlinks:
-            return False
-        return util.checklink(self.base)
+        return self._rustvfs.supports_symlinks()
 
     @util.propertycache
-    def _chmod(self) -> bool:
-        return util.checkexec(self.base)
+    def _rustvfs(self):
+        # This will raise if self.base does not exist
+        vfs = bindings.io.vfs(self.base, destructive=True)
+        if self._disablesymlinks:
+            vfs.set_supports_symlinks(False)
+        return vfs
 
-    def _fixfilemode(self, name: str) -> None:
-        if self.createmode is None or not self._chmod:
+    @util.propertycache
+    def _rustvfs_mkdir(self):
+        # Unlike _rustvfs, create self.base directory on demand.
+        util.makedirs(self.base, self.createmode)
+        return self._rustvfs
+
+    def _rustpath(self, path: "Optional[str]") -> str:
+        if not path:
+            # bindings vfs does not take None.
+            return ""
+        if os.path.isabs(path):
+            # Compatibility with older Python vfs callers that pass self.join(path).
+            # Rust VFS operates on root-relative RepoPath values, so convert full
+            # paths back to relative paths. Rust still validates and rejects paths
+            # that escape the root, such as "../outside".
+            originalpath = path
+            try:
+                path = os.path.relpath(path, self.base)
+            except ValueError:
+                raise error.ProgrammingError(
+                    "vfs path must be on the same drive with vfs, path: %s; vfs: %s"
+                    % (originalpath, self.base)
+                )
+
+        if path == os.curdir:
+            # bindings vfs prefers '' to '.'.
+            return ""
+
+        # Additional verifications like Windows path separator, etc.
+        # still happen in the lower Rust layer.
+        return path
+
+    def _rustcreatemode(self) -> int:
+        # Compatibility with pre-Rust-vfs logic. _fixfilemode used 0o666.
+        if self.createmode is None:
+            return 0o666
+        return typing.cast(int, self.createmode) & 0o666
+
+    def makedir(self, path: "Optional[str]" = None, notindexed: bool = True) -> None:
+        # notindexed is a legacy Windows indexing hint with few remaining
+        # callers. The Rust no-follow VFS intentionally ignores it.
+        return self.mkdir(path)
+
+    def makedirs(
+        self, path: "Optional[str]" = None, mode: "Optional[int]" = None
+    ) -> None:
+        if not path:
+            return util.makedirs(self.base, mode)
+        self._rustvfs_mkdir.makedirs(self._rustpath(path), mode=mode)
+
+    def mkdir(self, path: "Optional[str]" = None) -> None:
+        if not path:
+            return os.mkdir(self.base)
+        self._rustvfs_mkdir.mkdir(self._rustpath(path))
+
+    def chmod(self, path: str, mode: int) -> None:
+        self._rustvfs.set_permissions(self._rustpath(path), mode)
+
+    def exists(self, path: "Optional[str]" = None) -> bool:
+        """Return whether path exists, using no-follow lstat-style semantics.
+
+        With Rust VFS, exists() and lexists() are intentionally equivalent.
+        """
+        return self.lexists(path)
+
+    def isdir(self, path: "Optional[str]" = None) -> bool:
+        try:
+            return self.lstat(path).is_dir()
+        except OSError:
+            return False
+
+    def isfile(self, path: "Optional[str]" = None) -> bool:
+        try:
+            return self.lstat(path).is_file()
+        except OSError:
+            return False
+
+    def islink(self, path: "Optional[str]" = None) -> bool:
+        try:
+            return self.lstat(path).is_symlink()
+        except OSError:
+            return False
+
+    def isexec(self, path: "Optional[str]" = None) -> bool:
+        try:
+            return self.lstat(path).is_executable()
+        except OSError:
+            return False
+
+    def isfileorlink(self, path: "Optional[str]" = None) -> bool:
+        try:
+            st = self.lstat(path)
+            return st.is_file() or st.is_symlink()
+        except OSError:
+            return False
+
+    def lexists(self, path: "Optional[str]" = None) -> bool:
+        try:
+            return self._rustvfs.exists(self._rustpath(path))
+        except FileNotFoundError:
+            # vfs itself is missing
+            return False
+
+    def lstat(self, path: "Optional[str]" = None):
+        return self._rustvfs.metadata(self._rustpath(path))
+
+    def listdir(self, path: "Optional[str]" = None) -> "List[str]":
+        return self._rustvfs.listdir(self._rustpath(path))
+
+    def readlink(self, path: str) -> str:
+        return self._rustvfs.read(self._rustpath(path)).decode()
+
+    def rmtree(
+        self,
+        path: "Optional[str]" = None,
+        ignore_errors: bool = False,
+        forcibly: bool = False,
+    ) -> None:
+        try:
+            self._rustvfs.rmtree(self._rustpath(path))
+        except Exception:
+            if not ignore_errors:
+                raise
+
+    def rmdir(self, path: "Optional[str]" = None) -> None:
+        self._rustvfs.rmdir(self._rustpath(path))
+
+    def setflags(self, path: str, l: bool, x: bool) -> None:
+        # some code paths pass in int flags, convert to bool, required by rustvfs
+        l = bool(l)
+        x = bool(x)
+        path = self._rustpath(path)
+        metadata = self._rustvfs.metadata(path)
+        islink = metadata.is_symlink()
+        if l:
+            if not islink:
+                data = self._rustvfs.read(path)
+                self._rustvfs.unlink(path)
+                self._rustvfs.write(path, data, "l")
             return
-        os.chmod(name, typing.cast(int, self.createmode) & 0o666)
+
+        if islink:
+            data = self._rustvfs.read(path)
+            self._rustvfs.unlink(path)
+            self._rustvfs.write(path, data, "x" if x else "")
+            return
+
+        self._rustvfs.set_executable(path, x)
+
+    def stat(self, path: "Optional[str]" = None):
+        """Return no-follow lstat-style metadata.
+
+        With Rust VFS, stat() and lstat() are intentionally equivalent.
+        """
+        return self.lstat(path)
+
+    def unlink(self, path: "Optional[str]" = None) -> None:
+        self._rustvfs.unlink(self._rustpath(path))
+
+    def tryunlink(self, path: "Optional[str]" = None) -> None:
+        self._rustvfs.tryunlink(self._rustpath(path))
+
+    def unlinkpath(
+        self, path: "Optional[str]" = None, ignoremissing: bool = False
+    ) -> None:
+        self._rustvfs.unlinkpath(self._rustpath(path), ignoremissing=ignoremissing)
 
     def __call__(
         self,
@@ -439,134 +574,35 @@ class vfs(abstractvfs):
     ) -> "BinaryIO":
         """Open ``path`` file, which is relative to vfs root.
 
-        Newly created directories are marked as "not to be indexed by
-        the content indexing service", if ``notindexed`` is specified
-        for "write" mode access.
+        ``notindexed``, ``backgroundclose``, ``checkambig`` are for historical
+        Compatibility, they are ignored.
 
-        If ``backgroundclose`` is passed, the file may be closed asynchronously.
-        It can only be used if the ``self.backgroundclosing()`` context manager
-        is active. This should only be specified if the following criteria hold:
-
-        1. There is a potential for writing thousands of files. Unless you
-           are writing thousands of files, the performance benefits of
-           asynchronously closing files is not realized.
-        2. Files are opened exactly once for the ``backgroundclosing``
-           active duration and are therefore free of race conditions between
-           closing a file on a background thread and reopening it. (If the
-           file were opened multiple times, there could be unflushed data
-           because the original file handle hasn't been flushed/closed yet.)
-
-        ``checkambig`` argument is passed to atomictemplfile (valid
-        only for writing), and is useful only if target file is
-        guarded by any lock (e.g. repo.lock or repo.wlock).
-
-        To avoid file stat ambiguity forcibly, checkambig=True involves
-        copying ``path`` file opened in "append" mode (e.g. for
-        truncation), if it is owned by another. Therefore, use
-        combination of append mode and checkambig=True only in limited
-        cases (see also issue5418 and issue5584 for detail).
+        ``auditpath`` turns on extra auditing (e.g. devel-warn). The rust vfs
+        will audit paths (for illegal components) and prevent writing through
+        symlinks regardless.
         """
         assert isinstance(path, str)
         assert isinstance(mode, str)
+        assert not text, "open as text is no longer supported"
+        path = self._rustpath(path)
         if auditpath:
+            self.audit(path, mode=mode)
             if self._audit:
                 r = util.checkosfilename(path)
                 if r:
                     raise error.Abort("%s: %r" % (r, path))
-            self.audit(path, mode=mode)
-        f = self.join(path)
 
-        if not text and "b" not in mode:
-            mode += "b"  # for that other OS
-
-        nlink = -1
-        if mode not in ("r", "rb"):
-            dirname, basename = util.split(f)
-            # If basename is empty, then the path is malformed because it points
-            # to a directory. Let the posixfile() call below raise IOError.
-            if basename:
-                if atomictemp:
-                    util.makedirs(dirname, self.createmode, notindexed)
-                    return util.atomictempfile(
-                        f, mode, self.createmode, checkambig=checkambig
-                    )
-                try:
-                    if "w" in mode:
-                        util.unlink(f)
-                        nlink = 0
-                    else:
-                        # nlinks() may behave differently for files on Windows
-                        # shares if the file is open.
-                        with util.posixfile(f):
-                            nlink = util.nlinks(f)
-                            if nlink < 1:
-                                nlink = 2  # force mktempcopy (issue1922)
-                except (OSError, IOError) as e:
-                    if e.errno != errno.ENOENT:
-                        raise
-                    nlink = 0
-                    util.makedirs(dirname, self.createmode, notindexed)
-                if nlink > 0:
-                    if self._trustnlink is None:
-                        self._trustnlink = nlink > 1 or util.checknlink(f)
-                    if nlink > 1 or not self._trustnlink:
-                        util.rename(util.mktempcopy(f), f)
-        fp = util.posixfile(f, mode)
-        if nlink == 0:
-            self._fixfilemode(f)
-
-        if checkambig:
-            if mode in ("r", "rb"):
-                raise error.Abort(
-                    _("implementation error: mode %s is not valid for checkambig=True")
-                    % mode
-                )
-            fp = checkambigatclosing(fp)
-
-        if backgroundclose and isinstance(
-            threading.current_thread(),
-            threading._MainThread,  # pyre-fixme
-        ):
-            if not self._backgroundfilecloser:
-                raise error.Abort(
-                    _(
-                        "backgroundclose can only be used when a "
-                        "backgroundclosing context manager is active"
-                    )
-                )
-
-            fp = delayclosedfile(fp, self._backgroundfilecloser)
-
-        # pyre-fixme[7]: Expected `BinaryIO` but got `Union[IO[typing.Any],
-        #  checkambigatclosing, delayclosedfile]`.
-        return fp
+        createmode = self._rustcreatemode()
+        rustvfs = self._rustvfs if mode in ("r", "rb") else self._rustvfs_mkdir
+        return rustvfs.open(path, mode=mode, perm=createmode, atomicreplace=atomictemp)
 
     def symlink(self, src: "Union[bytes, str]", dst: str) -> None:
-        self.audit(dst)
-        linkname = self.join(dst)
-        util.tryunlink(linkname)
-
-        util.makedirs(os.path.dirname(linkname), self.createmode)
-
-        if self._cansymlink:
-            try:
-                if os.name == "nt":
-                    if isinstance(src, str):
-                        src = src.replace("/", "\\")
-                    else:
-                        src = src.replace(b"/", b"\\")
-                os.symlink(src, linkname)
-            except OSError as err:
-                raise OSError(
-                    err.errno,
-                    _("could not symlink to %r: %s") % (src, err.strerror),
-                    linkname,
-                )
-        else:
-            if isinstance(src, str):
-                self.writeutf8(dst, src)
-            else:
-                self.write(dst, src)
+        dst = self._rustpath(dst)
+        if isinstance(src, str):
+            src = src.encode()
+        rustvfs = self._rustvfs_mkdir
+        rustvfs.tryunlink(dst)
+        rustvfs.write(dst, src, "l")
 
     def join(self, path: "Optional[str]", *insidef: str) -> str:
         if path:
@@ -750,54 +786,3 @@ class checkambigatclosing(closewrapbase):
     def close(self):
         self._origfh.close()
         self._checkambig()
-
-
-# 64 bytes for SHA256
-_blobvfsre = re.compile(r"\A[a-f0-9]{64}\Z")
-
-
-class blobvfs(vfs):
-    def join(self, path: "Optional[str]", *insidef: str) -> str:
-        """split the path at first two characters, like: XX/XXXXX..."""
-        if path is None or not _blobvfsre.match(path):
-            raise error.ProgrammingError("unexpected blob vfs path: %r" % (path,))
-        if insidef:
-            raise error.ProgrammingError(
-                "unexpected blob vfs path: %r, %r" % (path, insidef)
-            )
-        return super(blobvfs, self).join(path[0:2], path[2:])
-
-    def walk(
-        self,
-        path: "Optional[str]" = None,
-        onerror: "Optional[Callable[[OSError], None]]" = None,
-    ) -> "Iterable[Tuple[str, List[str], List[str]]]":
-        """Yield (dirpath, [], oids) tuple for blobs under path
-
-        Oids only exist in the root of this vfs, so dirpath is always ''.
-        """
-        root = os.path.normpath(self.base)
-        # when dirpath == root, dirpath[prefixlen:] becomes empty
-        # because len(dirpath) < prefixlen.
-        prefixlen = len(pathutil.normasprefix(root))
-        oids = []
-
-        for dirpath, dirs, files in os.walk(
-            self.reljoin(self.base, path or ""), onerror=onerror
-        ):
-            dirpath = dirpath[prefixlen:]
-
-            # Silently skip unexpected files and directories
-            if len(dirpath) == 2:
-                oids.extend(
-                    [dirpath + f for f in files if _blobvfsre.match(dirpath + f)]
-                )
-
-        yield ("", [], oids)
-
-    def linktovfs(self, oid, vfs):
-        """Hardlink a file to another blob vfs"""
-        src = self.join(oid)
-        dst = vfs.join(oid)
-        util.makedirs(os.path.dirname(dst))
-        util.copyfile(src, dst, hardlink=True)

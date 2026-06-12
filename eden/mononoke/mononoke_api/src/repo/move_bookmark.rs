@@ -57,7 +57,7 @@ impl<R: MononokeRepo> RepoContext<R> {
                 .await
                 .context("Failed to fetch old bookmark target")?
                 .ok_or_else(|| {
-                    MononokeError::InvalidRequest(format!("bookmark '{}' does not exist", bookmark))
+                    MononokeError::InvalidRequest(format!("bookmark '{bookmark}' does not exist"))
                 })?,
         };
 
@@ -84,12 +84,12 @@ impl<R: MononokeRepo> RepoContext<R> {
             .with_pushvars(pushvars);
             op.log_new_public_commits_to_scribe()
         }
-        let op = if let Some(redirector) = self.push_redirector.as_ref() {
+        let push_redirector = self.push_redirector().await?;
+        let op = if let Some(redirector) = push_redirector.as_ref() {
             let large_bookmark = redirector.small_to_large_bookmark(bookmark).await?;
             if &large_bookmark == bookmark {
                 return Err(MononokeError::InvalidRequest(format!(
-                    "Cannot move shared bookmark '{}' from small repo",
-                    bookmark
+                    "Cannot move shared bookmark '{bookmark}' from small repo"
                 )));
             }
             let ctx = self.ctx();
@@ -104,8 +104,7 @@ impl<R: MononokeRepo> RepoContext<R> {
             .await?
             .ok_or_else(|| {
                 format_err!(
-                    "Error in move_bookmark absence of corresponding commit in target repo for {}",
-                    target,
+                    "Error in move_bookmark absence of corresponding commit in target repo for {target}",
                 )
             })?;
             let old_target = redirector
@@ -148,7 +147,8 @@ impl<R: MononokeRepo> RepoContext<R> {
                 pushvars,
             )
             .await?;
-        if let Some(redirector) = self.push_redirector.as_ref() {
+        let push_redirector = self.push_redirector().await?;
+        if let Some(redirector) = push_redirector.as_ref() {
             let ctx = self.ctx();
             let log_id = update_op
                 .run(
@@ -184,7 +184,7 @@ impl<R: MononokeRepo> RepoContext<R> {
         txn: Option<Box<dyn BookmarkTransaction>>,
         txn_hooks: Vec<BookmarkTransactionHook>,
     ) -> Result<BookmarkInfoTransaction, MononokeError> {
-        if self.push_redirector.is_some() {
+        if self.push_redirector().await?.is_some() {
             return Err(invalid_push_redirected_request(
                 "move_bookmark_with_transaction",
             ));

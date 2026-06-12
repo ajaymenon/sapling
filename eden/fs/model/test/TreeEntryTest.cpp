@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #include <optional>
 
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/model/TreeEntry.h"
 #include "eden/fs/testharness/TestUtil.h"
 #include "eden/fs/utils/EdenError.h"
@@ -69,11 +70,15 @@ TEST(TreeEntry, testEntryAttributesEqual) {
       std::nullopt,
       std::nullopt,
       std::nullopt,
+      std::nullopt,
+      std::nullopt,
       std::nullopt};
   EntryAttributes error1Attributes{
       std::nullopt,
       std::nullopt,
       folly::Try<uint64_t>{newEdenError(std::exception{})},
+      std::nullopt,
+      std::nullopt,
       std::nullopt,
       std::nullopt,
       std::nullopt,
@@ -90,11 +95,15 @@ TEST(TreeEntry, testEntryAttributesEqual) {
       std::nullopt,
       std::nullopt,
       std::nullopt,
+      std::nullopt,
+      std::nullopt,
       std::nullopt};
   EntryAttributes real1Attributes{
       std::nullopt,
       std::nullopt,
       folly::Try<uint64_t>{1},
+      std::nullopt,
+      std::nullopt,
       std::nullopt,
       std::nullopt,
       std::nullopt,
@@ -110,6 +119,8 @@ TEST(TreeEntry, testEntryAttributesEqual) {
       std::nullopt,
       std::nullopt,
       std::nullopt,
+      std::nullopt,
+      std::nullopt,
       std::nullopt};
 
   EXPECT_EQ(nullAttributes, nullAttributes);
@@ -120,37 +131,6 @@ TEST(TreeEntry, testEntryAttributesEqual) {
   EXPECT_EQ(real1Attributes, real1Attributes);
 }
 
-TEST(TreeEntry, filteredEntryType) {
-  if (folly::kIsWindows) {
-    // On windows, symlinks should be preserved if windowsSymlinksEnabled is
-    // true, and converted to regular files if windowsSymlinksEnabled is false
-    EXPECT_EQ(
-        TreeEntryType::SYMLINK,
-        filteredEntryType(TreeEntryType::SYMLINK, true));
-    EXPECT_EQ(
-        TreeEntryType::REGULAR_FILE,
-        filteredEntryType(TreeEntryType::SYMLINK, false));
-  } else {
-    // On non-windows, symlinks should be preserved regardless of
-    // windowsSymlinksEnabled
-    EXPECT_EQ(
-        TreeEntryType::SYMLINK,
-        filteredEntryType(TreeEntryType::SYMLINK, true));
-    EXPECT_EQ(
-        TreeEntryType::SYMLINK,
-        filteredEntryType(TreeEntryType::SYMLINK, false));
-  }
-
-  // Other than symlinks, the type should be preserved regardless of
-  // windowsSymlinksEnabled
-  for (auto type :
-       {TreeEntryType::TREE,
-        TreeEntryType::REGULAR_FILE,
-        TreeEntryType::EXECUTABLE_FILE}) {
-    EXPECT_EQ(type, filteredEntryType(type, true));
-    EXPECT_EQ(type, filteredEntryType(type, false));
-  }
-}
 TEST(TreeEntry, compareTreeEntryType) {
   // Test that identical types compare as equal
   EXPECT_TRUE(compareTreeEntryType(
@@ -181,4 +161,20 @@ TEST(TreeEntry, compareTreeEntryType) {
     EXPECT_FALSE(compareTreeEntryType(
         TreeEntryType::REGULAR_FILE, TreeEntryType::EXECUTABLE_FILE));
   }
+}
+
+TEST(TreeEntry, isRestrictedDefaultsFalse) {
+  TreeEntry entry(makeTestId("abc"), TreeEntryType::TREE);
+  EXPECT_FALSE(entry.isRestricted());
+}
+
+TEST(TreeEntry, isRestrictedSetTrue) {
+  TreeEntry entry(
+      makeTestId("abc"),
+      TreeEntryType::TREE,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      /*isRestricted=*/true);
+  EXPECT_TRUE(entry.isRestricted());
 }

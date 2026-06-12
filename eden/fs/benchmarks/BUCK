@@ -1,38 +1,58 @@
 load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
+load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 
 oncall("scm_client_infra")
+
+cpp_library(
+    name = "bench_utils",
+    headers = ["bench_utils.h"],
+    exported_deps = [
+        "//eden/common/utils:path",
+        "//eden/fs/service:thrift-cpp2-services",
+        "//folly/io/async:async_socket",
+        "//thrift/lib/cpp2/async:header_client_channel",
+    ],
+)
 
 # Run with --bench
 rust_binary(
     name = "benchmarks",
     srcs = ["benchmarks.rs"],
-    autocargo = {"cargo_toml_config": {"dependencies_override": {
-        "dependencies": {
-            "criterion": {
-                "features": [
-                    "async_tokio",
-                    "csv_output",
-                ],
-                "version": "0.5.1",
-            },
-            "rand": {
-                "features": ["small_rng"],
-                "version": "0.9",
-            },
-        },
-        "target": {
-            "'cfg(target_os = \"linux\")'": {"dependencies": {"libc": {"version": "0.2.139"}}},
-            "'cfg(target_os = \"macos\")'": {"dependencies": {"libc": {"version": "0.2.139"}}},
-            "'cfg(target_os = \"windows\")'": {"dependencies": {"winapi": {
-                "features": [
-                    "everything",
-                    "std",
-                ],
-                "version": "0.3",
-            }}},
-        },
-    }}},
+    autocargo = {
+        "cargo_toml_config": {
+            "dependencies_override": {
+                "dependencies": {
+                    "criterion": {
+                        "features": [
+                            "async_tokio",
+                            "csv_output",
+                        ],
+                        "version": "0.5.1",
+                    },
+                    "rand": {
+                        "features": ["small_rng"],
+                        "version": "0.9",
+                    },
+                },
+                "target": {
+                    "'cfg(target_os = \"linux\")'": {"dependencies": {"libc": {"version": "0.2.139"}}},
+                    "'cfg(target_os = \"macos\")'": {"dependencies": {"libc": {"version": "0.2.139"}}},
+                    "'cfg(target_os = \"windows\")'": {
+                        "dependencies": {
+                            "winapi": {
+                                "features": [
+                                    "everything",
+                                    "std",
+                                ],
+                                "version": "0.3",
+                            }
+                        }
+                    },
+                },
+            }
+        }
+    },
     deps = [
         "fbsource//third-party/rust:criterion",
         "fbsource//third-party/rust:rand",
@@ -151,10 +171,60 @@ cpp_binary(
     deps = [
         "//eden/common/utils:path",
         "//eden/common/utils/benchharness:benchharness",
+        "//eden/fs/benchmarks:bench_utils",
         "//eden/fs/service:thrift-cpp2-services",
         "//folly/io/async:event_base_thread",
-        "//thrift/lib/cpp2/async:header_client_channel",
         "//watchman/cppclient:cppclient",
+    ],
+)
+
+cpp_binary(
+    name = "prefetch",
+    srcs = ["prefetch.cpp"],
+    deps = [
+        "//eden/common/utils:path",
+        "//eden/common/utils/benchharness:benchharness",
+        "//eden/fs/benchmarks:bench_utils",
+        "//eden/fs/service:thrift-cpp2-services",
+        "//folly/io/async:event_base_thread",
+    ],
+)
+
+cpp_binary(
+    name = "get_blake3",
+    srcs = ["get_blake3.cpp"],
+    deps = [
+        "//eden/common/utils:path",
+        "//eden/common/utils/benchharness:benchharness",
+        "//eden/fs/benchmarks:bench_utils",
+        "//eden/fs/service:thrift-cpp2-services",
+        "//folly/io/async:event_base_thread",
+    ],
+)
+
+cpp_binary(
+    name = "get_sha1",
+    srcs = ["get_sha1.cpp"],
+    deps = [
+        "//eden/common/utils:path",
+        "//eden/common/utils/benchharness:benchharness",
+        "//eden/fs/benchmarks:bench_utils",
+        "//eden/fs/service:thrift-cpp2-services",
+        "//folly/io/async:event_base_thread",
+    ],
+)
+
+cpp_binary(
+    name = "get_digest_hash",
+    srcs = ["get_digest_hash.cpp"],
+    deps = [
+        "//eden/common/utils:path",
+        "//eden/common/utils/benchharness:benchharness",
+        "//eden/fs/benchmarks:bench_utils",
+        "//eden/fs/service:thrift-cpp2-services",
+        "//folly:exception_string",
+        "//folly/init:init",
+        "//folly/io/async:event_base_thread",
     ],
 )
 
@@ -165,10 +235,24 @@ cpp_binary(
         "//eden/common/utils:path",
         "//eden/common/utils:process",
         "//eden/common/utils/benchharness:benchharness",
+        "//eden/fs/benchmarks:bench_utils",
         "//eden/fs/service:thrift-cpp2-services",
         "//eden/fs/service:thrift_get_object_impl",
         "//folly/io/async:event_base_thread",
-        "//thrift/lib/cpp2/async:header_client_channel",
+    ],
+)
+
+cpp_binary(
+    name = "get_file_content",
+    srcs = ["get_file_content.cpp"],
+    deps = [
+        "//eden/common/utils:path",
+        "//eden/common/utils/benchharness:benchharness",
+        "//eden/fs/benchmarks:bench_utils",
+        "//eden/fs/service:thrift-cpp2-services",
+        "//folly/futures:core",
+        "//folly/io/async:event_base_thread",
+        "//folly/synchronization:call_once",
     ],
 )
 
@@ -187,8 +271,8 @@ cpp_binary(
         "//thrift/lib/cpp2/async:header_client_channel",
     ],
     external_deps = [
-        "gflags",
         ("boost", None, "boost_uuid"),
+        "gflags",
     ],
 )
 
@@ -198,8 +282,7 @@ cpp_binary(
     deps = [
         "fbsource//third-party/fmt:fmt",
         "//eden/common/utils/benchharness:benchharness",
-        "//folly:conv",
-        "//folly:format",
+        "//folly:string",
     ],
 )
 

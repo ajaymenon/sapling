@@ -185,14 +185,73 @@ struct DaemonStart : public EdenFSEvent {
   double duration = 0.0;
   bool is_takeover = false;
   bool success = false;
+  std::optional<uint64_t> daemon_mount_namespace;
+  std::optional<uint64_t> daemon_pid_namespace;
+  std::optional<uint64_t> privhelper_mount_namespace;
+  std::optional<uint64_t> privhelper_pid_namespace;
+  std::optional<bool> is_daemon_in_root_mount_namespace;
+  std::optional<bool> is_privhelper_in_root_mount_namespace;
+  std::optional<std::string> cgroup;
 
-  DaemonStart(double duration, bool is_takeover, bool success)
-      : duration(duration), is_takeover(is_takeover), success(success) {}
+  DaemonStart(
+      double duration,
+      bool is_takeover,
+      bool success,
+      std::optional<uint64_t> daemon_mount_namespace = std::nullopt,
+      std::optional<uint64_t> daemon_pid_namespace = std::nullopt,
+      std::optional<uint64_t> privhelper_mount_namespace = std::nullopt,
+      std::optional<uint64_t> privhelper_pid_namespace = std::nullopt,
+      std::optional<bool> is_daemon_in_root_mount_namespace = std::nullopt,
+      std::optional<bool> is_privhelper_in_root_mount_namespace = std::nullopt,
+      std::optional<std::string> cgroup = std::nullopt)
+      : duration(duration),
+        is_takeover(is_takeover),
+        success(success),
+        daemon_mount_namespace(daemon_mount_namespace),
+        daemon_pid_namespace(daemon_pid_namespace),
+        privhelper_mount_namespace(privhelper_mount_namespace),
+        privhelper_pid_namespace(privhelper_pid_namespace),
+        is_daemon_in_root_mount_namespace(is_daemon_in_root_mount_namespace),
+        is_privhelper_in_root_mount_namespace(
+            is_privhelper_in_root_mount_namespace),
+        cgroup(std::move(cgroup)) {}
 
   void populate(DynamicEvent& event) const override {
     event.addDouble("duration", duration);
     event.addBool("is_takeover", is_takeover);
     event.addBool("success", success);
+    if (daemon_mount_namespace.has_value()) {
+      event.addInt(
+          "daemon_mount_namespace",
+          static_cast<int64_t>(*daemon_mount_namespace));
+    }
+    if (daemon_pid_namespace.has_value()) {
+      event.addInt(
+          "daemon_pid_namespace", static_cast<int64_t>(*daemon_pid_namespace));
+    }
+    if (privhelper_mount_namespace.has_value()) {
+      event.addInt(
+          "privhelper_mount_namespace",
+          static_cast<int64_t>(*privhelper_mount_namespace));
+    }
+    if (privhelper_pid_namespace.has_value()) {
+      event.addInt(
+          "privhelper_pid_namespace",
+          static_cast<int64_t>(*privhelper_pid_namespace));
+    }
+    if (is_daemon_in_root_mount_namespace.has_value()) {
+      event.addBool(
+          "is_daemon_in_root_mount_namespace",
+          *is_daemon_in_root_mount_namespace);
+    }
+    if (is_privhelper_in_root_mount_namespace.has_value()) {
+      event.addBool(
+          "is_privhelper_in_root_mount_namespace",
+          *is_privhelper_in_root_mount_namespace);
+    }
+    if (cgroup.has_value()) {
+      event.addString("cgroup", *cgroup);
+    }
   }
 
   const char* getType() const override {
@@ -360,46 +419,48 @@ struct FinishedMount : public EdenFSEvent {
   std::string repo_type;
   std::string repo_source;
   std::string fs_channel_type;
+  std::optional<std::string> fuse_transport;
   bool is_takeover = false;
   double duration = 0.0;
   bool success = false;
   bool clean = false;
   int64_t inode_catalog_type = -1;
-  bool is_windows_symlink_enabled = false;
 
   FinishedMount(
       std::string backing_store_type,
       std::string repo_type,
       std::string repo_source,
       std::string fs_channel_type,
+      std::optional<std::string> fuse_transport,
       bool is_takeover,
       double duration,
       bool success,
       bool clean,
-      int64_t inode_catalog_type,
-      bool is_windows_symlink_enabled)
+      int64_t inode_catalog_type)
       : backing_store_type(std::move(backing_store_type)),
         repo_type(std::move(repo_type)),
         repo_source(std::move(repo_source)),
         fs_channel_type(std::move(fs_channel_type)),
+        fuse_transport(std::move(fuse_transport)),
         is_takeover(is_takeover),
         duration(duration),
         success(success),
         clean(clean),
-        inode_catalog_type(inode_catalog_type),
-        is_windows_symlink_enabled(is_windows_symlink_enabled) {}
+        inode_catalog_type(inode_catalog_type) {}
 
   void populate(DynamicEvent& event) const override {
     event.addString("backing_store_type", backing_store_type);
     event.addString("repo_type", repo_type);
     event.addString("repo_source", repo_source);
     event.addString("fs_channel_type", fs_channel_type);
+    if (fuse_transport.has_value()) {
+      event.addString("fuse_transport", *fuse_transport);
+    }
     event.addBool("is_takeover", is_takeover);
     event.addDouble("duration", duration);
     event.addBool("success", success);
     event.addBool("clean", clean);
     event.addInt("overlay_type", inode_catalog_type);
-    event.addBool("is_windows_symlink_enabled", is_windows_symlink_enabled);
   }
 
   const char* getType() const override {
@@ -626,31 +687,37 @@ struct WorkingCopyGc : public EdenFSEvent {
 struct SilentDaemonExit : public EdenFSEvent {
   uint64_t last_daemon_heartbeat = 0;
   uint8_t daemon_exit_signal = 0;
-  uint64_t last_mac_boot_timestamp = 0;
+  uint64_t system_boot_timestamp = 0;
   std::optional<bool> is_memory_pressure_kill = std::nullopt;
-  std::string is_memory_pressure_error_msg;
+  std::string system_log_check_error_str;
+  std::optional<uint64_t> daemon_downtime_s = std::nullopt;
 
   SilentDaemonExit(
       uint64_t last_daemon_heartbeat,
       uint8_t daemon_exit_signal,
-      uint64_t last_mac_boot_timestamp = 0,
+      uint64_t system_boot_timestamp = 0,
       std::optional<bool> is_memory_pressure_kill = std::nullopt,
-      std::string is_memory_pressure_error_msg = "")
+      std::string system_log_check_error_str = "",
+      std::optional<uint64_t> daemon_downtime_s = std::nullopt)
       : last_daemon_heartbeat(last_daemon_heartbeat),
         daemon_exit_signal(daemon_exit_signal),
-        last_mac_boot_timestamp(last_mac_boot_timestamp),
+        system_boot_timestamp(system_boot_timestamp),
         is_memory_pressure_kill(is_memory_pressure_kill),
-        is_memory_pressure_error_msg(is_memory_pressure_error_msg) {}
+        system_log_check_error_str(system_log_check_error_str),
+        daemon_downtime_s(daemon_downtime_s) {}
 
   void populate(DynamicEvent& event) const override {
     event.addInt("last_daemon_heartbeat", last_daemon_heartbeat);
     event.addInt("exit_signal", daemon_exit_signal);
-    event.addInt("last_mac_boot_timestamp", last_mac_boot_timestamp);
+    event.addInt("system_boot_timestamp", system_boot_timestamp);
     if (is_memory_pressure_kill.has_value()) {
       event.addBool("is_memory_pressure_kill", is_memory_pressure_kill.value());
     }
-    if (!is_memory_pressure_error_msg.empty()) {
-      event.addString("is_memory_pressure_error", is_memory_pressure_error_msg);
+    if (!system_log_check_error_str.empty()) {
+      event.addString("system_log_check_error", system_log_check_error_str);
+    }
+    if (daemon_downtime_s.has_value()) {
+      event.addInt("daemon_downtime_s", daemon_downtime_s.value());
     }
   }
 
@@ -844,14 +911,44 @@ struct EMenuActionEvent : public EdenFSEvent {
 struct LongRunningFSRequest : public EdenFSEvent {
   double duration = 0.0;
   std::string causeDetail;
+  double acceptedNs = -1.0;
+  double queueWaitNs = -1.0;
+  double processingNs = -1.0;
+  double writeWaitNs = -1.0;
 
   LongRunningFSRequest(double duration, std::string_view detail)
       : duration(duration), causeDetail(detail) {}
+
+  LongRunningFSRequest(
+      double duration,
+      std::string_view detail,
+      double accepted,
+      double queueWait,
+      double processing,
+      double writeWait)
+      : duration(duration),
+        causeDetail(detail),
+        acceptedNs(accepted),
+        queueWaitNs(queueWait),
+        processingNs(processing),
+        writeWaitNs(writeWait) {}
 
   void populate(DynamicEvent& event) const override {
     // Duration in nanoseconds
     event.addDouble("duration", duration);
     event.addString("causeDetail", causeDetail);
+    if (acceptedNs >= 0) {
+      event.addDouble("acceptedNs", acceptedNs);
+    }
+    if (queueWaitNs >= 0) {
+      event.addDouble("queueWaitNs", queueWaitNs);
+    }
+    if (processingNs >= 0) {
+      event.addDouble("processingNs", processingNs);
+    }
+    if (writeWaitNs >= 0) {
+      event.addDouble("writeWaitNs", writeWaitNs);
+    }
   }
 
   const char* getType() const override {
@@ -975,6 +1072,44 @@ struct ChangesSince : public EdenFSEvent {
 
   const char* getType() const override {
     return "changes_since";
+  }
+};
+
+struct StaleRedirectionCleanup : public EdenFSEvent {
+  std::string checkout_path;
+  int64_t stale_redirections_found;
+  int64_t stale_redirections_succeeded;
+  int64_t stale_redirections_failed;
+  bool stale_checkout_mount_unmounted;
+  // Derived: true when stale_redirections_failed == 0. Does not account for
+  // stale_checkout_mount_unmounted, which tracks a separate cleanup step.
+  bool success;
+
+  StaleRedirectionCleanup(
+      std::string checkout_path,
+      int64_t found,
+      int64_t succeeded,
+      int64_t failed,
+      bool checkoutUnmounted)
+      : checkout_path(std::move(checkout_path)),
+        stale_redirections_found(found),
+        stale_redirections_succeeded(succeeded),
+        stale_redirections_failed(failed),
+        stale_checkout_mount_unmounted(checkoutUnmounted),
+        success(failed == 0) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("checkout_path", checkout_path);
+    event.addInt("stale_redirections_found", stale_redirections_found);
+    event.addInt("stale_redirections_succeeded", stale_redirections_succeeded);
+    event.addInt("stale_redirections_failed", stale_redirections_failed);
+    event.addBool(
+        "stale_checkout_mount_unmounted", stale_checkout_mount_unmounted);
+    event.addBool("success", success);
+  }
+
+  const char* getType() const override {
+    return "stale_redirection_cleanup";
   }
 };
 

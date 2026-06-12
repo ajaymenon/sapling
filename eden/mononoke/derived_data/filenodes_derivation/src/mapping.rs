@@ -81,7 +81,7 @@ impl TryFrom<PreparedFilenode> for PreparedRootFilenode {
         } = info;
 
         if path != RepoPath::RootPath {
-            return Err(format_err!("unexpected path for root filenode: {:?}", path));
+            return Err(format_err!("unexpected path for root filenode: {path:?}"));
         }
         Ok(Self {
             filenode,
@@ -111,7 +111,6 @@ impl BonsaiDerivable for FilenodesOnlyPublic {
     const VARIANT: DerivableType = DerivableType::FileNodes;
 
     type Dependencies = dependencies![MappedHgChangesetId];
-    type PredecessorDependencies = dependencies![];
 
     async fn derive_single(
         ctx: &CoreContext,

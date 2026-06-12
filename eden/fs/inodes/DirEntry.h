@@ -40,25 +40,27 @@ class DirEntry {
   /**
    * Create an id for a non-materialized entry.
    */
-  DirEntry(mode_t m, InodeNumber number, ObjectId id)
+  DirEntry(mode_t m, InodeNumber number, ObjectId id, bool isRestricted = false)
       : initialMode_{m},
         hasId_{true},
         hasInodePointer_{false},
+        isRestricted_{isRestricted ? 1u : 0u},
         id_{id},
         inodeNumber_{number} {
-    XCHECK_EQ(m, m & 0x3fffffff);
+    XCHECK_EQ(m, m & 0x1fffffff);
     XDCHECK(number.hasValue());
   }
 
   /**
    * Create an id for a materialized entry.
    */
-  DirEntry(mode_t m, InodeNumber number)
+  DirEntry(mode_t m, InodeNumber number, bool isRestricted = false)
       : initialMode_{m},
         hasId_{false},
         hasInodePointer_{false},
+        isRestricted_{isRestricted ? 1u : 0u},
         inodeNumber_{number} {
-    XCHECK_EQ(m, m & 0x3fffffff);
+    XCHECK_EQ(m, m & 0x1fffffff);
     XDCHECK(number.hasValue());
   }
 
@@ -196,9 +198,21 @@ class DirEntry {
    */
   [[nodiscard]] InodeBase* clearInode();
 
+  bool isRestricted() const {
+    return isRestricted_;
+  }
+
+  /**
+   * Cache a restriction discovered after the parent TreeEntry was built.
+   * Used when parent metadata is stale or missing.
+   */
+  void setRestricted(bool isRestricted) {
+    isRestricted_ = isRestricted ? 1u : 0u;
+  }
+
  private:
   /**
-   * The initial entry type for this entry. Two bits are borrowed from the top
+   * The initial entry type for this entry. Three bits are borrowed from the top
    * so the entire struct fits in four words.
    *
    * TODO: This field is not updated when an inode's mode bits are changed.
@@ -206,7 +220,7 @@ class DirEntry {
    * Overlay Dir storage. After the InodeMetadataTable is in use for a while,
    * this should be replaced with dtype_t and the bitfields can go away.
    */
-  uint32_t initialMode_ : 30;
+  uint32_t initialMode_ : 29;
 
   /**
    * Whether the id_ field matches the contents from source control. If
@@ -219,6 +233,11 @@ class DirEntry {
    * Synonymous with the inode being "loaded".
    */
   uint32_t hasInodePointer_ : 1;
+
+  /**
+   * Whether this entry is restricted by ACLs.
+   */
+  uint32_t isRestricted_ : 1;
 
   /**
    * If the entry is not materialized, this contains the id
@@ -270,6 +289,14 @@ static_assert(CheckSize<DirEntry, 40>(), "DirEntry is five words");
 struct DirContents : PathMap<DirEntry> {
   explicit DirContents(CaseSensitivity caseSensitive)
       : PathMap(caseSensitive) {}
+
+  DirContents(
+      folly::fbvector<std::pair<PathComponent, DirEntry>>&& entries,
+      CaseSensitivity caseSensitive)
+      : PathMap(std::move(entries), caseSensitive) {}
+
+  // Allow construction from a PathMap (e.g., from PathMapMutator::finalize).
+  explicit DirContents(PathMap<DirEntry>&& map) : PathMap(std::move(map)) {}
 };
 
 } // namespace facebook::eden

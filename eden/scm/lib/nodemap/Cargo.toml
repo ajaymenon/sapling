@@ -13,12 +13,12 @@ license = "MIT"
 name = "nodemap"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 sapling-indexedlog = { version = "0.1.0", path = "../indexedlog" }
 sapling-types = { version = "0.1.0", path = "../types" }
 thiserror = "2.0.18"
 
 [dev-dependencies]
-quickcheck = "1.0"
+quickcheck = "1.1"
 sapling-types = { version = "0.1.0", path = "../types", features = ["for-tests"], default-features = false }
-tempfile = "3.22"
+tempfile = "3.27.0"

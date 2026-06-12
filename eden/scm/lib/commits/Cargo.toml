@@ -13,9 +13,9 @@ license = "MIT"
 name = "commits"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
-fs-err = { version = "3", features = ["tokio"] }
+fs-err = { version = "3.3.0", features = ["tokio"] }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 sapling-commits-trait = { version = "0.1.0", path = "trait" }
 sapling-dag = { version = "0.1.0", path = "../dag", features = ["indexedlog-backend"] }
@@ -33,4 +33,4 @@ tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
 sapling-nonblocking = { version = "0.1.0", path = "../nonblocking" }
-tempfile = "3.22"
+tempfile = "3.27.0"

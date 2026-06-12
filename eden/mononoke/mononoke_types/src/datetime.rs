@@ -65,15 +65,13 @@ impl DateTime {
         // https://docs.rs/chrono/latest/chrono/struct.FixedOffset.html#method.west_opt
         let tz = FixedOffset::west_opt(tz_offset_secs).ok_or_else(|| {
             MononokeTypeError::InvalidDateTime(format!(
-                "timezone offset out of range: {}",
-                tz_offset_secs
+                "timezone offset out of range: {tz_offset_secs}"
             ))
         })?;
         let dt = match tz.timestamp_opt(secs, 0) {
             LocalResult::Single(dt) => dt,
             _ => bail!(MononokeTypeError::InvalidDateTime(format!(
-                "seconds out of range: {}",
-                secs
+                "seconds out of range: {secs}"
             ))),
         };
         Ok(Self::new(dt))
@@ -383,7 +381,9 @@ mod test {
             let gix_time = original_date_time.into_gix();
             assert_eq!(
                 human_readable.to_string(),
-                gix_time.format(gix_date::time::format::ISO8601_STRICT)
+                gix_time
+                    .format(gix_date::time::format::ISO8601_STRICT)
+                    .unwrap(),
             );
             let roundtripped_date_time = DateTime::from_gix(gix_time).unwrap();
             assert_eq!(original_date_time, roundtripped_date_time);

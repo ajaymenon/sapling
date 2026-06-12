@@ -35,6 +35,7 @@ from sapling import (
     extensions,
     hg,
     i18n,
+    identity,
     lock,
     match as matchmod,
     merge as mergemod,
@@ -358,7 +359,8 @@ class rebaseruntime:
             cmdutil.wrongtooltocontinue(repo, _("rebase"))
 
         if originalwd is None:
-            raise error.Abort(_(".hg/rebasestate is incomplete"))
+            dotdir = identity.default().dotdir()
+            raise error.Abort(_("%s/rebasestate is incomplete") % dotdir)
 
         # recompute the predecessor map
         skipped = set()
@@ -425,7 +427,7 @@ class rebaseruntime:
                 return 0
             else:
                 msg = _("cannot continue inconsistent rebase")
-                hint = _('use "hg rebase --abort" to clear broken state')
+                hint = _('use "@prog@ rebase --abort" to clear broken state')
                 raise error.Abort(msg, hint=hint)
         if isabort:
             return abort(
@@ -982,6 +984,16 @@ class rebaseruntime:
                     )
                 else:
                     raise  # Keep old behavior
+
+        # Ensure p2 and merge state are cleared. Normally concludenode handles
+        # this per-commit, but if all revisions were skipped (e.g. detected as
+        # "already in destination" during --continue), concludenode is never
+        # called and p2 from the interrupted merge would leak out.
+        # Only do this for on-disk rebases — in-memory rebases never touch
+        # the dirstate, so we shouldn't clear a pre-existing p2.
+        if not self.inmemory:
+            repo.setparents(repo[None].p1().node())
+            mergemod.mergestate.clean(repo)
 
         collapsedas = None
         if not self.keepf:
@@ -2211,7 +2223,10 @@ def restorecollapsemsg(repo, isabort) -> str:
             # Oh well, just abort like normal
             collapsemsg = ""
         else:
-            raise error.Abort(_("missing .hg/last-message.txt for rebase"))
+            raise error.Abort(
+                _("missing %s/last-message.txt for rebase")
+                % identity.default().dotdir()
+            )
     return collapsemsg
 
 
@@ -2488,7 +2503,7 @@ def summaryhook(ui, repo) -> None:
         state = rbsrt.state
     except error.RepoLookupError:
         # i18n: column positioning for "hg summary"
-        msg = _('rebase: (use "hg rebase --abort" to clear broken state)\n')
+        msg = _('rebase: (use "@prog@ rebase --abort" to clear broken state)\n')
         ui.write(msg)
         return
     numrebased = len([i for i in state.values() if i >= 0])
@@ -2504,4 +2519,4 @@ def summaryhook(ui, repo) -> None:
 
 def uisetup(ui) -> None:
     cmdutil.summaryhooks.add("rebase", summaryhook)
-    cmdutil.afterresolvedstates.append(("rebasestate", _("@prog@ rebase --continue")))
+    cmdutil.afterresolvedstates.append(("rebasestate", "@prog@ rebase --continue"))

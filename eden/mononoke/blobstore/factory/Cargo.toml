@@ -8,7 +8,7 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 arg_extensions = { version = "0.1.0", path = "../../cmdlib/extensions" }
 blobstore = { version = "0.1.0", path = ".." }
 blobstore_stats = { version = "0.1.0", path = "../blobstore_stats" }
@@ -16,7 +16,7 @@ blobstore_sync_queue = { version = "0.1.0", path = "../../blobstore_sync_queue" 
 cacheblob = { version = "0.1.0", path = "../cacheblob" }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 chaosblob = { version = "0.1.0", path = "../chaosblob" }
-clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 delayblob = { version = "0.1.0", path = "../delayblob" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -29,7 +29,7 @@ multiplexedblob = { version = "0.1.0", path = "../multiplexedblob" }
 multiplexedblob_wal = { version = "0.1.0", path = "../multiplexedblob_wal" }
 packblob = { version = "0.1.0", path = "../packblob" }
 prefixblob = { version = "0.1.0", path = "../prefixblob" }
-rand_distr = "0.4"
+rand_distr = "0.6"
 readonlyblob = { version = "0.1.0", path = "../readonlyblob" }
 s3blob = { version = "0.1.0", path = "../s3blob" }
 samplingblob = { version = "0.1.0", path = "../samplingblob" }
@@ -39,4 +39,4 @@ sql_construct = { version = "0.1.0", path = "../../common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 sqlblob = { version = "0.1.0", path = "../sqlblob" }
 throttledblob = { version = "0.1.0", path = "../throttledblob" }
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }

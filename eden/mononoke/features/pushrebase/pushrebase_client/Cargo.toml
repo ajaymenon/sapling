@@ -11,8 +11,8 @@ license = "GPLv2+"
 path = "lib.rs"
 
 [dependencies]
-anyhow = "1.0.98"
-arc-swap = { version = "1.5", features = ["weak"] }
+anyhow = "1.0.102"
+arc-swap = { version = "1.9.0", features = ["weak"] }
 async-trait = "0.1.86"
 bookmarks = { version = "0.1.0", path = "../../../repo_attributes/bookmarks" }
 bookmarks_movement = { version = "0.1.0", path = "../../../repo_attributes/bookmarks/bookmarks_movement" }

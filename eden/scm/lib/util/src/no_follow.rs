@@ -1,0 +1,143 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! File operations that do not follow symlinks below a root directory.
+//!
+//! The root path itself is opened normally and may traverse symlinks. All
+//! paths passed to [`NoFollowRoot`] methods are converted to [`CheckedRelPath`]
+//! before any filesystem operation.
+
+use std::ffi::OsStr;
+use std::io;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
+
+#[cfg(test)]
+mod tests;
+mod types;
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+pub use types::LiteMetadata;
+pub use types::OpenFlags;
+#[cfg(unix)]
+pub use unix::AtomicReplaceFile;
+#[cfg(unix)]
+pub use unix::NoFollowRoot;
+#[cfg(windows)]
+pub use windows::AtomicReplaceFile;
+#[cfg(windows)]
+pub use windows::NoFollowRoot;
+
+/// A verified repository-relative path that cannot escape upward.
+///
+/// This path is relative, non-empty, and contains no `..` components. It may be
+/// constructed by validating a [`Path`], or by another crate from a stronger
+/// path type that already enforces the same invariant.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CheckedRelPath<'a>(&'a Path);
+
+impl<'a> CheckedRelPath<'a> {
+    /// Construct a path from an already-verified relative path.
+    ///
+    /// This is intended for stronger path newtypes, such as repository path
+    /// types, that already reject absolute paths and `..`. Callers must be
+    /// aware of platform-specific path separators and platform-specific file
+    /// name syntax: on Windows, every component must reject `:` so the path
+    /// cannot name an NTFS alternate data stream.
+    pub fn from_verified_relative(path: &'a Path) -> Self {
+        Self(path)
+    }
+
+    pub(crate) fn as_path(&self) -> &Path {
+        self.0
+    }
+}
+
+impl<'a> TryFrom<&'a Path> for CheckedRelPath<'a> {
+    type Error = io::Error;
+
+    fn try_from(path: &'a Path) -> io::Result<Self> {
+        let has_normal_component =
+            path.components()
+                .try_fold(false, |has_normal, component| match component {
+                    Component::Normal(component) => {
+                        reject_ntfs_ads_component(path, component)?;
+                        Ok(true)
+                    }
+                    Component::CurDir => Ok(has_normal),
+                    Component::ParentDir => Err(invalid_path(path, "path contains `..`")),
+                    Component::RootDir | Component::Prefix(_) => {
+                        Err(invalid_path(path, "path must be relative"))
+                    }
+                })?;
+
+        if !has_normal_component {
+            return Err(invalid_path(path, "path must name a file or directory"));
+        }
+
+        Ok(Self(path))
+    }
+}
+
+impl<'a> TryFrom<&'a PathBuf> for CheckedRelPath<'a> {
+    type Error = io::Error;
+
+    fn try_from(path: &'a PathBuf) -> io::Result<Self> {
+        path.as_path().try_into()
+    }
+}
+
+fn invalid_path(path: &Path, message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, format!("{message}: {path:?}"))
+}
+
+fn reject_ntfs_ads_component(path: &Path, component: &OsStr) -> io::Result<()> {
+    #[cfg(windows)]
+    if component.as_encoded_bytes().contains(&b':') {
+        return Err(invalid_path(
+            path,
+            "path component contains NTFS alternate data stream separator `:`",
+        ));
+    }
+
+    #[cfg(not(windows))]
+    let _ = component;
+
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+pub fn normalize_not_directory(err: io::Error) -> io::Error {
+    // Used by `symlink_metadata(path)`.
+    // If `path` contains a directory that doesn't actually exist on disk, it surfaces as a
+    // NotADirectory error. This error type is unstable and can't actually be matched on.
+    // See https://github.com/rust-lang/rust/issues/86442
+    // For now, let's convert it to a NotFound error, users probably want to treat it as such.
+    #[cfg(unix)]
+    const NOTDIR: i32 = 20; // ENOTDIR
+    #[cfg(windows)]
+    const NOTDIR: i32 = 267; // ERROR_DIRECTORY
+    #[cfg(windows)]
+    const PATH_NOT_FOUND: i32 = 3; // ERROR_PATH_NOT_FOUND
+
+    match err.raw_os_error() {
+        Some(errno) if errno == NOTDIR => io::Error::new(io::ErrorKind::NotFound, err),
+        #[cfg(windows)]
+        Some(errno) if errno == PATH_NOT_FOUND => io::Error::new(io::ErrorKind::NotFound, err),
+        _ => err,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn normalize_not_directory(err: io::Error) -> io::Error {
+    err
+}

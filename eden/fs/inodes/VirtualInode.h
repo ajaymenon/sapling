@@ -9,6 +9,8 @@
 
 #include <sys/stat.h>
 
+#include <folly/coro/safe/NowTask.h>
+
 #include "eden/common/utils/ImmediateFuture.h"
 #include "eden/common/utils/RefPtr.h"
 #include "eden/fs/inodes/InodePtr.h"
@@ -59,6 +61,22 @@ class VirtualInode {
   }
 
   /**
+   * Create a VirtualInode wrapping a restricted (ACL-denied) empty tree.
+   */
+  static VirtualInode makeRestricted(
+      const TreeEntry& entry,
+      CaseSensitivity caseSensitivity);
+
+  /**
+   * Overload for callers that have a DirEntry (ObjectId + mode) rather
+   * than a model TreeEntry.
+   */
+  static VirtualInode makeRestricted(
+      const ObjectId& id,
+      mode_t mode,
+      CaseSensitivity caseSensitivity);
+
+  /**
    * Returns the contained InodePtr.
    *
    * If there is not one, throws a std::exception.
@@ -96,8 +114,11 @@ class VirtualInode {
    */
   ImmediateFuture<std::optional<TreeEntryType>> getTreeEntryType(
       RelativePathPiece path,
-      const ObjectFetchContextPtr& fetchContext,
-      bool windowsSymlinksEnabled) const;
+      const ObjectFetchContextPtr& fetchContext) const;
+
+  folly::coro::now_task<std::optional<TreeEntryType>> co_getTreeEntryType(
+      RelativePathPiece path,
+      const ObjectFetchContextPtr& fetchContext) const;
 
   /**
    * Get the VirtualInode object for a child of this directory.
@@ -112,7 +133,26 @@ class VirtualInode {
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
 
+  /**
+   * Get the VirtualInode object for a child of this directory.
+   *
+   * Unlike TreeInode::getOrLoadChild, this method avoids loading the child's
+   * inode if it is not already loaded, instead falling back to looking up the
+   * object in the ObjectStore.
+   */
+  folly::coro::now_task<VirtualInode> co_getOrFindChild(
+      PathComponentPiece childName,
+      RelativePathPiece path,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      const ObjectFetchContextPtr& fetchContext) const;
+
+  // DEPRECATED: Use co_getSHA1 instead.
   ImmediateFuture<Hash20> getSHA1(
+      RelativePathPiece path,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      const ObjectFetchContextPtr& fetchContext) const;
+
+  folly::coro::now_task<Hash20> co_getSHA1(
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
@@ -122,7 +162,18 @@ class VirtualInode {
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
 
+  folly::coro::now_task<Hash32> co_getBlake3(
+      RelativePathPiece path,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      const ObjectFetchContextPtr& fetchContext) const;
+
+  // DEPRECATED: Use co_getDigestHash instead.
   ImmediateFuture<std::optional<Hash32>> getDigestHash(
+      RelativePathPiece path,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      const ObjectFetchContextPtr& fetchContext) const;
+
+  folly::coro::now_task<std::optional<Hash32>> co_getDigestHash(
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
@@ -149,6 +200,13 @@ class VirtualInode {
       timespec lastCheckoutTime,
       const ObjectFetchContextPtr& fetchContext) const;
 
+  folly::coro::now_task<EntryAttributes> co_getEntryAttributes(
+      EntryAttributeFlags requestedAttributes,
+      RelativePathPiece path,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      timespec lastCheckoutTime,
+      const ObjectFetchContextPtr& fetchContext) const;
+
   /**
    * Emulate stat in a way that works for source control.
    *
@@ -158,6 +216,11 @@ class VirtualInode {
    * lastCheckoutTime.
    */
   ImmediateFuture<struct stat> stat(
+      const struct timespec& lastCheckoutTime,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      const ObjectFetchContextPtr& fetchContext) const;
+
+  folly::coro::now_task<struct stat> co_stat(
       const struct timespec& lastCheckoutTime,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
@@ -172,6 +235,13 @@ class VirtualInode {
   folly::Try<
       std::vector<std::pair<PathComponent, ImmediateFuture<VirtualInode>>>>
   getChildren(
+      RelativePathPiece path,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      const ObjectFetchContextPtr& fetchContext);
+
+  folly::coro::now_task<
+      std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>>
+  co_getChildren(
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext);
@@ -200,7 +270,24 @@ class VirtualInode {
       timespec lastCheckoutTime,
       const ObjectFetchContextPtr& fetchContext);
 
+  folly::coro::now_task<
+      std::vector<std::pair<PathComponent, folly::Try<EntryAttributes>>>>
+  co_getChildrenAttributes(
+      EntryAttributeFlags requestedAttributes,
+      RelativePath path,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      timespec lastCheckoutTime,
+      const ObjectFetchContextPtr& fetchContext);
+
   ImmediateFuture<std::string> getBlob(
+      const std::shared_ptr<ObjectStore>& objectStore,
+      const ObjectFetchContextPtr& fetchContext) const;
+
+  folly::coro::now_task<std::string> co_getBlob(
+      const std::shared_ptr<ObjectStore>& objectStore,
+      const ObjectFetchContextPtr& fetchContext) const;
+
+  folly::coro::now_task<std::optional<TreeAuxData>> co_getTreeAuxData(
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
 

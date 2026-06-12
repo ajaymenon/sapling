@@ -36,6 +36,7 @@ import ssl
 import sys
 from typing import Any, List, Optional, Pattern, Set, Sized
 
+from bindings import agentdetect
 from sapling import (
     autopull,
     cmdutil,
@@ -100,6 +101,41 @@ GIT_CALLSIGN_PREFIXES: Set[str] = {"AOSP"}
 githashre: Pattern[str] = re.compile(r"g([0-9a-f]{40})")
 svnrevre: Pattern[str] = re.compile(r"^r[A-Z]+(\d+)$")
 phabhashre: Pattern[str] = re.compile(r"^r([A-Z]+)([0-9a-f]{12,40})$")
+
+
+def validate_message_change(repo, old_desc, new_desc):
+    """Abort or prompt if new commit message drops a Differential Revision line present in old.
+
+    - If running as an agent, abort unconditionally.
+    - Otherwise, prompt the user to confirm whether to proceed.
+    """
+    if repo.ui.configbool("fbcodereview", "allow-diff-revision-drop"):
+        return
+    if repo.ui.plain():
+        # should not block automation like `jf unlink`
+        return
+    if not new_desc:
+        return
+    old_rev = diffprops.parserevfromcommitmsg(old_desc)
+    new_rev = diffprops.parserevfromcommitmsg(new_desc)
+    if old_rev and not new_rev:
+        if agentdetect.is_agent():
+            raise error.Abort(
+                _("commit message drops phabricator diff number 'D%s'") % old_rev,
+                hint=_(
+                    "use `jf template` to modify commit message fields or use 'jf unlink' to remove the associated phabricator diff"
+                ),
+            )
+        else:
+            choice = repo.ui.promptchoice(
+                _(
+                    "commit message drops phabircator diff number 'D%s', proceed (Yn)? $$ &Yes $$ &No"
+                )
+                % old_rev,
+                default=0,
+            )
+            if choice != 0:
+                raise error.Abort(_("aborted by user"))
 
 
 @templatekeyword("phabdiff")
@@ -332,14 +368,46 @@ def showphabstatus(repo, ctx, templ, **args):
         landstatus = result.get("land_job_status")
         finalreviewstatus = result.get("needs_final_review_status")
         if landstatus == "LAND_JOB_RUNNING":
+            signalstatus = result.get("signal_status")
+            if signalstatus == "LAND_ON_HOLD":
+                return "Land On Hold"
             return "Landing"
         elif landstatus == "LAND_RECENTLY_SUCCEEDED":
             return "Committing"
         elif landstatus == "LAND_RECENTLY_FAILED":
             return "Recently Failed to Land"
+        elif landstatus == "LAND_ENQUEUED":
+            return "Land Enqueued"
+        elif landstatus == "LAND_SCHEDULED":
+            return "Land Scheduled"
+        elif landstatus == "LAND_ON_HOLD":
+            return "Land On Hold"
+        elif landstatus == "LAND_CANCELLED":
+            return "Land Cancelled"
         elif finalreviewstatus == "NEEDED":
             return "Needs Final Review"
         else:
+            required_reviewers_info = result.get("required_reviewers_info")
+            if (
+                required_reviewers_info
+                and required_reviewers_info.get("overall_status") == "AWAITING"
+            ):
+                rr_type = required_reviewers_info.get("type")
+                if rr_type == "CRS_SECOND_REVIEW":
+                    return "Needs Extra Review"
+                elif rr_type == "STEWARD_REVIEW":
+                    return "Needs Steward Review"
+                elif rr_type == "REVIEWERS_ACL":
+                    return "Needs ACL Review"
+                elif rr_type == "DRS_REVIEWER":
+                    return "Needs DRS Review"
+                elif rr_type == "CRS_RECOMMENDED_REVIEWER":
+                    return "Needs CRS Review"
+                else:
+                    return "Needs Extra Review"
+            badge_label = result.get("automated_review_badge_label")
+            if badge_label:
+                return badge_label
             return result.get("status")
     else:
         return "Error"
@@ -789,7 +857,7 @@ def mirrornode(ctx, mapping, args):
 
 @templatekeyword("gitnode")
 def showgitnode(repo, ctx, templ, **args):
-    """Return the git revision corresponding to a given hg rev"""
+    """Return the git revision corresponding to a given @prog@ rev"""
     # Try reading from commit extra first.
     extra = ctx.extra()
     if "hg-git-rename-source" in extra:

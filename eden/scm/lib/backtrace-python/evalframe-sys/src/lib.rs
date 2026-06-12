@@ -69,7 +69,7 @@ pub unsafe fn resolve_frame(frame_ptr: usize) -> *const u8 {
 ///   that owns the frame must be paused.
 pub unsafe fn extract_code_lineno_from_frame(
     frame: *mut libc::c_void,
-    pline_no: *mut libc::c_int,
+    pline_no: *mut isize,
 ) -> *mut libc::c_void {
     unsafe { sapling_cext_evalframe_extract_code_lineno_from_frame(frame, pline_no) }
 }
@@ -86,7 +86,7 @@ pub unsafe fn resolve_code_object(
     unsafe { sapling_cext_evalframe_resolve_code_object(code, pfilename) }
 }
 
-/// Get the address of the `Sapling_PyEvalFrame` function.
+/// Get the addresses of `Sapling_PyEvalFrame` and `Sapling_PyEvalFrameInner`.
 ///
 /// This is used to identify Python frames in native stack traces by
 /// comparing instruction pointers against known offsets from this address.
@@ -94,10 +94,21 @@ pub fn sapling_py_eval_frame_addr() -> usize {
     Sapling_PyEvalFrame as *const () as usize
 }
 
-/// Get the last PyFrame value captured by `Sapling_PyEvalFrame`.
+/// Get the last (code, line_no) captured by `Sapling_PyEvalFrameProbe`.
 ///
 /// This is useful for probing the PyFrame variable on the stack during
 /// offset detection at build time.
+pub fn get_last_code_line_no() -> (usize, isize) {
+    unsafe {
+        (
+            sapling_cext_evalframe_get_last_code(),
+            sapling_cext_evalframe_get_last_line_no(),
+        )
+    }
+}
+
+/// Get the last frame captured by `Sapling_PyEvalFrameProbe`.
+/// This is only used for compatibility.
 pub fn get_last_frame() -> usize {
     unsafe { sapling_cext_evalframe_get_last_frame() }
 }
@@ -113,7 +124,7 @@ unsafe extern "C" {
 
     fn sapling_cext_evalframe_extract_code_lineno_from_frame(
         frame: *mut libc::c_void,
-        pline_no: *mut libc::c_int,
+        pline_no: *mut isize,
     ) -> *mut libc::c_void;
 
     fn sapling_cext_evalframe_resolve_frame_is_supported() -> libc::c_int;
@@ -121,7 +132,10 @@ unsafe extern "C" {
     fn sapling_cext_evalframe_resolve_frame(frame_ptr: usize) -> *const u8;
 
     fn sapling_cext_evalframe_get_last_frame() -> usize;
+    fn sapling_cext_evalframe_get_last_code() -> usize;
+    fn sapling_cext_evalframe_get_last_line_no() -> isize;
 
-    // The pass-through eval frame function. We only need its address.
+    // The pass-through eval frame function. We use its address and scans its stack.
+    // It's not called directly.
     fn Sapling_PyEvalFrame(tstate: usize, f: usize, exc: libc::c_int);
 }

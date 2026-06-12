@@ -42,7 +42,7 @@ impl SaplingRemoteApiHandler for LandStackHandler {
     type Request = LandStackRequest;
     type Response = LandStackResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::LandStack;
     const ENDPOINT: &'static str = "/land";
 
@@ -69,7 +69,7 @@ impl SaplingRemoteApiHandler for LandStackHandler {
             .data
             .as_ref()
             .err()
-            .map(|err| format_err!("{:?}", err))
+            .map(|err| format_err!("{err:?}"))
     }
 }
 
@@ -83,7 +83,7 @@ async fn land_stack_response<R: MononokeRepo>(
     Ok(LandStackResponse {
         data: land_stack(repo, bookmark, head_hgid, base_hgid, pushvars)
             .await
-            .map_err(|e| ServerError::generic(format!("{:?}", e))),
+            .map_err(|e| ServerError::generic(format!("{e:?}"))),
     })
 }
 
@@ -97,27 +97,33 @@ async fn land_stack<R: MononokeRepo>(
     let repo = repo.repo_ctx();
 
     let head = HgChangesetId::new(HgNodeHash::from(head_hgid));
-    let head = repo
-        .changeset(head)
-        .await
-        .context("failed to resolve head")?
-        .ok_or(ErrorKind::HgIdNotFound(head_hgid))?
-        .id();
-
     let base = HgChangesetId::new(HgNodeHash::from(base_hgid));
-    let base = repo
-        .changeset(base)
-        .await
-        .context("failed to resolve base")?
-        .ok_or(ErrorKind::HgIdNotFound(base_hgid))?
-        .id();
+    let (head, base) = futures::try_join!(
+        async {
+            anyhow::Ok(
+                repo.changeset(head)
+                    .await
+                    .context("failed to resolve head")?
+                    .ok_or(ErrorKind::HgIdNotFound(head_hgid))?
+                    .id(),
+            )
+        },
+        async {
+            anyhow::Ok(
+                repo.changeset(base)
+                    .await
+                    .context("failed to resolve base")?
+                    .ok_or(ErrorKind::HgIdNotFound(base_hgid))?
+                    .id(),
+            )
+        },
+    )?;
 
     let force_local_pushrebase = justknobs::eval(
         "scm/mononoke:edenapi_force_local_pushrebase",
         None,
         Some(repo.repo().repo_identity().name()),
-    )
-    .unwrap_or(false);
+    );
 
     let pushrebase_outcome = repo
         .land_stack(
@@ -181,7 +187,7 @@ async fn land_stack<R: MononokeRepo>(
         })
         .collect();
 
-    let old_to_new_hgids = old_hgids?.into_iter().zip(new_hgids?.into_iter()).collect();
+    let old_to_new_hgids = old_hgids?.into_iter().zip(new_hgids?).collect();
 
     Ok(LandStackData {
         new_head: new_head_hgid,

@@ -6,6 +6,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::error::Error as _;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -21,8 +22,10 @@ use configmodel::ConfigExt;
 use fbthrift_socket::SocketTransport;
 use filters::filter::FilterGenerator;
 use filters::id::FilterId;
-use filters::migration::cleanup_migration;
-use filters::migration::prepare_migration;
+use filters::migration::FilterSyncResult;
+use filters::migration::cleanup_filter_sync_backup;
+use filters::migration::rollback_filter_sync;
+use filters::migration::sync_filters;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use thrift_types::edenfs;
@@ -30,6 +33,8 @@ use thrift_types::edenfs::CheckoutProgressInfoRequest;
 use thrift_types::edenfs::CheckoutProgressInfoResponse;
 use thrift_types::edenfs::RootIdOptions;
 use thrift_types::edenfs_clients::EdenService;
+use thrift_types::fbthrift::ApplicationException;
+use thrift_types::fbthrift::ApplicationExceptionErrorCode;
 use thrift_types::fbthrift::binary_protocol::BinaryProtocol;
 use tokio_uds_compat::UnixStream;
 use tracing::error;
@@ -49,40 +54,9 @@ pub struct EdenFsClient {
     eden_config: EdenConfig,
     filter_generator: Option<Mutex<FilterGenerator>>,
     dot_dir: PathBuf,
-    sl_config: Arc<dyn Config>,
 }
 
 impl EdenFsClient {
-    fn pre_checkout_routine(mode: CheckoutMode, dot_dir: &Path, config: &dyn Config) -> Result<()> {
-        // Migration is only attempted during non-dry-run checkouts
-        if config
-            .get_opt("edenfs", "edensparse-migration")?
-            .unwrap_or(true)
-        {
-            if matches!(mode, CheckoutMode::Force | CheckoutMode::Normal) {
-                prepare_migration(dot_dir, config)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn post_checkout_routine(
-        mode: CheckoutMode,
-        dot_dir: &Path,
-        config: &dyn Config,
-        success: bool,
-    ) -> Result<()> {
-        if config
-            .get_opt("edenfs", "edensparse-migration")?
-            .unwrap_or(true)
-        {
-            if matches!(mode, CheckoutMode::Force | CheckoutMode::Normal) {
-                cleanup_migration(dot_dir, success)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Construct a client and FilterGenerator using the supplied working dir
     /// root. The latter is used to pass a FilterId to each thrift call.
     pub fn from_wdir(
@@ -97,7 +71,6 @@ impl EdenFsClient {
             eden_config,
             filter_generator: Some(Mutex::new(filter_generator)),
             dot_dir,
-            sl_config: config.clone(),
         })
     }
 
@@ -145,7 +118,7 @@ impl EdenFsClient {
     }
 
     fn root_options_from_filter(filter: Option<FilterId>) -> RootIdOptions {
-        let fid = filter.map(|filt| filt.id().ok()).flatten();
+        let fid = filter.and_then(|filt| filt.id().ok());
         edenfs::RootIdOptions {
             fid,
             ..Default::default()
@@ -213,6 +186,43 @@ impl EdenFsClient {
         Ok(position)
     }
 
+    /// Like get_journal_position but doesn't mark the journal as observed.
+    /// Falls back to get_journal_position if the server doesn't support this method.
+    #[tracing::instrument(skip(self))]
+    pub fn peek_journal_position(&self) -> anyhow::Result<(i64, i64)> {
+        let thrift_client = block_on(self.get_async_thrift_client())?;
+        let result = block_on(thrift_client.peekCurrentJournalPosition(
+            &edenfs::PeekCurrentJournalPositionRequest {
+                mountId: edenfs::MountId {
+                    mountPoint: self.root_vec(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+
+        if let Err(err) = &result {
+            if let Some(app_ex) = err
+                .source()
+                .and_then(|s| s.downcast_ref::<ApplicationException>())
+            {
+                // TODO: remove fallback once peekCurrentJournalPosition is available everywhere
+                if app_ex.type_ == ApplicationExceptionErrorCode::UnknownMethod {
+                    tracing::debug!("peekCurrentJournalPosition not available, falling back");
+                    return self.get_journal_position();
+                }
+            }
+        }
+
+        let response = extract_error(result)?;
+        let position = (
+            response.position.mountGeneration,
+            response.position.sequenceNumber,
+        );
+        tracing::debug!("journal position {:?}", position);
+        Ok(position)
+    }
+
     /// Set the working copy (dirstate) parents.
     #[tracing::instrument(skip(self))]
     pub fn set_parents(&self, p1: HgId, p2: Option<HgId>, p1_tree: HgId) -> anyhow::Result<()> {
@@ -266,38 +276,96 @@ impl EdenFsClient {
     /// The client might want to write pending draft changes to disk
     /// so edenfs can find the new files during checkout.
     /// Normalize to non-Thrift types.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, config))]
     pub fn checkout(
         &self,
+        config: &dyn Config,
         node: HgId,
         tree: HgId,
         mode: CheckoutMode,
     ) -> anyhow::Result<Vec<CheckoutConflict>> {
-        Self::pre_checkout_routine(mode, &self.dot_dir, &self.sl_config)?;
-        let tree_vec = tree.into_byte_array().into();
+        let disable_filter_sync: bool =
+            config.get_or_default("edensparse", "disable-filter-sync")?;
+        let sync_result: Option<FilterSyncResult> =
+            if !disable_filter_sync && matches!(mode, CheckoutMode::Force | CheckoutMode::Normal) {
+                Some(sync_filters(&self.dot_dir, config)?)
+            } else {
+                None
+            };
+
+        if let Some(FilterSyncResult::Updated {
+            ref previous,
+            ref current,
+        }) = sync_result
+        {
+            tracing::info!(
+                "Filter sync: {:?} -> {:?}",
+                previous.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+                current.iter().map(|p| p.as_str()).collect::<Vec<_>>()
+            );
+        }
+
+        let tree_bytes: Vec<u8> = tree.into_byte_array().into();
         let thrift_client = block_on(self.get_async_thrift_client())?;
 
         let root_id_options = Self::root_options_from_filter(self.get_active_filter_id(node)?);
         let params = edenfs::CheckOutRevisionParams {
-            hgRootManifest: Some(tree_vec),
+            hgRootManifest: Some(tree_bytes.clone()),
             cri: Some(self.get_client_request_info()),
             rootIdOptions: Some(root_id_options),
             ..Default::default()
         };
         let root_vec = self.root_vec();
-        let node_vec = node.into_byte_array().into();
+        let node_vec: Vec<u8> = node.into_byte_array().into();
         let thrift_mode = edenfs::CheckoutMode::local_from(mode);
 
         let start_time = Instant::now();
 
-        let thrift_result = extract_error(block_on(thrift_client.checkOutRevision(
+        let mut thrift_result = extract_error(block_on(thrift_client.checkOutRevision(
             &root_vec,
             &node_vec,
             &thrift_mode,
             &params,
         )));
 
-        Self::post_checkout_routine(mode, &self.dot_dir, &self.sl_config, thrift_result.is_ok())?;
+        match (&sync_result, &thrift_result) {
+            (Some(FilterSyncResult::Updated { .. }), Err(err)) => {
+                // Checkout failed, rollback filter changes so that EdenFS and
+                // Sapling sources of truth match
+                rollback_filter_sync(&self.dot_dir)?;
+
+                // If the error is CHECKOUT_IN_PROGRESS for the same commit,
+                // the filter sync changed the filter ID causing a mismatch
+                // with the interrupted checkout's stored destination. Now that
+                // we've rolled back .hg/sparse, retry with the original
+                // filter ID.
+                if is_interrupted_checkout_error(err, &node) {
+                    let root_id_options =
+                        Self::root_options_from_filter(self.get_active_filter_id(node)?);
+                    let retry_params = edenfs::CheckOutRevisionParams {
+                        hgRootManifest: Some(tree_bytes),
+                        cri: Some(self.get_client_request_info()),
+                        rootIdOptions: Some(root_id_options),
+                        ..Default::default()
+                    };
+                    let retry_result = extract_error(block_on(thrift_client.checkOutRevision(
+                        &root_vec,
+                        &node_vec,
+                        &thrift_mode,
+                        &retry_params,
+                    )));
+                    if retry_result.is_ok() {
+                        cleanup_filter_sync_backup(&self.dot_dir)?;
+                    }
+                    thrift_result = retry_result;
+                }
+            }
+            (Some(_), Ok(_)) => {
+                // Checkout succeeded, cleanup filter backup and legacy migration files
+                cleanup_filter_sync_backup(&self.dot_dir)?;
+            }
+            _ => {}
+        }
 
         hg_metrics::increment_counter(
             "edenclientcheckout_time",
@@ -329,6 +397,15 @@ pub(crate) fn extract_error<V, E: std::error::Error + Send + Sync + 'static>(
         }
         Ok(v) => Ok(v),
     }
+}
+
+/// Check if an error is an EdenFS CHECKOUT_IN_PROGRESS error for a specific commit.
+fn is_interrupted_checkout_error(err: &anyhow::Error, node: &HgId) -> bool {
+    if let Some(eden_err) = err.downcast_ref::<EdenError>() {
+        return eden_err.error_type == "CHECKOUT_IN_PROGRESS"
+            && eden_err.message.contains(&node.to_hex());
+    }
+    false
 }
 
 async fn get_socket_transport(sock_path: &Path) -> Result<SocketTransport<UnixStream>> {
@@ -379,7 +456,7 @@ impl EdenConfig {
         let root = fs_err::read_link(dot_eden.join("root"))?
             .into_os_string()
             .into_string()
-            .map_err(|path| anyhow!("couldn't stringify path {:?}", path))?;
+            .map_err(|path| anyhow!("couldn't stringify path {path:?}"))?;
         let socket = fs_err::read_link(dot_eden.join("socket"))?;
         let client = fs_err::read_link(dot_eden.join("client"))?;
         Ok(Self {

@@ -16,6 +16,7 @@
 #include <folly/testing/TestUtil.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <atomic>
 #include <chrono>
 #include <unordered_map>
 
@@ -192,14 +193,43 @@ class PrivHelperThreadedTestServer : public PrivHelperServer {
     }
   }
 
-  void bindMount(const char* /* clientPath */, const char* mountPath) override {
+  void insecureBindMount(const char* /* clientPath */, const char* mountPath)
+      override {
     auto future = getResultFuture(data_.wlock()->bindMountResults, mountPath);
     std::move(future).get(1s);
   }
 
-  void bindUnmount(const char* mountPath) override {
+  void bindMount(
+      const char* /* clientPath */,
+      const char* mountPath,
+      folly::StringPiece mountRoot) override {
+#ifndef __APPLE__
+    static_cast<void>(openBindMountTarget(mountRoot, mountPath));
+#else
+    (void)mountRoot;
+#endif
+    auto future = getResultFuture(data_.wlock()->bindMountResults, mountPath);
+    std::move(future).get(1s);
+  }
+
+  void insecureBindUnmount(const char* mountPath) override {
     auto future = getResultFuture(data_.wlock()->bindUnmountResults, mountPath);
     std::move(future).get(1s);
+  }
+
+  void bindUnmount(const char* mountPath, folly::StringPiece mountRoot)
+      override {
+#ifndef __APPLE__
+    static_cast<void>(openBindMountTarget(mountRoot, mountPath));
+#else
+    (void)mountRoot;
+#endif
+    auto future = getResultFuture(data_.wlock()->bindUnmountResults, mountPath);
+    std::move(future).get(1s);
+  }
+
+  bool useModernMountApi() const override {
+    return false;
   }
 
   void setLogFile(folly::File logFile) override {
@@ -208,6 +238,24 @@ class PrivHelperThreadedTestServer : public PrivHelperServer {
   }
 
   folly::Synchronized<Data> data_;
+};
+
+class PrivHelperFdUnmountTestServer : public PrivHelperServer {
+ public:
+  bool insecureBindUnmountCalled() const {
+    return insecureBindUnmountCalled_.load();
+  }
+
+ private:
+  void unmount(const char* /* mountPath */, UnmountOptions /* options */)
+      override {}
+
+  void insecureBindUnmount(const char* /* mountPath */) override {
+    insecureBindUnmountCalled_.store(true);
+    throw std::runtime_error("unexpected path-based bind unmount fallback");
+  }
+
+  std::atomic<bool> insecureBindUnmountCalled_{false};
 };
 
 class PrivHelperTest : public ::testing::Test {
@@ -240,6 +288,36 @@ class PrivHelperTest : public ::testing::Test {
 
   std::unique_ptr<PrivHelper> client_;
   PrivHelperThreadedTestServer server_;
+  std::thread serverThread_;
+  EventBaseThread clientIoThread_;
+};
+
+class PrivHelperFdUnmountTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    File clientConn;
+    File serverConn;
+    PrivHelperConn::createConnPair(clientConn, serverConn);
+
+    serverThread_ =
+        std::thread([this, conn = std::move(serverConn)]() mutable noexcept {
+          server_.initPartial(std::move(conn), getuid(), getgid());
+          server_.run();
+        });
+    client_ = createTestPrivHelper(std::move(clientConn));
+    clientIoThread_.getEventBase()->runInEventBaseThreadAndWait(
+        [&] { client_->attachEventBase(clientIoThread_.getEventBase()); });
+  }
+
+  ~PrivHelperFdUnmountTest() override {
+    client_.reset();
+    if (serverThread_.joinable()) {
+      serverThread_.join();
+    }
+  }
+
+  std::unique_ptr<PrivHelper> client_;
+  PrivHelperFdUnmountTestServer server_;
   std::thread serverThread_;
   EventBaseThread clientIoThread_;
 };
@@ -421,6 +499,11 @@ TEST_F(PrivHelperTest, bindMounts) {
 
   boost::filesystem::create_directory(abcMountPoint.path() / "foo");
   boost::filesystem::create_directory(abcMountPoint.path() / "bar");
+  boost::filesystem::create_directory(abcMountPoint.path() / "buck-out");
+  boost::filesystem::create_directory(
+      abcMountPoint.path() / "foo" / "buck-out");
+  boost::filesystem::create_directory(
+      abcMountPoint.path() / "bar" / "buck-out");
 
   // Prepare promises for the mount calls
   server_.setFuseMountResult(abcPath).setValue(File(tempFile.fd(), false));
@@ -432,6 +515,8 @@ TEST_F(PrivHelperTest, bindMounts) {
   auto userPath = userMountPoint.path().string();
 
   boost::filesystem::create_directory(userMountPoint.path() / "somerepo");
+  boost::filesystem::create_directory(
+      userMountPoint.path() / "somerepo" / "buck-out");
 
   server_.setFuseMountResult(userPath + "/somerepo")
       .setValue(File(tempFile.fd(), false));
@@ -448,7 +533,7 @@ TEST_F(PrivHelperTest, bindMounts) {
   server_.setBindUnmountResult(abcPath + "/bar/buck-out").setValue();
   server_.setFuseUnmountResult(userPath + "/somerepo").setValue();
   server_.setFuseUnmountResult(userPath + "/somerepo2").setValue();
-  // Leave the promise for somerepo/buck-out unfulfilled for now
+  // Leave the promise for somerepo/buck-out unfulfilled for now.
   auto somerepoBuckOutUnmountPromise =
       server_.setBindUnmountResult(userPath + "/somerepo/buck-out");
 
@@ -468,7 +553,7 @@ TEST_F(PrivHelperTest, bindMounts) {
   client_->fuseMount(userPath + "/somerepo2", false, "fuse").get(1s);
   client_->bindMount("/bind/mount/source", abcPath + "/bar/buck-out").get(1s);
 
-  // Manually unmount /somerepo
+  // Manually unmount /somerepo.
   // This will finish even though somerepoBuckOutUnmountPromise is still
   // outstanding because the privhelper and the OS don't care about relative
   // ordering of these two operations.
@@ -492,6 +577,186 @@ TEST_F(PrivHelperTest, bindMounts) {
       UnorderedElementsAre("/bind/never/actually/mounted"));
 }
 
+TEST_F(PrivHelperTest, bindMountRejectsEscapedMountPath) {
+#ifdef __APPLE__
+  GTEST_SKIP() << "Linux-specific openat2 validation";
+#else
+  auto mountRoot = makeTempDir("mount-root");
+  auto source = makeTempDir("source");
+  boost::filesystem::create_directory(mountRoot.path() / "registered");
+  boost::filesystem::create_directory(mountRoot.path() / "target");
+
+  const auto registeredPath = (mountRoot.path() / "registered").string();
+  const auto escapedPath = registeredPath + "/../target";
+
+  client_->takeoverStartup(registeredPath, {}).get(1s);
+  server_.setFuseUnmountResult(registeredPath).setValue();
+
+  server_.setBindMountResult(escapedPath).setValue();
+  EXPECT_THROW_RE(
+      client_->bindMount(source.path().string(), escapedPath).get(1s),
+      std::exception,
+      "Invalid cross-device link");
+
+  server_.setBindUnmountResult(escapedPath).setValue();
+  EXPECT_THROW_RE(
+      client_->bindUnMount(escapedPath).get(1s),
+      std::exception,
+      "Invalid cross-device link");
+
+#endif
+}
+
+TEST_F(PrivHelperTest, bindMountRejectsSymlinkComponent) {
+#ifdef __APPLE__
+  GTEST_SKIP() << "Linux-specific openat2 validation";
+#else
+  auto mountRoot = makeTempDir("mount-root");
+  auto source = makeTempDir("source");
+  auto outside = makeTempDir("outside");
+  boost::filesystem::create_directory(mountRoot.path() / "registered");
+  boost::filesystem::create_directories(outside.path() / "target");
+  boost::filesystem::create_directory_symlink(
+      outside.path(), mountRoot.path() / "registered" / "link");
+
+  const auto registeredPath = (mountRoot.path() / "registered").string();
+  const auto symlinkPath = registeredPath + "/link/target";
+
+  client_->takeoverStartup(registeredPath, {}).get(1s);
+  server_.setFuseUnmountResult(registeredPath).setValue();
+
+  server_.setBindMountResult(symlinkPath).setValue();
+  EXPECT_THROW_RE(
+      client_->bindMount(source.path().string(), symlinkPath).get(1s),
+      std::exception,
+      "Too many levels of symbolic links");
+
+  server_.setBindUnmountResult(symlinkPath).setValue();
+  EXPECT_THROW_RE(
+      client_->bindUnMount(symlinkPath).get(1s),
+      std::exception,
+      "Too many levels of symbolic links");
+
+#endif
+}
+
+TEST_F(PrivHelperTest, bindMountRejectsSymlinkHiddenByDotDot) {
+#ifdef __APPLE__
+  GTEST_SKIP() << "Linux-specific openat2 validation";
+#else
+  auto mountRoot = makeTempDir("mount-root");
+  auto source = makeTempDir("source");
+  auto outside = makeTempDir("outside");
+  boost::filesystem::create_directory(mountRoot.path() / "registered");
+  boost::filesystem::create_directory(
+      mountRoot.path() / "registered" / "target");
+  boost::filesystem::create_directories(outside.path() / "child");
+  boost::filesystem::create_directory(outside.path() / "target");
+  boost::filesystem::create_directory_symlink(
+      outside.path() / "child", mountRoot.path() / "registered" / "link");
+
+  const auto registeredPath = (mountRoot.path() / "registered").string();
+  const auto symlinkDotDotPath = registeredPath + "/link/../target";
+
+  client_->takeoverStartup(registeredPath, {}).get(1s);
+  server_.setFuseUnmountResult(registeredPath).setValue();
+
+  server_.setBindMountResult(symlinkDotDotPath).setValue();
+  EXPECT_THROW_RE(
+      client_->bindMount(source.path().string(), symlinkDotDotPath).get(1s),
+      std::exception,
+      "Too many levels of symbolic links");
+
+  server_.setBindUnmountResult(symlinkDotDotPath).setValue();
+  EXPECT_THROW_RE(
+      client_->bindUnMount(symlinkDotDotPath).get(1s),
+      std::exception,
+      "Too many levels of symbolic links");
+
+#endif
+}
+
+TEST_F(PrivHelperTest, bindMountAllowsSymlinkAncestorOfRegisteredMount) {
+#ifdef __APPLE__
+  GTEST_SKIP() << "Linux-specific openat2 validation";
+#else
+  auto realRoot = makeTempDir("real-root");
+  auto linkRoot = makeTempDir("link-root");
+  auto source = makeTempDir("source");
+  boost::filesystem::create_directories(realRoot.path() / "registered");
+  boost::filesystem::create_directories(
+      realRoot.path() / "registered" / "redirected");
+  boost::filesystem::create_directory_symlink(
+      realRoot.path(), linkRoot.path() / "link");
+
+  const auto registeredPath =
+      (linkRoot.path() / "link" / "registered").string();
+  const auto bindPath = registeredPath + "/redirected";
+
+  client_->takeoverStartup(registeredPath, {}).get(1s);
+  server_.setFuseUnmountResult(registeredPath).setValue();
+  server_.setBindMountResult(bindPath).setValue();
+
+  client_->bindMount(source.path().string(), bindPath).get(1s);
+#endif
+}
+
+TEST_F(
+    PrivHelperTest,
+    bindMountRejectsRetargetedSymlinkAncestorOfRegisteredMount) {
+#ifdef __APPLE__
+  GTEST_SKIP() << "Linux-specific openat2 validation";
+#else
+  auto realRoot = makeTempDir("real-root");
+  auto alternateRoot = makeTempDir("alternate-root");
+  auto linkRoot = makeTempDir("link-root");
+  auto source = makeTempDir("source");
+  boost::filesystem::create_directories(realRoot.path() / "registered");
+  boost::filesystem::create_directories(
+      alternateRoot.path() / "registered" / "redirected");
+  boost::filesystem::create_directory_symlink(
+      realRoot.path(), linkRoot.path() / "link");
+
+  const auto registeredPath =
+      (linkRoot.path() / "link" / "registered").string();
+  const auto bindPath = registeredPath + "/redirected";
+
+  client_->takeoverStartup(registeredPath, {}).get(1s);
+  server_.setFuseUnmountResult(registeredPath).setValue();
+
+  boost::filesystem::remove(linkRoot.path() / "link");
+  boost::filesystem::create_directory_symlink(
+      alternateRoot.path(), linkRoot.path() / "link");
+
+  server_.setBindMountResult(bindPath).setValue();
+  EXPECT_THROW_RE(
+      client_->bindMount(source.path().string(), bindPath).get(1s),
+      std::exception,
+      "No such file or directory");
+#endif
+}
+
+TEST_F(
+    PrivHelperFdUnmountTest,
+    bindUnmountDoesNotFallBackAfterProcFdUnmountFailure) {
+#ifdef __APPLE__
+  GTEST_SKIP() << "Linux-specific procfd bind unmount validation";
+#else
+  auto mountRoot = makeTempDir("mount-root");
+  boost::filesystem::create_directory(mountRoot.path() / "registered");
+  boost::filesystem::create_directory(
+      mountRoot.path() / "registered" / "not-mounted");
+
+  const auto registeredPath = (mountRoot.path() / "registered").string();
+  const auto notMountedPath = registeredPath + "/not-mounted";
+
+  client_->takeoverStartup(registeredPath, {}).get(1s);
+
+  EXPECT_THROW(client_->bindUnMount(notMountedPath).get(1s), std::exception);
+  EXPECT_FALSE(server_.insecureBindUnmountCalled());
+#endif
+}
+
 TEST_F(PrivHelperTest, takeoverShutdown) {
   auto abcMountPoint = makeTempDir("abc");
   auto abcPath = abcMountPoint.path().string();
@@ -499,6 +764,11 @@ TEST_F(PrivHelperTest, takeoverShutdown) {
 
   boost::filesystem::create_directory(abcMountPoint.path() / "foo");
   boost::filesystem::create_directory(abcMountPoint.path() / "bar");
+  boost::filesystem::create_directory(abcMountPoint.path() / "buck-out");
+  boost::filesystem::create_directory(
+      abcMountPoint.path() / "foo" / "buck-out");
+  boost::filesystem::create_directory(
+      abcMountPoint.path() / "bar" / "buck-out");
 
   // Prepare promises for the mount calls
   server_.setFuseMountResult(abcPath).setValue(File(tempFile.fd(), false));
@@ -515,6 +785,8 @@ TEST_F(PrivHelperTest, takeoverShutdown) {
       .setValue(File(tempFile.fd(), false));
 
   boost::filesystem::create_directory(userMountPoint.path() / "somerepo2");
+  boost::filesystem::create_directory(
+      userMountPoint.path() / "somerepo2" / "buck-out");
   server_.setFuseMountResult(userPath + "/somerepo2")
       .setValue(File(tempFile.fd(), false));
   server_.setBindMountResult(userPath + "/somerepo2/buck-out").setValue();
@@ -585,6 +857,7 @@ TEST_F(PrivHelperTest, takeoverStartup) {
   // Manually mount one other mount point.
   auto xyzMountPoint = makeTempDir("xyz");
   auto xyzPath = xyzMountPoint.path().string();
+  boost::filesystem::create_directory(xyzMountPoint.path() / "buck-out");
   server_.setFuseMountResult(xyzPath).setValue(File(tempFile.fd(), false));
   server_.setBindMountResult(xyzPath + "/buck-out").setValue();
   client_->fuseMount(xyzPath, false, "fuse").get(1s);

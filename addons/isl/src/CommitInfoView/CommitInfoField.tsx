@@ -5,15 +5,21 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {ReactNode} from 'react';
+import type {JSX, ReactNode} from 'react';
 import type {FieldConfig} from './types';
 
 import {Icon} from 'isl-components/Icon';
 import {extractTokens, TokensList} from 'isl-components/Tokens';
+import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
+import {useAtomValue} from 'jotai';
 import {Fragment} from 'react';
+import {InternalFieldName} from 'shared/constants';
 import {tracker} from '../analytics';
 import {Copyable} from '../Copyable';
 import {T} from '../i18n';
+import {Internal} from '../Internal';
+import {copyFromParentCommit, parentCommitContextAtom} from './CommitInfoState';
+import {isFieldNonEmpty} from './CommitMessageFields';
 import {RenderMarkup} from './RenderMarkup';
 import {SeeMoreContainer} from './SeeMoreContainer';
 import {CommitInfoTextArea} from './TextArea';
@@ -41,6 +47,9 @@ export function CommitInfoField({
   extra?: JSX.Element;
   autofocus?: boolean;
 }): JSX.Element | null {
+  const parentFields = useAtomValue(parentCommitContextAtom)?.parentFields;
+  const showCopyFromParent =
+    !readonly && parentFields != null && isFieldNonEmpty(parentFields[field.key]);
   const editedFieldContent =
     editedField == null ? '' : Array.isArray(editedField) ? editedField.join(', ') : editedField;
   if (field.type === 'title') {
@@ -61,17 +70,20 @@ export function CommitInfoField({
             />
           </Section>
         ) : (
-          <ClickToEditField
-            startEditingField={readonly ? undefined : startEditingField}
-            kind={field.type}
-            fieldKey={field.key}>
-            <span>{content}</span>
-            {readonly ? null : (
-              <span className="hover-edit-button">
-                <Icon icon="edit" />
-              </span>
-            )}
-          </ClickToEditField>
+          <div className="commit-info-title-wrapper">
+            <ClickToEditField
+              startEditingField={readonly ? undefined : startEditingField}
+              kind={field.type}
+              fieldKey={field.key}>
+              <span>{content}</span>
+            </ClickToEditField>
+            <div className="commit-info-field-buttons">
+              {readonly ? null : <EditFieldButton onClick={startEditingField} />}
+              {showCopyFromParent ? (
+                <CopyFromParentButton onClick={() => copyFromParentCommit(field.key)} />
+              ) : null}
+            </div>
+          </div>
         )}
         {extra}
       </>
@@ -175,19 +187,30 @@ export function CommitInfoField({
     return (
       <Section>
         <Wrapper>
+          <SmallCapsTitle>
+            <Icon icon={field.icon} />
+            <T>{field.key}</T>
+            <div className="commit-info-field-buttons">
+              {readonly ? null : <EditFieldButton onClick={startEditingField} />}
+              {showCopyFromParent ? (
+                <CopyFromParentButton onClick={() => copyFromParentCommit(field.key)} />
+              ) : null}
+              {!readonly &&
+              field.key === InternalFieldName.TestPlan &&
+              Internal.RecommendTestPlanButton ? (
+                <Internal.RecommendTestPlanButton className="hover-edit-button" />
+              ) : null}
+              {!readonly &&
+              field.key === InternalFieldName.Summary &&
+              Internal.GenerateSummaryButton ? (
+                <Internal.GenerateSummaryButton className="hover-edit-button" />
+              ) : null}
+            </div>
+          </SmallCapsTitle>
           <ClickToEditField
             startEditingField={readonly ? undefined : startEditingField}
             kind={field.type}
             fieldKey={field.key}>
-            <SmallCapsTitle>
-              <Icon icon={field.icon} />
-              <T>{field.key}</T>
-              {readonly ? null : (
-                <span className="hover-edit-button">
-                  <Icon icon="edit" />
-                </span>
-              )}
-            </SmallCapsTitle>
             {renderedContent}
           </ClickToEditField>
           {extra}
@@ -240,5 +263,25 @@ function ClickToEditField({
       tabIndex={0}>
       {children}
     </div>
+  );
+}
+
+function EditFieldButton({onClick}: {onClick: () => void}) {
+  return (
+    <Tooltip title="Edit field" delayMs={DOCUMENTATION_DELAY}>
+      <button className="hover-edit-button" onClick={onClick}>
+        <Icon icon="edit" />
+      </button>
+    </Tooltip>
+  );
+}
+
+function CopyFromParentButton({onClick}: {onClick: () => void}) {
+  return (
+    <Tooltip title="Copy from previous commit" delayMs={DOCUMENTATION_DELAY}>
+      <button className="hover-edit-button" onClick={onClick}>
+        <Icon icon="clippy" />
+      </button>
+    </Tooltip>
   );
 }

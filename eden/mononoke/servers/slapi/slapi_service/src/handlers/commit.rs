@@ -115,6 +115,7 @@ use sorted_vector_map::SortedVectorMap;
 use tracing::debug;
 use types::HgId;
 use types::Parents;
+use vec1::Vec1;
 
 use super::HandlerInfo;
 use super::HandlerResult;
@@ -265,7 +266,7 @@ impl SaplingRemoteApiHandler for LocationToHashHandler {
     type Request = CommitLocationToHashRequestBatch;
     type Response = CommitLocationToHashResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitLocationToHash;
     const ENDPOINT: &'static str = "/commit/location_to_hash";
 
@@ -350,7 +351,7 @@ impl SaplingRemoteApiHandler for HashToLocationHandler {
     type Request = CommitHashToLocationRequestBatch;
     type Response = CommitHashToLocationResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitHashToLocation;
     const ENDPOINT: &'static str = "/commit/hash_to_location";
 
@@ -418,7 +419,7 @@ impl SaplingRemoteApiHandler for HashToLocationHandler {
             .result
             .as_ref()
             .err()
-            .map(|err| format_err!("{:?}", err))
+            .map(|err| format_err!("{err:?}"))
     }
 }
 
@@ -489,7 +490,7 @@ impl SaplingRemoteApiHandler for HashLookupHandler {
     type Request = Batch<CommitHashLookupRequest>;
     type Response = CommitHashLookupResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitHashLookup;
     const ENDPOINT: &'static str = "/commit/hash_lookup";
 
@@ -500,7 +501,7 @@ impl SaplingRemoteApiHandler for HashLookupHandler {
         let repo = ectx.repo();
         use CommitHashLookupRequest::*;
         Ok(stream::iter(request.batch)
-            .then(move |request| {
+            .map(move |request| {
                 let hg_repo_ctx = repo.clone();
                 async move {
                     let changesets = match request {
@@ -513,6 +514,7 @@ impl SaplingRemoteApiHandler for HashLookupHandler {
                     Ok(response)
                 }
             })
+            .buffered(MAX_CONCURRENT_FETCHES_PER_REQUEST)
             .boxed())
     }
 }
@@ -525,7 +527,7 @@ impl SaplingRemoteApiHandler for UploadHgChangesetsHandler {
     type Request = UploadHgChangesetsRequest;
     type Response = UploadTokensResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::UploadHgChangesets;
     const ENDPOINT: &'static str = "/upload/changesets";
 
@@ -537,6 +539,7 @@ impl SaplingRemoteApiHandler for UploadHgChangesetsHandler {
         let changesets = request.changesets;
 
         let ctx = repo.ctx().clone();
+        // Per-user commit rate limit: always 429, this client is the offender.
         bump_counter_check_ratelimit(ctx, COMMITS_PER_USER_RATE_LIMIT, 1.0)
             .await
             .map_err(HttpError::e429)?;
@@ -585,7 +588,7 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
     type Request = UploadBonsaiChangesetRequest;
     type Response = UploadTokensResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::UploadBonsaiChangeset;
     const ENDPOINT: &'static str = "/upload/changeset/bonsai";
 
@@ -600,6 +603,7 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
         let repo = &repo;
 
         let ctx = repo.ctx().clone();
+        // Per-user commit rate limit: always 429, this client is the offender.
         bump_counter_check_ratelimit(ctx, COMMITS_PER_USER_RATE_LIMIT, 1.0)
             .await
             .map_err(HttpError::e429)?;
@@ -608,7 +612,7 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
             .then(|hgid| async move {
                 repo.get_bonsai_from_hg(hgid.into())
                     .await?
-                    .ok_or_else(|| anyhow!("Parent HgId {} is invalid", hgid))
+                    .ok_or_else(|| anyhow!("Parent HgId {hgid} is invalid"))
             })
             .try_collect()
             .await?;
@@ -651,7 +655,7 @@ async fn upload_bonsai_changeset(
                 .into_iter()
                 .map(|(path, fc)| {
                     let create_change = to_create_change(fc, bubble_id)
-                        .with_context(|| anyhow!("Parsing file changes for {}", path))?;
+                        .with_context(|| anyhow!("Parsing file changes for {path}"))?;
                     Ok((to_mpath(path)?, create_change))
                 })
                 .collect::<anyhow::Result<_>>()?,
@@ -664,6 +668,8 @@ async fn upload_bonsai_changeset(
                 noop_file_changes: CreateChangesetCheckMode::Skip,
                 deleted_files_existed_in_a_parent: CreateChangesetCheckMode::Skip,
                 empty_changeset: CreateChangesetCheckMode::Skip,
+                copy_from_path: CreateChangesetCheckMode::Skip,
+                prefix_files_deleted: CreateChangesetCheckMode::Skip,
             },
         )
         .await
@@ -681,7 +687,7 @@ impl SaplingRemoteApiHandler for FetchSnapshotHandler {
     type Request = FetchSnapshotRequest;
     type Response = FetchSnapshotResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::FetchSnapshot;
     const ENDPOINT: &'static str = "/snapshot";
 
@@ -698,8 +704,7 @@ impl SaplingRemoteApiHandler for FetchSnapshotHandler {
             .context("Failure in fetching bubble from changeset")?
             .ok_or_else(|| {
                 HttpError::e404(MononokeError::NotAvailable(format!(
-                    "Snapshot for changeset {} not found in bubble",
-                    cs_id
+                    "Snapshot for changeset {cs_id} not found in bubble"
                 )))
             })?;
         let labels = repo
@@ -707,7 +712,27 @@ impl SaplingRemoteApiHandler for FetchSnapshotHandler {
             .labels_from_bubble(repo.ctx(), &bubble_id)
             .await
             .context("Failed to fetch labels associated with the snapshot")?;
-        let blobstore = repo.bubble_blobstore(Some(bubble_id)).await?;
+        let bubble = match repo
+            .ephemeral_store()
+            .open_bubble(repo.ctx(), bubble_id)
+            .await
+        {
+            Ok(bubble) => bubble,
+            Err(e) => {
+                let bubble_expired = e
+                    .downcast_ref::<EphemeralBlobstoreError>()
+                    .is_some_and(EphemeralBlobstoreError::is_bubble_expiry);
+                let err = if bubble_expired {
+                    HttpError::e400(MononokeError::NotAvailable(format!(
+                        "Snapshot for changeset {cs_id} with bubble ID {bubble_id} expired"
+                    )))
+                } else {
+                    HttpError::e500(MononokeError::from(e))
+                };
+                return Err(err.into());
+            }
+        };
+        let blobstore = bubble.wrap_repo_blobstore(repo.repo().repo_blobstore().clone());
         let fallible_cs = cs_id
             .load(repo.ctx(), &blobstore)
             .await
@@ -715,16 +740,14 @@ impl SaplingRemoteApiHandler for FetchSnapshotHandler {
         let cs = match fallible_cs {
             Ok(cs) => cs.into_mut(),
             Err(e) => {
-                // Check if this is a bubble expiration error by downcasting
-                let bubble_expired =
-                    e.downcast_ref::<EphemeralBlobstoreError>()
-                        .is_some_and(|ephemeral_err| {
-                            matches!(ephemeral_err, EphemeralBlobstoreError::NoSuchBubble(_))
-                        });
+                // Check if this is a bubble expiration error by downcasting.
+                // Matches both NoSuchBubble (open-time) and BubbleExpired (mid-operation).
+                let bubble_expired = e
+                    .downcast_ref::<EphemeralBlobstoreError>()
+                    .is_some_and(EphemeralBlobstoreError::is_bubble_expiry);
                 let err = if bubble_expired {
                     HttpError::e400(MononokeError::NotAvailable(format!(
-                        "Snapshot for changeset {} with bubble ID {} expired",
-                        cs_id, bubble_id
+                        "Snapshot for changeset {cs_id} with bubble ID {bubble_id} expired"
                     )))
                 } else {
                     HttpError::e500(MononokeError::from(e))
@@ -808,7 +831,7 @@ impl SaplingRemoteApiHandler for AlterSnapshotHandler {
     type Request = AlterSnapshotRequest;
     type Response = AlterSnapshotResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::AlterSnapshot;
     const ENDPOINT: &'static str = "/snapshot/alter";
 
@@ -824,8 +847,7 @@ impl SaplingRemoteApiHandler for AlterSnapshotHandler {
             .await?
             .ok_or_else(|| {
                 HttpError::e404(MononokeError::NotAvailable(format!(
-                    "Snapshot for changeset {} not found in bubble",
-                    cs_id
+                    "Snapshot for changeset {cs_id} not found in bubble"
                 )))
             })?;
         let (label_addition, label_removal) = (
@@ -866,7 +888,7 @@ impl SaplingRemoteApiHandler for EphemeralPrepareHandler {
     type Request = EphemeralPrepareRequest;
     type Response = EphemeralPrepareResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::EphemeralPrepare;
     const ENDPOINT: &'static str = "/ephemeral/prepare";
 
@@ -899,7 +921,7 @@ impl SaplingRemoteApiHandler for EphemeralExtendHandler {
     type Request = EphemeralExtendRequest;
     type Response = EphemeralExtendResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::EphemeralExtend;
     const ENDPOINT: &'static str = "/ephemeral/extend";
 
@@ -919,15 +941,12 @@ impl SaplingRemoteApiHandler for EphemeralExtendHandler {
         {
             Ok(outcome) => outcome,
             Err(e) => {
-                let bubble_expired =
-                    e.downcast_ref::<EphemeralBlobstoreError>()
-                        .is_some_and(|ephemeral_err| {
-                            matches!(ephemeral_err, EphemeralBlobstoreError::NoSuchBubble(_))
-                        });
+                let bubble_expired = e
+                    .downcast_ref::<EphemeralBlobstoreError>()
+                    .is_some_and(EphemeralBlobstoreError::is_bubble_expiry);
                 let err = if bubble_expired {
                     HttpError::e400(MononokeError::NotAvailable(format!(
-                        "Bubble with ID {} expired",
-                        bubble_id
+                        "Bubble with ID {bubble_id} expired"
                     )))
                 } else {
                     HttpError::e500(MononokeError::from(e))
@@ -962,7 +981,7 @@ impl SaplingRemoteApiHandler for GraphHandlerV2 {
     type Request = CommitGraphRequest;
     type Response = CommitGraphEntry;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitGraphV2;
     const ENDPOINT: &'static str = "/commit/graph_v2";
 
@@ -1040,7 +1059,7 @@ impl SaplingRemoteApiHandler for GraphSegmentsHandler {
     type Request = CommitGraphSegmentsRequest;
     type Response = CommitGraphSegmentsEntry;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitGraphSegments;
     const ENDPOINT: &'static str = "/commit/graph_segments";
     const SUPPORTED_FLAVOURS: &'static [SlapiCommitIdentityScheme] = &[
@@ -1121,7 +1140,7 @@ impl SaplingRemoteApiHandler for CommitMutationsHandler {
     type Request = CommitMutationsRequest;
     type Response = CommitMutationsResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitMutations;
     const ENDPOINT: &'static str = "/commit/mutations";
 
@@ -1158,7 +1177,7 @@ impl SaplingRemoteApiHandler for CommitTranslateId {
     type Request = CommitTranslateIdRequest;
     type Response = CommitTranslateIdResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitTranslateId;
     const ENDPOINT: &'static str = "/commit/translate_id";
 
@@ -1221,7 +1240,7 @@ impl SaplingRemoteApiHandler for CommitTranslateId {
 
         // Convert bonsai ids to that of "to" repo, if necessary.
         if from_repo.repoid() != to_repo.repoid() {
-            input_to_bonsai = stream::iter(input_to_bonsai.into_iter())
+            input_to_bonsai = stream::iter(input_to_bonsai)
                 .then(|(id, bs)| {
                     let from_repo = from_repo.clone();
                     let to_repo = to_repo.clone();
@@ -1303,7 +1322,7 @@ impl SaplingRemoteApiHandler for UploadIdenticalChangesetsHandler {
     type Request = UploadIdenticalChangesetsRequest;
     type Response = UploadTokensResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::UploadIdenticalChangesets;
     const ENDPOINT: &'static str = "/upload/changesets/identical";
 
@@ -1353,7 +1372,7 @@ impl SaplingRemoteApiHandler for UploadIdenticalChangesetsHandler {
                         .into_iter()
                         .map(|(path, bfc)| {
                             let create_change = to_create_change(bfc, None)
-                                .with_context(|| anyhow!("Parsing file changes for {}", path))?;
+                                .with_context(|| anyhow!("Parsing file changes for {path}"))?;
 
                             let create_change2 = create_change.into_file_change(&parents)?;
 
@@ -1464,20 +1483,38 @@ impl SaplingRemoteApiHandler for UploadIdenticalChangesetsHandler {
         let bonsai_changesets_clone = bonsai_changesets.clone();
         let bs_ctx = ctx.clone();
         let bs_fut = async move {
-            for res in bonsai_changesets_clone {
-                let (bcs, _) = res?;
-                let bonsai_blob = bcs.clone().into_blob();
-                let bcs_id = bcs.get_changeset_id();
-                let blobstore_key = bcs_id.blobstore_key();
+            // Single pass: build blobstore put futures and commit graph entries together.
+            let (put_futs, graph_entries_vec): (Vec<_>, Vec<_>) = bonsai_changesets_clone
+                .into_iter()
+                .map(|res| res.map(|(bcs, _)| bcs))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|bcs| {
+                    let bonsai_blob = bcs.clone().into_blob();
+                    let blobstore_key = bcs.get_changeset_id().blobstore_key();
+                    let put_fut = blobstore.put(&bs_ctx, blobstore_key, bonsai_blob.into());
+                    let graph_entry = (bcs.get_changeset_id(), bcs.parents().collect(), Vec::new());
+                    (put_fut, graph_entry)
+                })
+                .unzip();
 
-                blobstore
-                    .put(&bs_ctx, blobstore_key, bonsai_blob.into())
-                    .await?;
+            stream::iter(put_futs)
+                .buffer_unordered(100)
+                .try_collect::<Vec<_>>()
+                .await?;
 
-                commit_graph_writer
-                    .add(&bs_ctx, bcs_id, bcs.parents().collect(), Vec::new())
-                    .await
-                    .context("While inserting into changeset table")?;
+            match Vec1::try_from_vec(graph_entries_vec) {
+                Ok(graph_entries) => {
+                    commit_graph_writer
+                        .add_many(&bs_ctx, graph_entries)
+                        .await
+                        .context("While inserting into changeset table")?;
+                }
+                Err(_empty) => {
+                    // No changesets -- both put_futs and graph_entries are derived
+                    // from the same iterator, so empty here means zero blobstore
+                    // puts above as well.
+                }
             }
             Ok::<_, MononokeError>(())
         };
@@ -1499,18 +1536,22 @@ impl SaplingRemoteApiHandler for UploadIdenticalChangesetsHandler {
 
         let (_, hg_changesets) = tokio::try_join!(bs_fut, hg_fut)?;
 
-        for hg_cs in hg_changesets.clone() {
-            let (hg_cs_id, bcs) = hg_cs?;
-            let bonsai_hg_entry = BonsaiHgMappingEntry {
-                hg_cs_id,
-                bcs_id: bcs.get_changeset_id(),
-            };
+        let mapping_entries: Vec<BonsaiHgMappingEntry> = hg_changesets
+            .clone()
+            .into_iter()
+            .map(|hg_cs| {
+                let (hg_cs_id, bcs) = hg_cs?;
+                Ok(BonsaiHgMappingEntry {
+                    hg_cs_id,
+                    bcs_id: bcs.get_changeset_id(),
+                })
+            })
+            .collect::<Result<_, Error>>()?;
 
-            bonsai_hg_mapping
-                .add(&ctx, bonsai_hg_entry)
-                .await
-                .context("While inserting in bonsai-hg mapping")?;
-        }
+        bonsai_hg_mapping
+            .bulk_add(&ctx, &mapping_entries)
+            .await
+            .context("While inserting in bonsai-hg mapping")?;
 
         let tokens = hg_changesets.into_iter().map(move |r| {
             r.map(|(hg_cs_id, _)| {

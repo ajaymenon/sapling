@@ -310,9 +310,20 @@ struct EnumType {
 }
 
 /**
- * Indicates that frozen types should not be generated for a given struct.
+ * When applied to a struct or union, indicates that frozen types should not be
+ * generated for that type.
+ *
+ * When applied to a field, indicates that the field should be omitted from the
+ * frozen layout. The field's value is not laid out, not frozen, and not
+ * carried in the frozen blob; a populated excluded field will throw
+ * `LayoutExcludedException` on freeze, exactly as struct-level
+ * `@cpp.Frozen2Exclude` does when its type is used as a populated non-nullable
+ * field. Field-level `@cpp.Frozen2Exclude` is supported only on `optional`
+ * non-ref, non-adapted, non-boxed value fields; other shapes are rejected at
+ * compile time.
  */
 @scope.Structured
+@scope.Field
 struct Frozen2Exclude {}
 
 /**
@@ -428,6 +439,33 @@ struct EnableCustomTypeOrdering {}
  */
 @scope.Service
 struct GenerateServiceMethodDecorator {}
+
+/**
+ * When applied to a service, generates only a FastClient instead of the
+ * standard AsyncClient. The FastClient uses the fast_thrift pipeline for
+ * lower latency serialization and deserialization.
+ *
+ * Only request/response functions are supported. Functions using streams,
+ * sinks, oneway, or interactions are skipped.
+ */
+@scope.Service
+struct FastClient {}
+
+/**
+ * When applied to a service, generates an
+ * apache::thrift::FastServiceHandler<Service> specialization and a
+ * per-connection <Service>AppAdapter instead of the standard SvIf and
+ * AsyncProcessor. The generated server uses the fast_thrift pipeline for
+ * lower latency serialization and deserialization.
+ *
+ * Users implement apache::thrift::FastServiceHandler<MyService> and share
+ * a std::shared_ptr across per-connection <Service>AppAdapter instances.
+ *
+ * Only request/response functions are supported. Functions using streams,
+ * sinks, oneway, or interactions are skipped.
+ */
+@scope.Service
+struct FastServer {}
 
 /**
  * Marks a structured type as non-orderable, marking `operator<` as deleted.

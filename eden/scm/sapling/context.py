@@ -11,13 +11,12 @@
 # GNU General Public License version 2 or any later version.
 
 
+import bisect
 import errno
 import filecmp
-import hashlib
 import os
 import re
 import stat
-import sys
 from functools import partial
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -569,12 +568,10 @@ class changectx(basectx):
 
     @propertycache
     def _manifest(self):
-        self._repo.manifestlog.recentlinknode = self.node()
         return self._manifestctx.read()
 
     @property
     def _manifestctx(self):
-        self._repo.manifestlog.recentlinknode = self.node()
         try:
             return self._repo.manifestlog[self._changeset.manifest]
         except Exception as ex:
@@ -733,12 +730,23 @@ class changectx(basectx):
     def walk(self, match):
         """Generates matching file names."""
 
-        # Wrap match.bad method to have message with nodeid
         def bad(fn, msg):
-            match.bad(fn, _("no such file in rev %s") % self)
+            match.bad(fn, msg or _("no such file in rev %s") % self)
 
         m = matchmod.badmatch(match, bad)
-        return self._manifest.walk(m)
+
+        paths = self._manifest.walk(m)
+
+        for f in match.files():
+            match self._manifest.lookup(f):
+                case None:
+                    m.bad(f, "restricted path")
+                case True:
+                    pass
+                case False:
+                    m.bad(f, None)
+
+        return paths
 
     def matches(self, match):
         return self.walk(match)
@@ -1678,20 +1686,18 @@ class committablectx(basectx):
         removed = sorted(removed)
         drop = sorted(drop)
         if added or drop:
-            if isgit:
-                mn = mctx.writegit()
-            else:
-                mn = (
-                    mctx.write(
-                        tr,
-                        linkrev,
-                        p1.manifestnode(),
-                        p2.manifestnode(),
-                        added,
-                        drop,
-                    )
-                    or p1.manifestnode()
-                )
+            p1node = nullid if isgit else p1.manifestnode()
+            p2node = nullid if isgit else p2.manifestnode()
+            mn = mctx.write(
+                tr,
+                linkrev,
+                p1node,
+                p2node,
+                added,
+                drop,
+            )
+            if not isgit:
+                mn = mn or p1.manifestnode()
         else:
             mn = p1.manifestnode()
         files = changed + removed
@@ -1786,7 +1792,19 @@ class committablectx(basectx):
 
     def matches(self, match):
         # XXX: Consider using: return sorted(self._manifest.walk(match))
-        return sorted(self._repo.dirstate.matches(match))
+        results = sorted(self._repo.dirstate.matches(match))
+
+        # Check for restricted paths via the parent manifest.
+        if self._parents:
+            manifest = self._parents[0]._manifest
+            for f in match.files():
+                idx = bisect.bisect_left(results, f)
+                if (idx >= len(results) or results[idx] != f) and manifest.lookup(
+                    f
+                ) is None:
+                    match.bad(f, "restricted path")
+
+        return results
 
     def ancestors(self):
         for p in self._parents:

@@ -731,3 +731,101 @@ TEST_F(
   EXPECT_EQ(oldFile1Id, file1->getNodeId());
   EXPECT_EQ(oldFile2Id, file2->getNodeId());
 }
+
+// Verify createInodeLoadFailEvent publishes a FAIL event when a load fails
+// for an inode in unloadedInodes_.
+TEST(InodeMap, createInodeLoadFailEventPublishesFailEvent) {
+  folly::UnboundedQueue<InodeTraceEvent, true, true, false> queue;
+  auto builder = FakeTreeBuilder();
+  builder.setFile("src/test.txt", "this is a test file");
+  TestMount testMount{builder, false};
+  const auto& edenMount = testMount.getEdenMount();
+  auto& trace_bus = edenMount->getInodeTraceBus();
+
+  auto handle = trace_bus.subscribeFunction(
+      fmt::format("loadFailEventTest-{}", edenMount->getPath().basename()),
+      [&](const InodeTraceEvent& event) {
+        if (event.eventType == InodeEventType::LOAD) {
+          queue.enqueue(event);
+        }
+      });
+
+  size_t iteration_count = 0;
+  while (queue.try_dequeue_for(loadTimeoutLimit).has_value() &&
+         iteration_count < maxWaitForLoads) {
+    ++iteration_count;
+    if (iteration_count >= maxWaitForLoads) {
+      throw std::runtime_error{
+          "EdenFS not settling after startup, too many loads"};
+    }
+  }
+
+  auto rootInode = edenMount->getRootInode();
+  auto srcFuture =
+      rootInode->getOrLoadChild("src"_pc, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
+  testMount.drainServerExecutor();
+  EXPECT_FALSE(srcFuture.isReady());
+
+  auto startEvent = queue.try_dequeue_for(loadTimeoutLimit);
+  ASSERT_TRUE(startEvent.has_value());
+  EXPECT_EQ(InodeEventProgress::START, startEvent->progress);
+
+  builder.triggerError("src", std::domain_error("injected error for testing"));
+  testMount.drainServerExecutor();
+  ASSERT_TRUE(srcFuture.isReady());
+  EXPECT_THROW(std::move(srcFuture).get(), std::domain_error);
+
+  auto failEvent = queue.try_dequeue_for(loadTimeoutLimit);
+  ASSERT_TRUE(failEvent.has_value()) << "Expected a LOAD FAIL event";
+  EXPECT_EQ(InodeEventProgress::FAIL, failEvent->progress);
+  EXPECT_EQ(InodeEventType::LOAD, failEvent->eventType);
+  EXPECT_EQ(startEvent->ino, failEvent->ino);
+}
+
+TEST(InodeMap, totalInodeCountFastMatchesInodeCounts) {
+  FakeTreeBuilder builder;
+  builder.setFile("src/a.cpp", "a");
+  builder.setFile("src/b.cpp", "b");
+  builder.setFile("doc/readme.md", "hi");
+  TestMount testMount{builder};
+
+  auto* edenMount = testMount.getEdenMount().get();
+  auto* inodeMap = edenMount->getInodeMap();
+
+  auto getTotalFromCounts = [&]() {
+    auto counts = inodeMap->getInodeCounts();
+    return counts.fileCount + counts.treeCount + counts.unloadedInodeCount;
+  };
+
+  // After loading inodes, fast count should match the detailed counts.
+  auto srcA = testMount.getInode("src/a.cpp"_relpath);
+  auto srcB = testMount.getInode("src/b.cpp"_relpath);
+  auto doc = testMount.getInode("doc/readme.md"_relpath);
+
+  EXPECT_EQ(getTotalFromCounts(), inodeMap->getTotalInodeCountFast());
+
+  // Simulate FUSE references then unload — inodes become "unloaded" but
+  // the total count should still be consistent.
+  srcA->incFsRefcount();
+  srcB->incFsRefcount();
+  srcA.reset();
+  srcB.reset();
+  doc.reset();
+
+  edenMount->getRootInode()->unloadChildrenNow();
+
+  EXPECT_EQ(getTotalFromCounts(), inodeMap->getTotalInodeCountFast());
+
+  // Decrement FS refcount to fully forget inodes — total count should
+  // decrease.
+  auto countBeforeForget = inodeMap->getTotalInodeCountFast();
+  auto srcAIno = testMount.getInode("src/a.cpp"_relpath)->getNodeId();
+  testMount.getInode("src/a.cpp"_relpath).reset();
+  edenMount->getRootInode()->unloadChildrenNow();
+  inodeMap->decFsRefcount(srcAIno, 1);
+
+  EXPECT_EQ(getTotalFromCounts(), inodeMap->getTotalInodeCountFast());
+  EXPECT_LT(inodeMap->getTotalInodeCountFast(), countBeforeForget);
+}

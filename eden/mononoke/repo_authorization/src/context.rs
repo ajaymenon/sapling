@@ -15,13 +15,14 @@ use commit_cloud::ctx::CommitCloudContext;
 use commit_cloud_helpers::make_workspace_acl_name;
 #[cfg(fbcode_build)]
 use commit_cloud_intern_utils::acl_check::infer_workspace_identity;
+#[cfg(fbcode_build)]
+use commit_cloud_intern_utils::acl_check::requester_is_manager_of_departed_owner;
 use context::CoreContext;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::path::MPath;
 use permission_checker::AclProvider;
-use permission_checker::MononokeIdentity;
 use repo_bookmark_attrs::RepoBookmarkAttrsRef;
 use repo_identity::RepoIdentityRef;
 use repo_permission_checker::RepoPermissionCheckerRef;
@@ -201,6 +202,45 @@ impl AuthorizationContext {
         AuthorizationCheckOutcome::from_permitted(permitted)
     }
 
+    /// Check if user has read access to the repo metadata, also returning
+    /// the identity type string that granted access (if any).
+    pub async fn check_repo_metadata_read_with_result(
+        &self,
+        ctx: &CoreContext,
+        repo: &impl RepoPermissionCheckerRef,
+    ) -> (AuthorizationCheckOutcome, Option<String>) {
+        match self {
+            AuthorizationContext::FullAccess => (AuthorizationCheckOutcome::Permitted, None),
+            AuthorizationContext::Identity
+            | AuthorizationContext::ReadOnlyIdentity
+            | AuthorizationContext::DraftOnlyIdentity
+            | AuthorizationContext::Service(_) => {
+                // Check the caller's identity permits read access.  Acting as
+                // a service does not change read access, so we check the
+                // identity in this case also.
+                let result = repo
+                    .repo_permission_checker()
+                    .check_if_read_access_allowed_with_result(ctx.metadata().identities())
+                    .await;
+                if result.is_allowed() {
+                    return (
+                        AuthorizationCheckOutcome::Permitted,
+                        result.deciding_identity_type().map(str::to_owned),
+                    );
+                }
+                // Check if the caller can access via path ACLs.
+                if repo
+                    .repo_permission_checker()
+                    .check_if_any_region_read_access_allowed(ctx.metadata().identities())
+                    .await
+                {
+                    return (AuthorizationCheckOutcome::Permitted, None);
+                }
+                (AuthorizationCheckOutcome::Denied, None)
+            }
+        }
+    }
+
     /// Require that the user has read access to the repo metadata.
     pub async fn require_repo_metadata_read(
         &self,
@@ -210,6 +250,20 @@ impl AuthorizationContext {
         self.check_repo_metadata_read(ctx, repo)
             .await
             .permitted_or_else(|| self.permission_denied(ctx, repo, DeniedAction::RepoMetadataRead))
+    }
+
+    /// Require that the user has read access to the repo metadata,
+    /// also returning the identity type string that granted access (if any).
+    pub async fn require_repo_metadata_read_with_result(
+        &self,
+        ctx: &CoreContext,
+        repo: &(impl RepoPermissionCheckerRef + RepoIdentityRef),
+    ) -> Result<Option<String>, AuthorizationError> {
+        let (outcome, id_type) = self.check_repo_metadata_read_with_result(ctx, repo).await;
+        outcome.permitted_or_else(|| {
+            self.permission_denied(ctx, repo, DeniedAction::RepoMetadataRead)
+        })?;
+        Ok(id_type)
     }
 
     pub async fn check_path_read(
@@ -243,6 +297,54 @@ impl AuthorizationContext {
         Ok(AuthorizationCheckOutcome::from_permitted(permitted))
     }
 
+    /// Check if user has read access to the given path, also returning
+    /// the identity type string that granted access (if any).
+    pub async fn check_path_read_with_result(
+        &self,
+        ctx: &CoreContext,
+        repo: &(impl RepoPermissionCheckerRef + AclRegionsRef),
+        csid: ChangesetId,
+        path: &MPath,
+    ) -> Result<(AuthorizationCheckOutcome, Option<String>)> {
+        match self {
+            AuthorizationContext::FullAccess => Ok((AuthorizationCheckOutcome::Permitted, None)),
+            AuthorizationContext::Identity
+            | AuthorizationContext::ReadOnlyIdentity
+            | AuthorizationContext::DraftOnlyIdentity
+            | AuthorizationContext::Service(_) => {
+                // Check the caller's identity permits read access.  Acting as
+                // a service does not change read access, so we check the
+                // identity in this case also.
+                let result = repo
+                    .repo_permission_checker()
+                    .check_if_read_access_allowed_with_result(ctx.metadata().identities())
+                    .await;
+                if result.is_allowed() {
+                    return Ok((
+                        AuthorizationCheckOutcome::Permitted,
+                        result.deciding_identity_type().map(str::to_owned),
+                    ));
+                }
+                let rules = repo.acl_regions().associated_rules(ctx, csid, path).await?;
+                let acls = rules.hipster_acls();
+                let region_result = repo
+                    .repo_permission_checker()
+                    .check_if_region_read_access_allowed_with_result(
+                        &acls,
+                        ctx.metadata().identities(),
+                    )
+                    .await;
+                if region_result.is_allowed() {
+                    return Ok((
+                        AuthorizationCheckOutcome::Permitted,
+                        region_result.deciding_identity_type().map(str::to_owned),
+                    ));
+                }
+                Ok((AuthorizationCheckOutcome::Denied, None))
+            }
+        }
+    }
+
     pub async fn require_path_read(
         &self,
         ctx: &CoreContext,
@@ -255,6 +357,24 @@ impl AuthorizationContext {
             .permitted_or_else(|| {
                 self.permission_denied(ctx, repo, DeniedAction::PathRead(csid, path.clone()))
             })
+    }
+
+    /// Require that the user has read access to the given path,
+    /// also returning the identity type string that granted access (if any).
+    pub async fn require_path_read_with_result(
+        &self,
+        ctx: &CoreContext,
+        repo: &(impl RepoPermissionCheckerRef + AclRegionsRef + RepoIdentityRef),
+        csid: ChangesetId,
+        path: &MPath,
+    ) -> Result<Option<String>, AuthorizationError> {
+        let (outcome, id_type) = self
+            .check_path_read_with_result(ctx, repo, csid, path)
+            .await?;
+        outcome.permitted_or_else(|| {
+            self.permission_denied(ctx, repo, DeniedAction::PathRead(csid, path.clone()))
+        })?;
+        Ok(id_type)
     }
 
     /// Check whether the user has general draft access to the repo.
@@ -657,29 +777,13 @@ impl AuthorizationContext {
                     }
                     match &cc_ctx.owner {
                         Some(owner_identities) => {
-                            // Check if any requesting identity matches any owner identity
-                            // TODO(T248657108): Look into abstracting this in a better way and making authenticated identities be consistent with type data ones
+                            // Check if any requesting identity matches any owner identity.
                             for identity in ctx.metadata().identities().iter() {
                                 for owner in owner_identities.iter() {
-                                    match identity {
-                                        MononokeIdentity::TypeData { id_type, id_data } => {
-                                            if id_type == owner.id_type()
-                                                && id_data == owner.id_data()
-                                            {
-                                                return AuthorizationCheckOutcome::from_permitted(
-                                                    true,
-                                                );
-                                            }
-                                        }
-                                        MononokeIdentity::Authenticated(auth_ident) => {
-                                            if auth_ident.identity.id_type == owner.id_type()
-                                                && auth_ident.identity.id_data == owner.id_data()
-                                            {
-                                                return AuthorizationCheckOutcome::from_permitted(
-                                                    true,
-                                                );
-                                            }
-                                        }
+                                    if identity.id_type() == owner.id_type()
+                                        && identity.id_data() == owner.id_data()
+                                    {
+                                        return AuthorizationCheckOutcome::from_permitted(true);
                                     }
                                 }
                             }
@@ -722,6 +826,41 @@ impl AuthorizationContext {
                     }
                     Err(_) | Ok(None) => (),
                 }
+
+                #[cfg(fbcode_build)]
+                {
+                    // Fallback: allow the direct manager of a departed workspace
+                    // owner to recover the report's Commit Cloud workspace. Gated
+                    // by a default-off, per-repo JustKnob killswitch. We read it
+                    // via the Mononoke justknobs facade, which surfaces a read
+                    // failure loudly rather than silently defaulting on; a knob
+                    // that evaluates to false falls through to deny (fail closed).
+                    if justknobs::eval(
+                        "scm/mononoke:commitcloud_manager_access",
+                        None,
+                        Some(&cc_ctx.reponame),
+                    ) {
+                        match requester_is_manager_of_departed_owner(
+                            ctx.fb,
+                            &cc_ctx.workspace,
+                            ctx.metadata().identities(),
+                            repo.commit_cloud().config.mocked_employees.clone(),
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                ctx.scuba().clone().log_with_msg(
+                                    "commit cloud ACL check success",
+                                    Some(format!("manager of departed owner (action: {action})")),
+                                );
+                                return AuthorizationCheckOutcome::from_permitted(true);
+                            }
+                            // Not a manager, or resolution failed: fall through to deny.
+                            Ok(false) | Err(_) => {}
+                        }
+                    }
+                }
+
                 ctx.scuba().clone().log_with_msg(
                     "commit cloud ACL check failed",
                     Some(format!(
@@ -791,6 +930,30 @@ impl AuthorizationContext {
         self.check_mirror_upload_operations(ctx, repo)
             .await
             .permitted_or_else(|| self.permission_denied(ctx, repo, DeniedAction::MirrorUpload))
+    }
+
+    /// Check whether the caller is allowed to bypass the create-commit checks.
+    pub async fn check_create_commit_check_bypass(
+        &self,
+        ctx: &CoreContext,
+        repo: &(impl RepoPermissionCheckerRef + RepoConfigRef),
+    ) -> AuthorizationCheckOutcome {
+        let permitted = match self {
+            AuthorizationContext::FullAccess => true,
+            AuthorizationContext::Service(service_name) => {
+                repo.repo_permission_checker()
+                    .check_if_service_writes_allowed(ctx.metadata().identities(), service_name)
+                    .await
+                    && repo
+                        .repo_config()
+                        .source_control_service
+                        .service_create_commit_check_bypass_permitted(service_name)
+            }
+            AuthorizationContext::Identity
+            | AuthorizationContext::ReadOnlyIdentity
+            | AuthorizationContext::DraftOnlyIdentity => false,
+        };
+        AuthorizationCheckOutcome::from_permitted(permitted)
     }
 }
 

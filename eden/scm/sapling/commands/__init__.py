@@ -25,6 +25,7 @@ import time
 import bindings
 
 from .. import (
+    agent,
     annotate as annotatemod,
     archival,
     autopull,
@@ -852,6 +853,8 @@ def _dobackout(ui, repo, node=None, rev=None, **opts):
         if opts.get("parent"):
             raise error.Abort(_("cannot use --parent on non-merge changeset"))
         parent = p1
+
+    subtreeutil.check_commit_backoutable(repo, node)
 
     rctx = scmutil.revsingle(repo, hex(parent))
     if not opts.get("merge") and op1 != node:
@@ -1809,7 +1812,18 @@ def _docommit(ui, repo, *pats, **opts):
             if subtree_merges:
                 parents = repo.working_parent_nodes()
                 repo.setparents(parents[0])
-
+            # Block merge commits unless explicitly allowed. If repo state is not
+            # maintained for commands like rebase, commit can end up creating a
+            # merge commit, which is incorrect and has performance implications.
+            if not ui.configbool("ui", "allowmerge", default=True):
+                _p1, p2 = repo.dirstate.parents()
+                if p2 != nullid:
+                    raise error.Abort(
+                        _(
+                            "working copy has two parents (merge state) - "
+                            "refusing to create a merge commit"
+                        ),
+                    )
             editform = cmdutil.mergeeditform(repo[None], "commit.normal")
             editor = cmdutil.getcommiteditor(
                 editform=editform, summaryfooter=summaryfooter, **opts
@@ -2047,7 +2061,7 @@ def continuecmd(ui, repo):
     """resume operation after resolving conflicts"""
     for name, cmd in cmdutil.afterresolvedstates:
         if repo.localvfs.exists(name):
-            args = shlex.split(cmd)
+            args = shlex.split(_(cmd))
             if not ui.interactive():
                 args.append("--noninteractive")
             return bindings.commands.run(args)
@@ -2429,6 +2443,11 @@ def files(ui, repo, *pats, **opts):
 
     If no files are given to match, this command prints the names
     of all files under @Product@ control.
+
+    .. note::
+
+       Running without file arguments can be slow in large repositories.
+       Always provide a path or pattern to limit the output.
 
     .. container:: verbose
 
@@ -2882,28 +2901,19 @@ def _makegraftmessage(to_repo, ctx, opts, from_paths, to_paths, from_repo):
             _("PATTERN"),
         ),
     ],
-    "[OPTION]... PATTERN [FILE]...",
     inferrepo=True,
 )
 def grep(ui, repo, pattern, *pats, **opts):
-    """search for a pattern in tracked files in the working directory
-
-    The default regexp style is POSIX basic regexps. If no FILE parameters are
-    passed in, the current directory and its subdirectories will be searched.
-
-    For the old '@prog@ grep', which searches through history, see 'histgrep'."""
     # Copy match specific options
     match_opts = {}
     for k in ("include", "exclude"):
         if k in opts:
             match_opts[k] = opts.get(k)
 
-    # Search everything in the current directory
+    # Search everything in the current directory, or using the specified
+    # patterns instead.
     wctx = repo[None]
-    matcher = scmutil.match(wctx, ["."], match_opts)
-    if pats:
-        # Search using the specified patterns instead
-        matcher = scmutil.match(wctx, pats, match_opts)
+    matcher = scmutil.match(wctx, pats or ["."], match_opts)
 
     return cmdutil.grep(ui, repo, table, matcher, pattern, **opts)
 
@@ -2989,6 +2999,11 @@ def help_(ui, *names, **opts):
     # handling. To show hints (ex. ".. hint:: hint_name" in docstring),
     # explicitly call related functions.
     hintutil.loadhintconfig(ui)
+
+    if names and names[0] == "agent":
+        agent_instructions = agent.get_agent_instructions(ui, names)
+        ui.write(agent_instructions)
+        return 0
 
     name = " ".join(names) if names and names != (None,) else None
     keep = opts.get(r"system") or []
@@ -3818,6 +3833,11 @@ def locate(ui, repo, *pats, **opts):
     directory. To search just the current directory and its
     subdirectories, use "--include .".
 
+    .. note::
+
+       `locate` can be slow in large repositories. Consider using :prog:`files`
+       with a path filter instead.
+
     If no patterns are given to match, this command prints the names
     of all files under @Product@ control in the working directory.
 
@@ -3902,6 +3922,14 @@ def locate(ui, repo, *pats, **opts):
         ),
     ]
     + logopts
+    + [
+        (
+            "t",
+            "mutation",
+            False,
+            _("use mutation history for DAG and diffs (EXPERIMENTAL)"),
+        ),
+    ]
     + walkopts,
     _("[OPTION]... [FILE]"),
     inferrepo=True,
@@ -4080,6 +4108,9 @@ def log(ui, repo, *pats, **opts):
 def _dolog(ui, repo, pats, opts, count, xreponame):
     revs, expr, filematcher = cmdutil.getlogrevs(repo, pats, opts)
     hunksfilter = None
+    prevfn = None
+    if opts.get("mutation"):
+        prevfn = cmdutil.mutation_prevfn
 
     linerange = opts.get("line_range")
     if linerange:
@@ -4141,6 +4172,7 @@ def _dolog(ui, repo, pats, opts, count, xreponame):
             revcache=revcache,
             matchfn=revmatchfn,
             hunksfilterfn=revhunksfilter,
+            prevfn=prevfn,
         )
         if displayer.flush(ctx):
             count += 1
@@ -4170,6 +4202,11 @@ def manifest(ui, repo, node=None, rev=None, **opts):
     Print a list of version controlled files for the given revision.
     If no revision is given, the first parent of the working directory
     is used, or the null revision if no revision is checked out.
+
+    .. note::
+
+       This command lists all files and can be slow in large repositories.
+       Consider using :prog:`files` with a path filter instead.
 
     With -v, print file permissions, symlink and executable bits.
     With --debug, print file revision hashes.
@@ -4667,9 +4704,9 @@ def _newpull(ui, repo, source, **opts):
     selected = bookmarks.selectivepullbookmarknames(repo, remotename)
 
     if not bmarks:
-        # without -r or -B: Include selected -B to avoid pulling nothing.
-        # with -r without -B: Include selected -B to avoid wrong phases.
         bmarks += selected
+    elif ui.configbool("pull", "include-default-bookmarks"):
+        bmarks = list({*bmarks, *selected[:1]})
 
     # De-duplicate.
     bmarks = sorted(set(bmarks))
@@ -5369,12 +5406,12 @@ def revert(ui, repo, *pats, **opts):
                         "uncommitted changes, use --all to discard all"
                         " changes, or '@prog@ goto %s' to update"
                     )
-                    % ctx.rev()
+                    % ctx
                 )
             else:
                 hint = (
                     _("use --all to revert all files, or '@prog@ goto %s' to update")
-                    % ctx.rev()
+                    % ctx
                 )
         elif dirty:
             hint = _("uncommitted changes, use --all to discard all changes")
@@ -5540,11 +5577,12 @@ def serve(ui, repo, **opts):
         ("", "stat", None, _("output diffstat-style summary of changes")),
         ("g", "git", None, _("use git extended diff format")),
         ("U", "unified", 3, _("number of lines of diff context to show")),
+        ("r", "rev", [], _("show the specified revision")),
     ]
     + diffwsopts
     + templateopts
     + walkopts,
-    _("[OPTION]... [REV [FILE]...]"),
+    _("[OPTION]... [-r REV | REV] [FILE]..."),
     inferrepo=True,
     cmdtype=readonly,
 )
@@ -5554,13 +5592,24 @@ def show(ui, repo, *args, **opts):
     Show the commit message and contents for the specified commit. If no commit
     is specified, shows the current commit.
 
+    The revision can be given positionally or via ``-r/--rev``:
+
+    - ``@prog@ show REV [FILE]...`` — first positional is the revision, the rest
+      are files.
+    - ``@prog@ show -r REV [FILE]...`` — all positionals are files.
+
+    A bare ``@prog@ show FILE`` does not work, because ``FILE`` is parsed as a
+    revision.
+
     :prog:`show` behaves similarly to :prog:`log -vp -r REV [OPTION]... [FILE]...`, or
     if called without a ``REV``, :prog:`log -vp -r . [OPTION]...` Use
     :prog:`log` for more powerful operations than supported by :prog:`show`.
 
     """
     ui.pager("show")
-    if len(args) == 0:
+    if opts.get("rev"):
+        pats = args
+    elif len(args) == 0:
         opts["rev"] = ["."]
         pats = []
     else:

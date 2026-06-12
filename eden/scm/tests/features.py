@@ -3,7 +3,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
 
 """single place to control features used by tests
 
@@ -14,136 +14,67 @@ tests.
 """
 
 ignorerevnumincompatiblelist = """
-    test-alias.t
-    test-amend-hide.t
-    test-amend-rebase.t
-    test-amend-restack.t
-    test-annotate.t
-    test-backwards-remove.t
-    test-bisect.t
-    test-bookmarks.t
-    test-bookmark-strip.t
-    test-bundle-r.t
-    test-bundle.t
-    test-bundle-vs-outgoing.t
-    test-clone-r.t
-    test-command-template.t
-    test-commitcloud-hide.t
-    test-commitcloud-move.t
-    test-commitcloud-switch-workspace.t
-    test-commit-interactive.t
-    test-confused-revert.t
-    test-context-metadata.t
-    test-contrib-perf.t
-    test-debugbuilddag.t
-    test-debugcheckcasecollisions.t
-    test-debugindexdot-t.py
-    test-debugmetalog.t
-    test-debugrename.t
-    test-debugstrip.t
-    test-diff-change.t
-    test-diffdir.t
-    test-diff-issue2761.t
-    test-diff-only-files-in-revs.t
-    test-dirstate-race.t
-    test-empty-group-t.py
-    test-eol-clone.t
-    test-eol-hook.t
-    test-eol-update.t
-    test-export.t
-    test-copytrace-errormsg.t
-    test-drop.t
-    test-fastlog.t
-    test-fbhistedit-rebase-interactive.t
-    test-morestatus.t
-    test-phrevset.t
-    test-pushrebase-remotenames.t
-    test-remotefilelog-prefetch.t
-    test-remotefilelog-sparse.t
-    test-remotefilelog-wireproto.t
-    test-reset-remotenames.t
-    test-reset.t
-    test-smartlog-inhibit.t
-    test-smartlog-remotenames.t
-    test-treemanifest-noflat.t
-    test-treemanifest-prefetch.t
-    test-treemanifest.t
-    test-tweakdefaults-ordering.t
-    test-tweakdefaults-pullrebaseremotenames.t
-    test-tweakdefaults-remotenames.t
-    test-tweakdefaults.t
-    test-tweakdefaults-update.t
-    test-fileset.t
-    test-git-export.t
-    test-glog-topological.t
-    test-glog.t
-    test-graft.t
-    test-histedit-commute.t
-    test-histedit-edit.t
-    test-histedit-no-change.t
-    test-import-bypass.t
-    test-import-merge.t
-    test-import.t
-    test-import-unknown.t
-    test-issue1438.t
-    test-issue612.t
-    test-issue660.t
-    test-locate.t
-    test-log.t
-    test-manifest-merging.t
-    test-manifest.t
-    test-merge10-t.py
-    test-merge1.t
-    test-merge4.t
-    test-merge5.t
-    test-merge9.t
-    test-merge-ancestor-mergestate.t
-    test-merge-commit.t
-    test-merge-revert2.t
-    test-merge-revert.t
-    test-merge-tools.t
-    test-mv-cp-st-diff.t
-    test-pager.t
-    test-parse-date.t
-    test-patch.t
-    test-perftweaks-remotenames.t
-    test-pull-pull-corruption.t
-    test-pull-r.t
-    test-pull-update.t
-    test-push.t
-    test-rebase-issue-noparam-single-rev.t
-    test-rebase-parameters.t
-    test-rebase-pull.t
-    test-rebase-scenario-global.t
-    test-remotenames-bookmarks.t
-    test-remotenames-pull-rebase.t
-    test-remotenames-push.t
-    test-remotenames-shared-repo.t
-    test-remotenames-strip.t
-    test-remotenames-tracking.t
-    test-remotenames-update.t
-    test-rename-merge2.t
-    test-revert.t
-    test-revert-unknown.t
-    test-revnum-deprecate.t
-    test-revset2.t
-    test-revset.t
-    test-shelve.t
     test-sparse.t
-    test-sparse-verbose-json.t
-    test-ssh-clone-r.t
-    test-status-rev.t
     test-template-revf64.t
-    test-update-empty.t
     test-url-rev.t
-    test-visibility-reset.t
-    test-casecollision-merge.t
-    test-casefolding.t
-    test-commitcloud-backup-sql2.t
+
+    # drop internally uses rev numbers for rebase
+    test-drop.t
+    # coupled with rev numbers
+    test-debugbuilddag.t
+    # clone -u doesn't support revset
+    test-patch.t
+    test-pull-pull-corruption.t
+    # pull -r with revset fails on remote repos
+    test-pushrebase-remotenames.t
+    test-perftweaks-remotenames.t
+    test-treemanifest-noflat.t
+    # times out without ignorerevnum=False
+    test-fastlog.t
+    test-rename-merge2.t
+    # annotate -n output heavily relies on rev numbers
+    test-annotate.t
+    # many rev number references with ambiguous commit messages (msg 0..31)
+    test-bisect.t
+    # 135+ revision number references throughout
+    test-command-template.t
+    # heavily uses rev numbers in export ranges and %r/%R output format
+    test-export.t
+    # times out without ignorerevnum=False
+    test-debugstrip.t
+    # output changed significantly with ignorerevnum
+    test-commit-interactive.t
+    # times out without ignorerevnum=False
+    test-tweakdefaults.t
+    # many revision number references throughout (in fileset queries and -r arguments)
+    test-fileset.t
+    # 29+ revision number references across multiple commits
+    test-git-export.t
+    # 2742 lines with 29 revision references and 18 {rev} templates
+    test-glog.t
+    # 1181 lines with 33+ revision references
+    test-graft.t
+    # uses negative revision numbers in histedit commands
+    test-histedit-no-change.t
+    # 43 revision number references throughout
+    test-log.t
+    # 42 revision number references throughout
+    test-merge-tools.t
+    # times out at 30s timeout limit
+    test-rebase-scenario-global.t
+    test-remotenames-tracking.t
+    # intentionally tests rev number deprecation warnings; uses rev numbers by design
+    test-revnum-deprecate.t
+    # many rev number references across a large test file
+    test-revset2.t
+    # very complex, 2784 lines with many rev number references
+    test-revset.t
+    # complex unshelve state management
+    test-shelve.t
 """
 
 
-def setup(testname, hgrcpath):
+def setup(testname: str, hgrcpath: str) -> None:
     # Disable mutation.record to maintain commit hashes.
     with open(hgrcpath, "a") as f:
         f.write("\n[mutation]\nrecord=False\n")

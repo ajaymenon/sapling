@@ -1,5 +1,4 @@
 #chg-compatible
-#debugruntest-incompatible
 
   $ configure modern
   $ enable undo
@@ -16,27 +15,26 @@ Break the undo log
 
   $ cat > a.py << EOF
   > import os
-  > with open('.hg/undolog/index.i', 'rb+') as f:
+  > with open('.sl/undolog/index.i', 'rb+') as f:
   >     f.seek(-10, os.SEEK_END)
   >     f.write(b"x")
   > EOF
 
-  $ hg debugpython a.py
+  $ sl debugpython a.py
 
 Command should not abort
 
-  $ hg debugdrawdag << 'EOS'
+  $ sl debugdrawdag << 'EOS'
   >   C
   >   |
   > desc(A)
   > EOS
   hint[undo-corrupt]: undo history is corrupted
-  (try deleting $TESTTMP/repo1/.hg/undolog to recover)
+  (try deleting $TESTTMP/repo1/.sl/undolog to recover)
 
 Undo itself does not crash
 
-  $ hg undo
+  $ sl undo
   cannot undo: undo history is corrupted
   hint[undo-corrupt]: undo history is corrupted
-  (try deleting $TESTTMP/repo1/.hg/undolog to recover)
-
+  (try deleting $TESTTMP/repo1/.sl/undolog to recover)

@@ -9,25 +9,24 @@
 # test sparse with --verbose and -T json
 
   $ eagerepo
-  $ setconfig devel.segmented-changelog-rev-compat=true
   $ enable sparse
-  $ hg init myrepo
+  $ sl init myrepo
   $ cd myrepo
 
   $ echo a > show
   $ echo x > hide
-  $ hg ci -Aqm initial
+  $ sl ci -Aqm initial
 
   $ echo b > show
   $ echo y > hide
   $ echo aa > show2
   $ echo xx > hide2
-  $ hg ci -Aqm two
+  $ sl ci -Aqm two
 
 # Verify basic --include and reset
 
-  $ hg up -q 0
-  $ hg sparse --include hide -Tjson
+  $ sl up -q 'desc(initial)'
+  $ sl sparse --include hide -Tjson
   [
    {
     "exclude_rules_added": 0,
@@ -38,8 +37,8 @@
     "profiles_added": 0
    }
   ]
-  $ hg sparse --clear-rules
-  $ hg sparse --include hide --verbose
+  $ sl sparse --clear-rules
+  $ sl sparse --include hide --verbose
   calculating actions for refresh
   applying changes to disk (1 actions)
   removing show
@@ -48,7 +47,7 @@
   Include rule # change: 1
   Exclude rule # change: 0
 
-  $ hg sparse reset -Tjson
+  $ sl sparse reset -Tjson
   [
    {
     "exclude_rules_added": 0,
@@ -59,8 +58,8 @@
     "profiles_added": 0
    }
   ]
-  $ hg sparse --include hide
-  $ hg sparse reset --verbose
+  $ sl sparse --include hide
+  $ sl sparse reset --verbose
   calculating actions for refresh
   applying changes to disk (1 actions)
   getting show
@@ -71,9 +70,9 @@
 
 # Verifying that problematic files still allow us to see the deltas when forcing:
 
-  $ hg sparse --include 'show*'
+  $ sl sparse --include 'show*'
   $ touch hide
-  $ hg sparse --delete 'show*' --force -Tjson
+  $ sl sparse --delete 'show*' --force -Tjson
   pending changes to 'hide'
   [
    {
@@ -85,9 +84,9 @@
     "profiles_added": 0
    }
   ]
-  $ hg sparse --include 'show*' --force
+  $ sl sparse --include 'show*' --force
   pending changes to 'hide'
-  $ hg sparse --delete 'show*' --force --verbose
+  $ sl sparse --delete 'show*' --force --verbose
   calculating actions for refresh
   verifying no pending changes in newly included files
   pending changes to 'hide'

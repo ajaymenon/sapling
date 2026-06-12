@@ -137,7 +137,7 @@ pub fn run(ctx: ReqCtx<StatusOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8>
     ) {
         Ok(matcher) => {
             for warning in matcher.warnings() {
-                lgr.warn(format!("warning: {}", warning));
+                lgr.warn(format!("warning: {warning}"));
             }
 
             Arc::new(matcher)
@@ -246,13 +246,23 @@ pub fn run(ctx: ReqCtx<StatusOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8>
                 {
                     lgr.warn(format!(
                         "{}: invalid file type",
-                        relativizer.relativize(file)
+                        relativizer.relativized(file.as_repo_path())
                     ));
                 }
             }
             Err(err) => {
                 if !status.contains(file) {
-                    lgr.warn(format!("{}: {err}", relativizer.relativize(file)));
+                    let err = err
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(|err| {
+                            util::path_error_details(err).map(|details| details.original_io_error)
+                        })
+                        .map_or_else(|| err.to_string(), ToString::to_string);
+                    lgr.warn(format!(
+                        "{}: {}",
+                        relativizer.relativized(file.as_repo_path()),
+                        err,
+                    ));
                 }
             }
         }
@@ -303,6 +313,11 @@ pub fn doc() -> &'static str {
     the base revision. If two revisions are given, the differences between
     them are shown. The ``--change`` option can also be used as a shortcut
     to list the changed files of a revision from its first parent.
+
+    .. note::
+
+       ``-A/--all``, ``-c/--clean`` can be extremely slow in large repositories
+       because they scan all tracked files.
 
     .. note::
 

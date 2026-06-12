@@ -14,6 +14,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
 use futures_stats::TimedTryFutureExt;
+use gotham::helpers::http::Body;
 use gotham::mime;
 use gotham::state::FromState;
 use gotham::state::State;
@@ -21,17 +22,21 @@ use gotham_ext::error::HttpError;
 use gotham_ext::middleware::ScubaMiddlewareState;
 use gotham_ext::response::BytesBody;
 use gotham_ext::response::TryIntoResponse;
-use hyper::Body;
-use hyper::Response;
+use http::Response;
 use import_tools::GitImportLfs;
+use import_tools::LfsServerUrlFormat;
 use metaconfig_types::RepoConfigRef;
 use mononoke_macros::mononoke;
 use packetline::encode::flush_to_write;
 use packetline::encode::write_text_packetline;
 use protocol::pack_processor::parse_pack;
 use repo_blobstore::RepoBlobstoreArc;
+use repo_identity::RepoIdentityRef;
 use scuba_ext::FutureStatsScubaExt;
+use sharding_observability::WeightTracker;
 use tracing::info;
+use weight_observer::WeightGuard;
+use weight_observer::WeightObserver;
 
 use crate::command::Command;
 use crate::command::PushArgs;
@@ -57,7 +62,6 @@ const PACK_OK: &[u8] = b"unpack ok";
 const REF_OK: &str = "ok";
 const REF_ERR: &str = "ng";
 const REF_UPDATE_CONCURRENCY: usize = 20;
-const MAX_LFS_RETRIES: u32 = 2;
 const MAX_PACKETLINE_TEXT: usize = 65_000;
 
 pub async fn receive_pack(state: &mut State) -> Result<Response<Body>, HttpError> {
@@ -111,7 +115,7 @@ async fn push(
         let max_request_size = justknobs::get_as::<usize>(
             "scm/mononoke:git_server_max_packfile_size",
             Some(repo_name.as_str()),
-        )?;
+        );
 
         let packfile_size = pack_file.get_ref().len();
         if packfile_size > max_request_size {
@@ -126,39 +130,103 @@ async fn push(
         }
         let concurrency = request_context.pushvars.concurrency();
 
+        // Create a WeightTracker for push operations so ShardManager can see
+        // push memory pressure via estimated_memory_bytes counter.
+        let weight_observer: Option<Arc<dyn WeightObserver>> = if justknobs::eval(
+            "scm/mononoke:git_server_enable_push_memory_tracking",
+            None,
+            Some(repo_name.as_str()),
+        ) {
+            let main_client_id = request_context
+                .ctx
+                .metadata()
+                .client_info()
+                .and_then(|ci| ci.request_info.as_ref())
+                .and_then(|ri| ri.main_id.clone());
+            Some(WeightTracker::new(
+                request_context.ctx.fb,
+                repo_name.clone(),
+                main_client_id.as_deref(),
+            ))
+        } else {
+            None
+        };
+
         // Parse the packfile provided as part of the push and verify that its valid
-        let parsed_objects = parse_pack(pack_file.split().1, ctx, blobstore.clone(), concurrency)
-            .try_timed()
-            .await?
-            .log_future_stats(
-                scuba.clone(),
-                "Parsed complete Packfile",
-                "Push".to_string(),
-            );
+        let (parsed_objects, tracked_weight) = parse_pack(
+            pack_file.split().1,
+            ctx,
+            blobstore.clone(),
+            concurrency,
+            weight_observer.clone(),
+        )
+        .try_timed()
+        .await?
+        .log_future_stats(
+            scuba.clone(),
+            "Parsed complete Packfile",
+            "Push".to_string(),
+        );
         drop(pack_file);
+
+        // Keep weight on estimated_memory_bytes for the full push duration.
+        // The guard removes the weight when dropped (end of push or on error).
+        let _weight_guard = WeightGuard {
+            observer: weight_observer,
+            weight: tracked_weight,
+        };
 
         // Generate the GitObjectStore using the parsed objects
         let object_store = Arc::new(GitObjectStore::new(parsed_objects, ctx, blobstore.clone()));
-        // Instantiate the LFS configuration
+        // Instantiate the LFS configuration. `git_ctx.internal_lfs()` is the
+        // effective decision the CLI computed — it's true whenever the user
+        // either passed `--internal-lfs` or did not pass
+        // `--upstream-lfs-server` (so the default of "no LFS flags" is
+        // internal mode).
+        //
+        // The `x-git-allow-dangling-lfs-pointers` pushvar relaxes both modes:
+        // when set, an LFS push still succeeds even if the pointer's content
+        // can't be found (in the filestore for internal mode, or at the
+        // upstream LFS server for upstream mode), in which case the pointer
+        // bytes themselves are stored as the file content and the file is
+        // marked as `GitLfs::FullContent`. When the content *is* present, this
+        // flag changes nothing — the pointer is still resolved and the file is
+        // stored as a `GitLfsPointer` referencing the resolved bytes.
         let git_ctx = GitServerContext::borrow_from(state);
+        let allow_dangling_lfs_pointers = request_context.pushvars.allow_dangling_lfs_pointers();
         let lfs = if request_context
             .repo
             .repo_config()
             .git_configs
             .git_lfs_interpret_pointers
         {
-            let max_lfs_tries =
-                justknobs::get_as::<u32>("scm/mononoke:git_server_lfs_max_retries", None)
-                    .unwrap_or(MAX_LFS_RETRIES);
-            GitImportLfs::new(
-                git_ctx
-                    .upstream_lfs_server()?
-                    .ok_or_else(|| anyhow::anyhow!("No upstream LFS server specified"))?,
-                false,         // allow_not_found
-                max_lfs_tries, // max attempts
-                Some(50),      // conn_limit
-                git_ctx.tls_args()?,
-            )?
+            if git_ctx.internal_lfs() {
+                GitImportLfs::new_internal(
+                    request_context.repo.repo_blobstore_arc().boxed(),
+                    allow_dangling_lfs_pointers,
+                )
+            } else {
+                let max_lfs_tries =
+                    justknobs::get_as::<u32>("scm/mononoke:git_server_lfs_max_retries", None);
+                let url_format = match git_ctx.upstream_lfs_url_format() {
+                    crate::UpstreamLfsUrlFormat::Dewey => LfsServerUrlFormat::LegacyDewey,
+                    crate::UpstreamLfsUrlFormat::MononokeGitLfs => {
+                        LfsServerUrlFormat::MononokeGitLfs {
+                            repo_name: request_context.repo.repo_identity().name().to_string(),
+                        }
+                    }
+                };
+                GitImportLfs::new(
+                    git_ctx
+                        .upstream_lfs_server()?
+                        .ok_or_else(|| anyhow::anyhow!("No upstream LFS server specified"))?,
+                    url_format,
+                    allow_dangling_lfs_pointers,
+                    max_lfs_tries, // max attempts
+                    Some(50),      // conn_limit
+                    git_ctx.tls_args()?,
+                )?
+            }
         } else {
             GitImportLfs::new_disabled()
         };
@@ -170,6 +238,7 @@ async fn push(
             &ref_updates,
             lfs,
             concurrency,
+            git_ctx.persist_partial_mappings(),
         )
         .try_timed()
         .await;
@@ -180,12 +249,12 @@ async fn push(
                 "Push".to_string(),
             ),
             Err(e) => {
-                let err_msg = format!("{:?}", e);
+                let err_msg = format!("{e:?}");
                 if err_msg.contains("find_file_changes") && err_msg.contains("status: 404") {
                     return reject_push_with_message(
                         state,
                         &ref_updates,
-                        format!("LFS files missing in Git LFS server. Please upload before pushing. Error:\n {}", err_msg),
+                        format!("LFS files missing in Git LFS server. Please upload before pushing. Error:\n {err_msg}"),
                         true /* with_unpack_error */
                     )
                     .await;
@@ -207,12 +276,21 @@ async fn push(
             ref_map,
         ));
 
+        // Get the RL land service address if configured (for push diversion)
+        let multi_repo_land_service_address = git_ctx.multi_repo_land_service_address();
+
+        // Extract ACL provider while we have access to State (State is not
+        // Sync so it cannot be passed to refs_update across await points).
+        let acl_provider = git_ctx.acl_provider();
+
         let updated_refs = refs_update(
             ref_updates,
             request_context.clone(),
             git_bonsai_mapping_store.clone(),
             object_store.clone(),
             settings.atomic,
+            multi_repo_land_service_address,
+            acl_provider,
         )
         .try_timed()
         .await?
@@ -265,24 +343,89 @@ async fn refs_update(
     git_bonsai_mapping_store: Arc<GitMappingsStore>,
     object_store: Arc<GitObjectStore>,
     atomic_update: bool,
+    _multi_repo_land_service_address: Option<String>,
+    acl_provider: Arc<dyn permission_checker::AclProvider>,
 ) -> anyhow::Result<Vec<(RefUpdate, anyhow::Result<()>)>> {
-    if atomic_update {
+    use super::push_diversion::PushDiversionMode;
+
+    let diversion_mode = PushDiversionMode::resolve(&request_context, &acl_provider).await?;
+
+    // Normal RL Land Service diversion: submitLand + poll.
+    // Branch creates/moves are diverted; other refs (deletes, tags, etc.)
+    // are handled by the normal git server path below.
+    // NOTE: When diversion is active and the push contains both divertable and
+    // non-divertable refs, atomicity is not preserved across the two paths.
+    // In practice, diverted repos only have branch pushes, so this is acceptable.
+    #[cfg(fbcode_build)]
+    if matches!(diversion_mode, PushDiversionMode::RlLandServiceDiversion) {
+        let mut diversion = super::rl_land_service_diversion::divert_to_rl_land_service(
+            ref_updates,
+            request_context.clone(),
+            git_bonsai_mapping_store.clone(),
+            object_store.clone(),
+            _multi_repo_land_service_address,
+        )
+        .await?;
+
+        // Process remaining refs (deletes, tags, etc.) through the normal path.
+        if !diversion.remaining.is_empty() {
+            let remaining_results = if atomic_update {
+                atomic_refs_update(
+                    diversion.remaining,
+                    request_context,
+                    git_bonsai_mapping_store,
+                    object_store,
+                )
+                .await?
+            } else {
+                non_atomic_refs_update(
+                    diversion.remaining,
+                    request_context,
+                    git_bonsai_mapping_store,
+                    object_store,
+                )
+                .await?
+            };
+            diversion.diverted.extend(remaining_results);
+        }
+
+        return Ok(diversion.diverted);
+    }
+
+    // Normal git server path: process all refs directly.
+    // Used for non-diverted repos AND emergency pushes.
+    let results = if atomic_update {
         atomic_refs_update(
             ref_updates,
-            request_context,
+            request_context.clone(),
             git_bonsai_mapping_store,
             object_store,
         )
-        .await
+        .await?
     } else {
         non_atomic_refs_update(
             ref_updates,
-            request_context,
+            request_context.clone(),
             git_bonsai_mapping_store,
             object_store,
         )
-        .await
+        .await?
+    };
+
+    // For emergency pushes, send a best-effort notification to the RL Land Service.
+    #[cfg(fbcode_build)]
+    if matches!(diversion_mode, PushDiversionMode::EmergencyPush)
+        && results.iter().any(|(_, r)| r.is_ok())
+    {
+        super::rl_land_service_diversion::fire_and_forget_submit_land(
+            &results,
+            &request_context,
+            _multi_repo_land_service_address,
+        )
+        .await;
     }
+
+    Ok(results)
 }
 
 /// Function responsible for updating the refs in the repo non-atomically.
@@ -403,7 +546,7 @@ async fn reject_push_with_message(
     let mut output = vec![];
     let error_message = packetline_truncated_string(error_message);
     if with_unpack_error {
-        let unpack_error = format!("unpack {}", error_message);
+        let unpack_error = format!("unpack {error_message}");
         write_text_packetline(unpack_error.as_bytes(), &mut output).await?;
     } else {
         write_text_packetline(PACK_OK, &mut output).await?;

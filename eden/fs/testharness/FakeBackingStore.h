@@ -8,16 +8,19 @@
 #pragma once
 
 #include <folly/coro/Task.h>
+#include <folly/coro/safe/NowTask.h>
 #include <gtest/gtest_prod.h>
 #include <initializer_list>
 #include <memory>
 #include <string>
 #include <unordered_map>
 
+#include <folly/container/F14Map.h>
 #include "eden/fs/model/Blob.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/model/TreeEntry.h"
+
 #include "eden/fs/store/BackingStore.h"
 #include "eden/fs/store/ImportPriority.h"
 #include "eden/fs/testharness/StoredObject.h"
@@ -108,6 +111,12 @@ class FakeBackingStore final : public BackingStore {
   StoredTree* putTree(Tree::container entries);
   StoredTree* putTree(ObjectId id, Tree::container entries);
 
+  StoredTree* putRestrictedTree(
+      const std::initializer_list<TreeEntryData>& entries);
+  StoredTree* putRestrictedTree(
+      ObjectId id,
+      const std::initializer_list<TreeEntryData>& entries);
+
   /**
    * Add a tree to the backing store, or return the StoredTree already present
    * with this id.
@@ -177,9 +186,33 @@ class FakeBackingStore final : public BackingStore {
     return 0;
   }
 
+  void setRepoName(std::string name) {
+    repoName_ = std::move(name);
+  }
+
+  std::optional<folly::StringPiece> getRepoName() override {
+    if (repoName_.has_value()) {
+      return folly::StringPiece{repoName_.value()};
+    }
+    return std::nullopt;
+  }
+
   std::vector<ObjectId> getAuxDataLookups() const {
     return data_.rlock()->auxDataLookups;
   }
+
+  /**
+   * Configure the result of checkPermission for a specific manifest ID.
+   * If not configured, checkPermission defaults to true (fail-open).
+   */
+  void setCheckPermissionResult(const ObjectId& id, bool allowed);
+
+  /**
+   * Get the number of times checkPermission was called for a specific ID.
+   */
+  size_t getCheckPermissionCount(const ObjectId& id) const;
+
+  ImmediateFuture<bool> checkPermission(const ObjectId& manifestId) override;
 
  private:
   struct Data {
@@ -194,15 +227,21 @@ class FakeBackingStore final : public BackingStore {
     std::unordered_map<RootId, size_t> commitAccessCounts;
     std::unordered_map<ObjectId, size_t> accessCounts;
     std::vector<ObjectId> auxDataLookups;
+    folly::F14FastMap<ObjectId, bool> permissionResults;
+    folly::F14FastMap<ObjectId, size_t> permissionCheckCounts;
   };
 
   static Tree::container buildTreeEntries(
       const std::initializer_list<TreeEntryData>& entryArgs);
   static ObjectId computeTreeId(const Tree::container& sortedEntries);
-  StoredTree* putTreeImpl(ObjectId id, Tree::container&& sortedEntries);
+  StoredTree* putTreeImpl(
+      ObjectId id,
+      Tree::container&& sortedEntries,
+      bool isRestricted = false);
   std::pair<StoredTree*, bool> maybePutTreeImpl(
       ObjectId id,
-      Tree::container&& sortedEntries);
+      Tree::container&& sortedEntries,
+      bool isRestricted = false);
 
   FRIEND_TEST(FakeBackingStoreTest, getNonExistent);
   FRIEND_TEST(FakeBackingStoreTest, getBlob);
@@ -213,6 +252,9 @@ class FakeBackingStore final : public BackingStore {
   ImmediateFuture<GetRootTreeResult> getRootTree(
       const RootId& commitID,
       const ObjectFetchContextPtr& context) override;
+  folly::coro::now_task<GetRootTreeResult> co_getRootTree(
+      const RootId& rootId,
+      const ObjectFetchContextPtr& context) override;
   ImmediateFuture<std::shared_ptr<TreeEntry>> getTreeEntryForObjectId(
       const ObjectId& /* commitID */,
       TreeEntryType /* treeEntryType */,
@@ -221,9 +263,15 @@ class FakeBackingStore final : public BackingStore {
   folly::SemiFuture<GetTreeResult> getTree(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
+  folly::coro::now_task<GetTreeResult> co_getTree(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
   folly::SemiFuture<GetTreeAuxResult> getTreeAuxData(
       const ObjectId& /*id*/,
       const ObjectFetchContextPtr& /*context*/) override;
+  folly::coro::now_task<GetTreeAuxResult> co_getTreeAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
   folly::SemiFuture<GetBlobResult> getBlob(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
@@ -233,7 +281,14 @@ class FakeBackingStore final : public BackingStore {
   folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
+  folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
   ImmediateFuture<GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const std::vector<std::string>& prefixes) override;
+  folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
       const RootId& id,
       const std::vector<std::string>& globs,
       const std::vector<std::string>& prefixes) override;
@@ -241,6 +296,7 @@ class FakeBackingStore final : public BackingStore {
   std::shared_ptr<ServerState> serverState_;
   folly::Synchronized<Data> data_;
   std::optional<std::string> blake3Key_;
+  std::optional<std::string> repoName_;
 };
 
 enum class FakeBlobType {

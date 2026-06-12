@@ -23,6 +23,7 @@ use bonsai_hg_mapping::BonsaiHgMappingArc;
 use bookmarks::BookmarksRef;
 use commit_graph::CommitGraphArc;
 use commit_graph::CommitGraphWriterArc;
+use dbbookmarks::SqlBookmarksRef;
 use filestore::FilestoreConfigRef;
 pub use hook_running::run_hooks;
 pub use hooks::CrossRepoPushSource;
@@ -45,11 +46,10 @@ pub use resolver::PlainBookmarkPush;
 pub use resolver::PostResolveAction;
 pub use resolver::PostResolveBookmarkOnlyPushRebase;
 pub use resolver::PostResolveInfinitePush;
-pub use resolver::PostResolvePush;
-pub use resolver::PostResolvePushRebase;
-pub use resolver::PushrebaseBookmarkSpec;
-pub use resolver::UploadedBonsais;
-pub use resolver::UploadedHgChangesetIds;
+pub(crate) use resolver::PostResolvePush;
+pub(crate) use resolver::PostResolvePushRebase;
+pub(crate) use resolver::PushrebaseBookmarkSpec;
+pub(crate) use resolver::UploadedBonsais;
 pub use resolver::resolve;
 pub use response::UnbundleBookmarkOnlyPushRebaseResponse;
 pub use response::UnbundleInfinitePushResponse;
@@ -62,6 +62,7 @@ pub trait Repo = CommitGraphArc
     + CommitGraphWriterArc
     + BonsaiHgMappingArc
     + BookmarksRef
+    + SqlBookmarksRef
     + RepoDerivedDataArc
     + PhasesRef
     + HgMutationStoreArc

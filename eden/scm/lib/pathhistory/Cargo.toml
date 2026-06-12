@@ -13,7 +13,7 @@ license = "MIT"
 name = "pathhistory"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
 sapling-dag = { version = "0.1.0", path = "../dag" }
 sapling-manifest-tree = { version = "0.1.0", path = "../manifest-tree" }
@@ -25,7 +25,8 @@ tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 [dev-dependencies]
 async-trait = "0.1.86"
 blob = { version = "0.1.0", path = "../blob" }
+ctor = "1.0.7"
 sapling-dev-logger = { version = "0.1.0", path = "../dev-logger" }
 sapling-manifest = { version = "0.1.0", path = "../manifest" }
 sha1 = "0.10.5"
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }

@@ -19,8 +19,6 @@ use bytes::Bytes;
 use bytes::BytesMut;
 use hex::FromHex;
 use mercurial_types::HgChangesetId;
-use mercurial_types::HgManifestId;
-use mononoke_types::path::MPath;
 use nom::AsChar as _;
 use nom::Err;
 use nom::IResult;
@@ -40,11 +38,9 @@ use nom::combinator::rest;
 use nom::error::ErrorKind;
 use nom::error::FromExternalError;
 use nom::error::ParseError;
-use nom::multi::many0;
 use nom::multi::separated_list0;
 use nom::sequence::terminated;
 
-use crate::GettreepackArgs;
 use crate::Request;
 use crate::SingleRequest;
 use crate::batch;
@@ -54,7 +50,6 @@ use crate::errors;
 pub enum Error {
     Custom(u32),
     BadUtf8,
-    BadPath,
     Nom(ErrorKind),
 }
 
@@ -145,18 +140,6 @@ fn boolean(input: &[u8]) -> IResult<&[u8], bool, Error> {
         anyhow::Ok(u32::from_str(s)? != 0)
     })
     .parse(input)
-}
-
-fn batch_param_comma_separated(input: &[u8]) -> IResult<&[u8], Bytes, Error> {
-    map_res(terminated(take_while(notcomma), take(1usize)), |k| {
-        batch::unescape(k).map(Bytes::from)
-    })
-    .parse(input)
-}
-
-// List of comma-separated values, each of which is encoded using batch param encoding.
-fn gettreepack_directories(input: &[u8]) -> IResult<&[u8], Vec<Bytes>, Error> {
-    many0(complete(batch_param_comma_separated)).parse(input)
 }
 
 // A "*" parameter is a meta-parameter - its argument is a count of
@@ -256,23 +239,9 @@ fn nodehash(input: &[u8]) -> IResult<&[u8], HgChangesetId, Error> {
     .parse(input)
 }
 
-// A manifestid is simply 40 hex digits.
-fn manifestid(input: &[u8]) -> IResult<&[u8], HgManifestId, Error> {
-    map_res(
-        map_res(take(40usize), str::from_utf8),
-        HgManifestId::from_str,
-    )
-    .parse(input)
-}
-
 // A space-separated list of changeset IDs
 fn hashlist(input: &[u8]) -> IResult<&[u8], Vec<HgChangesetId>, Error> {
     separated_list_complete(" ", nodehash).parse(input)
-}
-
-// A space-separated list of manifest IDs
-fn manifestlist(input: &[u8]) -> IResult<&[u8], Vec<HgManifestId>, Error> {
-    separated_list_complete(" ", manifestid).parse(input)
 }
 
 // A space-separated list of strings
@@ -327,40 +296,14 @@ where
     F: Fn(&'a [u8]) -> IResult<&'a [u8], T, Error>,
 {
     match params.get(key.as_bytes()) {
-        None => bail!("missing param {}", key),
+        None => bail!("missing param {key}"),
         Some(v) => match parser(v.as_ref()) {
             Ok((rest, v)) => match rest {
                 [] => Ok(v),
                 [..] => bail!("Unconsumed characters remain after parsing param"),
             },
-            Err(Err::Incomplete(err)) => bail!("param parse incomplete: {:?}", err),
-            Err(Err::Error(err) | Err::Failure(err)) => bail!("param parse failed: {:?}", err),
-        },
-    }
-}
-
-/// Given a hash of parameters, look up a parameter by name, and if it exists,
-/// apply a parser to its value. If it doesn't, return None.
-fn parseval_option<'a, F, T>(
-    params: &'a HashMap<Vec<u8>, Vec<u8>>,
-    key: &str,
-    mut parser: F,
-) -> Result<Option<T>>
-where
-    F: Parser<&'a [u8], Output = T, Error = Error>,
-{
-    match params.get(key.as_bytes()) {
-        None => Ok(None),
-        Some(v) => match parser.parse(v.as_ref()) {
-            Ok((unparsed, v)) => match unparsed {
-                [] => Ok(Some(v)),
-                [..] => bail!(
-                    "Unconsumed characters remain after parsing param: {:?}",
-                    unparsed
-                ),
-            },
-            Err(Err::Incomplete(err)) => bail!("param parse incomplete: {:?}", err),
-            Err(Err::Error(err) | Err::Failure(err)) => bail!("param parse failed: {:?}", err),
+            Err(Err::Incomplete(err)) => bail!("param parse incomplete: {err:?}"),
+            Err(Err::Error(err) | Err::Failure(err)) => bail!("param parse failed: {err:?}"),
         },
     }
 }
@@ -404,14 +347,6 @@ fn utf8_string_complete(input: &[u8]) -> IResult<&[u8], String, Error> {
     match String::from_utf8(Vec::from(input)) {
         Ok(s) => Ok((b"", s)),
         Err(_) => Err(Err::Error(Error::BadUtf8)),
-    }
-}
-
-/// Parse an MPath; assumes that input is complete.
-fn path_complete(input: &[u8]) -> IResult<&[u8], MPath, Error> {
-    match MPath::new(input) {
-        Ok(path) => Ok((b"", path)),
-        Err(_) => Err(Err::Error(Error::BadPath)),
     }
 }
 
@@ -503,7 +438,7 @@ pub fn parse_request(buf: &mut BytesMut) -> Result<Option<Request>> {
         }
         Err(Err::Incomplete(_)) => Ok(None),
         Err(Err::Error(err) | Err::Failure(err)) => {
-            println!("parse_request parsing error: {:?}", err);
+            println!("parse_request parsing error: {err:?}");
             bail!(errors::ErrorKind::CommandParse(
                 String::from_utf8_lossy(buf.as_ref()).into_owned(),
             ));
@@ -558,23 +493,6 @@ fn parse_with_params(
             heads => stringlist,
             replaydata => utf8_string_complete,
             respondlightly => boolean,
-        }),
-        parse_command("gettreepack", parse_params, 1, |kv| {
-            Ok(Gettreepack(GettreepackArgs {
-                rootdir: parseval(&kv, "rootdir", path_complete)?,
-                mfnodes: parseval(&kv, "mfnodes", manifestlist)?,
-                basemfnodes: parseval(&kv, "basemfnodes", manifestlist)?.into_iter().collect(),
-                directories: parseval(&kv, "directories", gettreepack_directories)?,
-                depth: parseval_option(&kv, "depth", map_res(
-                    map_res(alt((complete(take_while1(u8::is_dec_digit)), rest)), str::from_utf8),
-                    usize::from_str
-                ))?,
-            }))
-        }),
-        parse_command("stream_out_shallow", parse_params, 1, |kv| {
-            Ok(StreamOutShallow {
-                tag: parseval_option(&kv, "tag", utf8_string_complete)?
-            })
         }),
 
     )).parse(input)
@@ -711,7 +629,7 @@ mod test {
                     b"bar".to_vec() => b"hello world!".to_vec(),
                 }
             ),
-            Err(bad) => panic!("bad result {:?}", bad),
+            Err(bad) => panic!("bad result {bad:?}"),
         }
 
         match params(p, 2) {
@@ -722,7 +640,7 @@ mod test {
                     b"foo".to_vec() => b"blibble".to_vec(),
                 }
             ),
-            Err(bad) => panic!("bad result {:?}", bad),
+            Err(bad) => panic!("bad result {bad:?}"),
         }
 
         match params(p, 4) {
@@ -735,17 +653,17 @@ mod test {
                     b"is_ok".to_vec() => b"y".to_vec(),
                 }
             ),
-            bad => panic!("bad result {:?}", bad),
+            bad => panic!("bad result {bad:?}"),
         }
 
         match params(p, 5) {
             Err(Err::Error(Error::Nom(ErrorKind::AlphaNumeric))) => {}
-            bad => panic!("bad result {:?}", bad),
+            bad => panic!("bad result {bad:?}"),
         }
 
         match params(&p[..3], 1) {
             Err(Err::Incomplete(_)) => {}
-            bad => panic!("bad result {:?}", bad),
+            bad => panic!("bad result {bad:?}"),
         }
 
         for l in 0..p.len() {
@@ -755,11 +673,10 @@ mod test {
                     assert_eq!(kv.len(), 4);
                     assert!(
                         b"\nbadly formatted thing ".starts_with(remain),
-                        "remain \"{:?}\"",
-                        remain
+                        "remain \"{remain:?}\""
                     );
                 }
-                bad => panic!("bad result l {} bad {:?}", l, bad),
+                bad => panic!("bad result l {l} bad {bad:?}"),
             }
         }
     }
@@ -781,7 +698,7 @@ mod test {
                     }
                 );
             }
-            Err(Err::Error(err) | Err::Failure(err)) => panic!("unexpected error {:?}", err),
+            Err(Err::Error(err) | Err::Failure(err)) => panic!("unexpected error {err:?}"),
         }
 
         let star = b"* 2\n\
@@ -801,7 +718,7 @@ mod test {
                     }
                 );
             }
-            Err(Err::Error(err) | Err::Failure(err)) => panic!("unexpected error {:?}", err),
+            Err(Err::Error(err) | Err::Failure(err)) => panic!("unexpected error {err:?}"),
         }
 
         let star = b"* 0\n\
@@ -817,13 +734,13 @@ mod test {
                     }
                 );
             }
-            Err(Err::Error(err) | Err::Failure(err)) => panic!("unexpected error {:?}", err),
+            Err(Err::Error(err) | Err::Failure(err)) => panic!("unexpected error {err:?}"),
         }
 
         match params(&star[..4], 2) {
             Err(Err::Incomplete(_)) => {}
-            Ok((remain, kv)) => panic!("unexpected Done remain {:?} kv {:?}", remain, kv),
-            Err(Err::Error(err) | Err::Failure(err)) => panic!("unexpected error {:?}", err),
+            Ok((remain, kv)) => panic!("unexpected Done remain {remain:?} kv {kv:?}"),
+            Err(Err::Error(err) | Err::Failure(err)) => panic!("unexpected error {err:?}"),
         }
     }
 
@@ -984,10 +901,8 @@ mod test {
 mod test_parse {
     use std::fmt::Debug;
 
-    use maplit::btreeset;
     use maplit::hashmap;
     use mononoke_macros::mononoke;
-    use mononoke_types::path::MPath;
 
     use super::*;
 
@@ -997,14 +912,6 @@ mod test_parse {
 
     fn hash_twos() -> HgChangesetId {
         HgChangesetId::new("2222222222222222222222222222222222222222".parse().unwrap())
-    }
-
-    fn hash_ones_manifest() -> HgManifestId {
-        HgManifestId::new("1111111111111111111111111111111111111111".parse().unwrap())
-    }
-
-    fn hash_twos_manifest() -> HgManifestId {
-        HgManifestId::new("2222222222222222222222222222222222222222".parse().unwrap())
     }
 
     /// Common code for testing parsing:
@@ -1203,98 +1110,6 @@ mod test_parse {
     }
 
     #[mononoke::test]
-    fn test_parse_gettreepack() {
-        let inp = "gettreepack\n\
-                   * 4\n\
-                   rootdir 0\n\
-                   mfnodes 40\n\
-                   1111111111111111111111111111111111111111\
-                   basemfnodes 40\n\
-                   1111111111111111111111111111111111111111\
-                   directories 0\n";
-
-        test_parse(
-            inp,
-            Request::Single(SingleRequest::Gettreepack(GettreepackArgs {
-                rootdir: MPath::ROOT,
-                mfnodes: vec![hash_ones_manifest()],
-                basemfnodes: btreeset![hash_ones_manifest()],
-                directories: vec![],
-                depth: None,
-            })),
-        );
-
-        let inp = "gettreepack\n\
-             * 5\n\
-             depth 1\n\
-             1\
-             rootdir 5\n\
-             ololo\
-             mfnodes 81\n\
-             1111111111111111111111111111111111111111 2222222222222222222222222222222222222222\
-             basemfnodes 81\n\
-             2222222222222222222222222222222222222222 1111111111111111111111111111111111111111\
-             directories 1\n\
-             ,";
-
-        test_parse(
-            inp,
-            Request::Single(SingleRequest::Gettreepack(GettreepackArgs {
-                rootdir: MPath::new("ololo").unwrap(),
-                mfnodes: vec![hash_ones_manifest(), hash_twos_manifest()],
-                basemfnodes: btreeset![hash_twos_manifest(), hash_ones_manifest()],
-                directories: vec![Bytes::from("".as_bytes())],
-                depth: Some(1),
-            })),
-        );
-
-        let inp = "gettreepack\n\
-             * 5\n\
-             depth 1\n\
-             1\
-             rootdir 5\n\
-             ololo\
-             mfnodes 81\n\
-             1111111111111111111111111111111111111111 2222222222222222222222222222222222222222\
-             basemfnodes 81\n\
-             2222222222222222222222222222222222222222 1111111111111111111111111111111111111111\
-             directories 6\n\
-             :o,:s,";
-
-        test_parse(
-            inp,
-            Request::Single(SingleRequest::Gettreepack(GettreepackArgs {
-                rootdir: MPath::new("ololo").unwrap(),
-                mfnodes: vec![hash_ones_manifest(), hash_twos_manifest()],
-                basemfnodes: btreeset![hash_twos_manifest(), hash_ones_manifest()],
-                directories: vec![Bytes::from(",".as_bytes()), Bytes::from(";".as_bytes())],
-                depth: Some(1),
-            })),
-        );
-
-        let inp = "gettreepack\n\
-                   * 4\n\
-                   rootdir 0\n\
-                   mfnodes 40\n\
-                   1111111111111111111111111111111111111111\
-                   basemfnodes 40\n\
-                   1111111111111111111111111111111111111111\
-                   directories 5\n\
-                   ,foo,";
-
-        test_parse(
-            inp,
-            Request::Single(SingleRequest::Gettreepack(GettreepackArgs {
-                rootdir: MPath::ROOT,
-                mfnodes: vec![hash_ones_manifest()],
-                basemfnodes: btreeset![hash_ones_manifest()],
-                directories: vec![Bytes::from(b"".as_ref()), Bytes::from(b"foo".as_ref())],
-                depth: None,
-            })),
-        );
-    }
-
-    #[mononoke::test]
     fn test_parse_known_1() {
         let inp = "known\n\
                    * 0\n\
@@ -1352,7 +1167,7 @@ mod test_parse {
                 assert_eq!(val, SingleRequest::Heads {});
             }
             Err(Err::Incomplete(_)) => panic!("unexpected incomplete input"),
-            Err(Err::Error(err) | Err::Failure(err)) => panic!("failed with {:?}", err),
+            Err(Err::Error(err) | Err::Failure(err)) => panic!("failed with {err:?}"),
         }
     }
 
@@ -1377,19 +1192,6 @@ mod test_parse {
                     nodes: vec![hash_ones(), hash_twos()],
                 },
             ]),
-        );
-    }
-
-    #[mononoke::test]
-    fn test_parse_stream_out_shallow() {
-        let inp = "stream_out_shallow\n\
-                   * 1\n\
-                   noflatmanifest 4\n\
-                   True";
-
-        test_parse(
-            inp,
-            Request::Single(SingleRequest::StreamOutShallow { tag: None }),
         );
     }
 

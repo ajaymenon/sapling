@@ -8,10 +8,10 @@
   > EOS
 
   $ newclientrepo client server
-  $ hg pull -qr $B
+  $ sl pull -qr $B
 
 We can fetch tree parents:
-  $ hg debugscmstore -r $B dir --mode=tree --tree-parents
+  $ sl debugscmstore -r $B dir --mode=tree --tree-parents
   Successfully fetched tree: (
       Key {
           path: RepoPathBuf(
@@ -39,8 +39,10 @@ We can fetch tree parents:
                       ),
                       children: None,
                       tree_aux_data: None,
+                      has_acl: None,
                   },
                   true,
+                  Hg,
               ),
           ),
           parents: Some(

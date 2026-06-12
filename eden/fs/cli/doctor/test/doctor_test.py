@@ -53,11 +53,12 @@ from eden.fs.cli.doctor.util import CheckoutInfo
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
 from eden.fs.cli.redirect import Redirection, RedirectionState, RedirectionType
 from eden.fs.cli.test.lib.output import TestOutput
-from facebook.eden.ttypes import (
+from eden.fs.service.eden.thrift_enums import MountState
+from eden.fs.service.eden.thrift_types import (
     GetScmStatusResult,
     InternalStats,
     MountInodeInfo,
-    MountState,
+    MountInodeInfo as LegacyMountInodeInfo,
     ScmFileStatus,
     ScmStatus,
     SHA1Result,
@@ -771,7 +772,7 @@ Repairing hg directory contents for {checkout.path}...<green>fixed<reset>
         # The dirstate file should have been updated to use the snapshot hash
         self.assertEqual(
             # pyre-fixme[16]: `EdenClient` has no attribute `set_parents_calls`.
-            checkout.instance.get_thrift_client_legacy().set_parents_calls,
+            checkout.instance._fake_client.set_parents_calls,
             [],
         )
         self.assert_dirstate_p0(checkout, snapshot_hex)
@@ -813,7 +814,7 @@ Repairing hg directory contents for {checkout.path}...<green>fixed<reset>
         # Make sure resetParentCommits() was called once with the expected arguments
         self.assertEqual(
             # pyre-fixme[16]: `EdenClient` has no attribute `set_parents_calls`.
-            checkout.instance.get_thrift_client_legacy().set_parents_calls,
+            checkout.instance._fake_client.set_parents_calls,
             [
                 ResetParentsCommitsArgs(
                     mount=bytes(checkout.path),
@@ -876,7 +877,7 @@ Repairing hg directory contents for {checkout.path}...<green>fixed<reset>
         # Make sure resetParentCommits() was called once with the expected arguments
         self.assertEqual(
             # pyre-fixme[16]: `EdenClient` has no attribute `set_parents_calls`.
-            checkout.instance.get_thrift_client_legacy().set_parents_calls,
+            checkout.instance._fake_client.set_parents_calls,
             [
                 ResetParentsCommitsArgs(
                     mount=bytes(checkout.path),
@@ -948,7 +949,7 @@ Repairing hg directory contents for {checkout.path}...<green>fixed<reset>
         # Make sure resetParentCommits() was called once with the expected arguments
         self.assertEqual(
             # pyre-fixme[16]: `EdenClient` has no attribute `set_parents_calls`.
-            checkout.instance.get_thrift_client_legacy().set_parents_calls,
+            checkout.instance._fake_client.set_parents_calls,
             [
                 ResetParentsCommitsArgs(
                     mount=bytes(checkout.path),
@@ -989,7 +990,7 @@ Repairing hg directory contents for {checkout.path}...<green>fixed<reset>
         # The dirstate file should have been updated to use the snapshot hash
         self.assertEqual(
             # pyre-fixme[16]: `EdenClient` has no attribute `set_parents_calls`.
-            checkout.instance.get_thrift_client_legacy().set_parents_calls,
+            checkout.instance._fake_client.set_parents_calls,
             [],
         )
         self.assert_dirstate_p0(checkout, snapshot_hex)
@@ -1114,27 +1115,9 @@ Remounting {mounts[1]}...<green>fixed<reset>
         )
         self.assertEqual(exit_code, 0)
 
-    def test_remount_checkouts_old_edenfs(self) -> None:
-        exit_code, out, mounts = self._test_remount_checkouts(
-            dry_run=False, old_edenfs=True
-        )
-        self.assertEqual(
-            f"""\
-Checking {mounts[0]}
-Checking {mounts[1]}
-<yellow>- Found problem:<reset>
-{mounts[1]} is not currently mounted
-Remounting {mounts[1]}...<green>fixed<reset>
-
-<yellow>Successfully fixed 1 problem.<reset>
-""",
-            out,
-        )
-        self.assertEqual(exit_code, 0)
-
     def test_remount_checkouts_dry_run(self) -> None:
         exit_code, out, mounts = self._test_remount_checkouts(
-            dry_run=True, old_edenfs=True
+            dry_run=True,
         )
         self.assertEqual(
             f"""\
@@ -1156,7 +1139,6 @@ Would remount {mounts[1]}
         # pyre-fixme[2]: Parameter must be annotated.
         mock_watchman,
         dry_run: bool,
-        old_edenfs: bool = False,
     ) -> Tuple[int, str, List[Path]]:
         """Test that `eden doctor` remounts configured mount points that are not
         currently mounted.
@@ -1168,9 +1150,6 @@ Would remount {mounts[1]}
         mount1 = instance.create_test_mount("path1")
         mounts.append(mount1.path)
         mounts.append(instance.create_test_mount("path2", active=False).path)
-        if old_edenfs:
-            # Mimic older versions of edenfs, and do not return mount state data.
-            instance.get_thrift_client_legacy().change_mount_state(mount1.path, None)
 
         out = TestOutput()
         exit_code = doctor.cure_what_ails_you(
@@ -1918,16 +1897,17 @@ Fixing files present on disk but not known to EdenFS in {Path(mount)}...<green>f
             problemDescriptions = {
                 problem.description() for problem in tracker.problems
             }
-            self.assertEqual(problemDescriptions, set())
+            self.assertEqual(
+                problemDescriptions,
+                {
+                    f"{Path('a/c')} has an unexpected file type: known to EdenFS as a file, but is a symlink on disk",
+                },
+            )
 
         @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
         def test_materialized_symlink_as_file(self, mock_debugInodeStatus) -> None:
             instance = FakeEdenInstance(self.make_temporary_directory())
             checkout = instance.create_test_mount("path1")
-            checkoutconfig = checkout.get_config()
-            # Enable symlinks on Windows
-            checkoutconfig._replace(enable_windows_symlinks=True)
-            checkout.save_config(checkoutconfig)
             mount = checkout.path
             os.makedirs(mount / "a")
             with open(mount / "a" / "b", "wb") as f:
@@ -2055,7 +2035,9 @@ Fixing files present on disk but not known to EdenFS in {Path(mount)}...<green>f
             self.assertEqual(
                 problemDescriptions,
                 {
-                    f"{Path('a/d')} has an unexpected file type: known to EdenFS as a directory, but is a file on disk",
+                    f"""\
+{Path("a/c")} has an unexpected file type: known to EdenFS as a file, but is a symlink on disk
+{Path("a/d")} has an unexpected file type: known to EdenFS as a directory, but is a symlink on disk"""
                 },
             )
 
@@ -2177,7 +2159,7 @@ Running chef may fix this.*""",
         checkout = instance.create_test_mount("path")
 
         before_mount_point_info = {
-            os.fsencode(checkout.path): MountInodeInfo(
+            os.fsencode(checkout.path): LegacyMountInodeInfo(
                 unloadedInodeCount=2_000_000,
                 loadedFileCount=3_000_000,
                 loadedTreeCount=4_000_000,
@@ -2185,7 +2167,7 @@ Running chef may fix this.*""",
         }
 
         after_mount_point_info = {
-            os.fsencode(checkout.path): MountInodeInfo(
+            os.fsencode(checkout.path): LegacyMountInodeInfo(
                 unloadedInodeCount=0,
                 loadedFileCount=0,
                 loadedTreeCount=0,
@@ -2233,7 +2215,7 @@ Starting background invalidation of not recently used files and directories in {
         tmp_dir = self.make_temporary_directory()
         instance = FakeEdenInstance(tmp_dir)
 
-        instance.get_thrift_client_legacy().set_counter_value(
+        instance._fake_client.set_counter_value(
             "store.sapling.live_import.max_duration_us", 15 * 60 * 1_000_000
         )
 
@@ -2259,7 +2241,7 @@ Starting background invalidation of not recently used files and directories in {
             r"""<yellow>- Found problem:<reset>
 Slow file download taking up to 15 minutes observed
 Try:
-- Running `hg debugnetwork`\.
+- Running `sl debugnetwork`\.
 - Checking your network connection's performance\.
 - Running `eden top` to check whether downloads are making progress\.
 
@@ -2323,7 +2305,7 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
         self.assertEqual(len(tracker.problems), 1)
         self.assertEqual(
             tracker.problems[0].description(),
-            f"{Path('foo/bar')} is present as modified in `hg status` but not in `hg diff`",
+            f"{Path('foo/bar')} is present as modified in `sl status` but not in `sl diff`",
         )
 
     def test_ignored_problems_config(self) -> None:
@@ -2335,7 +2317,7 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
             },
         )
 
-        instance.get_thrift_client_legacy().set_counter_value(
+        instance._fake_client.set_counter_value(
             "store.sapling.live_import.max_duration_us", 15 * 60 * 1_000_000
         )
 
@@ -2535,7 +2517,7 @@ Remounting {checkout.path}...<green>fixed<reset>
 <yellow>- Found problem:<reset>
 {checkout.path} is not currently mounted
 Remounting {checkout.path}...
-Mount failed. Running `hg doctor` in the backing repo and then will retry the mount.
+Mount failed. Running `sl doctor` in the backing repo and then will retry the mount.
 <green>fixed<reset>
 
 """,
@@ -2751,7 +2733,7 @@ Reinitialize checkout config.......<green>fixed<reset>
             out.getvalue(),
             f"""\
 <yellow>- Found problem:<reset>
-Eden's checkout state for {checkout.path} has been corrupted: toml config file {checkout.state_dir / "config.toml"} not valid: Found invalid character in key name: 'c'. Try quoting the key name. (line 1 column 11 char 10)Detected here (line 1): 
+Eden's checkout state for {checkout.path} has been corrupted: toml config file {checkout.state_dir / "config.toml"} not valid: Found invalid character in key name: 'c'. Try quoting the key name. (line 1 column 11 char 10)Detected here (line 1):
 
 corrupted config
 
@@ -2980,7 +2962,7 @@ To reclone the corrupted repo, run: `fbclone $REPO --reclone --eden`"""
             out.getvalue(),
             """\
 <yellow>- Found problem:<reset>
-Encountered an error checking connection to Source Control Servers: command 'hg debugnetworkdoctor' reported an error:
+Encountered an error checking connection to Source Control Servers: command 'sl debugnetworkdoctor' reported an error:
 Stdout:
 stdout
 Stderr:
@@ -3014,7 +2996,7 @@ Please check your network connection. If you are connected to the VPN, please tr
             out.getvalue(),
             """\
 <yellow>- Found problem:<reset>
-Encountered an error checking connection to Source Control Servers: command 'hg debugnetwork --connection' reported an error:
+Encountered an error checking connection to Source Control Servers: command 'sl debugnetwork --connection' reported an error:
 Stdout:
 stdout
 Stderr:
@@ -3049,13 +3031,13 @@ Please check your network connection. If you are connected to the VPN, please tr
             out.getvalue(),
             """\
 <yellow>- Found problem:<reset>
-Failed to verify speed of connection to eden services: 
+Failed to verify speed of connection to eden services:
 Stdout:
 stdout
 Stderr:
 stderror
 
-Check the speed report in hg debugnetwork --speed
+Check the speed report in sl debugnetwork --speed
 
 """,
         )
@@ -3099,7 +3081,7 @@ Check the speed report in hg debugnetwork --speed
                 out.getvalue(),
                 f"""\
 <yellow>- Found problem:<reset>
-Encountered an error checking connection to Source Control Servers: command 'hg {method}' {suffix}
+Encountered an error checking connection to Source Control Servers: command 'sl {method}' {suffix}
 Stdout:
 stdout
 Stderr:
@@ -3134,13 +3116,13 @@ Please check your network connection. If you are connected to the VPN, please tr
             out.getvalue(),
             """\
 <yellow>- Found problem:<reset>
-Failed to verify speed of connection to eden services: 
+Failed to verify speed of connection to eden services:
 Stdout:
 stdout
 Stderr:
 stderror
 
-Check the speed report in hg debugnetwork --speed
+Check the speed report in sl debugnetwork --speed
 
 """,
         )
@@ -3158,10 +3140,10 @@ Check the speed report in hg debugnetwork --speed
                 0,
                 stdout="""
 debugnetwork: Latency: 646.2 us (average of 5 round-trips)
-debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (4793.85 Mbit/s, 571.47 MiB/s)
-debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (4700.91 Mbit/s, 560.39 MiB/s)
 debugnetwork: Speed: (round 1) uploaded 50.0 MB in 134.6 ms (3116.99 Mbit/s, 371.57 MiB/s)
 debugnetwork: Speed: (round 2) uploaded 50.0 MB in 132.3 ms (3170.47 Mbit/s, 377.95 MiB/s)
+debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (4793.85 Mbit/s, 571.47 MiB/s)
+debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (4700.91 Mbit/s, 560.39 MiB/s)
 """,
             ),
         ]
@@ -3183,10 +3165,10 @@ debugnetwork: Speed: (round 2) uploaded 50.0 MB in 132.3 ms (3170.47 Mbit/s, 377
                 0,
                 stdout="""
 debugnetwork: Latency: 646.2 ms (average of 5 round-trips)
-debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (4793.85 Mbit/s, 571.47 MiB/s)
-debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (4700.91 Mbit/s, 560.39 MiB/s)
 debugnetwork: Speed: (round 1) uploaded 50.0 MB in 134.6 ms (3116.99 Mbit/s, 371.57 MiB/s)
 debugnetwork: Speed: (round 2) uploaded 50.0 MB in 132.3 ms (3170.47 Mbit/s, 377.95 MiB/s)
+debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (4793.85 Mbit/s, 571.47 MiB/s)
+debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (4700.91 Mbit/s, 560.39 MiB/s)
 """,
             ),
         ]
@@ -3221,10 +3203,10 @@ Please check if anything is causing high ping on your network.{get_netinfo_link(
                 0,
                 stdout="""
 debugnetwork: Latency: 646.2 us (average of 5 round-trips)
-debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (47.9385 Mbit/s, 57.147 MiB/s)
-debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (47.0091 Mbit/s, 56.039 MiB/s)
 debugnetwork: Speed: (round 1) uploaded 50.0 MB in 134.6 ms (31.1699 Mbit/s, 37.157 MiB/s)
 debugnetwork: Speed: (round 2) uploaded 50.0 MB in 132.3 ms (31.7047 Mbit/s, 37.795 MiB/s)
+debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (47.9385 Mbit/s, 57.147 MiB/s)
+debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (47.0091 Mbit/s, 56.039 MiB/s)
 """,
             ),
         ]
@@ -3259,10 +3241,10 @@ Please check if anything is consuming an excess amount of bandwidth on your netw
                 0,
                 stdout="""
 debugnetwork: Latency: 646.2 us (average of 5 round-trips)
-debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (52.9385 Mbit/s, 57.147 MiB/s)
-debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (52.0091 Mbit/s, 56.039 MiB/s)
 debugnetwork: Speed: (round 1) uploaded 15.0 MB in 134.6 ms (9.1699 Mbit/s, 37.157 MiB/s)
 debugnetwork: Speed: (round 2) uploaded 15.0 MB in 132.3 ms (9.7047 Mbit/s, 37.795 MiB/s)
+debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (52.9385 Mbit/s, 57.147 MiB/s)
+debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (52.0091 Mbit/s, 56.039 MiB/s)
 """,
             ),
         ]
@@ -3297,10 +3279,10 @@ Please check if anything is consuming an excess amount of bandwidth on your netw
                 0,
                 stdout="""
 debugnetwork: Latency: 17.14 ms (average of 5 round-trips)
-debugnetwork: Speed: (round 1) downloaded 10.0 MB in 1.635 s (40.31 Mbit/s, 6.12 MiB/s)
-debugnetwork: Speed: (round 2) downloaded 10.0 MB in 1.439 s (42.31 Mbit/s, 6.95 MiB/s)
 debugnetwork: Speed: (round 1) uploaded 2.00 MB in 1.143 s (11.68 Mbit/s, 1.75 MiB/s)
 debugnetwork: Speed: (round 2) uploaded 2.00 MB in 609.6 ms (7.52 Mbit/s, 3.28 MiB/s)
+debugnetwork: Speed: (round 1) downloaded 10.0 MB in 1.635 s (40.31 Mbit/s, 6.12 MiB/s)
+debugnetwork: Speed: (round 2) downloaded 10.0 MB in 1.439 s (42.31 Mbit/s, 6.95 MiB/s)
 """,
             ),
         ]

@@ -12,13 +12,13 @@
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/testharness/TempFile.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/inodes/overlay/gen-cpp2/overlay_types.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/TestMount.h"
@@ -79,14 +79,15 @@ INSTANTIATE_TEST_SUITE_P(
 
 TEST(PlainSqliteInodeCatalogTest, new_overlay_is_clean) {
   folly::test::TemporaryDirectory testDir;
+  auto noopErrorLogger = makeTestErrorLogger();
   auto overlay = Overlay::create(
       canonicalPath(testDir.path().string()),
       kPathMapDefaultCaseSensitive,
       InodeCatalogType::Sqlite,
       kDefaultInodeCatalogOptions,
-      std::make_shared<NullStructuredLogger>(),
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
-      true,
       *EdenConfig::createTestEdenConfig());
   overlay
       ->initialize(
@@ -98,14 +99,15 @@ TEST(PlainSqliteInodeCatalogTest, new_overlay_is_clean) {
 
 TEST(PlainSqliteInodeCatalogTest, new_overlay_is_clean_buffered) {
   folly::test::TemporaryDirectory testDir;
+  auto noopErrorLogger = makeTestErrorLogger();
   auto overlay = Overlay::create(
       canonicalPath(testDir.path().string()),
       kPathMapDefaultCaseSensitive,
       InodeCatalogType::Sqlite,
       INODE_CATALOG_BUFFERED,
-      std::make_shared<NullStructuredLogger>(),
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
-      true,
       *EdenConfig::createTestEdenConfig());
   overlay
       ->initialize(
@@ -117,15 +119,16 @@ TEST(PlainSqliteInodeCatalogTest, new_overlay_is_clean_buffered) {
 
 TEST(PlainSqliteInodeCatalogTest, reopened_overlay_is_clean) {
   folly::test::TemporaryDirectory testDir;
+  auto noopErrorLogger = makeTestErrorLogger();
   {
     auto overlay = Overlay::create(
         canonicalPath(testDir.path().string()),
         kPathMapDefaultCaseSensitive,
         InodeCatalogType::Sqlite,
         kDefaultInodeCatalogOptions,
-        std::make_shared<NullStructuredLogger>(),
+        makeTestEdenFsEventsLogger(),
+        /*errorLogger=*/noopErrorLogger,
         makeRefPtr<EdenStats>(),
-        true,
         *EdenConfig::createTestEdenConfig());
     overlay
         ->initialize(
@@ -138,9 +141,9 @@ TEST(PlainSqliteInodeCatalogTest, reopened_overlay_is_clean) {
       kPathMapDefaultCaseSensitive,
       InodeCatalogType::Sqlite,
       kDefaultInodeCatalogOptions,
-      std::make_shared<NullStructuredLogger>(),
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
-      true,
       *EdenConfig::createTestEdenConfig());
   overlay
       ->initialize(
@@ -152,15 +155,16 @@ TEST(PlainSqliteInodeCatalogTest, reopened_overlay_is_clean) {
 
 TEST(PlainSqliteInodeCatalogTest, reopened_overlay_is_clean_buffered) {
   folly::test::TemporaryDirectory testDir;
+  auto noopErrorLogger = makeTestErrorLogger();
   {
     auto overlay = Overlay::create(
         canonicalPath(testDir.path().string()),
         kPathMapDefaultCaseSensitive,
         InodeCatalogType::Sqlite,
         INODE_CATALOG_BUFFERED,
-        std::make_shared<NullStructuredLogger>(),
+        makeTestEdenFsEventsLogger(),
+        /*errorLogger=*/noopErrorLogger,
         makeRefPtr<EdenStats>(),
-        true,
         *EdenConfig::createTestEdenConfig());
     overlay
         ->initialize(
@@ -173,9 +177,9 @@ TEST(PlainSqliteInodeCatalogTest, reopened_overlay_is_clean_buffered) {
       kPathMapDefaultCaseSensitive,
       InodeCatalogType::Sqlite,
       INODE_CATALOG_BUFFERED,
-      std::make_shared<NullStructuredLogger>(),
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
-      true,
       *EdenConfig::createTestEdenConfig());
   overlay
       ->initialize(
@@ -189,14 +193,15 @@ TEST(PlainSqliteInodeCatalogTest, close_overlay_with_no_capacity_buffered) {
   auto config = EdenConfig::createTestEdenConfig();
   config->overlayBufferSize.setValue(0, ConfigSourceType::Default, true);
   folly::test::TemporaryDirectory testDir;
+  auto noopErrorLogger = makeTestErrorLogger();
   auto overlay = Overlay::create(
       canonicalPath(testDir.path().string()),
       kPathMapDefaultCaseSensitive,
       InodeCatalogType::Sqlite,
       INODE_CATALOG_BUFFERED,
-      std::make_shared<NullStructuredLogger>(),
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
-      true,
       *config);
   overlay
       ->initialize(
@@ -213,14 +218,15 @@ TEST(
   auto config = EdenConfig::createTestEdenConfig();
   config->overlayBufferSize.setValue(1, ConfigSourceType::Default, true);
   folly::test::TemporaryDirectory testDir;
+  auto noopErrorLogger = makeTestErrorLogger();
   auto overlay = Overlay::create(
       canonicalPath(testDir.path().string()),
       kPathMapDefaultCaseSensitive,
       InodeCatalogType::Sqlite,
       INODE_CATALOG_BUFFERED,
-      std::make_shared<NullStructuredLogger>(),
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
-      true,
       *config);
   overlay
       ->initialize(
@@ -272,9 +278,9 @@ class RawSqliteInodeCatalogTest
         kPathMapDefaultCaseSensitive,
         InodeCatalogType::Sqlite,
         overlayOptions(),
-        std::make_shared<NullStructuredLogger>(),
+        makeTestEdenFsEventsLogger(),
+        /*errorLogger=*/noopErrorLogger_,
         makeRefPtr<EdenStats>(),
-        true,
         *EdenConfig::createTestEdenConfig());
     overlay
         ->initialize(
@@ -288,6 +294,7 @@ class RawSqliteInodeCatalogTest
   }
 
   folly::test::TemporaryDirectory testDir_;
+  ErrorLogger noopErrorLogger_ = makeTestErrorLogger();
   std::shared_ptr<Overlay> overlay;
 };
 
@@ -453,9 +460,9 @@ class DebugDumpSqliteInodeCatalogInodesTest
         kPathMapDefaultCaseSensitive,
         InodeCatalogType::Sqlite,
         overlayOptions(),
-        std::make_shared<NullStructuredLogger>(),
+        makeTestEdenFsEventsLogger(),
+        /*errorLogger=*/noopErrorLogger_,
         makeRefPtr<EdenStats>(),
-        true,
         *EdenConfig::createTestEdenConfig());
     overlay
         ->initialize(
@@ -470,7 +477,7 @@ class DebugDumpSqliteInodeCatalogInodesTest
           ->flush();
       // A second flush is needed here to ensure the worker thread has a chance
       // to acquire the state_ lock and clear the inflightOperation map in the
-      // case that the first flush was was processed during the same iteration
+      // case that the first flush was processed during the same iteration
       // as outstanding writes
       static_cast<BufferedSqliteInodeCatalog*>(overlay->getRawInodeCatalog())
           ->flush();
@@ -478,6 +485,7 @@ class DebugDumpSqliteInodeCatalogInodesTest
   }
 
   folly::test::TemporaryDirectory testDir_;
+  ErrorLogger noopErrorLogger_ = makeTestErrorLogger();
   std::shared_ptr<Overlay> overlay;
 };
 

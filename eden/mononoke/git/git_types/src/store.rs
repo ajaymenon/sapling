@@ -52,7 +52,7 @@ where
     };
     // Check if the bytes actually correspond to a valid Git object
     let blobstore_bytes = BlobstoreBytes::from_bytes(bytes.clone());
-    gix_object::ObjectRef::from_loose(bytes.as_ref()).map_err(|e| {
+    gix_object::ObjectRef::from_loose(bytes.as_ref(), gix_hash::Kind::Sha1).map_err(|e| {
         GitError::InvalidContent(
             git_hash.to_hex().to_string(),
             anyhow::anyhow!(e.to_string()).into(),
@@ -168,7 +168,7 @@ async fn maybe_fetch_blob_bytes(
     };
     // The blob object stored in the blobstore exists without the git header. If requested, prepend the git blob header before returning the bytes
     let mut header_bytes = match header_state {
-        HeaderState::Included => format!("blob {}\0", num_bytes).into_bytes(),
+        HeaderState::Included => format!("blob {num_bytes}\0").into_bytes(),
         HeaderState::Excluded => vec![],
     };
     // We know the number of bytes we are going to write so reserve the buffer to avoid resizing

@@ -21,33 +21,35 @@ buck_genrule(
 rust_library(
     name = "backtrace-python",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "extra_buck_dependencies": {"build-dependencies": [
-            "//eden/scm/lib/backtrace-python/offset-probe:backtrace-python-offset-probe",
-        ]},
-        "lib": {"name": "backtrace-python"},
-        "package": {
-            "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-            "description": "Python frame resolution for backtrace-ext.",
-            "homepage": "https://sapling-scm.com/",
-            "license": "MIT",
-            "name": "sapling-backtrace-python",
-            "repository": "https://github.com/facebook/sapling",
+    autocargo = {
+        "cargo_toml_config": {
+            # Cargo build.rs dep (Buck uses gen_offsets.rs genrule instead).
+            "extra_buck_dependencies": {
+                "build-dependencies": [
+                    "//eden/scm/lib/backtrace-python/offset-probe:backtrace-python-offset-probe",
+                ],
+            },
+            "lib": {"name": "backtrace-python"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "description": "Python frame resolution for backtrace-ext.",
+                "homepage": "https://sapling-scm.com/",
+                "license": "MIT",
+                "name": "sapling-backtrace-python",
+                "repository": "https://github.com/facebook/sapling",
+            },
         },
-    }},
+    },
     crate_root = "src/lib.rs",
     mapped_srcs = {":gen_offsets.rs": "src/offsets.rs"},
-    os_deps = [
-        (
-            "windows",
-            [
-                "fbsource//third-party/rust:winapi",
-            ],
-        ),
-    ],
     deps = [
         "fbsource//third-party/rust:libc",
         "//eden/scm/lib/backtrace-ext:backtrace-ext",
         "//eden/scm/lib/backtrace-python/evalframe-sys:evalframe-sys",
-    ],
+    ] + select({
+        "DEFAULT": [],
+        "ovr_config//os:windows": [
+            "fbsource//third-party/rust:winapi",
+        ],
+    }),
 )

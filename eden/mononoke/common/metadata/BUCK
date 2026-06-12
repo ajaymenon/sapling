@@ -1,14 +1,14 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "metadata",
     srcs = glob(["src/**/*.rs"]),
     deps = [
         "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:hickory-resolver",
         "fbsource//third-party/rust:tokio",
-        "fbsource//third-party/rust:trust-dns-resolver",
         "//eden/mononoke/common/permission_checker:permission_checker",
         "//eden/mononoke/common/session_id:session_id",
         "//eden/scm/lib/clientinfo:clientinfo",

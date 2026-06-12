@@ -7,8 +7,6 @@
 
 #pragma once
 
-#include <folly/io/IOBuf.h>
-
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/PathMap.h"
 #include "eden/fs/model/Hash.h"
@@ -47,6 +45,18 @@ class Tree {
       : id_{std::move(id)},
         entries_{std::move(entries)},
         auxData_(std::move(auxData)) {}
+
+  /**
+   * Construct a restricted tree. This is an empty tree that indicates the
+   * server denied access to its contents via ACL.
+   */
+  struct Restricted {};
+  explicit Tree(Restricted, container entries, ObjectId id)
+      : id_{std::move(id)}, entries_{std::move(entries)}, isRestricted_{true} {}
+
+  TreePtr withNewId(container entries, ObjectId newId) const;
+
+  TreePtr withNewId(ObjectId newId) const;
 
   const ObjectId& getObjectId() const {
     return id_;
@@ -101,27 +111,12 @@ class Tree {
   }
 
   /**
-   * Serialize tree using custom format.
+   * Returns true if this tree represents a directory the server denied
+   * access to via ACL restrictions.
    */
-  folly::IOBuf serialize() const;
-
-  /**
-   * Serialize tree using custom format for version 1.
-   * This is used for testing and and should be removed when
-   * version 2 is fully rolled out. TODO: (lxw)
-   */
-  folly::IOBuf serialize_v1() const;
-
-  /**
-   * Deserialize tree if possible.
-   * Returns nullptr if serialization format is not supported.
-   *
-   * First byte is used to identify serialization format.
-   * Git tree starts with 'tree', so we can use any bytes other then 't' as a
-   * version identifier. Currently only V1_VERSION is supported, along with
-   * git tree format.
-   */
-  static TreePtr tryDeserialize(ObjectId id, folly::StringPiece data);
+  bool isRestricted() const {
+    return isRestricted_;
+  }
 
  private:
   friend bool operator==(const Tree& tree1, const Tree& tree2);
@@ -129,9 +124,7 @@ class Tree {
   ObjectId id_;
   container entries_;
   TreeAuxDataPtr auxData_;
-
-  static constexpr uint32_t V1_VERSION = 1u;
-  static constexpr uint32_t V2_VERSION = 2u;
+  bool isRestricted_{false};
 };
 
 } // namespace facebook::eden

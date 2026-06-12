@@ -5,10 +5,19 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+mod debug;
 mod linelog;
 mod maybe_mut;
+#[allow(unused)]
+mod nanodag;
+mod small_revs;
+mod stacks;
 
 pub use crate::linelog::AbstractLineLog;
+pub use crate::linelog::EditFlags;
+pub use crate::nanodag::NanoDag;
+pub use crate::small_revs::SmallRevs;
+pub use crate::stacks::FlattenLine;
 
 /// LineLog with string line content.
 pub type LineLog = AbstractLineLog<String>;

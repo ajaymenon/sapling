@@ -92,6 +92,12 @@ export async function activate(
       );
     }
 
+    if (enabledSCMApiFeatures.has('diffSignalDetails') && Internal.registerDiffSignalProvider) {
+      context.subscriptions.push(
+        Internal.registerDiffSignalProvider(context, extensionTracker, logger, reposList),
+      );
+    }
+
     context.subscriptions.push(...registerCommands(ctx));
 
     Internal?.registerInternalBugLogsProvider != null &&
@@ -99,6 +105,11 @@ export async function activate(
 
     extensionTracker.track('VSCodeExtensionActivated', {duration: Date.now() - start});
     const api = makeExtensionApi(platform, ctx, reposList);
+
+    context.subscriptions.push(
+      Internal?.vscodeCommandBasedApi?.(reposList) ?? vscode.Disposable.from(),
+    );
+
     return api;
   } catch (error) {
     extensionTracker.error('VSCodeExtensionActivated', 'VSCodeActivationError', error as Error, {

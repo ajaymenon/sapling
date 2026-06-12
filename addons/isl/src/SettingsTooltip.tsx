@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {ThemeColor} from './theme';
+import type {ThemePreference} from './theme';
 import type {PreferredSubmitCommand} from './types';
 
 import {Button} from 'isl-components/Button';
@@ -20,6 +20,7 @@ import {useAtom, useAtomValue} from 'jotai';
 import {Suspense} from 'react';
 import {nullthrows, tryJsonParse} from 'shared/utils';
 import {
+  copyCommitHashFormatAtom,
   distantRebaseWarningEnabled,
   rebaseOffWarmWarningEnabled,
   rebaseOntoMasterWarningEnabled,
@@ -45,6 +46,7 @@ import {
   overrideDisabledSubmitModes,
 } from './codeReview/github/branchPrState';
 import {debugToolsEnabledState} from './debug/DebugToolsState';
+import {commitInfoLocationAtom, type CommitInfoLocationWithAuto} from './drawerState';
 import {externalMergeToolAtom} from './externalMergeTool';
 import {t, T} from './i18n';
 import {configBackedAtom, readAtom} from './jotaiUtils';
@@ -55,10 +57,13 @@ import platform from './platform';
 import {irrelevantCwdDisplayModeAtom} from './repositoryData';
 import {renderCompactAtom, useZoomShortcut, zoomUISettingAtom} from './responsive';
 import {mainCommandName, repositoryInfo} from './serverAPIState';
-import {themeState, useThemeShortcut} from './theme';
+import {themePreferenceState, useThemeShortcut} from './theme';
 
+import {Internal} from './Internal';
 import './SettingsTooltip.css';
 import {enableSaplingDebugFlag, enableSaplingVerboseFlag} from './atoms/debugToolAtoms';
+
+export const showAuthoredDiffsConfig = configBackedAtom<boolean>('isl.show-authored-diffs', true);
 
 export function SettingsGearButton() {
   useThemeShortcut();
@@ -86,10 +91,11 @@ function SettingsDropdown({
   dismiss: () => unknown;
   showShortcutsHelp: () => unknown;
 }) {
-  const [theme, setTheme] = useAtom(themeState);
+  const [themePreference, setThemePreference] = useAtom(themePreferenceState);
   const [repoInfo, setRepoInfo] = useAtom(repositoryInfo);
   const runOperation = useRunOperation();
   const [showDiffNumber, setShowDiffNumber] = useAtom(showDiffNumberConfig);
+  const [showAuthoredDiffs, setShowAuthoredDiffs] = useAtom(showAuthoredDiffsConfig);
   return (
     <DropdownFields title={<T>Settings</T>} icon="gear" data-testid="settings-dropdown">
       <Button
@@ -113,10 +119,11 @@ function SettingsDropdown({
               [
                 {value: 'light', name: 'Light'},
                 {value: 'dark', name: 'Dark'},
-              ] as Array<{value: ThemeColor; name: string}>
+                {value: 'system', name: 'System'},
+              ] as Array<{value: ThemePreference; name: string}>
             }
-            value={theme}
-            onChange={event => setTheme(event.currentTarget.value as ThemeColor)}
+            value={themePreference}
+            onChange={event => setThemePreference(event.currentTarget.value as ThemePreference)}
           />
           <div style={{marginTop: 'var(--pad)'}}>
             <Subtle>
@@ -138,6 +145,7 @@ function SettingsDropdown({
           <DistantRebaseWarningSetting />
           <RebaseOntoMasterWarningSetting />
           <DeemphasizeIrrelevantCommitsSetting />
+          <CopyCommitHashFormatSetting />
         </Column>
       </Setting>
       <Setting title={<T>Conflicts</T>}>
@@ -203,6 +211,20 @@ function SettingsDropdown({
           </Checkbox>
           <ConfirmSubmitStackSetting />
           <SubmitAsDraftCheckbox forceShow />
+          {Internal.showAuthoredDiffsOption && (
+            <Tooltip
+              title={t(
+                'When enabled, ISL also fetches diff information for diffs you authored but where the latest version was submitted by someone else (e.g., via AI tools, or commandeering).',
+              )}>
+              <Checkbox
+                checked={showAuthoredDiffs}
+                onChange={checked => {
+                  setShowAuthoredDiffs(checked);
+                }}>
+                <T>Fetch authored diffs from Phabricator</T>
+              </Checkbox>
+            </Tooltip>
+          )}
         </div>
       </Setting>
       {platform.canCustomizeFileOpener && (
@@ -213,6 +235,11 @@ function SettingsDropdown({
           </Column>
         </Setting>
       )}
+      <Setting title={<T>Layout</T>}>
+        <Column alignStart>
+          <CommitInfoLocationSetting />
+        </Column>
+      </Setting>
       <Suspense>{platform.Settings == null ? null : <platform.Settings />}</Suspense>
       <DebugToolsField />
     </DropdownFields>
@@ -262,6 +289,33 @@ function RenderCompactSetting() {
   );
 }
 
+function CommitInfoLocationSetting() {
+  const [location, setLocation] = useAtom(commitInfoLocationAtom);
+  return (
+    <Tooltip
+      title={t(
+        'Position of the Commit Info panel relative to the commit graph. ' +
+          '"Auto" uses bottom in narrow mode (e.g. sidebar) and right otherwise.',
+      )}>
+      <div className="dropdown-container setting-inline-dropdown">
+        <T>Commit Info Panel</T>
+        <Dropdown<{value: CommitInfoLocationWithAuto; name: string}>
+          data-testid="commit-info-location-setting"
+          value={location}
+          options={[
+            {value: 'auto', name: t('Auto')},
+            {value: 'right', name: t('Right')},
+            {value: 'bottom', name: t('Bottom')},
+            {value: 'left', name: t('Left')},
+            {value: 'top', name: t('Top')},
+          ]}
+          onChange={event => setLocation(event.currentTarget.value as CommitInfoLocationWithAuto)}
+        />
+      </div>
+    </Tooltip>
+  );
+}
+
 function CondenseObsoleteSetting() {
   const [value, setValue] = useAtom(condenseObsoleteStacks);
   return (
@@ -277,6 +331,31 @@ function CondenseObsoleteSetting() {
         }}>
         <T>Condense Obsolete Stacks</T>
       </Checkbox>
+    </Tooltip>
+  );
+}
+
+function CopyCommitHashFormatSetting() {
+  const [value, setValue] = useAtom(copyCommitHashFormatAtom);
+  return (
+    <Tooltip
+      title={t(
+        'Choose whether "Copy Commit Hash" in the context menu copies the full hash or short (12-character) hash.',
+      )}>
+      <div className="dropdown-container setting-inline-dropdown">
+        <T>Copy Commit Hash Format</T>
+        <Dropdown<{value: typeof value; name: string}>
+          data-testid="copy-commit-hash-format"
+          options={[
+            {value: 'long', name: t('Full Hash')},
+            {value: 'short', name: t('Short Hash (12 chars)')},
+          ]}
+          value={value}
+          onChange={event => {
+            setValue(event.currentTarget.value as typeof value);
+          }}
+        />
+      </div>
     </Tooltip>
   );
 }

@@ -9,11 +9,11 @@ edition = "2024"
 name = "cpython_async"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 cpython = { version = "0.7.2", features = ["python3-sys"], default-features = false }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
 sapling-cpython-ext = { version = "0.1.0", path = "../cpython-ext" }
 
 [dev-dependencies]
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }

@@ -24,7 +24,7 @@ No leak without extensions
 
   $ newclientrepo >/dev/null
 
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   0000000000000000000000000000000000000000
   __del__ called
 
@@ -32,16 +32,16 @@ Fine extension: blackbox
 
   $ newclientrepo >/dev/null
   $ setconfig extensions.blackbox=
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   0000000000000000000000000000000000000000
   __del__ called
 
 Fine extension: remotefilelog
 
   $ newclientrepo >/dev/null
-  $ echo remotefilelog >> .hg/requires
+  $ echo remotefilelog >> .sl/requires
   $ setconfig extensions.remotefilelog= remotefilelog.cachepath=$TESTTMP/cache
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   0000000000000000000000000000000000000000
   __del__ called
 
@@ -49,10 +49,10 @@ Fine extension: treemanifest
 
   $ newclientrepo >/dev/null
   $ setconfig remotefilelog.reponame=x
-  $ hg log -r . -T '{node}\n'
+  $ sl log -r . -T '{node}\n'
   0000000000000000000000000000000000000000
   __del__ called
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   0000000000000000000000000000000000000000
   __del__ called
 
@@ -60,7 +60,7 @@ Fine extension: treemanifest only
 
   $ newclientrepo >/dev/null
   $ setconfig remotefilelog.reponame=x
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   0000000000000000000000000000000000000000
   __del__ called
 
@@ -68,7 +68,7 @@ Fine extension: sparse
 
   $ newclientrepo >/dev/null
   $ setconfig extensions.sparse=
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   0000000000000000000000000000000000000000
   __del__ called
 
@@ -76,7 +76,7 @@ Fine extension: commitcloud
 
   $ newclientrepo >/dev/null
   $ setconfig extensions.commitcloud=
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   0000000000000000000000000000000000000000
   __del__ called
 
@@ -84,15 +84,15 @@ Fine extension: sampling
 
   $ newclientrepo >/dev/null
   $ setconfig extensions.sampling=
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   0000000000000000000000000000000000000000
   __del__ called
 
 Somehow problematic: With many extensions
 
   $ newclientrepo >/dev/null
-  $ echo remotefilelog >> .hg/requires
-  $ cat >> .hg/hgrc <<EOF
+  $ echo remotefilelog >> .sl/requires
+  $ cat >> .sl/config <<EOF
   > [extensions]
   > absorb=
   > amend=
@@ -162,7 +162,7 @@ Somehow problematic: With many extensions
   > path=/conduit/
   > reponame=x
   > EOF
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   0000000000000000000000000000000000000000
   __del__ called
 
@@ -171,9 +171,9 @@ Somehow problematic: With many extensions
 FIXME: this is problematic in non-buck build.
  (this behaves differently with buck / setup.py build)
 
-  $ hg ci -m x -A x
+  $ sl ci -m x -A x
   __del__ called (?)
 
-  $ hg log -r . -T '{manifest % "{node}"}\n'
+  $ sl log -r . -T '{manifest % "{node}"}\n'
   c2ffc254676c538a75532e7b6ebbbccaf98e2545
   __del__ called

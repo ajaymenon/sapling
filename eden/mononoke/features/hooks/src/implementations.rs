@@ -11,10 +11,12 @@ mod always_fail_changeset;
 pub(crate) mod block_accidental_new_bookmark_creation;
 mod block_commit_message_pattern;
 mod block_content_pattern;
+pub(crate) mod block_dewey_lfs_url;
 mod block_empty_commit;
 mod block_files;
 pub(crate) mod block_invalid_symlinks;
 pub(crate) mod block_merge_commits;
+mod block_mixed_users_changes;
 pub(crate) mod block_new_bookmark_creations_by_name;
 pub(crate) mod block_unannotated_tags;
 pub(crate) mod block_unclean_merge_commits;
@@ -27,6 +29,7 @@ mod limit_path_length;
 pub(crate) mod limit_submodule_edits;
 mod limit_subtree_op_size;
 pub(crate) mod limit_tag_updates;
+mod limit_users_directory_size;
 pub(crate) mod missing_lfsconfig;
 pub(crate) mod no_bad_filenames;
 mod no_executable_binaries;
@@ -63,6 +66,9 @@ pub async fn make_bookmark_hook(
             block_accidental_new_bookmark_creation::BlockAccidentalNewBookmarkCreationHook::new(
                 &params.config,
             )?,
+        )),
+        "block_dewey_lfs_url_on_new_bookmark" => Some(b(
+            block_dewey_lfs_url::BlockDeweyLfsUrlOnNewBookmarkHook::new(),
         )),
         "block_new_bookmark_creations_by_name" => Some(b(
             block_new_bookmark_creations_by_name::BlockNewBookmarkCreationsByNameHook::new(
@@ -104,11 +110,15 @@ pub async fn make_changeset_hook(
         "limit_subtree_op_size" => Some(b(limit_subtree_op_size::LimitSubtreeOpSizeHook::new(
             &params.config,
         )?)),
+        "block_dewey_lfs_url" => Some(b(block_dewey_lfs_url::BlockDeweyLfsUrlHook::new())),
         "missing_lfsconfig" => Some(b(missing_lfsconfig::MissingLFSConfigHook::new())),
         "block_commit_message_pattern" => Some(b(
             block_commit_message_pattern::BlockCommitMessagePatternHook::new(&params.config)?,
         )),
         "block_empty_commit" => Some(b(block_empty_commit::BlockEmptyCommit::new())),
+        "block_mixed_users_changes" => Some(b(
+            block_mixed_users_changes::BlockMixedUsersChangesHook::new(&params.config)?,
+        )),
         "limit_commit_message_length" => {
             let hook =
                 limit_commit_message_length::LimitCommitMessageLengthHook::new(&params.config)?;
@@ -120,6 +130,9 @@ pub async fn make_changeset_hook(
         "limit_directory_size" => Some(b(limit_directory_size::LimitDirectorySizeHook::new(
             &params.config,
         )?)),
+        "limit_users_directory_size" => Some(b(
+            limit_users_directory_size::LimitUsersDirectorySizeHook::new(&params.config)?,
+        )),
         "require_commit_message_pattern" => Some(b(
             require_commit_message_pattern::RequireCommitMessagePatternHook::new(&params.config)?,
         )),

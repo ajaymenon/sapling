@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Error;
-use anyhow::anyhow;
 use blobstore::Loadable;
 use bonsai_tag_mapping::BonsaiTagMappingRef;
 use bookmarks::BookmarkCategory;
@@ -29,6 +28,7 @@ use clientinfo::ClientEntryPoint;
 use clientinfo::ClientInfo;
 use cloned::cloned;
 use context::CoreContext;
+use context::SessionContainer;
 use fbinit::FacebookInit;
 use futures::TryStreamExt;
 use futures::future;
@@ -42,6 +42,7 @@ use import_tools::GitRepoReader;
 use import_tools::GitUploader;
 use import_tools::GitimportPreferences;
 use import_tools::GitimportTarget;
+use import_tools::LfsServerUrlFormat;
 use import_tools::ReuploadCommits;
 use import_tools::bookmark::BookmarkOperationErrorReporting;
 use import_tools::create_changeset_for_annotated_tag;
@@ -67,6 +68,8 @@ use mononoke_app::monitoring::MonitoringAppExtension;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
 use mononoke_types::hash::GitSha1;
+#[allow(unused_imports)]
+use permission_checker::MononokeIdentity;
 use repo_authorization::AuthorizationContext;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_derived_data::RepoDerivedDataRef;
@@ -114,7 +117,7 @@ async fn derive_hg(
         let manifest = get_manifest_from_bonsai(
             ctx.clone(),
             repo.repo_blobstore_arc(),
-            repo.restricted_paths_arc(),
+            repo.restricted_paths_arc().config_based().clone(),
             bcs.clone(),
             parent_manifests,
             None,
@@ -127,6 +130,16 @@ async fn derive_hg(
     }
 
     Ok(())
+}
+
+/// URL pattern used by the LFS server to serve a single object by SHA256.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum LfsServerUrlFormatArg {
+    /// Dewey-style: `GET {server}/{sha256}`
+    #[default]
+    Dewey,
+    /// Mononoke git-LFS: `GET {server}/{repo}/download_sha256/{sha256}`
+    MononokeGitLfs,
 }
 
 /// Mononoke Git Importer
@@ -149,6 +162,13 @@ struct GitimportArgs {
     /// When set, the gitimport tool would bypass the read-only check while creating and moving bookmarks.
     #[clap(long)]
     bypass_readonly: bool,
+    /// When set, the gitimport tool would bypass all hooks while creating and moving bookmarks.
+    #[clap(long)]
+    bypass_all_hooks: bool,
+    /// When set, the gitimport tool would bypass the non-fast-forward check while moving bookmarks.
+    /// This is useful for re-importing repos where bookmarks may already exist from a prior import.
+    #[clap(long)]
+    bypass_non_fast_forward: bool,
     /// The concurrency to be used while importing commits in Mononoke
     #[clap(long, default_value_t = 20)]
     concurrency: usize,
@@ -188,9 +208,59 @@ struct GitimportArgs {
     /// explicitly specified refs
     #[clap(long, use_value_delimiter = true, value_delimiter = ',')]
     include_refs: Vec<String>,
-    /// Lfs server url to use to fetch lfs files from
-    #[clap(long)]
+    /// LFS server URL to fetch LFS files from over HTTP. When unset, gitimport
+    /// falls back to internal mode (resolves LFS pointers from the local
+    /// Mononoke filestore by SHA256 alias). Mutually exclusive with
+    /// `--internal-lfs` and `--github-lfs-url`.
+    #[clap(long, conflicts_with_all = ["internal_lfs", "github_lfs_url"])]
     lfs_server: Option<String>,
+    /// URL pattern that the LFS server uses to serve raw objects by SHA256.
+    /// Defaults to the Dewey-style `GET {server}/{sha256}`. Use `mononoke-git-lfs` for
+    /// the `GET {server}/{repo}/download_sha256/{sha256}` shape served by Mononoke LFS.
+    #[clap(long, value_enum, default_value_t = LfsServerUrlFormatArg::Dewey)]
+    lfs_server_url_format: LfsServerUrlFormatArg,
+    /// Explicitly request internal mode (resolve LFS pointers from the local
+    /// Mononoke filestore by SHA256 alias). Internal mode is also the default
+    /// when `--lfs-server` is not set; this flag is mainly useful for
+    /// documentation or to force a clap error if `--lfs-server` is also
+    /// passed by mistake. Mutually exclusive with `--lfs-server` and
+    /// `--github-lfs-url`.
+    #[clap(long, default_value_t = false, conflicts_with = "github_lfs_url")]
+    internal_lfs: bool,
+    /// GitHub LFS Batch API endpoint, e.g.
+    /// `https://github.com/par-msl/jarvis.git/info/lfs/objects/batch`. When
+    /// set, gitimport speaks the LFS Batch protocol against this URL using a
+    /// GitHub App installation token read from `--github-lfs-token-file`.
+    /// Mutually exclusive with `--lfs-server` and `--internal-lfs`.
+    #[clap(long, requires = "github_lfs_token_file")]
+    github_lfs_url: Option<String>,
+    /// Path to a file containing the GitHub App installation token used as
+    /// `Authorization: Bearer <token>` against the GitHub LFS Batch endpoint.
+    /// The file is re-read after a 401/403 response, so an out-of-process
+    /// refresher can rotate the token while gitimport is running
+    /// (installation tokens expire after ~1h; large imports take several
+    /// hours). Required when `--github-lfs-url` is set.
+    #[clap(long, requires = "github_lfs_url")]
+    github_lfs_token_file: Option<PathBuf>,
+    /// HTTP forward proxy URL used to tunnel GitHub LFS Batch API requests
+    /// through via HTTP CONNECT. Defaults to Meta's prod forward proxy
+    /// (`http://fwdproxy:8080`), which is required to reach github.com from
+    /// any Meta host (Sandcastle workers, devservers, OD sandboxes). Pair
+    /// with `--github-lfs-no-https-proxy` to disable proxying entirely
+    /// (e.g. when running outside Meta in OSS environments where github.com
+    /// is reachable directly). Only applies to the `--github-lfs-url` code
+    /// path; the other LFS modes ignore it.
+    #[clap(
+        long,
+        requires = "github_lfs_url",
+        default_value = "http://fwdproxy:8080"
+    )]
+    github_lfs_https_proxy: String,
+    /// Disable HTTPS proxying for GitHub LFS Batch requests, overriding the
+    /// default `--github-lfs-https-proxy`. Use when running outside Meta
+    /// (OSS) where github.com is reachable directly without a forward proxy.
+    #[clap(long, requires = "github_lfs_url")]
+    github_lfs_no_https_proxy: bool,
     /// TLS parameters for this service used for outbound LFS connections
     #[clap(flatten)]
     tls_args: Option<TLSArgs>,
@@ -208,6 +278,12 @@ struct GitimportArgs {
     /// imports.
     #[clap(long)]
     cleanup_mononoke_bookmarks: bool,
+    /// On failure, persist `bonsai_git_mapping` rows for commits already
+    /// fully processed so retries can resume incrementally. Also surfaces
+    /// the real underlying error to Scuba instead of the SendError
+    /// cascade. See `GitimportPreferences::persist_partial_mappings`.
+    #[clap(long)]
+    persist_partial_mappings: bool,
 }
 
 #[derive(Subcommand)]
@@ -239,15 +315,54 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         .with_app_extension(MonitoringAppExtension {})
         .build::<GitimportArgs>()?;
 
-    app.run_with_monitoring_and_logging(async_main, "gitimport", AliveService)
+    let result = app.run_with_monitoring_and_logging(async_main, "gitimport", AliveService);
+
+    if result.is_ok() {
+        // Skip C++ singleton teardown which hangs for ~5 minutes due to
+        // circular shared_ptr references in folly/scribe/manifold singletons.
+        // All import work is complete at this point.
+        //
+        // Must use libc::_exit instead of std::process::exit because the latter
+        // calls C exit() which still runs atexit handlers — and folly registers
+        // singleton teardown via atexit, which is the exact code path that hangs.
+        unsafe { libc::_exit(0) };
+    }
+
+    result
 }
 
 async fn async_main(app: MononokeApp) -> Result<(), Error> {
-    let ctx = CoreContext::new_with_client_info(
-        app.fb,
-        ClientInfo::default_with_entry_point(ClientEntryPoint::GitImport),
-    );
     let args: GitimportArgs = app.args()?;
+
+    let ctx = {
+        let mut metadata = metadata::Metadata::default();
+        metadata.add_client_info(ClientInfo::default_with_entry_point(
+            ClientEntryPoint::GitImport,
+        ));
+
+        // When bypassing hooks, we need real identities from the local machine's
+        // certificate so that the hook bypass authorization check can validate
+        // that this caller is permitted to bypass hooks.
+        #[cfg(fbcode_build)]
+        if args.bypass_all_hooks {
+            let local_idents = identity_ext::x509::get_locally_available_identities().context(
+                "Failed to read local certificate identities. \
+                     --bypass-all-hooks requires valid identities from the machine's \
+                     x509 certificate (THRIFT_TLS_CL_CERT_PATH)",
+            )?;
+            let identities = local_idents
+                .iter()
+                .map(MononokeIdentity::from_identity)
+                .collect();
+            metadata = metadata.set_identities(identities);
+        }
+
+        let session = SessionContainer::builder(app.fb)
+            .metadata(Arc::new(metadata))
+            .build();
+        session.new_context(scuba_ext::MononokeScubaSampleBuilder::with_discard())
+    };
+
     let path = Path::new(&args.git_repository_path);
 
     let reupload = if args.reupload_commits {
@@ -288,17 +403,57 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
     } else {
         BackfillDerivation::AllConfiguredTypes
     };
-    let lfs = match repo.repo_config().git_configs.git_lfs_interpret_pointers {
-        true => GitImportLfs::new(
-            args.lfs_server.ok_or_else(|| {
-                anyhow!("LFS server url is required when LFS is enabled in the repo config")
-            })?,
-            args.allow_dangling_lfs_pointers,
-            args.lfs_import_max_attempts,
-            Some(LFS_SIMULTANEOUS_CONNECTION_LIMIT),
-            args.tls_args,
-        )?,
-        false => GitImportLfs::new_disabled(),
+    // LFS resolution mode (only relevant when the repo config has LFS pointer
+    // interpretation enabled). Internal mode is the default — pass
+    // `--lfs-server URL` to opt into upstream HTTP fetches. The `--internal-lfs`
+    // flag is documentary only; without it, the absence of `--lfs-server`
+    // already selects internal mode.
+    let lfs = if repo.repo_config().git_configs.git_lfs_interpret_pointers {
+        match (args.lfs_server, args.github_lfs_url) {
+            (Some(lfs_server), None) => {
+                let url_format = match args.lfs_server_url_format {
+                    LfsServerUrlFormatArg::Dewey => LfsServerUrlFormat::LegacyDewey,
+                    LfsServerUrlFormatArg::MononokeGitLfs => LfsServerUrlFormat::MononokeGitLfs {
+                        repo_name: repo.repo_identity().name().to_string(),
+                    },
+                };
+                GitImportLfs::new(
+                    lfs_server,
+                    url_format,
+                    args.allow_dangling_lfs_pointers,
+                    args.lfs_import_max_attempts,
+                    Some(LFS_SIMULTANEOUS_CONNECTION_LIMIT),
+                    args.tls_args,
+                )?
+            }
+            (None, Some(github_lfs_url)) => {
+                let token_file = args.github_lfs_token_file.ok_or_else(|| {
+                    anyhow::format_err!(
+                        "--github-lfs-token-file is required when --github-lfs-url is set",
+                    )
+                })?;
+                let https_proxy = if args.github_lfs_no_https_proxy {
+                    None
+                } else {
+                    Some(args.github_lfs_https_proxy)
+                };
+                GitImportLfs::new_github(
+                    github_lfs_url,
+                    token_file,
+                    https_proxy,
+                    args.allow_dangling_lfs_pointers,
+                    args.lfs_import_max_attempts,
+                    Some(LFS_SIMULTANEOUS_CONNECTION_LIMIT),
+                )?
+            }
+            (None, None) => GitImportLfs::new_internal(
+                repo.repo_blobstore_arc().boxed(),
+                args.allow_dangling_lfs_pointers,
+            ),
+            (Some(_), Some(_)) => unreachable!("clap conflicts_with rejects this combination"),
+        }
+    } else {
+        GitImportLfs::new_disabled()
     };
 
     let mut prefs = GitimportPreferences {
@@ -307,6 +462,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
         allow_content_refs: args.allow_content_refs,
         backfill_derivation,
         lfs,
+        persist_partial_mappings: args.persist_partial_mappings,
         ..Default::default()
     };
 
@@ -350,12 +506,12 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     cloned!(ctx, uploader, reader);
                     async move {
                         let tag_sha1 = ObjectId::from_str(&tag_sha1).with_context(|| {
-                            format!("Invalid SHA1 hash provided for Git Tag {}", tag_sha1)
+                            format!("Invalid SHA1 hash provided for Git Tag {tag_sha1}")
                         })?;
                         upload_git_tag(&ctx, uploader.clone(), reader.clone(), &tag_sha1)
                             .await
                             .with_context(|| {
-                                format!("Error in uploading tag with ID {}", tag_sha1)
+                                format!("Error in uploading tag with ID {tag_sha1}")
                             })?;
                         info!("Uploaded tag with ID {}", tag_sha1);
                         anyhow::Ok(())
@@ -435,13 +591,21 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                 .into_iter()
                 .map(|entry| (entry.tag_name, entry.tag_hash))
                 .collect::<HashMap<_, _>>();
-            let pushvars = if args.bypass_readonly {
-                Some(HashMap::from_iter([(
-                    "BYPASS_READONLY".to_string(),
-                    bytes::Bytes::from("true"),
-                )]))
-            } else {
-                None
+            let pushvars = {
+                let mut pvs = HashMap::new();
+                if args.bypass_readonly {
+                    pvs.insert("BYPASS_READONLY".to_string(), bytes::Bytes::from("true"));
+                }
+                if args.bypass_all_hooks {
+                    pvs.insert("BYPASS_ALL_HOOKS".to_string(), bytes::Bytes::from("true"));
+                }
+                if args.bypass_non_fast_forward {
+                    pvs.insert(
+                        "x-git-allow-non-ffwd-push".to_string(),
+                        bytes::Bytes::from("true"),
+                    );
+                }
+                if pvs.is_empty() { None } else { Some(pvs) }
             };
             // We can make the below loop concurrent but since refs pointing to content is an anomaly,
             // we will only optimize its upload if we see a need.

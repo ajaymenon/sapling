@@ -9,10 +9,12 @@ rust_library(
     name = "edenfs_ffi",
     srcs = glob(["src/**/*.rs"]),
     autocargo = {
-        "cargo_target_config": {"crate_type": [
-            "staticlib",
-            "lib",
-        ]},
+        "cargo_target_config": {
+            "crate_type": [
+                "staticlib",
+                "lib",
+            ],
+        },
         "cargo_toml_config": {
             "dependencies_override": {"build-dependencies": {"cxx-build": {"optional": False}}},
             "lib": {"name": "edenfs_ffi"},
@@ -39,6 +41,7 @@ rust_library(
         "fbsource//third-party/rust:tracing",
         "//eden/scm/lib/async-runtime:async-runtime",
         "//eden/scm/lib/config/model:configmodel",
+        "//eden/scm/lib/edenfs_ffi/cxxerror:cxxerror",
         "//eden/scm/lib/filters:filters",
         "//eden/scm/lib/identity:identity",
         "//eden/scm/lib/metrics:metrics",

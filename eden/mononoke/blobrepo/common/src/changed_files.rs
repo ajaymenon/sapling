@@ -11,18 +11,14 @@ use std::sync::Arc;
 use anyhow::Error;
 use blobstore::KeyedBlobstore;
 use context::CoreContext;
-use futures::StreamExt;
-use futures::TryFutureExt;
 use futures::TryStreamExt;
 use futures::future;
 use manifest::Diff;
 use manifest::Entry;
 use manifest::ManifestOps;
-use mercurial_types::HgFileNodeId;
+use manifest::find_intersection_of_diffs;
 use mercurial_types::HgManifestId;
-use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
-use mononoke_types::path::MPath;
 
 /// NOTE: To be used only for generating list of files for old, Mercurial format of Changesets.
 ///
@@ -49,22 +45,23 @@ pub async fn compute_changed_files(
             compute_changed_files_pair(ctx, blobstore.clone(), root, manifest).await?
         }
         (Some(p1), Some(p2)) => {
-            let changed = future::try_join(
-                compute_changed_files_pair(ctx.clone(), blobstore.clone(), root, p1),
-                compute_changed_files_pair(ctx.clone(), blobstore.clone(), root, p2),
-            )
-            .map_ok(|(left, right)| left.intersection(&right).cloned().collect::<Vec<_>>());
-
-            // Mercurial always includes removed files, we need to match this behaviour
-            let (ch1, ch2, ch3) = future::try_join3(
-                changed,
+            let (changed, removed_p1, removed_p2) = future::try_join3(
+                find_intersection_of_diffs(ctx.clone(), blobstore.clone(), root, vec![p1, p2])
+                    .try_filter_map(|(path, entry)| async move {
+                        match entry {
+                            Entry::Leaf(_) => Ok(Option::<NonRootMPath>::from(path)),
+                            _ => Ok(None),
+                        }
+                    })
+                    .try_collect::<Vec<_>>(),
                 compute_removed_files(&ctx, blobstore.clone(), root, Some(p1)),
                 compute_removed_files(&ctx, blobstore.clone(), root, Some(p2)),
             )
             .await?;
-            ch1.into_iter()
-                .chain(ch2.into_iter())
-                .chain(ch3.into_iter())
+            changed
+                .into_iter()
+                .chain(removed_p1)
+                .chain(removed_p2)
                 .collect::<HashSet<_>>()
         }
     };
@@ -102,34 +99,26 @@ async fn compute_removed_files(
     child: HgManifestId,
     parent: Option<HgManifestId>,
 ) -> Result<Vec<NonRootMPath>, Error> {
-    compute_files_with_status(ctx, blobstore, child, parent, move |diff| match diff {
-        Diff::Removed(path, entry) => match entry {
-            Entry::Leaf(_) => path,
-            Entry::Tree(_) => MPath::ROOT,
-        },
-        _ => MPath::ROOT,
-    })
-    .await
-}
-
-async fn compute_files_with_status(
-    ctx: &CoreContext,
-    blobstore: Arc<dyn KeyedBlobstore>,
-    child: HgManifestId,
-    parent: Option<HgManifestId>,
-    filter_map: impl Fn(Diff<Entry<HgManifestId, (FileType, HgFileNodeId)>>) -> MPath,
-) -> Result<Vec<NonRootMPath>, Error> {
-    let s = match parent {
-        Some(parent) => parent.diff(ctx.clone(), blobstore, child).left_stream(),
-        None => child
-            .list_all_entries(ctx.clone(), blobstore)
-            .map_ok(|(path, entry)| Diff::Added(path, entry))
-            .right_stream(),
-    };
-
-    s.try_filter_map(|e| async { Ok(filter_map(e).into_optional_non_root_path()) })
-        .try_collect()
-        .await
+    match parent {
+        Some(parent) => {
+            parent
+                .filtered_diff(
+                    ctx.clone(),
+                    blobstore.clone(),
+                    child,
+                    blobstore,
+                    |diff| match diff {
+                        Diff::Removed(path, Entry::Leaf(_)) => path.into_optional_non_root_path(),
+                        _ => None,
+                    },
+                    |diff| !matches!(diff, Diff::Added(..)),
+                    Default::default(),
+                )
+                .try_collect()
+                .await
+        }
+        None => Ok(Vec::new()),
+    }
 }
 
 fn mercurial_mpath_comparator(a: &NonRootMPath, b: &NonRootMPath) -> ::std::cmp::Ordering {

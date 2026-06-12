@@ -1,30 +1,33 @@
 load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "scuba_ext",
     srcs = glob(["src/**/*.rs"]),
     deps = [
         "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:nonzero_ext",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/futures_stats:futures_stats",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//common/rust/shed/sampling:sampling",
         "//common/rust/shed/scuba_stub:scuba",
         "//common/rust/shed/time_ext:time_ext",
         "//eden/mononoke/common/memory:memory",
         "//eden/mononoke/common/metadata:metadata",
         "//eden/mononoke/common/observability:observability",
-        "//eden/mononoke/common/permission_checker:permission_checker",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/scribe_ext:scribe_ext",
         "//eden/scm/lib/clientinfo:clientinfo",
-    ] + ([] if rust_oss.is_oss_build() else [
-        # fbcode-only deps for schematized_logging module
-        "//common/rust/build_info:build_info",
-        "//common/rust/fbwhoami:fbwhoami",
-        "//common/rust/shed/hostname:hostname",
-    ]),
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            # fbcode-only deps for schematized_logging module
+            "//common/rust/build_info:build_info",
+            "//common/rust/fbwhoami:fbwhoami",
+            "//common/rust/shed/hostname:hostname",
+        ]
+    ),
 )

@@ -13,18 +13,18 @@
 
 # Test histgrep and check that it respects the specified file:
 
-  $ hg init repo
+  $ sl init repo
   $ cd repo
   $ mkdir histgrepdir
   $ cd histgrepdir
   $ echo ababagalamaga > histgrepfile1
   $ echo ababagalamaga > histgrepfile2
-  $ hg add histgrepfile1
-  $ hg add histgrepfile2
-  $ hg commit -m 'Added some files'
-  $ hg histgrep ababagalamaga histgrepfile1
+  $ sl add histgrepfile1
+  $ sl add histgrepfile2
+  $ sl commit -m 'Added some files'
+  $ sl histgrep ababagalamaga histgrepfile1
   histgrepdir/histgrepfile1:*:ababagalamaga (glob)
-  $ hg histgrep ababagalamaga
+  $ sl histgrep ababagalamaga
   abort: can't run histgrep on the whole repo, please provide filenames
   (this is disabled to avoid very slow greps over the whole repo)
   [255]
@@ -32,7 +32,7 @@
 # Now allow allowfullrepogrep:
 
   $ setconfig 'histgrep.allowfullrepogrep=True'
-  $ hg histgrep ababagalamaga
+  $ sl histgrep ababagalamaga
   histgrepdir/histgrepfile1:*:ababagalamaga (glob)
   histgrepdir/histgrepfile2:*:ababagalamaga (glob)
   $ cd ..

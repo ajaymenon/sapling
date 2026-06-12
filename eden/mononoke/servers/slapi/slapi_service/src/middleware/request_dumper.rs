@@ -12,7 +12,9 @@ use anyhow::Result;
 use anyhow::bail;
 use base64::Engine;
 use bytes::Bytes;
+use cats_constants::X_AUTH_CATS_HEADER;
 use fbinit::FacebookInit;
+use gotham::helpers::http::Body;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham_derive::StateData;
@@ -21,8 +23,7 @@ use gotham_ext::middleware::PostResponseCallbacks;
 use gotham_ext::middleware::request_context::RequestContext;
 use gotham_ext::state_ext::StateExt;
 use http::HeaderMap;
-use hyper::Body;
-use hyper::Response;
+use http::Response;
 use lazy_static::lazy_static;
 use scuba_ext::MononokeScubaSampleBuilder;
 use tracing::trace;
@@ -37,7 +38,7 @@ const SLOW_REQUEST_THRESHOLD_MS: i64 = 10000;
 lazy_static! {
     static ref FILTERED_HEADERS: HashSet<&'static str> = {
         let mut m = HashSet::new();
-        m.insert("x-auth-cats");
+        m.insert(X_AUTH_CATS_HEADER);
         m
     };
 }
@@ -146,7 +147,7 @@ impl RequestDumper {
         R: std::fmt::Debug,
     {
         if self.should_log_deserialized() {
-            self.logger.add("request", format!("{:?}", request));
+            self.logger.add("request", format!("{request:?}"));
         }
     }
 

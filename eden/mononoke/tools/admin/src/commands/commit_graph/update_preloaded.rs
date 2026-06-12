@@ -89,7 +89,7 @@ async fn try_fetch_chunk(
             Err(err) => match sql_retries {
                 0 => return Err(err),
                 _ => {
-                    println!("{:?}", err);
+                    println!("{err:?}");
                     println!("Retrying fetching changeset edges");
 
                     sql_retries -= 1;
@@ -144,10 +144,7 @@ pub(super) async fn update_preloaded(
         .with_context(|| format!("Failure to fetch max commit id for repo {}", repo.id.name()))?
         .unwrap_or(0);
 
-    println!(
-        "Updating with changesets having sql ids between {} and {} inclusive",
-        start_id, end_id
-    );
+    println!("Updating with changesets having sql ids between {start_id} and {end_id} inclusive");
 
     let mut extendable_preloaded_edges =
         ExtendablePreloadedEdges::from_preloaded_edges(preloaded_edges);
@@ -222,15 +219,22 @@ pub(super) async fn update_preloaded_all_repos(
     app: Arc<MononokeApp>,
     args: UpdatePreloadedArgs,
 ) -> Result<()> {
-    let repo_configs = app.repo_configs();
-    let applicable_repo_names =
-        Vec::from_iter(repo_configs.repos.iter().filter_map(|(name, repo_config)| {
+    // Enumerate via `load_all_repo_configs` so split-loaded repos
+    // (only present in the per-tier RepoSpec manifest) are included
+    // — iterating `repo_configs.repos` would silently skip them, and
+    // their preloaded commit graph would never get refreshed.
+    let applicable_repo_names = app
+        .configs()
+        .load_all_repo_configs()?
+        .into_iter()
+        .filter_map(|(name, repo_config)| {
             repo_config
                 .commit_graph_config
                 .preloaded_commit_graph_blobstore_key
                 .as_ref()
-                .map(|_| name.to_string())
-        }));
+                .map(|_| name)
+        })
+        .collect::<Vec<_>>();
     let repo_mgr: MononokeReposManager<Repo> = app
         .open_named_managed_repos(applicable_repo_names, None)
         .await?;

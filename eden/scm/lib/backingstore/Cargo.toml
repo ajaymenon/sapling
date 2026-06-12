@@ -14,14 +14,15 @@ name = "backingstore"
 crate-type = ["lib", "staticlib"]
 
 [dependencies]
-anyhow = "1.0.98"
-arc-swap = { version = "1.5", features = ["weak"] }
+anyhow = "1.0.102"
+arc-swap = { version = "1.9.0", features = ["weak"] }
 blob = { version = "0.1.0", path = "../blob" }
-cxx = "1.0.119"
-env_logger = { version = "0.11.8", features = ["color"] }
+cxx = "1.0.194"
+cxxerror = { version = "0.1.0", path = "../edenfs_ffi/cxxerror" }
+env_logger = { version = "0.11.10", features = ["color"] }
 flume = "0.11.1"
-log = { version = "0.4.27", features = ["kv_unstable", "kv_unstable_std"] }
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
+log = { version = "0.4.32", features = ["kv_unstable", "kv_unstable_std"] }
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-configloader = { version = "0.1.0", path = "../config/loader" }
 sapling-constructors = { version = "0.1.0", path = "../constructors", default-features = false }
 sapling-eagerepo = { version = "0.1.0", path = "../eagerepo" }
@@ -40,14 +41,14 @@ sapling-storemodel = { version = "0.1.0", path = "../storemodel" }
 sapling-testutil = { version = "0.1.0", path = "../util/testutil" }
 sapling-types = { version = "0.1.0", path = "../types" }
 sapling-walkdetector = { version = "0.1.0", path = "../walkdetector" }
-smallvec = { version = "1.15", features = ["impl_bincode", "serde", "specialization", "union"] }
+smallvec = { version = "1.15", features = ["impl_bincode", "serde", "specialization", "union", "write"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-tracing-subscriber = { version = "0.3.20", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
+tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
 
 [dev-dependencies]
-http = "0.2"
-rand_chacha = "0.3"
-url = "2.5.4"
+http = "=1.4.0"
+rand_chacha = "0.10"
+url = "2.5.8"
 
 [features]
 fb = ["sapling-configloader/fb"]

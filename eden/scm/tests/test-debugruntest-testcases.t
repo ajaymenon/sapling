@@ -43,7 +43,7 @@ Make sure we can't see case1's variable.
   $ echo in shared test
   in shared test
 
-  $ hg init
+  $ sl init
 
 
 #if case1

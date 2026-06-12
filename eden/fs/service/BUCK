@@ -14,12 +14,12 @@ cpp_library(
         "EdenMain.cpp",
     ],
     deps = [
+        "fbsource//third-party/fmt:fmt",
         ":init",
         ":startup_logger",
         ":startup_status_subscriber",
         "//common/init:light",
         "//eden/common/telemetry:log_info",
-        "//eden/common/telemetry:structured_logger",
         "//eden/common/utils:bug",
         "//eden/common/utils:user_info",
         "//eden/fs:config",
@@ -33,13 +33,14 @@ cpp_library(
         "//eden/fs/store/sl:sapling_backing_store",
         "//eden/fs/telemetry:log_info",
         "//eden/fs/telemetry:scribe_logger",
+        "//eden/fs/telemetry:structured_logger",
         "//eden/fs/utils:win_stacktrace",
         "//fb303:function_stat_handler",
         "//fb303:logging",
         "//folly:conv",
         "//folly:map_util",
         "//folly:stop_watch",
-        "//folly/executors:function_scheduler",
+        "//folly:string",
         "//folly/init:init",
         "//folly/logging:init",
         "//folly/logging:logging",
@@ -49,6 +50,7 @@ cpp_library(
     ] + select({
         "DEFAULT": [],
         "ovr_config//os:linux": [
+            "third-party//systemd:systemd",
             "//eden/fs/store/git:git",
         ],
     }),
@@ -122,6 +124,7 @@ cpp_binary(
     deps = [
         "//eden/common/utils:user_info",
         "//eden/fs/privhelper:flags",
+        "//eden/fs/privhelper:rollback",
         "//eden/fs/privhelper:server",
         "//folly:exception",
         "//folly:file",
@@ -129,6 +132,7 @@ cpp_binary(
         "//folly/init:init",
         "//folly/logging:init",
         "//folly/logging:logging",
+        "//folly/portability:unistd",
     ],
 )
 
@@ -140,6 +144,12 @@ buck_genrule(
         cp $SRCS $OUT &&
         chmod 04755 $OUT
     """,
+    compatible_with = [
+        "ovr_config//os:linux",
+    ],
+    exec_compatible_with = [
+        "ovr_config//os:linux",
+    ],
 )
 
 # The privhelper is installed setuid root. Since it is a privileged
@@ -154,8 +164,8 @@ audit_dependencies_test(
         # glog supports a GOOGLE_log_dir environment variable. I have
         # been unable to use it to trigger a write to a root-owned
         # directory, but ideally we wouldn't link with glog at all.
-        #"//third-party-buck/.*/build/glog:glog",
-        #"fbsource//third-party/glog/.*",
+        # "//third-party-buck/.*/build/glog:glog",
+        # "fbsource//third-party/glog/.*",
     ],
     compatible_with = [
         "ovr_config//os:linux",
@@ -303,7 +313,7 @@ cpp_library(
         "//folly/logging:logging",
     ],
     exported_deps = [
-        "//folly/futures:core",
+        "//folly/coro/safe:now_task",
     ],
 )
 
@@ -333,6 +343,7 @@ cpp_library(
         "//common/fb303/cpp:thread_pool_executor_counters",  # @manual
         "//common/network:hostname",
         "//eden/common/telemetry:log_info",
+        "//eden/common/telemetry:scribe_logger",
         "//eden/common/telemetry:structured_logger",
         "//eden/common/telemetry:structured_logger_factory",
         "//eden/common/utils:bug",
@@ -368,10 +379,15 @@ cpp_library(
         "//eden/fs/store:store",
         "//eden/fs/store/filter:glob_filter",
         "//eden/fs/store/sl:sapling_backing_store",
+        "//eden/fs/telemetry:error_info",
+        "//eden/fs/telemetry:error_logger",
         "//eden/fs/telemetry:log_info",
         "//eden/fs/telemetry:scribe_logger",
         "//eden/fs/telemetry:structured_logger",
         "//eden/fs/telemetry:task_trace",
+        "//eden/fs/telemetry:xplat_keys",
+        "//eden/fs/telemetry/facebook:xplat_logger",  # @manual
+        "//eden/fs/telemetry/facebook:xplat_transforms",
         "//eden/fs/utils:clock",
         "//eden/fs/utils:eden_error",
         "//eden/fs/utils:eden_task_queue",
@@ -389,10 +405,10 @@ cpp_library(
         "//folly:string",
         "//folly/chrono:conv",
         "//folly/coro:collect",
-        "//folly/executors/thread_factory:named_thread_factory",
+        "//folly/coro:current_executor",
+        "//folly/coro:invoke",
         "//folly/executors:cpu_thread_pool_executor",
-        "//folly/executors:serial_executor",
-        "//folly/futures:core",
+        "//folly/executors/thread_factory:named_thread_factory",
         "//folly/io/async:async_signal_handler",
         "//folly/json:dynamic",
         "//folly/logging:logging",
@@ -441,11 +457,13 @@ cpp_library(
         "//folly:thread_local",
         "//folly:try",
         "//folly/coro:task",
+        "//folly/coro/safe:now_task",
         "//folly/executors:serial_executor",
         "//folly/futures:core",
         "//folly/futures:shared_promise",
         "//folly/io/async:async_base",
         "//folly/portability:sys_stat",
+        "//folly/synchronization:lifo_sem",
         "//monitoring/obc:obc_lib",
         "//thrift/lib/cpp:event_handler_base",
     ],
@@ -465,10 +483,8 @@ thrift_library(
     languages = [
         "cpp2",
         "java-swift",
-        "py3-deprecated",
         "python",
         "rust",
-        "py-deprecated",
     ],
     py3_namespace = "eden.fs.service",
     py_base_module = "facebook",
@@ -493,7 +509,6 @@ thrift_library(
     languages = [
         "cpp2",
         "java-swift",
-        "py3-deprecated",
         "python",
         "rust",
     ],
@@ -550,6 +565,9 @@ cpp_library(
         "//eden/fs/store:context",
         "//eden/fs/store:store",
         "//eden/fs/utils:eden_error",
+        "//folly/coro:collect",
+        "//folly/coro:invoke",
+        "//folly/coro:task",
         "//folly/logging:log_level",
         "//folly/logging:logging",
     ],
@@ -559,6 +577,7 @@ cpp_library(
         "//eden/fs/inodes:inodes",
         "//eden/fs/utils:glob",
         "//folly:range",
+        "//folly/coro/safe:now_task",
     ],
 )
 

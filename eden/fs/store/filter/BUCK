@@ -10,6 +10,7 @@ cpp_library(
         "//eden/common/utils:enum",
         "//eden/common/utils:throw",
         "//eden/fs/store:backing_store_interface",
+        "//folly:conv",
         "//folly:varint",
         "//folly/logging:logging",
     ],
@@ -28,6 +29,7 @@ cpp_library(
         "//eden/common/utils:immediate_future",
         "//eden/common/utils:path",
         "//folly:range",
+        "//folly/coro/safe:now_task",
     ],
 )
 
@@ -45,6 +47,7 @@ cpp_library(
         "//eden/scm/lib/edenfs_ffi:edenfs_ffi",  # @manual
         "//eden/scm/lib/edenfs_ffi:edenfs_ffi-wrapper",  # @manual
         "//eden/scm/lib/edenfs_ffi:edenfs_ffi@header",  # @manual
+        "//folly/coro/safe:now_task",
     ],
 )
 
@@ -57,11 +60,13 @@ cpp_library(
     deps = select({
         "DEFAULT": [],
         "ovr_config//os:windows": ["fbsource//third-party/rust:cxx"],
-    }) + [
+    })
+    + [
         "//eden/fs/model:model",
         "//eden/fs/service:thrift_util",
         "//folly/futures:core",
-    ] + select({
+    ]
+    + select({
         "DEFAULT": [],
         "ovr_config//os:windows": ["fbsource//third-party/rust:cxx"],
     }),
@@ -72,6 +77,7 @@ cpp_library(
         "//eden/scm/lib/edenfs_ffi:edenfs_ffi-wrapper",
         "//eden/scm/lib/edenfs_ffi:edenfs_ffi@header",  # @manual
         "//folly/container:f14_hash",
+        "//folly/coro/safe:now_task",
         "//folly/logging:logging",
     ],
 )

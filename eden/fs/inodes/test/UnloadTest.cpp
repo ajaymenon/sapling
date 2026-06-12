@@ -7,10 +7,14 @@
 
 #ifndef _WIN32
 
+#include <thread>
+
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
 
+#include "eden/common/utils/FaultInjector.h"
 #include "eden/fs/inodes/InodeMap.h"
+#include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
@@ -127,6 +131,112 @@ TYPED_TEST(UnloadTest, inodesCanBeUnloadedDuringLoad) {
 
   auto sub = std::move(subFuture).get(1s);
   EXPECT_NE(kRootNodeId, sub->getNodeId());
+}
+
+TEST(UnloadAfterAsyncLoad, unloadRacesDeterministicallyWithInodeLoadComplete) {
+  // This test deterministically reproduces the race between the background
+  // unloader and async inode load completion by using fault injection to pause
+  // inodeLoadComplete after the lock is released but before promises are
+  // fulfilled. The fix (moving takeOwnership inside the lock) ensures
+  // ptrAcquireCount_ > 0 during this window, so the unloader skips the inode.
+  auto builder = FakeTreeBuilder{};
+  builder.setFile("dir/subdir/file.txt", "test file contents");
+  TestMount testMount{builder, false};
+
+  auto& fi = testMount.getServerState()->getFaultInjector();
+  fi.injectBlock("inodeLoadComplete", ".*");
+
+  auto rootInode = testMount.getEdenMount()->getRootInode();
+
+  // Start loading "dir". This creates the Promise<InodePtr> and starts the
+  // async tree fetch from FakeBackingStore.
+  auto dirFuture =
+      rootInode->getOrLoadChild("dir"_pc, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
+
+  // Complete the backing store load on a background thread. The detached
+  // executor is QueuedImmediateExecutor, so inodeLoadComplete runs inline
+  // on this thread and blocks on the fault injection checkpoint.
+  std::thread bgThread([&] { builder.setReady("dir"); });
+
+  // Wait for inodeLoadComplete to hit the fault point. At this point:
+  // - The inode is in loadedInodes_ and the DirEntry
+  // - ptrAcquireCount_ == 1 (from takeOwnership inside the lock)
+  // - The contents_ lock has been released
+  // - Promises have NOT been fulfilled yet
+  ASSERT_TRUE(fi.waitUntilBlocked("inodeLoadComplete", 10s));
+
+  // Race: try to unload while inodeLoadComplete is paused. With the fix,
+  // the unloader sees ptrAcquireCount_ == 1 and skips the inode. Without the
+  // fix, ptrAcquireCount_ would be 0 here and the unloader would delete the
+  // inode, causing a use-after-free when promises are fulfilled.
+  rootInode->unloadChildrenNow();
+
+  // Unblock to let promise fulfillment proceed.
+  fi.unblock("inodeLoadComplete", ".*");
+  fi.removeFault("inodeLoadComplete", ".*");
+  bgThread.join();
+
+  // Drive the executor to complete the ImmediateFuture callback chain.
+  testMount.drainServerExecutor();
+
+  // The future should resolve with a valid TreeInode (no use-after-free).
+  ASSERT_TRUE(dirFuture.isReady());
+  auto dirInode = std::move(dirFuture).get(1s).asTreePtr();
+  EXPECT_NE(kRootNodeId, dirInode->getNodeId());
+}
+
+TEST(
+    UnloadLastAccessedBefore,
+    unloadsInodesByLastFsRequestTimeNotMetadataAtime) {
+  FakeTreeBuilder builder;
+  builder.setFile("old.txt", "old contents");
+  builder.setFile("new.txt", "new contents");
+  TestMount testMount{builder};
+
+  const auto* edenMount = testMount.getEdenMount().get();
+  auto inodeMap = edenMount->getInodeMap();
+
+  // Load both files and give them FUSE references so they stay loaded
+  auto oldInode = testMount.getInode("old.txt"_relpath);
+  auto newInode = testMount.getInode("new.txt"_relpath);
+  auto oldIno = oldInode->getNodeId();
+  auto newIno = newInode->getNodeId();
+  oldInode->incFsRefcount();
+  newInode->incFsRefcount();
+
+  // Advance the clock and touch only "new.txt" via updateLastFsRequestTime.
+  // Both inodes start with lastFsRequestTime from mount creation.
+  // After this, new.txt's lastFsRequestTime is 120s later than old.txt's.
+  testMount.getClock().advance(120s);
+  newInode->updateLastFsRequestTime();
+
+  // Use a cutoff between old and new lastFsRequestTime values.
+  auto cutoff = oldInode->getLastFsRequestTime().toTimespec();
+  cutoff.tv_sec += 60;
+
+  // Release InodePtrs (FUSE refcount keeps them alive in InodeMap)
+  oldInode.reset();
+  newInode.reset();
+
+  // Drop FUSE references so inodes are eligible for unloading
+  inodeMap->decFsRefcount(oldIno, 1);
+  inodeMap->decFsRefcount(newIno, 1);
+
+  auto countsBefore = inodeMap->getInodeCounts();
+
+  auto rootInode = edenMount->getRootInode();
+  auto unloaded = rootInode->unloadChildrenLastAccessedBefore(cutoff);
+
+  // old.txt (lastFsRequestTime < cutoff) should be unloaded.
+  // new.txt (lastFsRequestTime > cutoff) should remain loaded.
+  EXPECT_GE(unloaded, 1);
+  auto countsAfter = inodeMap->getInodeCounts();
+  EXPECT_LT(countsAfter.fileCount, countsBefore.fileCount);
+
+  // new.txt should still be loadable (still in loaded inodes)
+  EXPECT_TRUE(inodeMap->lookupInode(newIno).get());
 }
 
 TEST(UnloadUnreferencedByFuse, inodesReferencedByFuseAreNotUnloaded) {

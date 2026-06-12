@@ -10,6 +10,7 @@ import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 import type {TrackDataWithEventName} from 'isl-server/src/analytics/types';
 import type {GitHubDiffSummary} from 'isl-server/src/github/githubCodeReviewProvider';
 import type {Comparison} from 'shared/Comparison';
+import type {InternalFieldName} from 'shared/constants';
 import type {ParsedDiff} from 'shared/patch/types';
 import type {AllUndefined, Json} from 'shared/typeUtils';
 import type {Hash} from 'shared/types/common';
@@ -31,7 +32,9 @@ export type PlatformName =
   | 'webview'
   | 'chromelike_app'
   | 'visualStudio'
-  | 'obsidian';
+  | 'obsidian'
+  | 'agentHome'
+  | 'tui';
 
 export type AbsolutePath = string;
 /**
@@ -171,16 +174,48 @@ export type DiffComment = {
 
 /**
  * Summary of CI test results for a Diff.
+ * 'running' if tests are in progress with no issues so far.
+ * 'running-warnings' if tests are in progress but have warnings.
+ * 'running-failed' if tests are in progress but have failures.
  * 'pass' if ALL signals succeed and not still running.
- * 'failed' if ANY signal doesn't succeed, even if some are still running.
+ * 'failed' if ANY signal doesn't succeed (finished).
+ * 'warning' if tests finished with warnings but no failures.
+ * 'deferred' if tests are deferred and waiting to be started.
  */
 export type DiffSignalSummary =
   | 'running'
+  | 'running-warnings'
+  | 'running-failed'
   | 'pass'
   | 'failed'
   | 'warning'
   | 'no-signal'
-  | 'land-cancelled';
+  | 'land-cancelled'
+  | 'land-on-hold'
+  | 'deferred';
+
+/**
+ * Detailed information about a single CI signal result on a Diff.
+ * Signals may apply to the entire diff, or to a specific file and line range.
+ */
+export type DiffSignalDetail = {
+  /** Name of the signal (e.g. "sandcastle", "lint", "mypy") */
+  name: string;
+  /** Status of this individual signal */
+  status: 'pass' | 'fail' | 'warning' | 'running' | 'skip';
+  /** Severity level */
+  severity: 'error' | 'warning' | 'info';
+  /** Human-readable message/description */
+  message?: string;
+  /** URL to view more details about this signal */
+  url?: string;
+  /** File path if the signal applies to a specific file */
+  filepath?: string;
+  /** Start line number if the signal applies to a specific range */
+  startLine?: number;
+  /** End line number if the signal applies to a specific range */
+  endLine?: number;
+};
 
 /**
  * Information about a land request, specific to each Code Review Provider.
@@ -247,6 +282,22 @@ export type ValidatedRepoInfo = {
   pullRequestDomain: string | undefined;
   preferredSubmitCommand?: PreferredSubmitCommand;
   isEdenFs: boolean;
+};
+
+export type WorktreeInfo = {
+  /** The shared/main repo root, as returned by `sl root --shared`. */
+  sharedRoot: AbsolutePath;
+  /** All worktrees in this group, including the current one. */
+  worktrees: WorktreeEntry[];
+};
+
+export type WorktreeEntry = {
+  /** Absolute path to this worktree's working directory. */
+  path: AbsolutePath;
+  /** User-assigned label, or null if none. */
+  label?: string;
+  /** Whether this is the main (original) worktree. */
+  role: 'main' | 'linked';
 };
 
 export type ApplicationInfo = {
@@ -713,8 +764,12 @@ export type PlatformSpecificClientToServerMessages =
       options?: {line?: OneIndexedLineNumber};
     }
   | {type: 'platform/openContainingFolder'; path: RepoRelativePath}
+  | {type: 'platform/revealInFileExplorer'; path: RepoRelativePath}
+  | {type: 'platform/revealInExplorerView'; path: RepoRelativePath}
   | {type: 'platform/openDiff'; path: RepoRelativePath; comparison: Comparison}
   | {type: 'platform/openExternal'; url: string}
+  | {type: 'platform/openInNewWindow'; path: AbsolutePath}
+  | {type: 'platform/openFolder'; path: AbsolutePath}
   | {type: 'platform/changeTitle'; title: string}
   | {type: 'platform/confirm'; message: string; details?: string | undefined}
   | {type: 'platform/subscribeToAvailableCwds'}
@@ -742,33 +797,48 @@ export type PlatformSpecificClientToServerMessages =
       comments: Array<DiffComment>;
       filePaths: Array<RepoRelativePath>;
       repoPath?: string;
+      userContext?: string;
     }
   | {
       type: 'platform/resolveFailedSignalsWithAI';
       diffId: string;
       diffVersionNumber: number;
       repoPath?: string;
+      userContext?: string;
     }
   | {
       type: 'platform/fillCommitMessageWithAI';
       id: string;
       source: 'commitInfoView' | 'smartAction';
+      userContext?: string;
     }
   | {
       type: 'platform/splitCommitWithAI';
       diffCommit: string;
       args?: string;
       repoPath?: string;
+      userContext?: string;
     }
   | {
       type: 'platform/createTestForModifiedCodeWithAI';
     }
   | {
+      type: 'platform/recommendTestPlanWithAI';
+      commitHash?: string;
+      userContext?: string;
+    }
+  | {
+      type: 'platform/generateSummaryWithAI';
+      commitHash?: string;
+      userContext?: string;
+    }
+  | {
       type: 'platform/validateChangesWithAI';
+      userContext?: string;
     }
   | {
       type: 'platform/resolveAllConflictsWithAI';
-      conflicts: MergeConflicts;
+      userContext?: string;
     }
   | {
       type: 'platform/runAICodeReviewPlatform';
@@ -778,6 +848,9 @@ export type PlatformSpecificClientToServerMessages =
       type: 'platform/runAICodeReviewChat';
       source: 'commitInfoView' | 'smartAction';
       reviewScope: CodeReviewScope;
+      userContext?: string;
+      agentBackend?: 'devmate' | 'claude';
+      reviewAndFix?: boolean;
     }
   | {
       type: 'platform/subscribeToAIReviewComments';
@@ -811,6 +884,13 @@ export type PlatformSpecificServerToClientMessages =
   | {
       type: 'platform/gotAIReviewComments';
       comments: Result<CodeReviewIssue[]>;
+    }
+  | {
+      type: 'platform/commitFieldAIStatus';
+      target: Hash | 'head';
+      field: InternalFieldName;
+      status: 'loading' | 'idle' | 'error';
+      error?: string;
     };
 
 export type CodeReviewProviderSpecificClientToServerMessages =
@@ -839,7 +919,8 @@ export type SubscriptionKind =
   | 'smartlogCommits'
   | 'mergeConflicts'
   | 'submodules'
-  | 'subscribedFullRepoBranches';
+  | 'subscribedFullRepoBranches'
+  | 'worktreeInfo';
 
 export const allConfigNames = [
   // these config names are for compatibility.
@@ -864,6 +945,9 @@ export const allConfigNames = [
   'ui.merge',
   'fbcodereview.code-browser-url',
   'extensions.commitcloud',
+  'isl.show-authored-diffs',
+  'isl.auto-detect-commit-schema',
+  'isl.focus-dot-on-repo-change',
 ] as const;
 
 /** sl configs read by ISL */
@@ -890,10 +974,13 @@ export const settableConfigNames = [
   'isl.use-sl-graphql',
   'isl.experimental-graph-renderer',
   'isl.generated-files-regex',
+  'isl.copy-commit-hash-format',
   'github.preferred_submit_command',
   'ui.allowemptycommit',
   'ui.merge',
   'amend.autorestack',
+  'isl.show-authored-diffs',
+  'worktree.enabled',
 ] as const;
 
 /** sl configs written to by ISL */
@@ -902,6 +989,7 @@ export type SettableConfigName = (typeof settableConfigNames)[number];
 /** local storage keys written by ISL */
 export type LocalStorageName =
   | 'isl.drawer-state'
+  | 'isl.commit-info-location'
   | 'isl.bookmarks'
   | 'isl.recommended-bookmarks-reminder'
   | 'isl.recommended-bookmarks-onboarding'
@@ -917,6 +1005,7 @@ export type LocalStorageName =
   | 'isl.hide-cwd-irrelevant-stacks'
   | 'isl.split-suggestion-enabled'
   | 'isl.comparison-display-mode'
+  | 'isl.comparison-ignore-whitespace'
   | 'isl.expand-generated-files'
   | 'isl-color-theme'
   | 'isl.auto-resolve-before-continue'
@@ -928,6 +1017,7 @@ export type LocalStorageName =
   | 'isl.experimental-features-local-override'
   | 'isl.partial-abort'
   | 'isl.smart-actions-order'
+  | 'isl.ai-code-review-selected-option'
   // The keys below are prefixes, with further dynamic keys appended afterwards
   | 'isl.edited-commit-messages:'
   | 'isl.first-pass-comments:';
@@ -975,7 +1065,7 @@ export type ClientToServerMessage =
   | {type: 'updateRemoteDiffMessage'; diffId: DiffId; title: string; description: string}
   | {type: 'pageVisibility'; state: PageVisibility}
   | {type: 'getRepoUrlAtHash'; revset: Revset; path?: string}
-  | {type: 'requestComparison'; comparison: Comparison}
+  | {type: 'requestComparison'; comparison: Comparison; ignoreWhitespace?: boolean}
   | {
       type: 'requestComparisonContextLines';
       id: {
@@ -1072,6 +1162,16 @@ export type ClientToServerMessage =
       type: 'unsubscribeToFullRepoBranch';
       id: string;
       fullRepoBranch: InternalTypes['FullRepoBranch'];
+    }
+  | {
+      type: 'createFullRepoBranch';
+      id: string;
+      input: InternalTypes['CreateFullRepoBranchInput'];
+    }
+  | {
+      type: 'checkBranchNameExists';
+      id: string;
+      branchName: string;
     };
 
 export type SubscriptionResultsData = {
@@ -1080,6 +1180,7 @@ export type SubscriptionResultsData = {
   mergeConflicts: MergeConflicts | undefined;
   submodules: SubmodulesByRoot;
   subscribedFullRepoBranches: Array<InternalTypes['FullRepoBranch']>;
+  worktreeInfo: WorktreeInfo | undefined;
 };
 
 export type SubscriptionResult<K extends SubscriptionKind> = {
@@ -1095,6 +1196,7 @@ export type ServerToClientMessage =
   | SubscriptionResult<'mergeConflicts'>
   | SubscriptionResult<'submodules'>
   | SubscriptionResult<'subscribedFullRepoBranches'>
+  | SubscriptionResult<'worktreeInfo'>
   | BeganFetchingUncommittedChangesEvent
   | BeganFetchingSmartlogCommitsEvent
   | {
@@ -1129,6 +1231,12 @@ export type ServerToClientMessage =
   | {type: 'fetchedCommitCloudState'; state: Result<CommitCloudSyncState>}
   | {type: 'fetchedStables'; stables: StableLocationData}
   | {type: 'fetchedRecommendedBookmarks'; bookmarks: Array<string>}
+  | {
+      type: 'fetchedHiddenMasterBranchConfig';
+      config: Record<string, Array<string>> | null;
+      odType: string | null;
+      cwd: string;
+    }
   | {type: 'fetchedStableLocationAutocompleteOptions'; result: Result<Array<TypeaheadResult>>}
   | {type: 'renderedMarkup'; html: string; id: number}
   | {type: 'gotSuggestedReviewers'; reviewers: Array<string>; key: string}
@@ -1140,10 +1248,11 @@ export type ServerToClientMessage =
       description: string;
       mode?: 'commit' | 'amend';
       hash?: string;
+      preserveFocus?: boolean;
     }
   | {type: 'uploadFileResult'; id: string; result: Result<string>}
   | {type: 'gotRepoUrlAtHash'; url: Result<string>}
-  | {type: 'comparison'; comparison: Comparison; data: ComparisonData}
+  | {type: 'comparison'; comparison: Comparison; data: ComparisonData; ignoreWhitespace?: boolean}
   | {type: 'comparisonContextLines'; path: RepoRelativePath; lines: Result<Array<string>>}
   | {type: 'beganLoadingMoreCommits'}
   | {type: 'commitsShownRange'; rangeInDays: number | undefined}
@@ -1245,9 +1354,24 @@ export type ServerToClientMessage =
       result: Result<Array<string>>;
     }
   | {
+      type: 'createdFullRepoBranch';
+      id: string;
+      result: Result<InternalTypes['CreateFullRepoBranchResult']>;
+    }
+  | {
+      type: 'checkedBranchNameExists';
+      id: string;
+      result: Result<{exists: boolean}>;
+    }
+  | {
       type: 'openSplitViewForCommit';
       commitHash: string;
       commits?: Array<PartiallySelectedDiffCommit>;
+    }
+  | {
+      type: 'changeActiveRepo';
+      cwd: string;
+      focusDotCommit?: boolean;
     };
 
 export type Disposable = {

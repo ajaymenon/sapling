@@ -83,6 +83,9 @@ cpp_library(
         "GlobResult.h",
         "GlobTree.h",
     ],
+    deps = [
+        "//eden/fs/config:config",
+    ],
     exported_deps = [
         ":matcher",
         "//eden/common/utils:case_sensitivity",
@@ -92,6 +95,10 @@ cpp_library(
         "//eden/fs/model:model",
         "//eden/fs/store:store",
         "//eden/fs/telemetry:task_trace",
+        "//folly/coro:collect",
+        "//folly/coro:invoke",
+        "//folly/coro:task",
+        "//folly/coro/safe:now_task",
         "//folly/futures:core",
     ],
 )
@@ -209,18 +216,6 @@ cpp_library(
 )
 
 cpp_library(
-    name = "dir_type",
-    srcs = [
-        "DirType.cpp",
-    ],
-    deps = [
-        "//eden/common/utils:utils",
-        "//eden/fs/service:thrift-cpp2-types",
-        "//folly:utility",
-    ],
-)
-
-cpp_library(
     name = "chrono",
     srcs = [
         "ChronoParse.cpp",
@@ -323,4 +318,20 @@ cpp_library(
     deps = [
         "fbsource//third-party/fmt:fmt",
     ],
+)
+
+cpp_library(
+    name = "statmount",
+    headers = ["Statmount.h"],
+)
+
+cpp_library(
+    name = "mount_info_table",
+    srcs = ["MountInfoTable.cpp"],
+    headers = ["MountInfoTable.h"],
+    deps = [
+        ":statmount",
+        "//folly/logging:logging",
+    ],
+    exported_deps = ["//folly:expected"],
 )

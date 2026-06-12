@@ -17,6 +17,11 @@ use edenapi_types::AnyId;
 use edenapi_types::BlameResult;
 use edenapi_types::BonsaiChangesetContent;
 use edenapi_types::BookmarkEntry;
+use edenapi_types::BookmarkKind;
+use edenapi_types::CheckManifestPermissionRequest;
+use edenapi_types::CheckManifestPermissionResponse;
+use edenapi_types::CheckPathPermissionRequest;
+use edenapi_types::CheckPathPermissionResponse;
 use edenapi_types::CloudShareWorkspaceRequest;
 use edenapi_types::CloudShareWorkspaceResponse;
 use edenapi_types::CommitGraphEntry;
@@ -237,6 +242,18 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
         freshness: Option<Freshness>,
     ) -> Result<Vec<BookmarkEntry>, SaplingRemoteApiError> {
         let _ = (bookmarks, freshness);
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    /// List bookmarks matching patterns (replacement for wireproto listkeyspatterns).
+    /// Patterns can be exact bookmark names or prefix patterns ending with '*'.
+    /// `kinds` specifies which bookmark kinds to include; empty means PullDefaultPublishing only.
+    async fn list_bookmark_patterns(
+        &self,
+        patterns: Vec<String>,
+        kinds: Vec<BookmarkKind>,
+    ) -> Result<Vec<BookmarkEntry>, SaplingRemoteApiError> {
+        let _ = (patterns, kinds);
         Err(SaplingRemoteApiError::NotSupported)
     }
 
@@ -532,6 +549,24 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
         tag: Option<String>,
     ) -> Result<Response<StreamingChangelogResponse>, SaplingRemoteApiError> {
         let _ = tag;
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    /// Check whether the caller has access to the given paths.
+    async fn check_permission(
+        &self,
+        request: CheckPathPermissionRequest,
+    ) -> Result<Response<CheckPathPermissionResponse>, SaplingRemoteApiError> {
+        let _ = request;
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    /// Check whether the caller has access to the given manifest IDs.
+    async fn check_manifest_permission(
+        &self,
+        request: CheckManifestPermissionRequest,
+    ) -> Result<Response<CheckManifestPermissionResponse>, SaplingRemoteApiError> {
+        let _ = request;
         Err(SaplingRemoteApiError::NotSupported)
     }
 }

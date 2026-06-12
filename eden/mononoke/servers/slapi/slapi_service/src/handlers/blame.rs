@@ -50,7 +50,7 @@ impl SaplingRemoteApiHandler for BlameHandler {
     type Request = BlameRequest;
     type Response = BlameResult;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::Blame;
     const ENDPOINT: &'static str = "/blame";
     const SUPPORTED_FLAVOURS: &'static [SlapiCommitIdentityScheme] = &[
@@ -84,7 +84,7 @@ impl SaplingRemoteApiHandler for BlameHandler {
             .data
             .as_ref()
             .err()
-            .map(|err| format_err!("{:?}", err))
+            .map(|err| format_err!("{err:?}"))
     }
 }
 
@@ -97,7 +97,7 @@ async fn blame_file<R: MononokeRepo>(
         file: key.clone(),
         data: blame_file_data(repo, key.clone(), flavour)
             .await
-            .map_err(|e| ServerError::generic(format!("{:?}", e))),
+            .map_err(|e| ServerError::generic(format!("{e:?}"))),
     })
 }
 
@@ -125,8 +125,7 @@ async fn blame_file_data<R: MononokeRepo>(
         "scm/mononoke:edenapi_disable_mutable_blame",
         None,
         Some(repo.name()),
-    )
-    .unwrap_or(false);
+    );
 
     let blame = cs
         .path_with_history(
@@ -193,7 +192,7 @@ async fn blame_file_data<R: MononokeRepo>(
                     to_id
                         .remove(csid)
                         .map(|git_sha1| HgId::from_byte_array(git_sha1.into_inner()))
-                        .ok_or_else(|| anyhow!("no git mapping for blame csid {:?}", csid))
+                        .ok_or_else(|| anyhow!("no git mapping for blame csid {csid:?}"))
                 })
                 .collect::<Result<Vec<_>>>()?
         }
@@ -209,7 +208,7 @@ async fn blame_file_data<R: MononokeRepo>(
                     to_id
                         .remove(csid)
                         .map(Into::into)
-                        .ok_or_else(|| anyhow!("no hg mapping for blame csid {:?}", csid))
+                        .ok_or_else(|| anyhow!("no hg mapping for blame csid {csid:?}"))
                 })
                 .collect::<Result<Vec<_>>>()?
         }

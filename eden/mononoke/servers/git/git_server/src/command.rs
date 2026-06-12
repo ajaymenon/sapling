@@ -8,13 +8,17 @@
 use anyhow::Context;
 use bytes::Bytes;
 use gix_packetline::PacketLineRef;
-use gix_packetline::StreamingPeekableIter;
+use gix_packetline::blocking_io::StreamingPeekableIter;
 use gix_transport::bstr::BString;
 use gix_transport::bstr::ByteSlice;
 
 pub use self::fetch::FetchArgs;
 pub use self::ls_refs::LsRefsArgs;
 pub use self::push::PushArgs;
+// Test-only re-export for `RefUpdate` fixtures in sibling modules.
+// Kept under `#[cfg(test)]` to avoid widening the production API surface.
+#[cfg(test)]
+pub(crate) use self::push::RefType;
 pub use self::push::RefUpdate;
 
 mod fetch;
@@ -67,7 +71,7 @@ impl RequestCommand {
                         capability_list.push(BString::new(data.trim().to_vec()));
                     }
                 } else {
-                    anyhow::bail!("Unexpected token {:?} in packetline", token);
+                    anyhow::bail!("Unexpected token {token:?} in packetline");
                 }
             }
         }
@@ -78,7 +82,7 @@ impl RequestCommand {
             PUSH_COMMAND => Command::Push(PushArgs::parse_from_packetline(args)?), // we went over
             BUNDLE_URI_COMMAND => Command::BundleUri,
             unknown_command => {
-                anyhow::bail!("Unknown git protocol V2 command {:?}", unknown_command)
+                anyhow::bail!("Unknown git protocol V2 command {unknown_command:?}")
             }
         };
         Ok(RequestCommand {

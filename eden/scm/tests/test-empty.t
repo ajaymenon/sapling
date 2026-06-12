@@ -14,15 +14,15 @@
 
 # Try some commands:
 
-  $ hg log
-  $ hg histgrep wah
+  $ sl log
+  $ sl histgrep wah
   [1]
-  $ hg manifest
+  $ sl manifest
 
 # Poke at a clone:
 
-  $ hg push -r . -q --to book --create
+  $ sl push -r . -q --to book --create
 
   $ cd ..
   $ newclientrepo b a_server
-  $ hg log
+  $ sl log

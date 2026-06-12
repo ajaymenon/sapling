@@ -8,7 +8,7 @@
   $ . "${TEST_FIXTURES}/library.sh"
 
 setup configuration
-  $ ADDITIONAL_DERIVED_DATA="content_manifests" setup_common_config
+  $ ADDITIONAL_DERIVED_DATA="content_manifests history_manifests" setup_common_config
   $ testtool_drawdag -R repo <<'EOF'
   > A-B-C
   > # modify: A "a/foo.txt" "a_foo"
@@ -83,7 +83,7 @@ Fsnodes from B's root path (recursive)
 
 Content manifests
   $ mononoke_admin derived-data -R repo list-manifest -p "a" -B main -t content-manifests --derive | sort
-  a/b/	6c6855704970b38c87329e762932ff95eebcfb2b60ec2e93150f6b5270b42e1f
+  a/b/	f422eaf3d8684d0116745ae3c9271b392a39921fa245d458b5c5ae6a1d0b55b9
   a/foo.txt	67f9f510b6a13f94986928ba0f270ec005b194edd77b22a13dec797471a4fe85	type=regular	size=5
 Content manifests from root path, recursive
   $ mononoke_admin derived-data -R repo list-manifest -p "" -B main -t content-manifests --recursive | sort
@@ -135,6 +135,39 @@ Note that `b/` appears because the directory was fully deleted.
   a/foo.txt	a4307d05df50a4b31e6b6b9da8c5921ffafbae96	mode=100644
   script	0231def3d8f55958dddba757de918ca5eae0df4c	mode=120000
   script.sh	30d74d258442c7c65512eafab474568dd706c430	mode=100755
+
+History manifest of B's root (non-recursive): shows live files, directories, and deleted entries
+  $ mononoke_admin derived-data -R repo list-manifest -i "$B" -t history-manifests --derive | sort
+  A	File	linknode=734dc23869fbed1c81d6561a16f0e896aa73bf037e688562c6bad691368db9fa	parents=0
+  B	File	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=0
+  a/	Directory	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=1
+  b/	Directory	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=0
+  script	File	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=0
+  script.sh	File	linknode=734dc23869fbed1c81d6561a16f0e896aa73bf037e688562c6bad691368db9fa	parents=0
+
+History manifest of B's a directory: should show deleted bar.txt
+  $ mononoke_admin derived-data -R repo list-manifest -p "a" -i "$B" -t history-manifests | sort
+  a/b/	Directory	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=0
+  a/bar.txt	DeletedNode	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=1
+  a/foo.txt	File	linknode=734dc23869fbed1c81d6561a16f0e896aa73bf037e688562c6bad691368db9fa	parents=0
+
+History manifest of main from root (recursive): shows all live and deleted entries
+  $ mononoke_admin derived-data -R repo list-manifest -B "main" -t history-manifests --derive --recursive | sort
+  A	File	linknode=734dc23869fbed1c81d6561a16f0e896aa73bf037e688562c6bad691368db9fa	parents=0
+  B	File	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=0
+  C	File	linknode=3371afd62725ca00669b19e45fed925030a601c26c409742583da2cf3c5e6eae	parents=0
+  a/	Directory	linknode=3371afd62725ca00669b19e45fed925030a601c26c409742583da2cf3c5e6eae	parents=1
+  a/b/	Directory	linknode=3371afd62725ca00669b19e45fed925030a601c26c409742583da2cf3c5e6eae	parents=1
+  a/b/bar.txt	File	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=0
+  a/b/c/	Directory	linknode=3371afd62725ca00669b19e45fed925030a601c26c409742583da2cf3c5e6eae	parents=0
+  a/b/c/foo.txt	File	linknode=3371afd62725ca00669b19e45fed925030a601c26c409742583da2cf3c5e6eae	parents=0
+  a/b/c/hoo.txt	File	linknode=3371afd62725ca00669b19e45fed925030a601c26c409742583da2cf3c5e6eae	parents=0
+  a/bar.txt	DeletedNode	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=1
+  a/foo.txt	File	linknode=734dc23869fbed1c81d6561a16f0e896aa73bf037e688562c6bad691368db9fa	parents=0
+  b	DeletedNode	linknode=3371afd62725ca00669b19e45fed925030a601c26c409742583da2cf3c5e6eae	parents=1
+  b/hoo.txt	DeletedNode	linknode=3371afd62725ca00669b19e45fed925030a601c26c409742583da2cf3c5e6eae	parents=1
+  script	File	linknode=581ea2acc78e89f96ece88fc87956018ffd01941d62119e055bbc9348d98caad	parents=0
+  script.sh	File	linknode=734dc23869fbed1c81d6561a16f0e896aa73bf037e688562c6bad691368db9fa	parents=0
 
 Validate all these manifests are equivalent
   $ mononoke_admin derived-data -R repo verify-manifests -i "$A" -T fsnodes -T hgchangesets -T unodes -T skeleton_manifests -T git_commits -T content_manifests

@@ -2,22 +2,22 @@
 #require execbit no-eden
 
   $ eagerepo
-  $ hg init repo
+  $ sl init repo
   $ cd repo
   $ echo foo > foo
   $ chmod 644 foo
-  $ hg ci -qAm '644'
+  $ sl ci -qAm '644'
 
   $ chmod 755 foo
-  $ hg ci -qAm '755'
+  $ sl ci -qAm '755'
 
 reverting to rev 0
 
-  $ hg revert -a -r 'desc(644)'
+  $ sl revert -a -r 'desc(644)'
   reverting foo
-  $ hg st
+  $ sl st
   M foo
-  $ hg diff --git
+  $ sl diff --git
   diff --git a/foo b/foo
   old mode 100755
   new mode 100644

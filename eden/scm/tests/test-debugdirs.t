@@ -16,9 +16,9 @@
   >   touch $d/x
   > done
 
-  $ hg commit -Aqm init
+  $ sl commit -Aqm init
 
-  $ hg debugdirs a a/b a/b/c a/b/d b/c/ b/d m m/n a/b/m b/m/ b/m/n
+  $ sl debugdirs a a/b a/b/c a/b/d b/c/ b/d m m/n a/b/m b/m/ b/m/n
   a
   a/b
   a/b/c

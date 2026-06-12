@@ -293,7 +293,7 @@ pub(crate) async fn resolve_commit_ids(
                     CommitId::Svnrev(rev) => Ok(thrift::CommitId::svnrev((*rev).try_into()?)),
                     CommitId::Bookmark(bookmark) => try_resolve_bookmark(conn, repo, bookmark)
                         .await?
-                        .ok_or_else(|| format_err!("bookmark not found: {}", bookmark)),
+                        .ok_or_else(|| format_err!("bookmark not found: {bookmark}")),
                     CommitId::Resolve(commit_id) => {
                         let resolvers = vec![
                             try_resolve_bonsai_id(conn, repo, commit_id).boxed(),
@@ -302,13 +302,13 @@ pub(crate) async fn resolve_commit_ids(
                             try_resolve_globalrev(conn, repo, commit_id).boxed(),
                             try_resolve_svnrev(conn, repo, commit_id).boxed(),
                         ];
-                        let candidates: Vec<_> = try_join_all(resolvers.into_iter())
+                        let candidates: Vec<_> = try_join_all(resolvers)
                             .await?
                             .into_iter()
                             .flatten()
                             .collect();
                         match candidates.as_slice() {
-                            [] => Err(format_err!("commit not found: {}", commit_id)),
+                            [] => Err(format_err!("commit not found: {commit_id}")),
                             [id] => Ok(id.clone()),
                             _ => {
                                 // This commit ID resolves to different
@@ -323,7 +323,7 @@ pub(crate) async fn resolve_commit_ids(
                                 // specify which scheme should be used by
                                 // using the appropriate argument to specify
                                 // the ID (e.g. --hg-commit-id).
-                                Err(format_err!("ambiguous commit id: {}", commit_id))
+                                Err(format_err!("ambiguous commit id: {commit_id}"))
                             }
                         }
                     }
@@ -341,7 +341,7 @@ pub(crate) async fn resolve_commit_id(
     repo: &thrift::RepoSpecifier,
     commit_id: &CommitId,
 ) -> Result<thrift::CommitId, Error> {
-    let commit_ids = resolve_commit_ids(conn, repo, Some(commit_id).into_iter()).await?;
+    let commit_ids = resolve_commit_ids(conn, repo, Some(commit_id)).await?;
     Ok(commit_ids.into_iter().next().expect("commit id expected"))
 }
 

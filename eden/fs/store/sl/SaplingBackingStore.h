@@ -11,6 +11,7 @@
 #include <folly/Range.h>
 #include <folly/Synchronized.h>
 #include <folly/coro/Task.h>
+#include <folly/coro/safe/NowTask.h>
 #include <gtest/gtest_prod.h>
 #include <sys/types.h>
 #include <atomic>
@@ -65,8 +66,9 @@ class BackingStoreLogger;
 class ReloadableConfig;
 class UnboundedQueueExecutor;
 class EdenStats;
+class ErrorLogger;
 class SaplingImportRequest;
-class StructuredLogger;
+class EdenFsEventsLogger;
 class FaultInjector;
 template <typename T>
 class RefPtr;
@@ -167,7 +169,9 @@ struct HgImportTraceEvent : TraceEventBase {
  * fulfilling these requests via different methods (reading from hgcache,
  * Mononoke, debugimporthelper, etc.).
  */
-class SaplingBackingStore final : public BackingStore {
+class SaplingBackingStore final
+    : public BackingStore,
+      public std::enable_shared_from_this<SaplingBackingStore> {
  public:
   using ImportRequestsList = std::vector<std::shared_ptr<SaplingImportRequest>>;
   using ImportRequestsMap = std::
@@ -176,29 +180,34 @@ class SaplingBackingStore final : public BackingStore {
   SaplingBackingStore(
       AbsolutePathPiece repository,
       AbsolutePathPiece mount,
+      AbsolutePathPiece clientDirectory,
       CaseSensitivity caseSensitive,
       EdenStatsPtr stats,
       UnboundedQueueExecutor* serverThreadPool,
       std::shared_ptr<ReloadableConfig> config,
       std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions,
-      std::shared_ptr<StructuredLogger> structuredLogger,
+      std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
+      ErrorLogger& errorLogger,
       std::unique_ptr<BackingStoreLogger> logger,
       FaultInjector* FOLLY_NONNULL faultInjector);
 
   /**
-   * Create an SaplingBackingStore suitable for use in unit tests. It uses an
-   * inline executor to process loaded objects rather than the thread pools used
-   * in production Eden.
+   * Create a SaplingBackingStore suitable for use in unit tests. Pass any
+   * executor (InlineExecutor for synchronous tests, CPUThreadPoolExecutor
+   * for coroutine tests that need a real executor to avoid the coro::Task
+   * DCHECK on InlineExecutor).
    */
   SaplingBackingStore(
       AbsolutePathPiece repository,
       AbsolutePathPiece mount,
+      AbsolutePathPiece clientDirectory,
       CaseSensitivity caseSensitive,
       EdenStatsPtr stats,
-      folly::InlineExecutor* inlineExecutor,
+      folly::Executor* executor,
       std::shared_ptr<ReloadableConfig> config,
       std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions,
-      std::shared_ptr<StructuredLogger> structuredLogger,
+      std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
+      ErrorLogger& errorLogger,
       std::unique_ptr<BackingStoreLogger> logger,
       FaultInjector* FOLLY_NONNULL faultInjector);
 
@@ -342,6 +351,21 @@ class SaplingBackingStore final : public BackingStore {
   FRIEND_TEST(
       SaplingBackingStoreWithFaultInjectorIgnoreConfigTest,
       getTreeBatch);
+  FRIEND_TEST(
+      SaplingBackingStoreNoFaultInjectorTest,
+      getTreeBatchConvertsPermissionDeniedToRestrictedTree);
+  FRIEND_TEST(
+      SaplingBackingStoreWithFaultInjectorTest,
+      getRootTreeFutureChainCanBePausedAndResumed);
+  FRIEND_TEST(
+      SaplingBackingStoreWithFaultInjectorTest,
+      getTreeEnqueueFutureChainCanBePausedAndResumed);
+  FRIEND_TEST(
+      SaplingBackingStoreWithFaultInjectorTest,
+      coGetTreeEnqueueCoroutineKeepsObjectAlive);
+  FRIEND_TEST(
+      SaplingBackingStoreWithFaultInjectorTest,
+      coGetRootTreeFaultInjection);
   friend class EdenServiceHandler;
 
   // Forbidden copy constructor and assignment operator
@@ -362,7 +386,15 @@ class SaplingBackingStore final : public BackingStore {
       const ObjectFetchContextPtr& context,
       const ObjectFetchContext::ObjectType type);
 
+  folly::Try<TreePtr> importTreeManifestSync(
+      Hash20 manifestNode,
+      const ObjectFetchContextPtr& context,
+      const ObjectFetchContext::ObjectType type);
+
   ImmediateFuture<GetRootTreeResult> getRootTree(
+      const RootId& rootId,
+      const ObjectFetchContextPtr& context) override;
+  folly::coro::now_task<GetRootTreeResult> co_getRootTree(
       const RootId& rootId,
       const ObjectFetchContextPtr& context) override;
   ImmediateFuture<std::shared_ptr<TreeEntry>> getTreeEntryForObjectId(
@@ -377,6 +409,10 @@ class SaplingBackingStore final : public BackingStore {
       sapling::FetchMode fetch_mode);
 
   folly::SemiFuture<GetTreeResult> getTree(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+
+  folly::coro::now_task<GetTreeResult> co_getTree(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
 
@@ -421,7 +457,14 @@ class SaplingBackingStore final : public BackingStore {
       const SlOid& slOid,
       const ObjectFetchContextPtr& context);
 
+  folly::coro::now_task<GetTreeResult> co_getTreeEnqueue(
+      const SlOid& slOid,
+      const ObjectFetchContextPtr& context);
+
   folly::SemiFuture<GetTreeAuxResult> getTreeAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+  folly::coro::now_task<GetTreeAuxResult> co_getTreeAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
 
@@ -491,14 +534,7 @@ class SaplingBackingStore final : public BackingStore {
       const ObjectFetchContextPtr& context,
       const SaplingImportRequest::FetchType fetch_type);
 
-  /**
-   * Create a blob fetch request and enqueue it to the SaplingImportRequestQueue
-   *
-   * For latency sensitive context, the caller is responsible for checking if
-   * the blob is present locally, as this function will always push the request
-   * at the end of the queue.
-   */
-  folly::coro::Task<GetBlobResult> co_getBlobEnqueue(
+  folly::coro::now_task<GetBlobResult> co_getBlobEnqueue(
       const SlOid& slOid,
       const ObjectFetchContextPtr& context,
       const SaplingImportRequest::FetchType fetch_type);
@@ -541,6 +577,10 @@ class SaplingBackingStore final : public BackingStore {
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
 
+  folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+
   /**
    * Create a blob aux data fetch request and enqueue it to the
    * SaplingImportRequestQueue
@@ -550,6 +590,10 @@ class SaplingBackingStore final : public BackingStore {
    * the request at the end of the queue.
    */
   ImmediateFuture<GetBlobAuxResult> getBlobAuxDataEnqueue(
+      const SlOid& slOid,
+      const ObjectFetchContextPtr& context);
+
+  folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxDataEnqueue(
       const SlOid& slOid,
       const ObjectFetchContextPtr& context);
 
@@ -568,6 +612,10 @@ class SaplingBackingStore final : public BackingStore {
   folly::Try<BlobAuxDataPtr> getLocalBlobAuxData(SlOidView id);
 
   [[nodiscard]] virtual folly::SemiFuture<folly::Unit> prefetchBlobs(
+      ObjectIdRange ids,
+      const ObjectFetchContextPtr& context) override;
+
+  folly::coro::now_task<folly::Unit> co_prefetchBlobs(
       ObjectIdRange ids,
       const ObjectFetchContextPtr& context) override;
 
@@ -605,6 +653,12 @@ class SaplingBackingStore final : public BackingStore {
       const RootId& id,
       const std::vector<std::string>& globs,
       const std::vector<std::string>& prefixes) override;
+  folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const std::vector<std::string>& prefixes) override;
+
+  ImmediateFuture<bool> checkPermission(const ObjectId& manifestId) override;
 
   /**
    * The worker runloop function.
@@ -632,6 +686,11 @@ class SaplingBackingStore final : public BackingStore {
   RequestMetricsScope::LockedRequestWatchList& getImportWatches(
       RequestMetricsScope::RequestStage stage,
       SaplingImportObject object) const;
+
+  TreePtr makeRestrictedTree(ObjectId id) const;
+  folly::Try<TreePtr> convertPermissionDeniedToRestrictedTree(
+      folly::Try<TreePtr> content,
+      ObjectId id) const;
 
   /**
    * Gets the watches timing pending `object` imports
@@ -720,7 +779,8 @@ class SaplingBackingStore final : public BackingStore {
    */
   std::vector<std::thread> threads_;
 
-  std::shared_ptr<StructuredLogger> structuredLogger_;
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
+  ErrorLogger& errorLogger_;
 
   /**
    * Logger for backing store imports

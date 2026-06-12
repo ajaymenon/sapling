@@ -6,6 +6,7 @@ use std::path::Path;
 use thrift_compiler::Config;
 use thrift_compiler::GenContext;
 const CRATEMAP: &str = "\
+eden/mononoke/mononoke_types/serialization/acl_manifest.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/blame.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/bonsai.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/bssm.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
@@ -15,8 +16,10 @@ eden/mononoke/mononoke_types/serialization/content.thrift crate //eden/mononoke/
 eden/mononoke/mononoke_types/serialization/content_manifest.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/data.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/deleted_manifest.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
+eden/mononoke/mononoke_types/serialization/directory_branch_cluster_manifest.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/fastlog.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/fsnodes.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
+eden/mononoke/mononoke_types/serialization/history_manifest.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/id.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/inferred_copy_from.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 eden/mononoke/mononoke_types/serialization/path.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
@@ -29,6 +32,7 @@ eden/mononoke/mononoke_types/serialization/time.thrift crate //eden/mononoke/mon
 eden/mononoke/mononoke_types/serialization/unodes.thrift crate //eden/mononoke/mononoke_types/serialization:mononoke_types_serialization-rust
 thrift/annotation/rust.thrift rust //thrift/annotation:rust-rust
 thrift/annotation/scope.thrift rust->scope //thrift/annotation:scope-rust
+thrift/annotation/thrift.thrift thrift //thrift/annotation:thrift-rust
 ";
 #[rustfmt::skip]
 fn main() {
@@ -42,6 +46,7 @@ fn main() {
         .types_crate("mononoke_types_serialization__types")
         .clients_crate("mononoke_types_serialization__clients")
         .run([
+            "../acl_manifest.thrift",
             "../blame.thrift",
             "../bonsai.thrift",
             "../bssm.thrift",
@@ -51,8 +56,10 @@ fn main() {
             "../content_manifest.thrift",
             "../data.thrift",
             "../deleted_manifest.thrift",
+            "../directory_branch_cluster_manifest.thrift",
             "../fastlog.thrift",
             "../fsnodes.thrift",
+            "../history_manifest.thrift",
             "../id.thrift",
             "../inferred_copy_from.thrift",
             "../path.thrift",

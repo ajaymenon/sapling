@@ -16,6 +16,9 @@ const USE_ONLY_OFFSET_DELTA: &str = "x-git-only-offset-delta";
 const PUSH_CONCURRENCY: &str = "x-git-push-concurrency";
 const BYPASS_BOOKMARK_CACHE: &str = "x-git-bypass-bookmark-cache";
 const UNSAMPLED_PERF_LOGGING: &str = "x-git-unsampled-perf-logging";
+const EMERGENCY_PUSH: &str = "x-git-emergency-push";
+const ALLOW_NON_FAST_FORWARD: &str = "x-git-allow-non-ffwd-push";
+const ALLOW_DANGLING_LFS_POINTERS: &str = "x-git-allow-dangling-lfs-pointers";
 
 #[derive(Clone, StateData)]
 pub struct Pushvars(HashMap<String, Bytes>);
@@ -66,6 +69,28 @@ impl Pushvars {
         self.0
             .get(UNSAMPLED_PERF_LOGGING)
             .is_some_and(|v| **v == *b"1")
+    }
+
+    pub fn emergency_push(&self) -> bool {
+        self.0.get(EMERGENCY_PUSH).is_some_and(|v| **v == *b"1")
+    }
+
+    /// Mirrors `bookmarks_movement::ALLOW_NON_FFWD_PUSHVAR`: presence of the
+    /// header is sufficient (value is not inspected), so the diverted MRL
+    /// path behaves identically to the local push path.
+    pub fn allow_non_fast_forward(&self) -> bool {
+        self.0.contains_key(ALLOW_NON_FAST_FORWARD)
+    }
+
+    /// When set, the git server should accept LFS pushes whose pointer
+    /// content is not (yet) present in the Mononoke filestore (internal mode)
+    /// or in the upstream LFS server. The pointer text itself becomes the
+    /// file content in the bonsai and the file is marked as
+    /// `GitLfs::FullContent`. Presence of the header is sufficient — the
+    /// value is not inspected. When the content *is* available, this flag
+    /// changes nothing: the pointer is still resolved and interpreted as LFS.
+    pub fn allow_dangling_lfs_pointers(&self) -> bool {
+        self.0.contains_key(ALLOW_DANGLING_LFS_POINTERS)
     }
 }
 

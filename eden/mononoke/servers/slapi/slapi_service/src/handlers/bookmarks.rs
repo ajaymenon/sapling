@@ -54,13 +54,13 @@ async fn fetch_bookmark<R: MononokeRepo>(
         SlapiCommitIdentityScheme::Git => repo
             .resolve_bookmark_git(bookmark.clone(), freshness)
             .await
-            .map_err(|_| ErrorKind::BookmarkResolutionFailed(bookmark.clone()))?
+            .map_err(|e| ErrorKind::BookmarkResolutionFailed(bookmark.clone(), e.into()))?
             .map(|id| HgId::from_slice(id.as_ref()))
             .transpose()?,
         SlapiCommitIdentityScheme::Hg => repo
             .resolve_bookmark(bookmark.clone(), freshness)
             .await
-            .map_err(|_| ErrorKind::BookmarkResolutionFailed(bookmark.clone()))?
+            .map_err(|e| ErrorKind::BookmarkResolutionFailed(bookmark.clone(), e.into()))?
             .map(|id| HgId::from(id.into_nodehash())),
     };
 
@@ -75,7 +75,7 @@ impl SaplingRemoteApiHandler for SetBookmarkHandler {
     type Request = SetBookmarkRequest;
     type Response = SetBookmarkResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::SetBookmark;
     const ENDPOINT: &'static str = "/bookmarks/set";
 
@@ -103,7 +103,7 @@ impl SaplingRemoteApiHandler for SetBookmarkHandler {
             .data
             .as_ref()
             .err()
-            .map(|err| format_err!("{:?}", err))
+            .map(|err| format_err!("{err:?}"))
     }
 }
 
@@ -117,7 +117,7 @@ async fn set_bookmark_response<R: MononokeRepo>(
     Ok(SetBookmarkResponse {
         data: set_bookmark(repo, bookmark, to, from, pushvars)
             .await
-            .map_err(|e| ServerError::generic(format!("{:?}", e))),
+            .map_err(|e| ServerError::generic(format!("{e:?}"))),
     })
 }
 
@@ -140,20 +140,27 @@ async fn set_bookmark<R: MononokeRepo>(
         (Some(to_hgid), Some(from_hgid)) => {
             // Move bookmark
             let to = HgChangesetId::new(HgNodeHash::from(to_hgid));
-            let to = repo
-                .changeset(to)
-                .await
-                .context("failed to resolve 'to' hgid")?
-                .ok_or(ErrorKind::HgIdNotFound(to_hgid))?
-                .id();
-
             let from = HgChangesetId::new(HgNodeHash::from(from_hgid));
-            let from = repo
-                .changeset(from)
-                .await
-                .context("failed to resolve 'from' hgid")?
-                .ok_or(ErrorKind::HgIdNotFound(from_hgid))?
-                .id();
+            let (to, from) = futures::try_join!(
+                async {
+                    anyhow::Ok(
+                        repo.changeset(to)
+                            .await
+                            .context("failed to resolve 'to' hgid")?
+                            .ok_or(ErrorKind::HgIdNotFound(to_hgid))?
+                            .id(),
+                    )
+                },
+                async {
+                    anyhow::Ok(
+                        repo.changeset(from)
+                            .await
+                            .context("failed to resolve 'from' hgid")?
+                            .ok_or(ErrorKind::HgIdNotFound(from_hgid))?
+                            .id(),
+                    )
+                },
+            )?;
 
             repo.move_bookmark(
                 &BookmarkKey::new(&bookmark)?,
@@ -205,7 +212,7 @@ impl SaplingRemoteApiHandler for Bookmarks2Handler {
     type Request = Bookmark2Request;
     type Response = BookmarkResult;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::Bookmarks2;
     const ENDPOINT: &'static str = "/bookmarks2";
     const SUPPORTED_FLAVOURS: &'static [SlapiCommitIdentityScheme] = &[
@@ -246,6 +253,6 @@ impl SaplingRemoteApiHandler for Bookmarks2Handler {
             .data
             .as_ref()
             .err()
-            .map(|err| format_err!("{:?}", err))
+            .map(|err| format_err!("{err:?}"))
     }
 }

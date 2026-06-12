@@ -15,6 +15,7 @@ import {BookmarksManagerMenu} from './BookmarksManager';
 import {BugButton} from './BugButton';
 import {BulkActionsMenu} from './BulkActionsMenu';
 import serverAPI from './ClientToServerAPI';
+import {CommitTreeSearchFilterButton} from './CommitTreeSearchFilter';
 import {CwdSelector} from './CwdSelector';
 import {DownloadCommitsTooltipButton} from './DownloadCommitsMenu';
 import {FocusModeToggle} from './FocusMode';
@@ -53,6 +54,7 @@ export function TopBar() {
       <span className="button-group">
         <FlexSpacer />
         <DebugToolsButton />
+        <CommitTreeSearchFilterButton />
         <FocusModeToggle />
         <BugButton />
         <SettingsGearButton />
@@ -64,7 +66,9 @@ export function TopBar() {
 
 function FetchingDataIndicator() {
   const isFetching = useAtomValue(isFetchingCommits);
-  return <Icon icon={isFetching ? 'loading' : 'blank'} />;
+  return (
+    <span className="fetching-data-indicator">{isFetching ? <Icon icon="loading" /> : null}</span>
+  );
 }
 
 function RefreshButton() {

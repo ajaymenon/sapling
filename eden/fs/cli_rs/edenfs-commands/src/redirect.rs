@@ -39,6 +39,10 @@ use edenfs_client::redirect::get_effective_redirs_for_mount;
 use edenfs_client::redirect::try_add_redirection;
 use edenfs_client::utils::expand_path_or_cwd;
 use edenfs_client::utils::remove_trailing_slash;
+#[cfg(fbcode_build)]
+use edenfs_telemetry::EDEN_EVENTS_SCUBA;
+#[cfg(fbcode_build)]
+use edenfs_telemetry::send;
 use hg_util::path::expand_path;
 use tabular::Table;
 use tabular::row;
@@ -60,11 +64,11 @@ pub enum RedirectCmd {
     },
     #[clap(about = "Add or change a redirection")]
     Add {
-        #[clap(long, parse(from_str = expand_path), help = "The EdenFS mount point path.")]
+        #[clap(long, value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) }, help = "The EdenFS mount point path.")]
         mount: Option<PathBuf>,
-        #[clap(parse(from_str = expand_path), index = 1, help = "The path in the repo which should be redirected")]
+        #[clap(value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) }, index = 1, help = "The path in the repo which should be redirected")]
         repo_path: PathBuf,
-        #[clap(index = 2, help = "The type of the redirection", possible_values = ["bind", "symlink"])]
+        #[clap(index = 2, help = "The type of the redirection", value_parser = ["bind", "symlink"])]
         redir_type: String,
         #[clap(
             long,
@@ -89,7 +93,7 @@ pub enum RedirectCmd {
         so that a subsequent fixup will restore it"
     )]
     Unmount {
-        #[clap(long, parse(from_str = expand_path), help = "The EdenFS mount point path.")]
+        #[clap(long, value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) }, help = "The EdenFS mount point path.")]
         mount: Option<PathBuf>,
         #[clap(
             long,
@@ -99,9 +103,9 @@ pub enum RedirectCmd {
     },
     #[clap(about = "Delete a redirection")]
     Del {
-        #[clap(long, parse(from_str = expand_path), help = "The EdenFS mount point path.")]
+        #[clap(long, value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) }, help = "The EdenFS mount point path.")]
         mount: Option<PathBuf>,
-        #[clap(parse(from_str = expand_path), index = 1, help = "The path in the repo which should no longer be redirected")]
+        #[clap(value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) }, index = 1, help = "The path in the repo which should no longer be redirected")]
         repo_path: PathBuf,
         #[clap(
             long,
@@ -114,7 +118,7 @@ pub enum RedirectCmd {
         remove things that should not be redirected"
     )]
     Fixup {
-        #[clap(long, parse(from_str = expand_path), help = "The EdenFS mount point path.")]
+        #[clap(long, value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) }, help = "The EdenFS mount point path.")]
         mount: Option<PathBuf>,
         #[clap(
             long,
@@ -158,7 +162,7 @@ impl RedirectCmd {
                 redir.state,
             ));
         }
-        println!("{}", table);
+        println!("{table}");
         Ok(0)
     }
 
@@ -168,7 +172,7 @@ impl RedirectCmd {
     ) -> Result<ExitCode> {
         let json_out = serde_json::to_string(&redirections.into_values().collect::<Vec<_>>())
             .with_context(|| anyhow!("could not serialize redirections",))?;
-        println!("{}", json_out);
+        println!("{json_out}");
         Ok(0)
     }
 
@@ -427,6 +431,18 @@ impl RedirectCmd {
                     redir.repo_path.display(),
                     e
                 );
+                #[cfg(fbcode_build)]
+                {
+                    let sample = edenfs_telemetry::redirect::build_fixup_result(
+                        checkout.path().to_string_lossy().as_ref(),
+                        &redir.repo_path.to_string_lossy(),
+                        &redir.redir_type.to_string(),
+                        &redir.state.to_string(),
+                        &redir.source,
+                        &e.to_string(),
+                    );
+                    send(EDEN_EVENTS_SCUBA.to_string(), sample);
+                }
             }
         }
 

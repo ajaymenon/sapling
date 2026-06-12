@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/coro/Task.h>
+#include <folly/coro/safe/NowTask.h>
 #include <gtest/gtest_prod.h>
 
 #include "eden/common/utils/PathMap.h"
@@ -144,11 +145,20 @@ class FilteredBackingStore
   FRIEND_TEST(SaplingFilteredBackingStoreTest, testMercurialFFIInvalidFOID);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getNonExistent);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getBlob);
+  FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, co_getBlobAuxData);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getTree);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getRootTree);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getGlobFiles);
+  FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, co_getGlobFiles);
+  FRIEND_TEST(
+      FakeSubstringFilteredBackingStoreTest,
+      restrictedTreePreservedAfterFiltering);
 
   ImmediateFuture<GetRootTreeResult> getRootTree(
+      const RootId& rootId,
+      const ObjectFetchContextPtr& context) override;
+
+  folly::coro::now_task<GetRootTreeResult> co_getRootTree(
       const RootId& rootId,
       const ObjectFetchContextPtr& context) override;
 
@@ -161,7 +171,14 @@ class FilteredBackingStore
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
 
+  folly::coro::now_task<GetTreeResult> co_getTree(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+
   folly::SemiFuture<GetTreeAuxResult> getTreeAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+  folly::coro::now_task<GetTreeAuxResult> co_getTreeAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
 
@@ -177,7 +194,15 @@ class FilteredBackingStore
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
 
+  folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+
   [[nodiscard]] folly::SemiFuture<folly::Unit> prefetchBlobs(
+      ObjectIdRange ids,
+      const ObjectFetchContextPtr& context) override;
+
+  folly::coro::now_task<folly::Unit> co_prefetchBlobs(
       ObjectIdRange ids,
       const ObjectFetchContextPtr& context) override;
 
@@ -186,10 +211,23 @@ class FilteredBackingStore
       const std::vector<std::string>& globs,
       const std::vector<std::string>& prefixes) override;
 
+  folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const std::vector<std::string>& prefixes) override;
+
+  ImmediateFuture<bool> checkPermission(const ObjectId& manifestId) override;
+
   /*
    * Does the actual filtering logic for tree and root-tree objects.
    */
   ImmediateFuture<std::unique_ptr<PathMap<TreeEntry>>> filterImpl(
+      const TreePtr unfilteredTree,
+      RelativePathPiece treePath,
+      folly::StringPiece filterId,
+      FilteredObjectIdType treeType);
+
+  folly::coro::now_task<std::unique_ptr<PathMap<TreeEntry>>> co_filterImpl(
       const TreePtr unfilteredTree,
       RelativePathPiece treePath,
       folly::StringPiece filterId,

@@ -1,7 +1,7 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "mercurial_revlog",
@@ -45,7 +45,6 @@ rust_library(
     srcs = glob(["types/src/**/*.rs"]),
     autocargo = {"cargo_toml_dir": "types"},
     named_deps = {
-        "bincode": "fbsource//third-party/rust:bincode-2",
         "blake3-constants": "//blake3:blake3-constants-rust-nothrift",
     },
     test_deps = [
@@ -73,6 +72,7 @@ rust_library(
         "fbsource//third-party/rust:async-stream",
         "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:base64",
+        "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:bitflags",
         "fbsource//third-party/rust:blake3",
         "fbsource//third-party/rust:bytes",
@@ -80,11 +80,12 @@ rust_library(
         "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:percent-encoding",
         "fbsource//third-party/rust:quickcheck",
-        "fbsource//third-party/rust:rand_08",
-        "fbsource//third-party/rust:rand_distr_04",
+        "fbsource//third-party/rust:rand",
+        "fbsource//third-party/rust:rand_distr",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_derive",
         "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
         "//common/rust/shed/cloned:cloned",
@@ -174,7 +175,6 @@ rust_library(
         ":mercurial_types",
         "//common/rust/shed/futures_ext:futures_ext",
         "//common/rust/shed/futures_stats:futures_stats",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/repo_attributes/phases:phases",
@@ -192,9 +192,6 @@ rust_library(
         "mutation/schemas/**/*.sql",
     ]),
     autocargo = {"cargo_toml_dir": "mutation"},
-    named_deps = {
-        "bincode": "fbsource//third-party/rust:bincode-2",
-    },
     test_deps = [
         "fbsource//third-party/rust:quickcheck",
         "//common/rust/shed/quickcheck_arbitrary_derive:quickcheck_arbitrary_derive",
@@ -202,6 +199,7 @@ rust_library(
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:bytes",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:itertools",
@@ -211,10 +209,10 @@ rust_library(
         "//common/rust/shed/abomonable_string:abomonable_string",
         "//common/rust/shed/facet:facet",
         "//common/rust/shed/futures_retry:futures_retry",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//common/rust/shed/memcache_stub:memcache",
         "//common/rust/shed/sql:sql",
         "//eden/mononoke/common/rust/caching_ext:caching_ext",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",
         "//eden/mononoke/common/sql_construct:sql_construct",
         "//eden/mononoke/mercurial/mutation/if:hg_mutation_entry_thrift-rust",

@@ -22,6 +22,7 @@ use clap::Args;
 use context::CoreContext;
 use mononoke_api::Mononoke;
 use mononoke_api::MononokeRepo;
+use mononoke_app::args::RepoArgs;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
 use source_control as thrift;
@@ -30,6 +31,9 @@ use source_control as thrift;
 /// Subcommand responsible for showing the request
 /// details.
 pub struct AsyncRequestsShowArgs {
+    /// The repository name or ID
+    #[clap(flatten)]
+    pub repo: RepoArgs,
     /// ID of the request.
     #[clap(long)]
     request_id: u64,
@@ -88,7 +92,7 @@ impl<'a, R: MononokeRepo> std::fmt::Debug for ParamsWrapper<'a, R> {
                     &ChangesetId::from_bytes(&params.target_location),
                 )
                 .finish()?,
-            other => f.write_str(format!("{:?}", other).as_str())?,
+            other => f.write_str(format!("{other:?}").as_str())?,
         }
         Ok(())
     }
@@ -112,7 +116,7 @@ impl std::fmt::Debug for ResultsWrapper {
                     .debug_struct("MegarepoChangeTargetConfigResponse")
                     .field("cs_id", &ChangesetId::from_bytes(&result.cs_id))
                     .finish()?,
-                other => f.write_str(format!("{:?}", other).as_str())?,
+                other => f.write_str(format!("{other:?}").as_str())?,
             },
             None => (),
         }
@@ -146,10 +150,10 @@ pub async fn show_request<R: MononokeRepo>(
             if let Some(repo_id) = target.repo_id {
                 let repo_name = mononoke
                     .repo_name_from_id(RepositoryId::new(repo_id as i32))
-                    .unwrap_or_else(|| format!("--repo-id {}", repo_id));
+                    .unwrap_or_else(|| format!("--repo-id {repo_id}"));
                 println!(
                     "\nHint: To see the full config for new_version, run:\n  \
-                     mononoke_admin async-requests -R {} show-megarepo-sync-target-config \
+                     mononoke_admin async-requests show-megarepo-sync-target-config -R {} \
                      --bookmark \"{}\" --version \"{}\"",
                     repo_name, target.bookmark, p.new_version
                 );

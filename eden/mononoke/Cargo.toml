@@ -1,54 +1,81 @@
 [patch.crates-io]
 abomonation = { git = "https://github.com/markbt/abomonation", rev = "0f43346d2afa2aedc64d61f3f4273e8d1e454642" }
-audio_streams = { git = "https://github.com/google/crosvm", rev = "7d2e877a2a0a772c199fe8b6b51aec7c1b166467" }
+audio_streams = { git = "https://github.com/google/crosvm", rev = "299c1e7c3d5a1b98106212c20f58b9fdb7b1b1ea" }
 backtrace = { git = "https://github.com/rust-lang/backtrace-rs", rev = "df979dcf80027eb047d7bb9e0874710c15009f31" }
 base64urlsafedata = { git = "https://github.com/kanidm/webauthn-rs.git", rev = "d278c56adfa39a0723c79bdcd461644194bc5138" }
-bf-tree = { git = "https://github.com/ddrcoder/bf-tree.git", rev = "d84feb51c4568c9e1aa6716e7dcd99f8d9892da8" }
+bf-tree = { git = "https://github.com/fbsource/bf-tree", rev = "da3f2364e8f9fe002a85c19de8a879fc2c05f12c" }
 bindgen = { git = "https://github.com/jsgf/rust-bindgen", rev = "4d385d21c160e6ee1f443aeb7e00528a1dc7fd44" }
 bindgen-cli = { git = "https://github.com/jsgf/rust-bindgen", rev = "4d385d21c160e6ee1f443aeb7e00528a1dc7fd44" }
-bytemuck = { git = "https://github.com/jsgf/bytemuck", rev = "e7ba210910d49dee833773b2a3e0f5e39805ba08" }
-bytemuck_derive = { git = "https://github.com/jsgf/bytemuck", rev = "e7ba210910d49dee833773b2a3e0f5e39805ba08" }
-c2pa = { git = "https://github.com/dhruvmongia/c2pa-rs", rev = "871a0f10d6a3a627229fc769de3d88f85024b64d" }
-cbindgen = { git = "https://github.com/mozilla/cbindgen.git", rev = "cf94b56ef35d91f8420e8f89fee70074d39d068d" }
-cxx = { git = "https://github.com/facebookexperimental/cxx.git", rev = "870ebbecad0f6be394d4f9fb9bd62b551662651a" }
-cxx-build = { git = "https://github.com/facebookexperimental/cxx.git", rev = "870ebbecad0f6be394d4f9fb9bd62b551662651a" }
-displaydoc = { git = "https://github.com/yaahc/displaydoc", rev = "7dc6e324b1788a6b7fb9f3a1953c512923a3e9f0" }
+c2pa = { git = "https://github.com/peekmoar/c2pa-rs", rev = "6bcd530a0b681d828e1b07430058c13427fe8bb1" }
+cxx = { git = "https://github.com/facebookexperimental/cxx.git", rev = "d98f6c434f8e6a018533c31a7a4cf7cdc7252210" }
+cxx-build = { git = "https://github.com/facebookexperimental/cxx.git", rev = "d98f6c434f8e6a018533c31a7a4cf7cdc7252210" }
 imgui = { git = "https://github.com/imgui-rs/imgui-rs.git", rev = "2abba18c08fb5e70c699ba7992342e7ff8573b09" }
 imgui-sys = { git = "https://github.com/imgui-rs/imgui-rs.git", rev = "2abba18c08fb5e70c699ba7992342e7ff8573b09" }
 k = { git = "https://github.com/prnthp-meta/k", rev = "f06b504c563a4763dbf2d47366b868f67d5c9dd2" }
-libbpf-sys = { git = "https://github.com/calebho/libbpf-sys.git", rev = "ac56b9d69f477711b8f02bab12319999e8ba410b" }
-libcras = { git = "https://github.com/google/crosvm", rev = "7d2e877a2a0a772c199fe8b6b51aec7c1b166467" }
+libcras = { git = "https://github.com/google/crosvm", rev = "299c1e7c3d5a1b98106212c20f58b9fdb7b1b1ea" }
+libssh2-sys = { git = "https://github.com/alexcrichton/ssh2-rs", rev = "5219ffbaa5b0a170376d6d1896c5cb5367bdedb8" }
 lru-disk-cache = { git = "https://github.com/mozilla/sccache", rev = "fdbf843d174c6796d736b2b61dab0297670390f8" }
 minijail = { git = "https://chromium.googlesource.com/chromiumos/platform/minijail", rev = "fc020fd4672b3340ee706e192d043e12df8c8578" }
+modcholesky = { git = "https://github.com/argmin-rs/modcholesky", rev = "0ef5ed8f589ec77ff348d98747431aefa369f942" }
 murmur3 = { git = "https://github.com/stusmall/murmur3", rev = "f363bf6dd1d668988bf798c320823f8ceaedf5aa" }
+opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "b998a568632baaa424793a000dfb015f28b5aa5c" }
+opentelemetry-http = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "b998a568632baaa424793a000dfb015f28b5aa5c" }
+opentelemetry-otlp = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "b998a568632baaa424793a000dfb015f28b5aa5c" }
+opentelemetry-proto = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "b998a568632baaa424793a000dfb015f28b5aa5c" }
+opentelemetry-stdout = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "b998a568632baaa424793a000dfb015f28b5aa5c" }
+opentelemetry_sdk = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "b998a568632baaa424793a000dfb015f28b5aa5c" }
 pcap = { git = "https://github.com/qrnch-jan/pcap", rev = "0c6ed076c84ef0c63198d384a24d66b737b24e4a" }
 perf-event = { version = "0.4", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 perf-event-open-sys = { version = "5.0", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
+pest_consume_macros = { git = "https://github.com/fbsource/pest_consume", rev = "d71e4813aaf5514b8340d2970b3a717e1cf2ea45" }
 plexi-core = { version = "0.1.2", git = "https://github.com/markbt/plexi", rev = "9d459b7fb26101e5c9c2489c220cbae03d1d7afe" }
+postgres = { git = "https://github.com/neondatabase/rust-postgres.git", rev = "f3cf448febde5fd298071d54d568a9c875a7a62b" }
+postgres-protocol = { git = "https://github.com/neondatabase/rust-postgres.git", rev = "f3cf448febde5fd298071d54d568a9c875a7a62b" }
+postgres-types = { git = "https://github.com/neondatabase/rust-postgres.git", rev = "f3cf448febde5fd298071d54d568a9c875a7a62b" }
 prettytable-rs = { git = "https://github.com/asm89/prettytable-rs", rev = "d5e2a480c02b0c4be8d61f4f3a9039c841376433" }
 protobuf-build = { git = "https://github.com/fbsource/protobuf-build", rev = "ee1de946ce2fd7d06a7a4fab7141e02c49f0981f" }
-quickcheck = { git = "https://github.com/jakoschiko/quickcheck", rev = "6ecdf5bb4b0132ce66670b4d46453aa022ea892c" }
 quickcheck_async = { git = "https://github.com/markbt/quickcheck_async", rev = "76b13525ca93e0725e757f841fc6ccab8bae1913" }
 ratatui = { git = "https://github.com/fbsource/ratatui", rev = "e49703b568262fceffcb8b95456a47926ebabf33" }
 rinja = { git = "https://github.com/fbsource/askama", rev = "2fc6173c98034c148f46330fc39a006cf0b09efe" }
-riscv = { git = "https://github.com/jsgf/riscv.git", rev = "90cfc5f2404e39e085e12845944d5bbbc869c290" }
-riscv-pac = { git = "https://github.com/jsgf/riscv.git", rev = "90cfc5f2404e39e085e12845944d5bbbc869c290" }
-riscv-rt = { git = "https://github.com/jsgf/riscv.git", rev = "90cfc5f2404e39e085e12845944d5bbbc869c290" }
 rootcause = { git = "https://github.com/rootcause-rs/rootcause.git", rev = "5010b020a57786de6f18bad027560d54b73875b0" }
 rootcause-backtrace = { git = "https://github.com/rootcause-rs/rootcause.git", rev = "5010b020a57786de6f18bad027560d54b73875b0" }
+rust-stemmers = { git = "https://github.com/fbsource/rust-stemmers", rev = "3b2545218f76e797baecbf91fa1cbd2c0db60726" }
+rustls-native-certs = { git = "https://github.com/rustls/rustls-native-certs", rev = "9734b4cc0bfa88224e0fc49867abafa1c56fa28d" }
+rustversion = { git = "https://github.com/fbsource/rustversion", rev = "3f072e049635b7463275fc4edebbbed3840d9297" }
+spm_precompiled = { version = "0.1.4", git = "https://github.com/huggingface/spm_precompiled", rev = "6e3ffb3ef2504f38e66273002fca0661da4121cc" }
 sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "24317d5eab40fbc33caf1142946e2f39caad73ea" }
+ssh2 = { git = "https://github.com/alexcrichton/ssh2-rs", rev = "5219ffbaa5b0a170376d6d1896c5cb5367bdedb8" }
 stabby = { git = "https://github.com/nitinsingh-meta/stabby", rev = "304c895c34e502fc635b85df6d4f22f746747ed4" }
-vhost = { git = "https://github.com/rust-vmm/vhost/", rev = "93e2d9cf9151a5cbeef4fff1fdf26fdb989f060d" }
+tokio-postgres = { git = "https://github.com/neondatabase/rust-postgres.git", rev = "f3cf448febde5fd298071d54d568a9c875a7a62b" }
+tonic = { git = "https://github.com/grpc/grpc-rust", rev = "de65d0a48783869d89b7d8d4a65ce703f1612249" }
 vm-allocator = { git = "https://github.com/rust-vmm/vm-allocator", rev = "5fb545cc6e41fdc9f27d48d97ed26274a35bc6c6" }
 warp = { git = "https://github.com/jdthomas/warp.git", rev = "c794232d182abaa3add8184e7d661e084cc516c5" }
+wezterm-color-types = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
+wezterm-dynamic = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
+wezterm-input-types = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
+zbus_macros = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
+zvariant = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
+zvariant_derive = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
+
+[patch."https://github.com/milvus-io/rust-stemmers.git"]
+rust-stemmers = { git = "https://github.com/fbsource/rust-stemmers", rev = "3b2545218f76e797baecbf91fa1cbd2c0db60726" }
+
+[patch."https://github.com/wez/finl_unicode.git"]
+finl_unicode = { git = "https://github.com/dahosek/finl_unicode.git", rev = "a1892f26245529f2ef3877a9ebd610c96cec07a6" }
+
+[patch."https://github.com/wezterm/wezterm.git"]
+filedescriptor = "0.8.3"
+vtparse = "0.7"
+wezterm-bidi = "0.2.3"
+wezterm-blob-leases = "0.1.1"
+wezterm-dynamic-derive = "0.1.1"
 
 [workspace]
 members = [
   "benchmarks/derived_data",
   "benchmarks/filestore",
   "benchmarks/storage_config",
-  "blobimport_lib",
-  "blobimport_lib/consts",
   "blobrepo/blobrepo_hg",
   "blobrepo/blobsync",
   "blobrepo/common",
@@ -59,6 +86,7 @@ members = [
   "blobstore/blobstore_stats",
   "blobstore/cacheblob",
   "blobstore/chaosblob",
+  "blobstore/counting_blob",
   "blobstore/delayblob",
   "blobstore/ephemeral_blobstore",
   "blobstore/factory",
@@ -103,6 +131,7 @@ members = [
   "cmdlib/scrubbing",
   "cmdlib/sharding",
   "cmdlib/sharding_ext",
+  "cmdlib/sharding_observability",
   "cmdlib/zk_leader_election",
   "common/acl_regions",
   "common/assembly_line",
@@ -112,6 +141,7 @@ members = [
   "common/cas_client/client",
   "common/cas_client/scm_client",
   "common/cats",
+  "common/client_memory",
   "common/connection_security_checker",
   "common/copy_utils",
   "common/dedupmap",
@@ -138,6 +168,7 @@ members = [
   "common/rendezvous",
   "common/running",
   "common/rust/caching_ext",
+  "common/rust/justknobs_ext",
   "common/rust/sql_ext",
   "common/rust/sql_ext/proc_macros",
   "common/rust/sql_ext/sql_query_telemetry",
@@ -145,6 +176,7 @@ members = [
   "common/scuba_ext",
   "common/session_id",
   "common/sql_construct",
+  "common/three_way_merge",
   "common/thrift_convert",
   "common/thrift_convert/proc_macros",
   "common/thrift_convert/tests/if",
@@ -159,6 +191,7 @@ members = [
   "common/wait_for_replication",
   "common/yield_stream",
   "derived_data",
+  "derived_data/acl_manifest",
   "derived_data/basename_suffix_skeleton_manifest_v3",
   "derived_data/blame",
   "derived_data/bulk_derivation",
@@ -167,9 +200,13 @@ members = [
   "derived_data/constants",
   "derived_data/content_manifest_derivation",
   "derived_data/deleted_manifest",
+  "derived_data/derivation_pipeline_test_harness",
+  "derived_data/derivation_pipeline_utils",
+  "derived_data/directory_branch_cluster_manifest",
   "derived_data/fastlog",
   "derived_data/filenodes_derivation",
   "derived_data/fsnodes",
+  "derived_data/history_manifest",
   "derived_data/if",
   "derived_data/if/clients",
   "derived_data/if/mocks",
@@ -189,18 +226,23 @@ members = [
   "derived_data/test_utils",
   "derived_data/unodes",
   "features/async_requests",
+  "features/async_requests/backfill_worker",
   "features/async_requests/client",
   "features/async_requests/if",
   "features/async_requests/if/clients",
   "features/async_requests/if/mocks",
   "features/async_requests/if/services",
   "features/async_requests/requests_table",
+  "features/async_requests/types",
   "features/async_requests/worker",
+  "features/async_requests/worker_lib",
   "features/cache_warmup",
   "features/changesets_creation",
   "features/commit_cloud",
   "features/commit_cloud/helpers",
   "features/commit_cloud/types",
+  "features/commit_compare",
+  "features/commit_rate_limit",
   "features/commit_rewriting/backsyncer",
   "features/commit_rewriting/backsyncer/features/commit_rewriting/backsyncer_cmd",
   "features/commit_rewriting/bookmark_renaming",
@@ -321,7 +363,9 @@ members = [
   "repo_attributes/bookmarks/bookmarks_movement",
   "repo_attributes/bookmarks/bookmarks_types",
   "repo_attributes/bookmarks/dbbookmarks",
+  "repo_attributes/bookmarks/multi_repo_bookmarks_transaction",
   "repo_attributes/bookmarks/warm_bookmarks_cache",
+  "repo_attributes/commit_derived_data_mapping",
   "repo_attributes/commit_graph/buffered_commit_graph_storage",
   "repo_attributes/commit_graph/caching_commit_graph_storage",
   "repo_attributes/commit_graph/commit_graph",
@@ -335,6 +379,7 @@ members = [
   "repo_attributes/commit_graph/memwrites_commit_graph_storage",
   "repo_attributes/commit_graph/preloaded_commit_graph_storage",
   "repo_attributes/commit_graph/sql_commit_graph_storage",
+  "repo_attributes/commit_rate_limit",
   "repo_attributes/deletion_log",
   "repo_attributes/filenodes",
   "repo_attributes/filenodes/if",
@@ -378,6 +423,8 @@ members = [
   "repo_attributes/repo_permission_checker",
   "repo_attributes/repo_sparse_profiles",
   "repo_attributes/restricted_paths",
+  "repo_attributes/restricted_paths_acl_file",
+  "repo_attributes/restricted_paths_common",
   "repo_attributes/sql_query_config",
   "repo_authorization",
   "repo_client",
@@ -411,7 +458,6 @@ members = [
   "tools/admin",
   "tools/aliasverify/tools/aliasverify",
   "tools/backfill_mapping",
-  "tools/blobimport/tools/blobimport",
   "tools/bonsai_verify",
   "tools/check_git_wc/tools/check_git_wc",
   "tools/example",
@@ -419,6 +465,7 @@ members = [
   "tools/import",
   "tools/packer",
   "tools/repo_import",
+  "tools/repo_spec_writer",
   "tools/sqlblob_gc",
   "tools/streaming_clone",
   "tools/tail-to-cloudwatch",

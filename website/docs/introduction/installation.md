@@ -6,7 +6,7 @@ import {gitHubRepo, gitHubRepoName, latestReleasePage} from '@site/constants'
 
 import {Command, SLCommand} from '@site/elements'
 
-import {latestReleaseVersion, macArmAsset, ubuntu20, ubuntu22, windowsAsset} from '@site/src/releaseData';
+import {latestReleaseVersion, macArmAsset, linuxAssetUrlPrefix, windowsAsset} from '@site/src/releaseData';
 
 import CodeBlock from '@theme/CodeBlock';
 
@@ -43,7 +43,7 @@ curl -L -o {macArmAsset.name} {macArmAsset.url}
 Then install:
 
 <CodeBlock>
-brew install ./{macArmAsset.name}
+HOMEBREW_DEVELOPER=1 brew install ./{macArmAsset.name}
 </CodeBlock>
 
 :::caution
@@ -65,7 +65,7 @@ echo "ulimit -n 1048576" >> ~/.zshrc
 
 ### Windows
 
-After downloading the `sapling_windows` ZIP from the <a href={latestReleasePage}>latest release</a>, run the following in PowerShell as Administrator (substituting the name of the `.zip` file you downloaded, as appropriate):
+After downloading the Windows ZIP from the <a href={latestReleasePage}>latest release</a>, run the following in PowerShell as Administrator (substituting the name of the `.zip` file you downloaded, as appropriate):
 
 <CodeBlock>
 Expand-Archive ~/Downloads/{windowsAsset.name} 'C:\Program Files'{'\n'}
@@ -82,42 +82,54 @@ Note the following tools must be installed to leverage Sapling's full feature se
 - [Git for Windows](https://git-scm.com/download/win) is required to use Sapling with Git repositories
 - [Node.js](https://nodejs.org/en/download/) (v16 or later) is required to use <SLCommand name="web" />
 
-Note that the name of the Sapling CLI `sl.exe` conflicts with the `sl` shell built-in in PowerShell (`sl` is an alias for `Set-Location`, which is equivalent to `cd`). If you want to use `sl` to run `sl.exe` in PowerShell, you must reassign the alias. Again, you must run the following as Administrator:
+Note that the name of the Sapling CLI `sl.exe` conflicts with the `sl` shell built-in in PowerShell (`sl` is an alias for `Set-Location`, which is equivalent to `cd`). If you want to use `sl` to run `sl.exe` in PowerShell, you need to remove or override this alias.
+
+**Option 1: Remove the built-in alias** (recommended, works on all PowerShell versions):
+
+```
+Remove-Item Alias:sl -Force
+```
+
+**Option 2: Reassign the alias** (must be run as Administrator):
 
 <CodeBlock>
-Set-Alias -Name sl -Value 'C:\Program Files\Sapling\sl.exe' -Force -Option Constant,ReadOnly,AllScope{'\n'}
-sl --version{'\n'}
-Sapling {latestReleaseVersion}
+Set-Alias -Name sl -Value 'C:\Program Files\Sapling\sl.exe' -Force -Option Constant,ReadOnly,AllScope
 </CodeBlock>
+
+To make the change persist across PowerShell sessions, add the command to your [PowerShell profile](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_profiles). You can open it with:
+
+```
+notepad $PROFILE
+```
+
+Verify `sl` resolves correctly:
+
+```
+sl --version
+```
 
 ### Linux
 
-#### Ubuntu 22.04
-
-Download using `curl`:
+Download and extract:
 
 <CodeBlock>
-curl -L -o {ubuntu22.name} {ubuntu22.url}
+{`ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')
+rm -rf ~/.local/share/sapling
+mkdir -p ~/.local/share/sapling
+curl -L "${linuxAssetUrlPrefix}\${ARCH}.tar.xz" | tar xJf - -C ~/.local/share/sapling`}
 </CodeBlock>
 
-Then install:
-
-<CodeBlock>
-sudo apt install -y ./{ubuntu22.name}
-</CodeBlock>
-
-#### Arch Linux (AUR)
+Add it to your `PATH`:
 
 ```
-yay -S sapling-scm-bin
+echo 'export PATH="$HOME/.local/share/sapling:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-#### Other Linux distros
-
-Sapling can be installed from Homebrew on Linux. First install Homebrew on your machine, then run
+Verify the installation:
 
 ```
-brew install sapling
+sl --version
 ```
 
 ## Building from source

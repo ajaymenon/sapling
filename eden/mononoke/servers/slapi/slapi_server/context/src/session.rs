@@ -11,7 +11,6 @@ use async_limiter::AsyncLimiter;
 use clientinfo::ClientInfo;
 use fbinit::FacebookInit;
 use metadata::Metadata;
-use permission_checker::MononokeIdentitySetExt;
 use rate_limiting::BoxRateLimiter;
 use rate_limiting::LoadCost;
 use rate_limiting::LoadShedResult;
@@ -60,6 +59,12 @@ struct SessionContainerInner {
     // Whether this session is supposed to be readonly, this will cause the right
     // AuthContext to constructed.
     readonly: bool,
+    /// Temporary client opt-in flag for server-side path ACL enforcement.
+    /// Used during the initial rollout to let clients opt in and disable
+    /// enforcement if it causes issues. Should be removed once rollout is complete.
+    // TODO(T248658346): Remove this flag once path ACL enforcement is fully rolled out.
+    // TODO(T248658346): Wire this from request headers/thrift per server entry point.
+    server_side_tenting: bool,
 }
 
 impl SessionContainer {
@@ -172,12 +177,12 @@ impl SessionContainer {
         }
     }
 
-    pub fn is_quicksand(&self) -> bool {
-        self.metadata().identities().is_quicksand()
-    }
-
     pub fn is_readonly(&self) -> bool {
         self.inner.readonly
+    }
+
+    pub fn server_side_tenting(&self) -> bool {
+        self.inner.server_side_tenting
     }
 
     pub fn blobstore_read_limiter(&self) -> Option<&AsyncLimiter> {

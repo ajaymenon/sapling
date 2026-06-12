@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use anyhow::Error;
@@ -34,6 +35,7 @@ use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::Generation;
 use mononoke_types::Globalrev;
+use mononoke_types::NonRootMPath;
 use once_cell::sync::Lazy;
 use permission_checker::MononokeIdentitySet;
 use phases::PhasesRef;
@@ -47,6 +49,7 @@ use whence_logged::WhenceScribeLogged;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CommitInfo {
     changeset_id: ChangesetId,
+    changeset_author: String,
     bubble_id: Option<NonZeroU64>,
     diff_id: Option<String>,
     changed_files_info: ChangedFilesInfo,
@@ -56,6 +59,7 @@ impl CommitInfo {
     pub fn new(bcs: &BonsaiChangeset, bubble_id: Option<BubbleId>) -> Self {
         CommitInfo {
             changeset_id: bcs.get_changeset_id(),
+            changeset_author: bcs.author().to_string(),
             bubble_id: bubble_id.map(Into::into),
             diff_id: extract_differential_revision(bcs.message()).map(ToString::to_string),
             changed_files_info: ChangedFilesInfo::new(bcs),
@@ -99,20 +103,32 @@ pub fn extract_differential_revision(message: &str) -> Option<&str> {
 pub struct ChangedFilesInfo {
     changed_files_count: u64,
     changed_files_size: u64,
+    changed_paths: BTreeSet<NonRootMPath>,
 }
+
+/// Cap on the number of paths retained in `ChangedFilesInfo::changed_paths`.
+/// Large codemod commits can touch hundreds of thousands of paths; logging all
+/// of them blows up memory and log payload size. Consumers can detect
+/// truncation by comparing `changed_paths.len()` against `changed_files_count`.
+const MAX_LOGGED_CHANGED_PATHS: usize = 10_000;
 
 impl ChangedFilesInfo {
     pub fn new(bcs: &BonsaiChangeset) -> Self {
-        let changed_files_count = bcs.file_changes_map().len() as u64;
-        let changed_files_size = bcs
-            .file_changes_map()
-            .values()
-            .map(|fc| fc.size().unwrap_or(0))
-            .sum::<u64>();
+        let (changed_files_count, changed_files_size, changed_paths) =
+            bcs.file_changes_map().iter().fold(
+                (0u64, 0u64, BTreeSet::<NonRootMPath>::new()),
+                |(count, size, mut paths), (path, change)| {
+                    if paths.len() < MAX_LOGGED_CHANGED_PATHS {
+                        paths.insert(path.clone());
+                    }
+                    (count + 1, size + change.size().unwrap_or(0), paths)
+                },
+            );
 
         Self {
             changed_files_count,
             changed_files_size,
+            changed_paths,
         }
     }
 }
@@ -125,6 +141,7 @@ struct PlainCommitInfo {
     repo_name: String,
     is_public: bool,
     changeset_id: ChangesetId,
+    author: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     bubble_id: Option<NonZeroU64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,6 +168,7 @@ struct PlainCommitInfo {
     pusher_main_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     globalrev: Option<Globalrev>,
+    changed_paths: Vec<String>,
 }
 
 impl PlainCommitInfo {
@@ -163,29 +181,42 @@ impl PlainCommitInfo {
     ) -> Result<PlainCommitInfo> {
         let CommitInfo {
             changeset_id,
+            changeset_author,
             bubble_id,
             diff_id,
             changed_files_info:
                 ChangedFilesInfo {
                     changed_files_count,
                     changed_files_size,
+                    changed_paths,
                 },
         } = commit_info;
         let repo_id = repo.repo_identity().id().id();
         let repo_name = repo.repo_identity().name().to_string();
-        let parents = repo
-            .commit_graph()
-            .changeset_parents(ctx, changeset_id)
-            .await?
-            .to_vec();
-        let generation = repo
-            .commit_graph()
-            .changeset_generation(ctx, changeset_id)
-            .await?;
-        let globalrev = repo
-            .bonsai_globalrev_mapping()
-            .get_globalrev_from_bonsai(ctx, changeset_id)
-            .await?;
+        let (parents, generation, globalrev) = futures::try_join!(
+            async {
+                anyhow::Ok(
+                    repo.commit_graph()
+                        .changeset_parents(ctx, changeset_id)
+                        .await?
+                        .to_vec(),
+                )
+            },
+            async {
+                anyhow::Ok(
+                    repo.commit_graph()
+                        .changeset_generation(ctx, changeset_id)
+                        .await?,
+                )
+            },
+            async {
+                anyhow::Ok(
+                    repo.bonsai_globalrev_mapping()
+                        .get_globalrev_from_bonsai(ctx, changeset_id)
+                        .await?,
+                )
+            },
+        )?;
         let user_unix_name = ctx.metadata().unix_name().map(|un| un.to_string());
         let user_identities = ctx.metadata().identities().clone();
         let source_hostname = ctx.metadata().client_hostname().map(|hn| hn.to_string());
@@ -201,11 +232,17 @@ impl PlainCommitInfo {
             pusher_main_id = cri.main_id.clone();
         }
 
+        let changed_paths = changed_paths
+            .iter()
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>();
+
         Ok(PlainCommitInfo {
             repo_id,
             repo_name,
             is_public,
             changeset_id,
+            author: changeset_author,
             bubble_id,
             diff_id,
             changed_files_count,
@@ -221,6 +258,7 @@ impl PlainCommitInfo {
             pusher_entry_point,
             pusher_main_id,
             globalrev,
+            changed_paths,
         })
     }
 }
@@ -241,10 +279,12 @@ impl Loggable for PlainCommitInfo {
             .set_repo_name(self.repo_name.clone())
             .set_is_public(self.is_public)
             .set_changeset_id(self.changeset_id.to_string())
+            .set_author(self.author.clone())
             .set_parents(self.parents.iter().map(ToString::to_string).collect())
             .set_generation(self.generation.value() as i64)
             .set_changed_files_count(self.changed_files_count as i64)
             .set_changed_files_size(self.changed_files_size as i64)
+            .set_changed_paths(self.changed_paths.clone())
             .set_pusher_identities(
                 self.user_identities
                     .iter()
@@ -405,6 +445,7 @@ mod test {
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
     use repo_identity::RepoIdentity;
+    use tests_utils::CreateCommitContext;
     use tests_utils::bookmark;
     use tests_utils::drawdag::create_from_dag;
 
@@ -533,6 +574,28 @@ mod test {
                 *mapping.get("D").unwrap(),
             }
         );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_commit_info_preserves_changeset_author(fb: FacebookInit) -> Result<(), Error> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: Repo = test_repo_factory::build_empty(fb).await?;
+        let author = "Test User <test@meta.com>";
+        let cs_id = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("README", "init")
+            .set_author(author)
+            .commit()
+            .await?;
+        let bcs = cs_id.load(&ctx, &repo.repo_blobstore).await?;
+
+        let commit_info = CommitInfo::new(&bcs, None);
+        assert_eq!(commit_info.changeset_author, author);
+
+        let plain_commit_info =
+            PlainCommitInfo::new(&ctx, &repo, Utc::now(), None, commit_info).await?;
+        assert_eq!(plain_commit_info.author, author);
 
         Ok(())
     }

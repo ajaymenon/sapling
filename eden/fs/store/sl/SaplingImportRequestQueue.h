@@ -11,6 +11,7 @@
 #include <folly/Try.h>
 #include <folly/container/F14Map.h>
 #include <folly/coro/Task.h>
+#include <folly/coro/safe/NowTask.h>
 #include <condition_variable>
 #include <mutex>
 #include <vector>
@@ -37,11 +38,6 @@ class SaplingImportRequestQueue {
   ImmediateFuture<BlobPtr> enqueueBlob(
       std::shared_ptr<SaplingImportRequest> request);
 
-  /**
-   * Enqueue a blob request to the queue.
-   *
-   * Return a future that will complete when the blob request completes.
-   */
   folly::coro::Task<BlobPtr> co_enqueueBlob(
       std::shared_ptr<SaplingImportRequest> request);
 
@@ -53,6 +49,9 @@ class SaplingImportRequestQueue {
   ImmediateFuture<TreePtr> enqueueTree(
       std::shared_ptr<SaplingImportRequest> request);
 
+  folly::coro::now_task<TreePtr> co_enqueueTree(
+      std::shared_ptr<SaplingImportRequest> request);
+
   /**
    * Enqueue a blob aux data request to the queue.
    *
@@ -60,6 +59,9 @@ class SaplingImportRequestQueue {
    * completes.
    */
   ImmediateFuture<BlobAuxDataPtr> enqueueBlobAux(
+      std::shared_ptr<SaplingImportRequest> request);
+
+  folly::coro::Task<BlobAuxDataPtr> co_enqueueBlobAux(
       std::shared_ptr<SaplingImportRequest> request);
 
   /**

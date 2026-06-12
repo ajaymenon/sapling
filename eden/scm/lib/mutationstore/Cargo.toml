@@ -13,8 +13,8 @@ license = "MIT"
 name = "mutationstore"
 
 [dependencies]
-anyhow = "1.0.98"
-bitflags = { version = "2.9", features = ["serde", "std"], default-features = false }
+anyhow = "1.0.102"
+bitflags = { version = "2.11.1", features = ["serde", "std"], default-features = false }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 sapling-dag = { version = "0.1.0", path = "../dag", features = ["render"] }
 sapling-indexedlog = { version = "0.1.0", path = "../indexedlog" }
@@ -22,8 +22,8 @@ sapling-types = { version = "0.1.0", path = "../types" }
 sapling-vlqencoding = { version = "0.1.0", path = "../vlqencoding" }
 
 [dev-dependencies]
-rand = { version = "0.8", features = ["small_rng"] }
-rand_chacha = "0.3"
+rand = "0.10.1"
+rand_chacha = "0.10"
 sapling-drawdag = { version = "0.1.0", path = "../drawdag" }
 sapling-types = { version = "0.1.0", path = "../types", features = ["for-tests"], default-features = false }
-tempfile = "3.22"
+tempfile = "3.27.0"

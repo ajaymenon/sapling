@@ -17,6 +17,7 @@ use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use thiserror::Error;
 use type_macros::auto_wire;
+use types::RepoPathBuf;
 use types::hgid::HgId;
 use types::hgid::NULL_ID;
 use types::key::Key;
@@ -76,6 +77,7 @@ pub struct TreeEntry {
     pub parents: Option<Parents>,
     pub children: Option<Vec<Result<TreeChildEntry, SaplingRemoteApiServerError>>>,
     pub tree_aux_data: Option<TreeAuxData>,
+    pub has_acl: Option<bool>,
 }
 
 impl TreeEntry {
@@ -106,6 +108,11 @@ impl TreeEntry {
 
     pub fn with_tree_aux_data<'a>(&'a mut self, tree_aux_data: TreeAuxData) -> &'a mut Self {
         self.tree_aux_data = Some(tree_aux_data);
+        self
+    }
+
+    pub fn with_has_acl<'a>(&'a mut self, has_acl: bool) -> &'a mut Self {
+        self.has_acl = Some(has_acl);
         self
     }
 
@@ -189,6 +196,7 @@ pub struct TreeChildDirectoryEntry {
     // See above comment warning about using a RepoPathBuf to represent a PathComponent.
     pub key: Key,
     pub tree_aux_data: Option<TreeAuxData>,
+    pub has_acl: Option<bool>,
 }
 
 impl TreeChildEntry {
@@ -199,10 +207,11 @@ impl TreeChildEntry {
         })
     }
 
-    pub fn new_directory_entry(key: Key, aux_data: TreeAuxData) -> Self {
+    pub fn new_directory_entry(key: Key, aux_data: TreeAuxData, has_acl: Option<bool>) -> Self {
         TreeChildEntry::Directory(TreeChildDirectoryEntry {
             key,
             tree_aux_data: Some(aux_data),
+            has_acl,
         })
     }
 }
@@ -245,18 +254,22 @@ impl TryFrom<AugmentedTree> for TreeEntry {
                         .into(),
                     )),
                     AugmentedTreeEntry::DirectoryNode(tree) => {
-                        Ok(TreeChildEntry::new_directory_entry(
-                            Key {
+                        Ok(TreeChildEntry::Directory(TreeChildDirectoryEntry {
+                            key: Key {
                                 hgid: tree.treenode,
                                 path: path.into(),
                             },
-                            DirectoryMetadata {
+                            tree_aux_data: Some(DirectoryMetadata {
                                 augmented_manifest_id: Blake3::from_another(
                                     tree.augmented_manifest_id,
                                 ),
                                 augmented_manifest_size: tree.augmented_manifest_size,
-                            },
-                        ))
+                            }),
+                            // AugmentedDirectoryNode (client-side) does not carry
+                            // acl_manifest_directory_id — populated via wire format
+                            // when served by SLAPI.
+                            has_acl: Some(tree.has_acl),
+                        }))
                     }
                 })
                 .collect::<Result<Vec<_>, TreeError>>()?
@@ -294,6 +307,7 @@ impl Arbitrary for TreeEntry {
             // Recursive TreeEntry in children causes stack overflow in QuickCheck
             children: None,
             tree_aux_data: None,
+            has_acl: Arbitrary::arbitrary(g),
         }
     }
 }
@@ -385,4 +399,55 @@ pub struct UploadTreeRequest {
 pub struct UploadTreeResponse {
     #[id(1)]
     pub token: UploadToken,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct CheckManifestPermissionRequest {
+    #[id(1)]
+    pub manifest_ids: Vec<HgId>,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct CheckManifestPermissionResponse {
+    #[id(1)]
+    pub manifest_id: HgId,
+    /// Whether the caller has access to this manifest.
+    #[id(2)]
+    pub has_access: bool,
+    /// ACL to request access through. Present when has_access is false.
+    // TODO(T248658346): change this to a vector so manifest permission
+    // responses can expose every request ACL that covers the manifest.
+    #[id(3)]
+    pub request_acl: Option<String>,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct CheckPathPermissionRequest {
+    #[id(1)]
+    pub hg_cs_id: HgId,
+    #[id(2)]
+    pub paths: Vec<RepoPathBuf>,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct CheckPathPermissionResponse {
+    #[id(1)]
+    pub path: RepoPathBuf,
+    /// Whether the caller has access to this path.
+    #[id(2)]
+    pub has_access: bool,
+    /// ACLs to request access through (one per restriction covering this path).
+    #[id(3)]
+    pub request_acls: Vec<String>,
+    /// Repo region ACLs that govern access to this path.
+    #[id(4)]
+    pub repo_region_acls: Vec<String>,
 }

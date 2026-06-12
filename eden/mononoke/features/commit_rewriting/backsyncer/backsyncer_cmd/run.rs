@@ -22,6 +22,7 @@ use backsyncer::backsync_latest;
 use backsyncer::format_counter;
 use backsyncer::open_backsyncer_dbs;
 use blobrepo_hg::BlobRepoHg;
+use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::Freshness;
 use cloned::cloned;
@@ -37,7 +38,6 @@ use futures::future::FutureExt;
 use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
-use futures::try_join;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_types::HgChangesetId;
@@ -95,7 +95,7 @@ pub(crate) async fn run_backsyncer(
             );
 
             // TODO(ikostia): why do we use discarding ScubaSample for BACKSYNC_ALL?
-            backsync_latest(
+            let (_delay_info, future) = backsync_latest(
                 ctx.as_ref().clone(),
                 commit_sync_data,
                 target_repo_dbs,
@@ -106,8 +106,8 @@ pub(crate) async fn run_backsyncer(
                 Box::new(future::ready(())),
             )
             .boxed()
-            .await?
-            .await;
+            .await?;
+            future.await;
         }
         BacksyncerCommand::Forever => {
             let target_repo_dbs = Arc::new(
@@ -256,15 +256,49 @@ async fn backsync_forever(
             .await?;
 
         if enabled {
-            let delay = calculate_delay(ctx, &commit_sync_data, &target_repo_dbs).await?;
-            log_delay(ctx, &delay, &source_repo_name, &target_repo_name);
-            if delay.remaining_entries == 0 {
-                debug!("no entries remained");
+            let paused = justknobs::eval(
+                "scm/mononoke:cross_repo_pause_backsyncer",
+                None,
+                Some(&target_repo_name),
+            );
+
+            if paused {
+                // Compute stats without doing any sync work
+                let large_repo_id = commit_sync_data.get_source_repo().repo_identity().id();
+                let counter_name = format_counter(&large_repo_id);
+                let counter: BookmarkUpdateLogId = target_repo_dbs
+                    .counters
+                    .get_counter(ctx, &counter_name)
+                    .await?
+                    .unwrap_or(0)
+                    .try_into()?;
+
+                let remaining_entries = commit_sync_data
+                    .get_source_repo()
+                    .bookmark_update_log()
+                    .count_further_bookmark_log_entries(ctx.clone(), counter, None)
+                    .await?;
+
+                let delay_secs = commit_sync_data
+                    .get_source_repo()
+                    .bookmark_update_log()
+                    .read_next_bookmark_log_entries(ctx.clone(), counter, 1, Freshness::MostRecent)
+                    .try_next()
+                    .await?
+                    .map_or(0, |entry| entry.timestamp.since_seconds());
+
+                let delay = Delay {
+                    delay_secs,
+                    remaining_entries,
+                };
+                log_delay(ctx, &delay, &source_repo_name, &target_repo_name);
+                info!(
+                    "Backsyncer paused by JustKnob for {}, delay: {}s, remaining: {}",
+                    target_repo_name, delay_secs, remaining_entries,
+                );
                 tokio::time::sleep(Duration::new(1, 0)).await;
             } else {
-                debug!("backsyncing...");
-
-                commit_only_backsync_future = backsync_latest(
+                let (delay_info, new_future) = backsync_latest(
                     ctx.clone(),
                     commit_sync_data.clone(),
                     target_repo_dbs.clone(),
@@ -274,7 +308,24 @@ async fn backsync_forever(
                     false,
                     commit_only_backsync_future,
                 )
-                .await?
+                .await?;
+
+                let delay = Delay {
+                    delay_secs: delay_info.delay_secs,
+                    remaining_entries: delay_info.remaining_entries,
+                };
+                log_delay(ctx, &delay, &source_repo_name, &target_repo_name);
+                commit_only_backsync_future = new_future;
+
+                if delay.remaining_entries == 0 {
+                    debug!("no entries remained");
+                    tokio::time::sleep(Duration::new(1, 0)).await;
+                } else {
+                    debug!(
+                        "backsyncing {} remaining entries (delay: {}s)",
+                        delay.remaining_entries, delay.delay_secs
+                    );
+                }
             }
         } else {
             debug!("push redirector is disabled");
@@ -296,8 +347,7 @@ fn extract_cs_id_from_sync_outcome(
         Some(NotSyncCandidate(_)) => Ok(None),
         Some(EquivalentWorkingCopyAncestor(cs_id, _)) => Ok(Some(cs_id)),
         None => Err(format_err!(
-            "sync outcome is not available for {}",
-            source_cs_id
+            "sync outcome is not available for {source_cs_id}"
         )),
     }
 }
@@ -332,40 +382,6 @@ impl Delay {
             remaining_entries: 0,
         }
     }
-}
-
-// Returns logs delay and returns the number of remaining bookmark update log entries
-async fn calculate_delay(
-    ctx: &CoreContext,
-    commit_sync_data: &CommitSyncData<Repo>,
-    target_repo_dbs: &TargetRepoDbs,
-) -> Result<Delay, Error> {
-    let TargetRepoDbs { counters, .. } = target_repo_dbs;
-    let source_repo_id = commit_sync_data.get_source_repo().repo_identity().id();
-
-    let counter_name = format_counter(&source_repo_id);
-    let maybe_counter = counters.get_counter(ctx, &counter_name).await?;
-    let counter = maybe_counter
-        .ok_or_else(|| format_err!("{} counter not found", counter_name))?
-        .try_into()?;
-    let source_repo = commit_sync_data.get_source_repo();
-    let next_entry = source_repo
-        .bookmark_update_log()
-        .read_next_bookmark_log_entries(ctx.clone(), counter, 1, Freshness::MostRecent)
-        .try_collect::<Vec<_>>();
-    let remaining_entries = source_repo
-        .bookmark_update_log()
-        .count_further_bookmark_log_entries(ctx.clone(), counter, None);
-
-    let (next_entry, remaining_entries) = try_join!(next_entry, remaining_entries)?;
-    let delay_secs = next_entry
-        .first()
-        .map_or(0, |entry| entry.timestamp.since_seconds());
-
-    Ok(Delay {
-        delay_secs,
-        remaining_entries,
-    })
 }
 
 fn log_delay(ctx: &CoreContext, delay: &Delay, source_repo_name: &str, target_repo_name: &str) {

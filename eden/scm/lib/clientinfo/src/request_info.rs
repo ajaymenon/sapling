@@ -11,7 +11,7 @@ use std::fmt::Display;
 use anyhow::Result;
 use anyhow::anyhow;
 use once_cell::sync::Lazy;
-use rand::Rng;
+use rand::RngExt as _;
 use rand::distr::Alphanumeric;
 use rand::rng;
 use serde::Deserialize;
@@ -105,6 +105,8 @@ pub enum ClientEntryPoint {
     ScsServer,
     ScmQuery,
     ScmQueryClientLib,
+    ScmQueryWebAdapter,
+    ScmQueryWeb,
     #[serde(rename = "EdenApi", alias = "SaplingRemoteApi")]
     SaplingRemoteApi,
     LandService,
@@ -122,7 +124,6 @@ pub enum ClientEntryPoint {
     MegarepoForwardsyncer,
     MononokeAdmin,
     GitImport,
-    RemoteGitImport,
     #[serde(rename = "EdenApiReplay", alias = "SaplingRemoteApiReplay")]
     SaplingRemoteApiReplay,
     MononokeCasSync,
@@ -199,6 +200,8 @@ impl Display for ClientEntryPoint {
             ClientEntryPoint::ScsServer => "scs",
             ClientEntryPoint::ScmQuery => "scm_query",
             ClientEntryPoint::ScmQueryClientLib => "scm_query_client_lib",
+            ClientEntryPoint::ScmQueryWebAdapter => "scm_query_web_adapter",
+            ClientEntryPoint::ScmQueryWeb => "scm_query_web",
             ClientEntryPoint::SaplingRemoteApi => "eden_api",
             ClientEntryPoint::LandService => "landservice",
             ClientEntryPoint::LfsServer => "lfs",
@@ -215,7 +218,6 @@ impl Display for ClientEntryPoint {
             ClientEntryPoint::MononokeAdmin => "mononoke_admin",
             ClientEntryPoint::DiffService => "diff_service",
             ClientEntryPoint::GitImport => "git_import",
-            ClientEntryPoint::RemoteGitImport => "remote_git_import",
             ClientEntryPoint::SaplingRemoteApiReplay => "eden_api_replay",
             ClientEntryPoint::MononokeCasSync => "mononoke_re_cas_sync",
             ClientEntryPoint::ModernSync => "modern_sync",
@@ -230,7 +232,7 @@ impl Display for ClientEntryPoint {
             ClientEntryPoint::MononokeCasNewCommitTailer => "mononoke_cas_new_commit_tailer",
             ClientEntryPoint::Tests => "tests",
         };
-        write!(f, "{}", out)
+        write!(f, "{out}")
     }
 }
 
@@ -245,6 +247,8 @@ impl TryFrom<&str> for ClientEntryPoint {
             "scs" => Ok(ClientEntryPoint::ScsServer),
             "scm_query" => Ok(ClientEntryPoint::ScmQuery),
             "scm_query_client_lib" => Ok(ClientEntryPoint::ScmQueryClientLib),
+            "scm_query_web_adapter" => Ok(ClientEntryPoint::ScmQueryWebAdapter),
+            "scm_query_web" => Ok(ClientEntryPoint::ScmQueryWeb),
             "eden_api" => Ok(ClientEntryPoint::SaplingRemoteApi),
             "landservice" => Ok(ClientEntryPoint::LandService),
             "lfs" => Ok(ClientEntryPoint::LfsServer),
@@ -261,7 +265,6 @@ impl TryFrom<&str> for ClientEntryPoint {
             "mononoke_admin" => Ok(ClientEntryPoint::MononokeAdmin),
             "diff_service" => Ok(ClientEntryPoint::DiffService),
             "git_import" => Ok(ClientEntryPoint::GitImport),
-            "remote_git_import" => Ok(ClientEntryPoint::RemoteGitImport),
             "eden_api_replay" => Ok(ClientEntryPoint::SaplingRemoteApiReplay),
             "mononoke_re_cas_sync" => Ok(ClientEntryPoint::MononokeCasSync),
             "modern_sync" => Ok(ClientEntryPoint::ModernSync),
@@ -417,10 +420,6 @@ mod tests {
         assert_eq!(
             Some(ClientEntryPoint::GitImport),
             ClientEntryPoint::try_from(ClientEntryPoint::GitImport.to_string().as_ref()).ok()
-        );
-        assert_eq!(
-            Some(ClientEntryPoint::RemoteGitImport),
-            ClientEntryPoint::try_from(ClientEntryPoint::RemoteGitImport.to_string().as_ref()).ok()
         );
         assert_eq!(
             Some(ClientEntryPoint::SaplingRemoteApiReplay),

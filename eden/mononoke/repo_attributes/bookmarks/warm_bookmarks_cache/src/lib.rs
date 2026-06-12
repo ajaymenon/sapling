@@ -30,6 +30,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use basename_suffix_skeleton_manifest_v3::RootBssmV3DirectoryId;
 use blame::RootBlameV2;
+use blame::RootBlameV3;
 use bookmarks::ArcBookmarkUpdateLog;
 use bookmarks::ArcBookmarks;
 use bookmarks::BookmarkCategory;
@@ -56,6 +57,7 @@ use context::CoreContext;
 use context::SessionClass;
 use deleted_manifest::RootDeletedManifestV2Id;
 use derived_data_manager::BonsaiDerivable as NewBonsaiDerivable;
+use directory_branch_cluster_manifest::RootDirectoryBranchClusterManifestId;
 use enum_map::EnumMap;
 use fastlog::RootFastlog;
 use filenodes_derivation::FilenodesOnlyPublic;
@@ -211,8 +213,7 @@ impl BookmarkState {
             Ok(())
         } else {
             Err(anyhow!(
-                "The specified requirement is not being tracked: {:?}",
-                requirement
+                "The specified requirement is not being tracked: {requirement:?}"
             ))
         }
     }
@@ -223,8 +224,7 @@ impl BookmarkState {
             RequirementState::At(cs_id) => Ok(Some(cs_id)),
             RequirementState::Unknown => Ok(None),
             RequirementState::NotTracked => Err(anyhow!(
-                "The requirement requested is not being tracked: {:?}",
-                requirement
+                "The requirement requested is not being tracked: {requirement:?}"
             )),
         }
     }
@@ -397,10 +397,16 @@ impl WarmBookmarksCacheBuilder {
                 repo_derived_data.clone(),
                 vec![WarmerTag::Hg, WarmerTag::Git],
             )),
-            DerivableType::FileNodes => {
-                // TODO: add warmer for filenodes
-                None
-            }
+            DerivableType::BlameV3 => Some(create_derived_data_warmer::<RootBlameV3>(
+                &self.ctx,
+                repo_derived_data.clone(),
+                vec![WarmerTag::Hg, WarmerTag::Git],
+            )),
+            DerivableType::FileNodes => Some(create_derived_data_warmer::<FilenodesOnlyPublic>(
+                &self.ctx,
+                repo_derived_data.clone(),
+                vec![WarmerTag::Hg],
+            )),
             DerivableType::HgChangesets => Some(create_derived_data_warmer::<MappedHgChangesetId>(
                 &self.ctx,
                 repo_derived_data.clone(),
@@ -488,8 +494,17 @@ impl WarmBookmarksCacheBuilder {
                     vec![WarmerTag::Hg, WarmerTag::Git],
                 ))
             }
+            DerivableType::DirectoryBranchClusterManifest => {
+                Some(create_derived_data_warmer::<
+                    RootDirectoryBranchClusterManifestId,
+                >(
+                    &self.ctx, repo_derived_data.clone(), vec![WarmerTag::Hg]
+                ))
+            }
+            DerivableType::AclManifests => None,
             DerivableType::TestManifests => None,
             DerivableType::TestShardedManifests => None,
+            DerivableType::HistoryManifests => None,
         }
     }
 
@@ -628,11 +643,24 @@ impl WarmBookmarksCache {
         let notify_sync_start = Arc::new(Notify::new());
         let notify_sync_complete = Arc::new(Notify::new());
 
-        tracing::info!(repo = %repo_identity.name(), "Starting warm bookmark cache updater");
+        let warmer_names = warmers.iter().map(|w| w.name.as_str()).join(", ");
+        tracing::info!(
+            repo = %repo_identity.name(),
+            warmers = %warmer_names,
+            "Starting warm bookmark cache updater"
+        );
+        tracing::info!(
+            repo = %repo_identity.name(),
+            "WBC: creating bookmarks subscription"
+        );
         let sub = bookmarks
             .create_subscription(ctx, Freshness::MaybeStale)
             .await
             .context("Error creating bookmarks subscription")?;
+        tracing::info!(
+            repo = %repo_identity.name(),
+            "WBC: bookmarks subscription created, starting init_bookmarks"
+        );
 
         let bookmarks_to_watch = init_bookmarks(
             ctx,
@@ -644,6 +672,11 @@ impl WarmBookmarksCache {
         )
         .instrument(tracing::info_span!("init bookmarks", repo = %repo_identity.name()))
         .await?;
+        tracing::info!(
+            repo = %repo_identity.name(),
+            bookmark_count = bookmarks_to_watch.len(),
+            "WBC: init_bookmarks completed, spawning coordinator"
+        );
 
         let bookmarks_to_watch = Arc::new(RwLock::new(bookmarks_to_watch));
 
@@ -661,6 +694,10 @@ impl WarmBookmarksCache {
             receiver,
             notify_sync_start.clone(),
             notify_sync_complete.clone(),
+        );
+        tracing::info!(
+            repo = %repo_identity.name(),
+            "WBC: coordinator spawned, warm bookmarks cache ready"
         );
 
         Ok(Self {
@@ -684,7 +721,7 @@ impl ScopedBookmarksCache for WarmBookmarksCache {
         Ok(self
             .bookmarks
             .read()
-            .map_err(|e| anyhow!("Failed to take bookmarks lock: {:#?}", e))?
+            .map_err(|e| anyhow!("Failed to take bookmarks lock: {e:#?}"))?
             .get(bookmark)
             .map(|state| state.get(scope))
             .transpose()?
@@ -702,7 +739,7 @@ impl ScopedBookmarksCache for WarmBookmarksCache {
         let bookmarks = self
             .bookmarks
             .read()
-            .map_err(|e| anyhow!("Failed to take bookmarks lock: {:#?}", e))?;
+            .map_err(|e| anyhow!("Failed to take bookmarks lock: {e:#?}"))?;
 
         if prefix.is_empty() && *pagination == BookmarkPagination::FromStart && limit.is_none() {
             // Simple case: return all bookmarks
@@ -1009,8 +1046,7 @@ impl WarmState {
             }
             TagStatus::Untracked => {
                 return Err(anyhow!(
-                    "WarmState.apply() called on non-tracked tag {:?}",
-                    tag
+                    "WarmState.apply() called on non-tracked tag {tag:?}"
                 ));
             }
         };
@@ -1062,7 +1098,7 @@ async fn warm_all(ctx: &CoreContext, cs_id: ChangesetId, warmers: &[Warmer]) -> 
                     scuba.log_with_msg("Warmer succeed", None);
                 }
                 Err(err) => {
-                    scuba.log_with_msg("Warmer failed", Some(format!("{:#}", err)));
+                    scuba.log_with_msg("Warmer failed", Some(format!("{err:#}")));
                 }
             }
             res
@@ -1442,8 +1478,7 @@ impl BookmarksCoordinator {
                 "scm/mononoke:wbc_update_by_scribe_tailer",
                 None,
                 Some(&repo_name),
-            )
-            .unwrap_or(false);
+            );
             let mut bookmark_update_subscriber = tailing_enabled
                 .then(|| {
                     self.repo
@@ -1488,21 +1523,16 @@ impl BookmarksCoordinator {
                         notify_sync_complete.notify_waiters();
                     }
 
-                    const FALLBACK_WBC_POLL_INTERVAL_MS: u64 = 5000;
-                    let delay = Duration::from_millis(
-                        justknobs::get_as::<u64>(
-                            "scm/mononoke:warm_bookmark_cache_poll_interval_ms",
-                            None,
-                        )
-                        .unwrap_or(FALLBACK_WBC_POLL_INTERVAL_MS),
-                    );
+                    let delay = Duration::from_millis(justknobs::get_as::<u64>(
+                        "scm/mononoke:warm_bookmark_cache_poll_interval_ms",
+                        None,
+                    ));
 
                     let tailing_enabled = justknobs::eval(
                         "scm/mononoke:wbc_update_by_scribe_tailer",
                         None,
                         Some(&repo_name),
-                    )
-                    .unwrap_or(false);
+                    );
 
                     // Receiving a sync notification interrupts sleep/listen and forces
                     // waiting for all updaters to finish in the next iteration
@@ -1528,6 +1558,9 @@ impl BookmarksCoordinator {
             .boxed();
 
             let _ = select(infinite_loop, terminate).await;
+
+            // Reset the gauge so fb303/ODS stop reporting the last value indefinitely after shutdown.
+            STATS::max_staleness_secs.set_value(ctx.fb, 0, (repo_name.clone(),));
 
             tracing::info!("Stopped warm bookmark cache updater");
         }
@@ -1971,7 +2004,7 @@ mod tests {
 
         for i in 1..50 {
             let new_master = CreateCommitContext::new(&ctx, &repo, vec!["master"])
-                .add_file(format!("{}", i).as_str(), "content")
+                .add_file(format!("{i}").as_str(), "content")
                 .commit()
                 .await?;
 
@@ -2030,7 +2063,7 @@ mod tests {
         // First history threshold is 10. Let's make sure we don't have off-by one errors
         for i in 0..10 {
             let new_master = CreateCommitContext::new(&ctx, &repo, vec!["master"])
-                .add_file(format!("{}", i).as_str(), "content")
+                .add_file(format!("{i}").as_str(), "content")
                 .commit()
                 .await?;
 
@@ -2165,7 +2198,7 @@ mod tests {
         tracing::info!("created stack of commits");
         for i in 1..10 {
             let master = CreateCommitContext::new(&ctx, &repo, vec!["master"])
-                .add_file(format!("somefile{}", i).as_str(), "content")
+                .add_file(format!("somefile{i}").as_str(), "content")
                 .commit()
                 .await?;
             tracing::info!("created {}", master);

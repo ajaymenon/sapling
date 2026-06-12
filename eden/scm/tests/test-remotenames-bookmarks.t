@@ -7,28 +7,27 @@
 # GNU General Public License version 2.
 
   $ eagerepo
-  $ setconfig devel.segmented-changelog-rev-compat=true
 
 # Setup repo
 
-  $ hg init repo
+  $ sl init repo
   $ cd repo
   $ echo foo > a.txt
-  $ hg add a.txt
-  $ hg commit -m a
+  $ sl add a.txt
+  $ sl commit -m a
 
 # Testing bookmark options without args
 
-  $ hg bookmark a
-  $ hg bookmark b
-  $ hg bookmark -v
+  $ sl bookmark a
+  $ sl bookmark b
+  $ sl bookmark -v
      a                         2dcb9139ea49
    * b                         2dcb9139ea49
-  $ hg bookmark --track a
-  $ hg bookmark -v
+  $ sl bookmark --track a
+  $ sl bookmark -v
      a                         2dcb9139ea49
-   * b                         2dcb9139ea49            [a]
-  $ hg bookmark --untrack
-  $ hg bookmark -v
+   * b                         2dcb9139ea49[a]
+  $ sl bookmark --untrack
+  $ sl bookmark -v
      a                         2dcb9139ea49
    * b                         2dcb9139ea49

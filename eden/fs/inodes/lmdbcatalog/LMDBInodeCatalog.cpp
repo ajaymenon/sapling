@@ -56,7 +56,8 @@ std::optional<overlay::OverlayDir> LMDBInodeCatalog::loadAndRemoveOverlayDir(
 
 void LMDBInodeCatalog::saveOverlayDir(
     InodeNumber inodeNumber,
-    overlay::OverlayDir&& odir) {
+    overlay::OverlayDir&& odir,
+    bool /*crashSafe*/) {
   auto deserializedOverlayDir =
       apache::thrift::CompactSerializer::serialize<std::string>(
           std::move(odir));
@@ -85,7 +86,6 @@ std::optional<fsck::InodeInfo> LMDBInodeCatalog::loadInodeInfo(
 InodeNumber LMDBInodeCatalog::scanLocalChanges(
     std::shared_ptr<ReloadableConfig> /*config*/,
     AbsolutePathPiece /*mountPath*/,
-    bool /*windowsSymlinksEnabled*/,
     [[maybe_unused]] InodeCatalog::LookupCallback& /*callback*/) {
   NOT_IMPLEMENTED();
 }

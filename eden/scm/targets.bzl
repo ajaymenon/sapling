@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_genrule", "buck_sh_binary")
-load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:buckconfig.bzl", "read_bool")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
@@ -72,13 +71,13 @@ def rust_python_library(deps = None, include_python_sys = False, include_cpython
     kwargs3["deps"] = deps3
     rust_library(**kwargs3)
 
-def gen_hgpython(hg_target, suffix = ""):
+def gen_slpython(sl_target, suffix = ""):
     if read_bool("fbcode", "mode_win_enabled", False) and "ovr_config//os:windows":
         return buck_genrule(
-            name = "hgpython" + suffix,
+            name = "slpython" + suffix,
             out = "python.exe",
-            bash = "ln -s $(location " + hg_target + ") $OUT",
-            cmd_exe = "mklink $OUT $(location :hg)",
+            bash = "ln -s $(location " + sl_target + ") $OUT",
+            cmd_exe = "mklink $OUT $(location :sl)",
             executable = True,
         )
 
@@ -86,24 +85,25 @@ def gen_hgpython(hg_target, suffix = ""):
     # used sometimes, and that copies the binary into another location rather
     # than actually creating a symlink like in other modes for some reason.
     return buck_sh_binary(
-        name = "hgpython" + suffix,
+        name = "slpython" + suffix,
         main = "run_buck_hgpython.sh",
         resources = [
-            hg_target,
+            sl_target,
         ],
     )
 
 def fetch_as_eden():
     return read_bool("sl", "fetch_as_eden", False)
 
-def hg_binary(name, extra_deps = [], extra_features = [], **kwargs):
+def sl_binary(name, extra_deps = [], extra_features = [], **kwargs):
     rust_binary(
         name = name,
         srcs = glob(["exec/hgmain/src/**/*.rs"]),
         features = [
             "fb",
             "with_chg",
-        ] + extra_features,
+        ]
+        + extra_features,
         link_style = "static",
         linker_flags = select({
             "DEFAULT": [],
@@ -120,10 +120,9 @@ def hg_binary(name, extra_deps = [], extra_features = [], **kwargs):
             "//eden/scm/lib/config/loader:configloader",
             "//eden/scm/lib/commands:commands",
             "//eden/scm/lib/util/atexit:atexit",
-        ] + extra_deps + ([] if rust_oss.is_oss_build() else [
-            "//common/rust/shed/fbinit:fbinit",
-            "//common/rust/cpp_log_spew:cpp_log_spew",
-        ]) + select({
+        ]
+        + extra_deps
+        + select({
             "DEFAULT": [],
             "ovr_config//os:linux": [
                 "fbsource//third-party/rust:dirs",
@@ -149,14 +148,36 @@ def hg_binary(name, extra_deps = [], extra_features = [], **kwargs):
                 "fbsource//third-party/rust:winapi",
             ],
         }),
-        **kwargs
+        **kwargs,
     )
 
-    # Try to override target depth so //eden/scm/tests:hg_run_tests and other
+    # Try to override target depth so //eden/scm/tests:sl_run_tests and other
     # important test targets reliably pick up Python code changes despite target
     # depth greater than 4.
     ci_hint(
         ci_deps = ["fbcode//eden/scm/lib/python-modules:python-modules"],
-        reason = "hg is very close to Python source files despite large target depth",
+        reason = "sl is very close to Python source files despite large target depth",
         target = name,
+    )
+
+# Backwards-compatible aliases
+hg_binary = sl_binary
+
+def gen_hgpython(hg_target, suffix = ""):
+    """Backwards-compatible alias that generates hgpython-named targets."""
+    if read_bool("fbcode", "mode_win_enabled", False) and "ovr_config//os:windows":
+        return buck_genrule(
+            name = "hgpython" + suffix,
+            out = "python.exe",
+            bash = "ln -s $(location " + hg_target + ") $OUT",
+            cmd_exe = "mklink $OUT $(location :hg)",
+            executable = True,
+        )
+
+    return buck_sh_binary(
+        name = "hgpython" + suffix,
+        main = "run_buck_hgpython.sh",
+        resources = [
+            hg_target,
+        ],
     )

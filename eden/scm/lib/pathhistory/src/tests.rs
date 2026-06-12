@@ -24,6 +24,7 @@ use dag::ops::DagAlgorithm;
 use manifest::FileMetadata;
 use manifest::FileType;
 use manifest::Manifest;
+use manifest::PersistOpts;
 use manifest_tree::TreeManifest;
 use sha1::Digest;
 use sha1::Sha1;
@@ -85,11 +86,11 @@ impl TestHistory {
         let mut last_commit_int = 0;
         let mut tree = TreeManifest::ephemeral(Arc::new(this.clone()));
         // Write empty tree.
-        let empty_tree_id = tree.flush().unwrap();
+        let empty_tree_id = Manifest::persist(&mut tree, PersistOpts { parents: &[] }).unwrap();
         for (commit_int, path, content_int, file_type) in input {
             if commit_int > last_commit_int {
                 // Commit last_commit.
-                let tree_id = tree.flush().unwrap();
+                let tree_id = Manifest::persist(&mut tree, PersistOpts { parents: &[] }).unwrap();
                 let mut inner = this.inner.lock().unwrap();
                 inner.commit_to_tree.insert(last_commit_int, tree_id);
                 last_commit_int = commit_int;
@@ -103,7 +104,7 @@ impl TestHistory {
             }
         }
 
-        let tree_id = tree.flush().unwrap();
+        let tree_id = Manifest::persist(&mut tree, PersistOpts { parents: &[] }).unwrap();
         {
             let mut inner = this.inner.lock().unwrap();
             inner.commit_to_tree.insert(last_commit_int, tree_id);
@@ -244,18 +245,10 @@ impl KeyStore for TestHistory {
         }
     }
 
-    fn insert_data(
-        &self,
-        _opts: InsertOpts,
-        _path: &RepoPath,
-        data: &[u8],
-    ) -> anyhow::Result<HgId> {
-        let hgid = compute_sha1(data);
-        self.inner
-            .lock()
-            .unwrap()
-            .trees
-            .insert(hgid, Bytes::copy_from_slice(data));
+    fn insert_data(&self, _opts: InsertOpts, _path: &RepoPath, data: Blob) -> anyhow::Result<HgId> {
+        let data = data.to_bytes();
+        let hgid = compute_sha1(data.as_ref());
+        self.inner.lock().unwrap().trees.insert(hgid, data);
         Ok(hgid)
     }
 
@@ -266,7 +259,7 @@ impl KeyStore for TestHistory {
             .map(|k| format!("{}/{}", &k.hgid.to_hex()[..5], k.path.as_str()))
             .collect::<Vec<_>>()
             .join(", ");
-        let log = format!("Trees: [{}]", log);
+        let log = format!("Trees: [{log}]");
         let mut inner = self.inner.lock().unwrap();
         for key in keys {
             inner.prefetched_trees.insert(key);
@@ -298,7 +291,7 @@ impl ReadRootTreeIds for TestHistory {
             .map(|id| hgid_to_int(*id).to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let log = format!("Commits: [{}]", log);
+        let log = format!("Commits: [{log}]");
         let result = commits
             .into_iter()
             .map(|commit_id| {

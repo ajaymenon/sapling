@@ -26,8 +26,8 @@ metalog.
   >         ml["FOO"] = b"BAR"
   > EOF
 
-  $ setconfig 'hooks.pretxnclose=hg showpending' extensions.ext="$TESTTMP/ext.py"
+  $ setconfig 'hooks.pretxnclose=sl showpending' extensions.ext="$TESTTMP/ext.py"
 
   $ newrepo
-  $ hg triggerpending
+  $ sl triggerpending
   FOO: 'BAR'

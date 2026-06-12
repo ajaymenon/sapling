@@ -7,6 +7,13 @@
 
 #include "eden/fs/privhelper/PrivHelperImpl.h"
 
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
+#include "eden/fs/telemetry/LogEvent.h"
+
+#ifndef _WIN32
+#include <sysexits.h>
+#endif
+
 #include <folly/Exception.h>
 #include <folly/Expected.h>
 #include <folly/File.h>
@@ -123,6 +130,7 @@ class PrivHelperClientImpl : public PrivHelper,
       std::chrono::nanoseconds duration) override;
   Future<folly::Unit> setUseEdenFs(bool useEdenFs) override;
   Future<pid_t> getServerPid() override;
+  Future<NamespaceInfo> getNamespaceInfo(pid_t daemonPid) override;
   Future<pid_t> startFam(
       const std::vector<std::string>& paths,
       const std::string& tmpOutputPath,
@@ -131,6 +139,13 @@ class PrivHelperClientImpl : public PrivHelper,
   Future<StopFileAccessMonitorResponse> stopFam() override;
   Future<folly::Unit> setMemoryPriorityForProcess(pid_t pid, int priority)
       override;
+  Future<folly::Unit> setFuseReadAhead(
+      StringPiece mountPath,
+      uint32_t readAheadKb) override;
+  void setEdenFsEventsLogger(
+      std::shared_ptr<EdenFsEventsLogger> logger) override {
+    edenFsEventsLogger_ = std::move(logger);
+  }
   int stop() override;
   int getRawClientFd() const override {
     auto state = state_.rlock();
@@ -376,6 +391,9 @@ class PrivHelperClientImpl : public PrivHelper,
   std::atomic<uint32_t> nextXid_{1};
   folly::Synchronized<ThreadSafeData> state_;
   pid_t pid_;
+  // Must be set (via setEdenFsEventsLogger) before attachEventBase() is called.
+  // Read from EventBase thread thereafter; do not modify after attach.
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
 
   // sendPending_, and pendingRequests_ are only accessed from the
   // EventBase thread.
@@ -383,19 +401,62 @@ class PrivHelperClientImpl : public PrivHelper,
   PendingRequestMap pendingRequests_;
 };
 
+/**
+ * Parse sanity-check results from a privhelper response and log a
+ * StaleRedirectionCleanup event when stale mounts were found.
+ *
+ * Best-effort: parsing or logging failures are caught so that telemetry
+ * never breaks mount/takeover operations.
+ *
+ * TODO: The response packet header is parsed twice (once by
+ * parseEmptyResponse and once here). Consider refactoring
+ * parseEmptyResponse to return a Cursor positioned after the header.
+ */
+void logSanityCheckResult(
+    const std::shared_ptr<EdenFsEventsLogger>& logger,
+    const UnixSocket::Message& response,
+    const std::string& mountPath) {
+  try {
+    Cursor cursor(&response.data);
+    PrivHelperConn::parsePacket(cursor);
+    auto sanityResult = PrivHelperConn::parseSanityCheckResult(cursor);
+
+    if (logger &&
+        (sanityResult.staleRedirectionMountsFound > 0 ||
+         sanityResult.staleCheckoutMountUnmounted)) {
+      logger->logEvent(
+          StaleRedirectionCleanup{
+              mountPath,
+              sanityResult.staleRedirectionMountsFound,
+              sanityResult.staleRedirectionMountsSucceeded,
+              sanityResult.staleRedirectionMountsFailed,
+              sanityResult.staleCheckoutMountUnmounted});
+    }
+  } catch (const std::exception& ex) {
+    XLOGF(
+        WARN,
+        "Failed to parse sanity check result for {}: {}",
+        mountPath,
+        ex.what());
+  }
+}
+
 Future<File> PrivHelperClientImpl::fuseMount(
     StringPiece mountPath,
     bool readOnly,
     StringPiece vfsType) {
   auto xid = getNextXid();
+  auto mountPathStr = mountPath.str();
   auto request =
       PrivHelperConn::serializeMountRequest(xid, mountPath, readOnly, vfsType);
   return sendAndRecv(xid, std::move(request))
       .thenValue(
-          [](UnixSocket::Message&& response)
+          [mountPathStr = std::move(mountPathStr),
+           logger = edenFsEventsLogger_](UnixSocket::Message&& response)
               -> folly::Future<UnixSocket::Message> {
             PrivHelperConn::parseEmptyResponse(
                 PrivHelperConn::REQ_MOUNT_FUSE, response);
+            logSanityCheckResult(logger, response, mountPathStr);
             return std::move(response);
           })
       .thenValue([](UnixSocket::Message&& response) {
@@ -413,15 +474,20 @@ Future<Unit> PrivHelperClientImpl::nfsMount(
     folly::StringPiece mountPath,
     const NFSMountOptions& options) {
   auto xid = getNextXid();
+  auto mountPathStr = mountPath.str();
   auto request =
       PrivHelperConn::serializeMountNfsRequest(xid, mountPath, options);
 
   return sendAndRecv(xid, std::move(request))
-      .thenValue([](UnixSocket::Message&& response) mutable -> Future<Unit> {
-        PrivHelperConn::parseEmptyResponse(
-            PrivHelperConn::REQ_MOUNT_NFS, response);
-        return folly::unit;
-      });
+      .thenValue(
+          [mountPathStr = std::move(mountPathStr),
+           logger = edenFsEventsLogger_](
+              UnixSocket::Message&& response) mutable -> Future<Unit> {
+            PrivHelperConn::parseEmptyResponse(
+                PrivHelperConn::REQ_MOUNT_NFS, response);
+            logSanityCheckResult(logger, response, mountPathStr);
+            return folly::unit;
+          });
 }
 
 Future<Unit> PrivHelperClientImpl::fuseUnmount(
@@ -491,14 +557,18 @@ Future<Unit> PrivHelperClientImpl::takeoverStartup(
     StringPiece mountPath,
     const vector<string>& bindMounts) {
   auto xid = getNextXid();
+  auto mountPathStr = mountPath.str();
   auto request = PrivHelperConn::serializeTakeoverStartupRequest(
       xid, mountPath, bindMounts);
 
   return sendAndRecv(xid, std::move(request))
-      .thenValue([](UnixSocket::Message&& response) {
-        PrivHelperConn::parseEmptyResponse(
-            PrivHelperConn::REQ_TAKEOVER_STARTUP, response);
-      });
+      .thenValue(
+          [mountPathStr = std::move(mountPathStr),
+           logger = edenFsEventsLogger_](UnixSocket::Message&& response) {
+            PrivHelperConn::parseEmptyResponse(
+                PrivHelperConn::REQ_TAKEOVER_STARTUP, response);
+            logSanityCheckResult(logger, response, mountPathStr);
+          });
 }
 
 Future<Unit> PrivHelperClientImpl::setLogFile(folly::File logFile) {
@@ -545,6 +615,17 @@ Future<pid_t> PrivHelperClientImpl::getServerPid() {
   return sendAndRecv(xid, std::move(request))
       .thenValue([](UnixSocket::Message&& response) {
         return PrivHelperConn::parseGetPidResponse(response);
+      });
+}
+
+Future<NamespaceInfo> PrivHelperClientImpl::getNamespaceInfo(pid_t daemonPid) {
+  auto xid = getNextXid();
+  auto request =
+      PrivHelperConn::serializeGetNamespaceInfoRequest(xid, daemonPid);
+
+  return sendAndRecv(xid, std::move(request))
+      .thenValue([](UnixSocket::Message&& response) {
+        return PrivHelperConn::parseGetNamespaceInfoResponse(response);
       });
 }
 
@@ -604,6 +685,19 @@ Future<Unit> PrivHelperClientImpl::setMemoryPriorityForProcess(
               e.what());
         }
         return folly::unit;
+      });
+}
+
+Future<Unit> PrivHelperClientImpl::setFuseReadAhead(
+    StringPiece mountPath,
+    uint32_t readAheadKb) {
+  auto xid = getNextXid();
+  auto request = PrivHelperConn::serializeSetFuseReadAheadRequest(
+      xid, mountPath, readAheadKb);
+  return sendAndRecv(xid, std::move(request))
+      .thenValue([](UnixSocket::Message&& response) {
+        PrivHelperConn::parseEmptyResponse(
+            PrivHelperConn::REQ_SET_FUSE_READ_AHEAD, response);
       });
 }
 
@@ -777,20 +871,32 @@ startOrConnectToPrivHelper(const UserInfo& userInfo, int argc, char** argv) {
   PrivHelperConn::createConnPair(clientConn, serverConn);
   auto control = opts.inheritDescriptor(
       FileDescriptor(serverConn.release(), FileDescriptor::FDType::Socket));
-  SpawnedProcess proc(
-      {
-          "edenfs_privhelper",
-          // pass down identity information.
-          folly::to<std::string>("--privhelper_uid=", userInfo.getUid()),
-          folly::to<std::string>("--privhelper_gid=", userInfo.getGid()),
-          // pass down the control pipe
-          folly::to<std::string>("--privhelper_fd=", control),
-      },
-      std::move(opts));
+  try {
+    SpawnedProcess proc(
+        {
+            "edenfs_privhelper",
+            // pass down identity information.
+            folly::to<std::string>("--privhelper_uid=", userInfo.getUid()),
+            folly::to<std::string>("--privhelper_gid=", userInfo.getGid()),
+            // pass down the control pipe
+            folly::to<std::string>("--privhelper_fd=", control),
+        },
+        std::move(opts));
 
-  XLOGF(DBG1, "Spawned mount helper process: pid={}", proc.pid());
-  return make_unique<PrivHelperClientImpl>(
-      std::move(clientConn), std::move(proc));
+    XLOGF(DBG1, "Spawned mount helper process: pid={}", proc.pid());
+    return make_unique<PrivHelperClientImpl>(
+        std::move(clientConn), std::move(proc));
+  } catch (const std::system_error& ex) {
+    if (ex.code().value() == EPERM) {
+      XLOG(
+          ERR,
+          "error starting EdenFS: could not start privhelper process. "
+          "This can happen when EdenFS is started in an environment "
+          "that does not allow to launch privileged processes.");
+      _exit(EX_NOPERM);
+    }
+    throw;
+  }
 }
 
 unique_ptr<PrivHelper> createTestPrivHelper(File conn) {
@@ -901,6 +1007,11 @@ class StubPrivHelper final : public PrivHelper {
     return -1;
   }
 
+  Future<NamespaceInfo> getNamespaceInfo(pid_t daemonPid) override {
+    (void)daemonPid;
+    NOT_IMPLEMENTED();
+  }
+
   folly::Future<pid_t> startFam(
       const std::vector<std::string>& paths,
       const std::string& tmpOutputPath,
@@ -919,9 +1030,17 @@ class StubPrivHelper final : public PrivHelper {
 
   folly::Future<folly::Unit> setMemoryPriorityForProcess(
       pid_t pid,
-      int priority) {
+      int priority) override {
     (void)pid;
     (void)priority;
+    NOT_IMPLEMENTED();
+  }
+
+  folly::Future<folly::Unit> setFuseReadAhead(
+      folly::StringPiece mountPath,
+      uint32_t readAheadKb) override {
+    (void)mountPath;
+    (void)readAheadKb;
     NOT_IMPLEMENTED();
   }
 

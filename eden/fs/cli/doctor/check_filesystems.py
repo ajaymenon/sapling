@@ -31,10 +31,11 @@ from eden.fs.cli.doctor.problem import (
 from eden.fs.cli.doctor.util import CheckoutInfo, get_mount_inode_info
 from eden.fs.cli.filesystem import FsUtil
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
-from facebook.eden.constants import DIS_REQUIRE_LOADED, DIS_REQUIRE_MATERIALIZED
-from facebook.eden.ttypes import (
+from eden.fs.service.eden.thrift_types import (
     DebugInvalidateRequest,
     DebugInvalidateResponse,
+    DIS_REQUIRE_LOADED,
+    DIS_REQUIRE_MATERIALIZED,
     EdenError,
     EdenErrorType,
     GetCurrentSnapshotInfoRequest,
@@ -424,7 +425,7 @@ class MaterializedInodesHaveDifferentModeOnDisk(PathsProblem, FixableProblem):
 
     def check_fix(self) -> bool:
         mismatched_modes = []
-        with self._instance.get_thrift_client_legacy() as client:
+        with self._instance.get_thrift_client() as client:
             try:
                 materialized = client.debugInodeStatus(
                     bytes(self._mount),
@@ -506,7 +507,7 @@ class MissingInodesForFiles(PathsProblem, FixableProblem):
         Execute a thrift call to EdenFS to force sync the eden state with the filesystem
         Don't catch errors here, handle them in the caller
         """
-        with self._instance.get_thrift_client_legacy() as client:
+        with self._instance.get_thrift_client() as client:
             result = client.matchFilesystem(
                 MatchFileSystemRequest(
                     mountPoint=MountId(mountPoint=str(self._mount).encode()),
@@ -652,7 +653,7 @@ def check_materialized_are_accessible(
     # This generally always should be [], EdenFS directories should not be able to contain duplicates.
     duplicate_inodes = []
 
-    with instance.get_thrift_client_legacy() as client:
+    with instance.get_thrift_client() as client:
         try:
             materialized = client.debugInodeStatus(
                 bytes(checkout.path),
@@ -665,7 +666,6 @@ def check_materialized_are_accessible(
             return
 
     case_sensitive = checkout.get_config().case_sensitive
-    windows_symlinks_enabled = checkout.get_config().enable_windows_symlinks
     for materialized_dir in materialized:
         materialized_name = os.fsdecode(materialized_dir.path)
         path = Path(materialized_name)
@@ -716,10 +716,7 @@ def check_materialized_are_accessible(
                     continue
 
                 if sys.platform == "win32":
-                    if stat.S_ISLNK(dirent_mode):
-                        if not windows_symlinks_enabled:
-                            dirent_mode = stat.S_IFREG
-                    elif stat.S_ISDIR(dirent_mode):
+                    if stat.S_ISDIR(dirent_mode):
                         # Python considers junctions as directory.
                         import ctypes
 
@@ -732,11 +729,7 @@ def check_materialized_are_accessible(
                             == FILE_ATTRIBUTE_REPARSE_POINT
                         )
                         if is_reparse:
-                            dirent_mode = (
-                                stat.S_IFLNK
-                                if windows_symlinks_enabled
-                                else stat.S_IFREG
-                            )
+                            dirent_mode = stat.S_IFLNK
                         else:
                             dirent_mode = stat.S_IFDIR
 
@@ -820,7 +813,7 @@ def check_loaded_content(
     checkout: EdenCheckout,
     query_prjfs_file: Callable[[Path], PRJ_FILE_STATE],
 ) -> None:
-    with instance.get_thrift_client_legacy() as client:
+    with instance.get_thrift_client() as client:
         try:
             loaded = client.debugInodeStatus(
                 bytes(checkout.path),
@@ -884,7 +877,7 @@ def check_loaded_content(
 
                 sha1 = client.getSHA1(
                     bytes(checkout.path), [bytes(dirent_path)], sync=SyncBehavior()
-                )[0].get_sha1()
+                )[0].sha1
 
                 try:
                     on_disk_sha1 = _compute_file_sha1(checkout.path / dirent_path)
@@ -935,7 +928,7 @@ class HighInodeCountProblemWindowsOrDarwin(Problem, FixableProblem):
 
     def perform_fix(self) -> None:
         """Invalidate all non-materialized inodes."""
-        with self._info.instance.get_thrift_client_legacy() as client:
+        with self._info.instance.get_thrift_client() as client:
             try:
                 self.fix_result = client.debugInvalidateNonMaterialized(
                     DebugInvalidateRequest(
@@ -994,6 +987,7 @@ def check_inode_counts(
         tracker.add_problem(UnknownInodeCountProblem(checkout.path))
         return
 
+    # pyrefly: ignore [bad-argument-type]
     inode_count = total_inode_count(inode_info)
     if inode_count > threshold:
         tracker.add_problem(
@@ -1005,14 +999,14 @@ class HgStatusAndDiffMismatch(PathsProblem):
     def __init__(self, files: List[Path]) -> None:
         super().__init__(
             self.omitPathsDescription(
-                files, " is present as modified in `hg status` but not in `hg diff`"
+                files, " is present as modified in `sl status` but not in `sl diff`"
             ),
             severity=ProblemSeverity.ERROR,
         )
 
 
 def get_modified_files(instance: EdenInstance, checkout: EdenCheckout) -> List[Path]:
-    with instance.get_thrift_client_legacy(timeout=60.0) as client:
+    with instance.get_thrift_client(timeout=60.0) as client:
         # We are required to pass the active FilterId to getScmStatusV2. We
         # can find the active FilterId with GetCurrentSnapshotInfo
         snapshot_info = client.getCurrentSnapshotInfo(
@@ -1020,10 +1014,10 @@ def get_modified_files(instance: EdenInstance, checkout: EdenCheckout) -> List[P
                 mountId=MountId(mountPoint=bytes(checkout.path))
             )
         )
-        rootId = RootIdOptions()
         active_fid = snapshot_info.fid
-        if active_fid is not None:
-            rootId.fid = active_fid
+        rootId = (
+            RootIdOptions(fid=active_fid) if active_fid is not None else RootIdOptions()
+        )
 
         status = client.getScmStatusV2(
             GetScmStatusParams(

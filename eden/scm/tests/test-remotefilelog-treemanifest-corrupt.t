@@ -8,24 +8,24 @@
   $ hginit sane
 
   $ cd master
-  $ cat >> .hg/hgrc <<EOF
+  $ cat >> .sl/config <<EOF
   > [remotefilelog]
   > server=True
   > EOF
   $ echo x > x
-  $ hg commit -qAm x1
-  $ rm -f .hg/store/00manifesttree.i
+  $ sl commit -qAm x1
+  $ rm -f .sl/store/00manifesttree.i
   $ cd ..
 
 Populate the second repository
 
   $ cd sane
-  $ cat >> .hg/hgrc <<EOF
+  $ cat >> .sl/config <<EOF
   > [remotefilelog]
   > server=True
   > EOF
   $ echo x > x
-  $ hg commit -qAm x1
+  $ sl commit -qAm x1
   $ cd ..
 
   $ hgcloneshallow ssh://user@dummy/sane shallow -q

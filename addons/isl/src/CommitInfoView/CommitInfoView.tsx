@@ -34,6 +34,7 @@ import serverAPI from '../ClientToServerAPI';
 import {
   allDiffSummaries,
   codeReviewProvider,
+  effectiveSchemaForCommit,
   latestCommitMessageFields,
 } from '../codeReview/CodeReviewInfo';
 import {submitAsDraft, SubmitAsDraftCheckbox} from '../codeReview/DraftCheckbox';
@@ -69,7 +70,7 @@ import {useUncommittedSelection} from '../partialSelection';
 import platform from '../platform';
 import {CommitPreview, dagWithPreviews, uncommittedChangesWithPreviews} from '../previews';
 import {repoRelativeCwd, useIsIrrelevantToCwd} from '../repositoryData';
-import {selectedCommits} from '../selection';
+import {selectedCommits, selectedCommitsRangeComparison} from '../selection';
 import {authorString, commitByHash, latestHeadCommit, repositoryInfo} from '../serverAPIState';
 import {SplitButton} from '../stackEdit/ui/SplitButton';
 import {SubmitSelectionButton} from '../SubmitSelectionButton';
@@ -94,7 +95,6 @@ import {
 } from './CommitInfoState';
 import {
   applyEditedFields,
-  commitMessageFieldsSchema,
   commitMessageFieldsToString,
   editedMessageSubset,
   findEditedDiffNumber,
@@ -136,6 +136,8 @@ export function CommitInfoSidebar() {
 
 export function MultiCommitInfo({selectedCommits}: {selectedCommits: Array<CommitInfo>}) {
   const commitsWithDiffs = selectedCommits.filter(commit => commit.diffId != null);
+  const commitRangeComparison = useAtomValue(selectedCommitsRangeComparison);
+
   return (
     <div className="commit-info-view-multi-commit" data-testid="commit-info-view">
       <strong className="commit-list-header">
@@ -155,6 +157,9 @@ export function MultiCommitInfo({selectedCommits}: {selectedCommits: Array<Commi
       </div>
       <div className="commit-info-actions-bar">
         <div className="commit-info-actions-bar-right">
+          {commitRangeComparison != null && (
+            <OpenComparisonViewButton comparison={commitRangeComparison} />
+          )}
           <SuggestedRebaseButton
             sources={selectedCommits.map(commit => succeedableRevset(commit.hash))}
           />
@@ -199,7 +204,7 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
   const [editedMessage, setEditedCommitMessage] = useAtom(editedCommitMessages(hashOrHead));
   const uncommittedChanges = useAtomValue(uncommittedChangesWithPreviews);
   const selection = useUncommittedSelection();
-  const schema = useAtomValue(commitMessageFieldsSchema);
+  const schema = useAtomValue(effectiveSchemaForCommit(hashOrHead));
 
   const isFoldPreview = commit.hash.startsWith(FOLD_COMMIT_PREVIEW_HASH_PREFIX);
   const isOptimistic =
@@ -306,18 +311,18 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
               return;
             }
 
-            const setField = (newVal: string) =>
-              setEditedCommitMessage(val => ({
-                ...val,
-                [field.key]: field.type === 'field' ? newVal.split(',') : newVal,
-              }));
-
             let editedFieldValue = editedMessage?.[field.key];
             if (editedFieldValue == null && isCommitMode) {
               // If the field is supposed to edited but not in the editedMessage,
               // it means we're loading from a blank slate. This is when we can load from the commit template.
               editedFieldValue = parsedFields[field.key];
             }
+
+            const setField = (newVal: string) =>
+              setEditedCommitMessage(val => ({
+                ...val,
+                [field.key]: field.type === 'field' ? newVal.split(',') : newVal,
+              }));
 
             return (
               <CommitInfoField
@@ -542,7 +547,7 @@ function ShowingRemoteMessageBanner({
   editedCommitMessageKey: string;
 }) {
   const provider = useAtomValue(codeReviewProvider);
-  const schema = useAtomValue(commitMessageFieldsSchema);
+  const schema = useAtomValue(effectiveSchemaForCommit(commit.hash));
   const runOperation = useRunOperation();
   const syncingEnabled = useAtomValue(messageSyncingEnabledState);
   const syncingOverride = useAtomValue(messageSyncingOverrideState);
@@ -683,7 +688,7 @@ function ActionsBar({
     ((!isCommitMode && isAnythingBeingEdited) || uncommittedChanges.length > 0);
 
   const provider = useAtomValue(codeReviewProvider);
-  const schema = useAtomValue(commitMessageFieldsSchema);
+  const schema = useAtomValue(effectiveSchemaForCommit(isCommitMode ? 'head' : commit.hash));
   const headCommit = useAtomValue(latestHeadCommit);
 
   const messageSyncEnabled = useAtomValue(messageSyncingEnabledState);

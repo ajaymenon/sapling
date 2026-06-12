@@ -8,7 +8,7 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 blobstore = { version = "0.1.0", path = "../../../blobstore" }
 bonsai_git_mapping = { version = "0.1.0", path = "../../../repo_attributes/bonsai_git_mapping" }
 bonsai_globalrev_mapping = { version = "0.1.0", path = "../../../repo_attributes/bonsai_globalrev_mapping" }
@@ -18,13 +18,14 @@ cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rus
 commit_graph = { version = "0.1.0", path = "../../../repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "../../../servers/slapi/slapi_server/context" }
 cross_repo_sync = { version = "0.1.0", path = "../../cross_repo_sync" }
-facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+dbbookmarks = { version = "0.1.0", path = "../../../repo_attributes/bookmarks/dbbookmarks" }
+facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 filenodes = { version = "0.1.0", path = "../../../repo_attributes/filenodes" }
 filestore = { version = "0.1.0", path = "../../../repo_attributes/filestore" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_source_of_truth = { version = "0.1.0", path = "../../../repo_attributes/git_source_of_truth" }
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
 metaconfig_types = { version = "0.1.0", path = "../../../metaconfig/types" }
 mononoke_macros = { version = "0.1.0", path = "../../../common/mononoke_macros" }
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
@@ -41,7 +42,7 @@ scuba_ext = { version = "0.1.0", path = "../../../common/scuba_ext" }
 sql_ext = { version = "0.1.0", path = "../../../common/rust/sql_ext" }
 sql_query_config = { version = "0.1.0", path = "../../../repo_attributes/sql_query_config" }
 thiserror = "2.0.18"
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 wireproto_handler = { version = "0.1.0", path = "../../../servers/slapi/wireproto_handler" }
 
@@ -61,7 +62,7 @@ maplit = "1.0"
 mercurial_derivation = { version = "0.1.0", path = "../../../derived_data/mercurial_derivation" }
 mercurial_types = { version = "0.1.0", path = "../../../mercurial/types" }
 movers = { version = "0.1.0", path = "../movers" }
-pretty_assertions = { version = "1.2", features = ["alloc"], default-features = false }
+pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 rendezvous = { version = "0.1.0", path = "../../../common/rendezvous" }
 sql_construct = { version = "0.1.0", path = "../../../common/sql_construct" }
 synced_commit_mapping = { version = "0.1.0", path = "../synced_commit_mapping" }

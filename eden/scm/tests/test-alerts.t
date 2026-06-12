@@ -1,4 +1,4 @@
-#debugruntest-incompatible
+#inprocess-hg-incompatible
 
   $ newext crash <<EOF
   > from sapling import registrar
@@ -23,7 +23,7 @@ Alerts show in doctor
   > S12345.show_in_isl=False
   > S12345.show_after_crashes_regex=None
   > EOF
-  $ hg doctor 2>&1 | head -3
+  $ sl doctor 2>&1 | head -3
   Ongoing issue
   SEV 4 Test Alert
   This is a test
@@ -53,7 +53,7 @@ Alerts show in backtrace
   > S33333.show-after-crashes-regex=blahblah
   > EOF
 
-  $ hg crash 2>&1 | head -6
+  $ sl crash 2>&1 | head -6
   ** Sapling SCM (version *) has crashed: (glob)
   This crash may be related to an ongoing issue:
   Ongoing issue
@@ -62,7 +62,7 @@ Alerts show in backtrace
   Traceback (most recent call last):
 
 Make sure we see the alert when errorredirect is configured:
-  $ hg crash --config extensions.errorredirect= --config "errorredirect.script=echo redirected"
+  $ sl crash --config extensions.errorredirect= --config "errorredirect.script=echo redirected"
   This crash may be related to an ongoing issue:
   Ongoing issue
   SEV 4 Test Alert in Backtrace
@@ -71,5 +71,5 @@ Make sure we see the alert when errorredirect is configured:
   [255]
 
 Don't show alert with HGPLAIN:
-  $ HGPLAIN=1 hg crash 2>&1 | grep SEV
+  $ HGPLAIN=1 sl crash 2>&1 | grep SEV
   [1]

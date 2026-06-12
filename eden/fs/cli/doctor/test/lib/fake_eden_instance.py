@@ -14,8 +14,9 @@ import stat
 import sys
 import typing
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, Generator, Iterable, List, NamedTuple, Optional, Tuple, Union
 
 import eden.dirstate
 from eden.fs.cli import mtab, version as version_mod
@@ -163,7 +164,6 @@ class FakeEdenInstance(AbstractEdenInstance):
             enable_sqlite_overlay=True,
             use_write_back_cache=False,
             re_use_case="buck2-default",
-            enable_windows_symlinks=False,
             inode_catalog_type=None,
             off_mount_repo_dir=False,
         )
@@ -278,9 +278,7 @@ class FakeEdenInstance(AbstractEdenInstance):
         return 0
 
     def check_health(self) -> HealthStatus:
-        return HealthStatus(
-            self._status._to_py_deprecated(), pid=None, uptime=None, detail=""
-        )
+        return HealthStatus(self._status, pid=None, uptime=None, detail="")
 
     def check_privhelper_connection(self) -> bool:
         return True
@@ -288,8 +286,12 @@ class FakeEdenInstance(AbstractEdenInstance):
     def get_server_build_info(self) -> Dict[str, str]:
         return dict(self._build_info)
 
-    def get_thrift_client_legacy(self, timeout: Optional[float] = None) -> FakeClient:
-        return self._fake_client
+    @contextmanager
+    def get_thrift_client(
+        self, timeout: Optional[float] = None
+    ) -> Generator[FakeClient, None, None]:
+        """Get a mock thrift client for testing."""
+        yield self._fake_client
 
     def get_checkouts(self) -> List[EdenCheckout]:
         results: List[EdenCheckout] = []
@@ -312,6 +314,7 @@ class FakeEdenInstance(AbstractEdenInstance):
         return default
 
     def get_config_strs(self, key: str, default: configutil.Strs) -> configutil.Strs:
+        # pyrefly: ignore [bad-return]
         return self._config.get(key, default)
 
     def get_hg_repo(self, path: Path) -> FakeHgRepo:

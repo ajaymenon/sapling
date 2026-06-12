@@ -6,6 +6,7 @@
  */
 
 use std::cmp::Ordering;
+use std::convert::Infallible;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -69,7 +70,7 @@ impl Delta {
         let mut prev_frag: Option<&Fragment> = None;
         for (i, frag) in frags.iter().enumerate() {
             frag.verify().with_context(|| {
-                MononokeHgError::InvalidFragmentList(format!("invalid fragment {}", i))
+                MononokeHgError::InvalidFragmentList(format!("invalid fragment {i}"))
             })?;
             if let Some(prev) = prev_frag {
                 if frag.start < prev.end {
@@ -196,23 +197,21 @@ struct GenRngWrapper<'a> {
     r#gen: &'a mut Gen,
 }
 
-impl<'a> rand::RngCore for GenRngWrapper<'a> {
-    fn next_u32(&mut self) -> u32 {
-        u32::arbitrary(self.r#gen)
+impl<'a> rand::TryRng for GenRngWrapper<'a> {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(u32::arbitrary(self.r#gen))
     }
 
-    fn next_u64(&mut self) -> u64 {
-        u64::arbitrary(self.r#gen)
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(u64::arbitrary(self.r#gen))
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         for b in dest {
             *b = u8::arbitrary(self.r#gen);
         }
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }
@@ -533,7 +532,7 @@ mod tests {
 
         match apply(text, &delta) {
             Err(_) => {}
-            Ok(res) => panic!("Unexpected success: {:?}", res),
+            Ok(res) => panic!("Unexpected success: {res:?}"),
         }
     }
 
@@ -550,7 +549,7 @@ mod tests {
 
         match apply(text, &delta) {
             Err(_) => {}
-            Ok(res) => panic!("Unexpected success: {:?}", res),
+            Ok(res) => panic!("Unexpected success: {res:?}"),
         }
     }
 

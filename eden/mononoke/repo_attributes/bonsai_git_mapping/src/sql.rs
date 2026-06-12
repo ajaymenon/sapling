@@ -64,15 +64,13 @@ impl RendezVousConnection {
             bonsai: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
-                    "bonsai_git_mapping.bonsai.{}",
-                    name,
+                    "bonsai_git_mapping.bonsai.{name}",
                 ))),
             ),
             git: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
-                    "bonsai_git_mapping.git.{}",
-                    name,
+                    "bonsai_git_mapping.git.{name}",
                 ))),
             ),
         }
@@ -252,18 +250,7 @@ impl BonsaiGitMapping for SqlBonsaiGitMapping {
 
         STATS::left_to_fetch.add_value(left_to_fetch_count);
 
-        let client_correlator = ctx.client_correlator();
-
-        // Callsites that don't require the most recent bookmark value should
-        // read from a replica. More context on D81212709.
-        let disable_primary_fallback = justknobs::eval(
-            "scm/mononoke:disable_bonsai_mapping_read_fallback_to_primary",
-            client_correlator,
-            Some("git"),
-        )
-        .unwrap_or(false);
-
-        if !left_to_fetch.is_empty() && !disable_primary_fallback {
+        if !left_to_fetch.is_empty() {
             STATS::gets_master.add_value(1);
             ctx.perf_counters()
                 .increment_counter(PerfCounterType::SqlReadsMaster);
@@ -421,7 +408,7 @@ async fn select_mapping(
         "scm/mononoke:rendezvous_bonsai_git_mapping",
         ctx.client_correlator(),
         None,
-    )?;
+    );
 
     if use_rendezvous {
         select_mapping_rendezvous(ctx, connection, repo_id, objects).await

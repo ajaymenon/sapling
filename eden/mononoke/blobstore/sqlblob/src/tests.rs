@@ -12,10 +12,9 @@ use borrowed::borrowed;
 use bytes::Bytes;
 use fbinit::FacebookInit;
 use mononoke_macros::mononoke;
-use rand::Rng;
-use rand::RngCore;
-use rand::distributions::Alphanumeric;
-use rand::thread_rng;
+use rand::Rng as _;
+use rand::RngExt as _;
+use rand::distr::Alphanumeric;
 use strum::IntoEnumIterator;
 
 use super::*;
@@ -36,7 +35,7 @@ where
         let ctx = CoreContext::test_mock(fb);
         do_test(ctx, blobstore, test_source)
             .await
-            .with_context(|| format_err!("while testing allow_inline {}", allow_inline))?;
+            .with_context(|| format_err!("while testing allow_inline {allow_inline}"))?;
     }
     Ok(())
 }
@@ -49,15 +48,15 @@ async fn read_write_size(
     test_chunking_methods(fb, put_behaviour, |ctx, bs, _| async move {
         borrowed!(ctx);
         // Generate unique keys.
-        let suffix: String = thread_rng()
+        let suffix: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect();
-        let key = format!("manifoldblob_test_{}", suffix);
+        let key = format!("manifoldblob_test_{suffix}");
 
         let mut bytes_in = vec![0u8; blob_size];
-        thread_rng().fill_bytes(&mut bytes_in);
+        rand::rng().fill_bytes(&mut bytes_in);
 
         let blobstore_bytes = BlobstoreBytes::from_bytes(Bytes::copy_from_slice(&bytes_in));
 
@@ -89,7 +88,7 @@ async fn read_write(fb: FacebookInit) -> Result<(), Error> {
             let blob_size: usize = size.try_into()?;
             read_write_size(fb, put_behaviour, blob_size)
                 .await
-                .with_context(|| format_err!("while testing size {}", size))?;
+                .with_context(|| format_err!("while testing size {size}"))?;
         }
     }
     Ok(())
@@ -100,15 +99,15 @@ async fn double_put(fb: FacebookInit) -> Result<(), Error> {
     test_chunking_methods(fb, DEFAULT_PUT_BEHAVIOUR, |ctx, bs, _| async move {
         borrowed!(ctx);
         // Generate unique keys.
-        let suffix: String = thread_rng()
+        let suffix: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect();
-        let key = format!("manifoldblob_test_{}", suffix);
+        let key = format!("manifoldblob_test_{suffix}");
 
         let mut bytes_in = [0u8; 64];
-        thread_rng().fill_bytes(&mut bytes_in);
+        rand::rng().fill_bytes(&mut bytes_in);
 
         let blobstore_bytes = BlobstoreBytes::from_bytes(Bytes::copy_from_slice(&bytes_in));
 
@@ -136,17 +135,17 @@ async fn overwrite(fb: FacebookInit) -> Result<(), Error> {
     test_chunking_methods(fb, PutBehaviour::Overwrite, |ctx, bs, _| async move {
         borrowed!(ctx);
         // Generate unique keys.
-        let suffix: String = thread_rng()
+        let suffix: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect();
-        let key = format!("manifoldblob_test_{}", suffix);
+        let key = format!("manifoldblob_test_{suffix}");
 
         let mut bytes_1 = [0u8; 64];
-        thread_rng().fill_bytes(&mut bytes_1);
+        rand::rng().fill_bytes(&mut bytes_1);
         let mut bytes_2 = [0u8; 32];
-        thread_rng().fill_bytes(&mut bytes_2);
+        rand::rng().fill_bytes(&mut bytes_2);
 
         let blobstore_bytes_1 = BlobstoreBytes::from_bytes(Bytes::copy_from_slice(&bytes_1));
         let blobstore_bytes_2 = BlobstoreBytes::from_bytes(Bytes::copy_from_slice(&bytes_2));
@@ -170,21 +169,21 @@ async fn dedup(fb: FacebookInit) -> Result<(), Error> {
     test_chunking_methods(fb, DEFAULT_PUT_BEHAVIOUR, |ctx, bs, _| async move {
         borrowed!(ctx);
         // Generate unique keys.
-        let suffix: String = thread_rng()
+        let suffix: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect();
-        let key1 = format!("manifoldblob_test_{}", suffix);
-        let suffix: String = thread_rng()
+        let key1 = format!("manifoldblob_test_{suffix}");
+        let suffix: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect();
-        let key2 = format!("manifoldblob_test_{}", suffix);
+        let key2 = format!("manifoldblob_test_{suffix}");
 
         let mut bytes_in = [0u8; 64];
-        thread_rng().fill_bytes(&mut bytes_in);
+        rand::rng().fill_bytes(&mut bytes_in);
 
         let blobstore_bytes = BlobstoreBytes::from_bytes(Bytes::copy_from_slice(&bytes_in));
 
@@ -227,21 +226,21 @@ async fn link(fb: FacebookInit) -> Result<(), Error> {
     test_chunking_methods(fb, DEFAULT_PUT_BEHAVIOUR, |ctx, bs, _| async move {
         borrowed!(ctx);
         // Generate unique keys.
-        let suffix: String = thread_rng()
+        let suffix: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect();
-        let key1 = format!("manifoldblob_test_{}", suffix);
-        let suffix: String = thread_rng()
+        let key1 = format!("manifoldblob_test_{suffix}");
+        let suffix: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect();
-        let key2 = format!("manifoldblob_test_{}", suffix);
+        let key2 = format!("manifoldblob_test_{suffix}");
 
         let mut bytes_in = [0u8; 64];
-        thread_rng().fill_bytes(&mut bytes_in);
+        rand::rng().fill_bytes(&mut bytes_in);
 
         let blobstore_bytes = BlobstoreBytes::from_bytes(Bytes::copy_from_slice(&bytes_in));
 
@@ -291,28 +290,28 @@ async fn link(fb: FacebookInit) -> Result<(), Error> {
 async fn generations(fb: FacebookInit) -> Result<(), Error> {
     for auto_inline_puts in [true, false] {
         // Generate unique keys.
-        let suffix: String = thread_rng()
+        let suffix: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect();
-        let key1 = format!("manifoldblob_test_{}", suffix);
-        let suffix: String = thread_rng()
+        let key1 = format!("manifoldblob_test_{suffix}");
+        let suffix: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect();
-        let key2 = format!("manifoldblob_test_{}", suffix);
+        let key2 = format!("manifoldblob_test_{suffix}");
 
         let blobstore_bytes_inline = {
             let mut bytes_in = [0u8; MAX_INLINE_LEN as usize];
-            thread_rng().fill_bytes(&mut bytes_in);
+            rand::rng().fill_bytes(&mut bytes_in);
             BlobstoreBytes::from_bytes(Bytes::copy_from_slice(&bytes_in))
         };
 
         let blobstore_bytes = {
             let mut bytes_in = [0u8; 1024];
-            thread_rng().fill_bytes(&mut bytes_in);
+            rand::rng().fill_bytes(&mut bytes_in);
             BlobstoreBytes::from_bytes(Bytes::copy_from_slice(&bytes_in))
         };
 
@@ -339,9 +338,7 @@ async fn generations(fb: FacebookInit) -> Result<(), Error> {
                 assert_eq!(
                     generations,
                     vec![Some(2)],
-                    "Generation set to 2 {} {}",
-                    auto_inline_puts,
-                    value_len
+                    "Generation set to 2 {auto_inline_puts} {value_len}"
                 );
             } else {
                 assert_eq!(

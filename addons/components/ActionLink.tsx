@@ -5,24 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import * as stylex from '@stylexjs/stylex';
-
-const styles = stylex.create({
-  button: {
-    display: 'flex',
-    alignItems: 'center',
-    fontSize: '12px',
-    color: 'var(--vscode-descriptionForeground)',
-    whiteSpace: 'nowrap',
-    cursor: 'pointer',
-    gap: '5px',
-    boxSizing: 'border-box',
-    borderBottom: {
-      default: '1px solid transparent',
-      ':hover': '1px solid var(--vscode-editor-foreground)',
-    },
-  },
-});
+import css from './ActionLink.module.css';
 
 export default function ActionLink({
   onClick,
@@ -34,7 +17,7 @@ export default function ActionLink({
   children: React.ReactNode;
 }) {
   return (
-    <div {...stylex.props(styles.button)} onClick={() => onClick()} title={title}>
+    <div className={css.button} onClick={() => onClick()} title={title}>
       {children}
     </div>
   );

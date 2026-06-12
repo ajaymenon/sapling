@@ -12,7 +12,7 @@ name = "dbcommitcloud_test"
 path = "tests/main.rs"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
 bonsai_git_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_git_mapping" }
 bonsai_hg_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_hg_mapping" }
@@ -22,10 +22,10 @@ commit_cloud_helpers = { version = "0.1.0", path = "helpers" }
 commit_cloud_types = { version = "0.1.0", path = "types" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
-facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }

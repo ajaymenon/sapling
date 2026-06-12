@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/Synchronized.h>
+#include <folly/coro/safe/NowTask.h>
 #include <folly/futures/SharedPromise.h>
 #include <chrono>
 #include <optional>
@@ -242,6 +243,12 @@ class FileInode final : public InodeBaseMetadata<FileInodeState> {
 
   ImmediateFuture<Hash32> getBlake3(const ObjectFetchContextPtr& fetchContext);
 
+  folly::coro::now_task<Hash20> co_getSha1(
+      const ObjectFetchContextPtr& fetchContext);
+
+  folly::coro::now_task<Hash32> co_getBlake3(
+      const ObjectFetchContextPtr& fetchContext);
+
   ImmediateFuture<BlobAuxData> getBlobAuxData(
       const ObjectFetchContextPtr& fetchContext,
       bool blake3Required = false);
@@ -331,15 +338,24 @@ class FileInode final : public InodeBaseMetadata<FileInodeState> {
       CacheHint cacheHint = CacheHint::LikelyNeededAgain);
 
   /**
+   * Read the entire file contents, and return them as a string.
+   *
+   * Note that this API generally should only be used for fairly small files.
+   */
+  [[nodiscard]] folly::coro::now_task<std::string> co_readAll(
+      const ObjectFetchContextPtr& fetchContext,
+      CacheHint cacheHint = CacheHint::LikelyNeededAgain);
+
+  /**
    * Read up to size bytes from the file at the specified offset.
    *
-   * Returns a tuple of a BufVec containing the data and a boolean indicating
-   * if the end-of-file was reached.  This may return fewer bytes than
-   * requested.  If the specified offset is at or past the end of the buffer an
-   * empty IOBuf will be returned.  Otherwise between 1 and size bytes will be
-   * returned.  If fewer than size bytes are returned this does *not* guarantee
-   * that the end of the file was reached, the boolean should be checked for
-   * this.
+   * Returns a tuple of a BufVec containing the data and a boolean
+   * indicating if the end-of-file was reached.  This may return fewer bytes
+   * than requested.  If the specified offset is at or past the end of the
+   * buffer an empty IOBuf will be returned.  Otherwise between 1 and size
+   * bytes will be returned.  If fewer than size bytes are returned this
+   * does *not* guarantee that the end of the file was reached, the boolean
+   * should be checked for this.
    *
    * May throw exceptions on error.
    */
@@ -377,6 +393,9 @@ class FileInode final : public InodeBaseMetadata<FileInodeState> {
 #endif // !_WIN32
 
   ImmediateFuture<struct stat> stat(
+      const ObjectFetchContextPtr& context) override;
+
+  folly::coro::now_task<struct stat> co_stat(
       const ObjectFetchContextPtr& context) override;
 
  private:
@@ -451,6 +470,20 @@ class FileInode final : public InodeBaseMetadata<FileInodeState> {
    * runWhileDataLoaded() or runWhileMaterialized() instead.
    */
   [[nodiscard]] ImmediateFuture<BlobPtr> startLoadingData(
+      LockedState state,
+      BlobCache::Interest interest,
+      const ObjectFetchContextPtr& fetchContext);
+
+  /**
+   * Start loading the file data.
+   *
+   * state->tag must be NOT_LOADED when this is called.
+   *
+   * This should normally only be invoked by runWhileDataLoaded() or
+   * runWhileMaterialized().  Most other callers should use
+   * runWhileDataLoaded() or runWhileMaterialized() instead.
+   */
+  [[nodiscard]] folly::coro::now_task<BlobPtr> co_startLoadingData(
       LockedState state,
       BlobCache::Interest interest,
       const ObjectFetchContextPtr& fetchContext);

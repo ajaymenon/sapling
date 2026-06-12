@@ -16,8 +16,12 @@ from typing import Dict, List, Optional, Set
 
 from eden.fs.cli.config import EdenCheckout, EdenInstance
 from eden.fs.cli.util import get_environment_suitable_for_subprocess
-from facebook.eden.constants import STATS_MOUNTS_STATS
-from facebook.eden.ttypes import GetStatInfoParams, MountInodeInfo, MountState
+from eden.fs.service.eden.thrift_types import (
+    GetStatInfoParams,
+    MountInodeInfo,
+    MountState,
+    STATS_MOUNTS_STATS,
+)
 
 
 class CheckoutInfo:
@@ -126,13 +130,13 @@ normal directory not with `eden rm`), and finally running fbclone as normal."""
     if exitcode != 0:
         raise Exception(
             f"""\
-`hg doctor` in the backing repository {backing_repo}
+`sl doctor` in the backing repository {backing_repo}
 failed with exit code {exitcode}. This indicates
 {recommended_remediation}
 
-`hg doctor` stdout:
+`sl doctor` stdout:
 {formatted_out}
-`hg doctor` stderr:
+`sl doctor` stderr:
 {formatted_err}
 """
         )
@@ -142,14 +146,14 @@ failed with exit code {exitcode}. This indicates
     # fixing the issue. So we will just forward this to the user.
     if formatted_err:
         return f"""\
-`hg doctor` attempted to fix something in the backing repo
+`sl doctor` attempted to fix something in the backing repo
 {backing_repo}.
 It may or may not have succeeded. If it does not seem to have fixed things, then
 may be corrupted beyond repair and {recommended_remediation}
 
-`hg doctor` stdout:
+`sl doctor` stdout:
 {formatted_out}
-`hg doctor` stderr:
+`sl doctor` stderr:
 {formatted_err}
 
 """
@@ -215,7 +219,7 @@ def get_mount_inode_info(checkout_info: CheckoutInfo) -> Optional[MountInodeInfo
     Gets current MountInodeInfo from an EdenInstance and CheckoutInfo.
     """
     instance = checkout_info.instance
-    with instance.get_thrift_client_legacy() as client:
+    with instance.get_thrift_client() as client:
         internal_stats = client.getStatInfo(
             GetStatInfoParams(statsMask=STATS_MOUNTS_STATS)
         )
@@ -229,19 +233,13 @@ def get_checkouts_info(instance: EdenInstance) -> Dict[Path, CheckoutInfo]:
     # Get information about the checkouts currently known to the running
     # edenfs process
     try:
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             internal_stats = client.getStatInfo(
                 GetStatInfoParams(statsMask=STATS_MOUNTS_STATS)
             )
             mount_point_info = internal_stats.mountPointInfo or {}
 
             for mount in client.listMounts():
-                # Old versions of edenfs did not return a mount state field.
-                # These versions only listed running mounts, so treat the mount state
-                # as running in this case.
-                mount_state = (
-                    mount.state if mount.state is not None else MountState.RUNNING
-                )
                 path = Path(os.fsdecode(mount.mountPoint))
                 checkout = CheckoutInfo(
                     instance,
@@ -252,7 +250,7 @@ def get_checkouts_info(instance: EdenInstance) -> Dict[Path, CheckoutInfo]:
                         else None
                     ),
                     running_state_dir=Path(os.fsdecode(mount.edenClientPath)),
-                    state=mount_state,
+                    state=mount.state,
                     mount_inode_info=mount_point_info.get(mount.mountPoint),
                 )
                 checkouts[path] = checkout

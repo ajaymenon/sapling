@@ -42,7 +42,7 @@ from . import (
 # Sync status file.  Contains whether the previous sync was successful or not.
 _syncstatusfile = "commitcloudsyncstatus"
 
-_maxomittedheadsoutput = 30
+_maxomittedheadsoutput = 5
 
 _maxomittedbookmarksoutput = 30
 
@@ -106,9 +106,10 @@ def _iscleanrepo(repo):
 @perftrace.tracefunc("Cloud Sync")
 def sync(repo, *args, **kwargs):
     besteffort = kwargs.get("besteffort", False)
+    lockfree = repo.config.get.as_bool("experimental", "lock-free-cloud-sync1", True)
     try:
         with backuplock.trylock(repo) if besteffort else backuplock.lock(repo):
-            if besteffort:
+            if besteffort or lockfree:
                 rc, synced = _sync(repo, *args, **kwargs)
             else:
                 with (
@@ -118,16 +119,16 @@ def sync(repo, *args, **kwargs):
                 ):
                     rc, synced = _sync(repo, *args, **kwargs)
             if synced is not None:
-                with repo.svfs(_syncstatusfile, "w+") as fp:
+                with repo.svfs(_syncstatusfile, "w") as fp:
                     fp.write(("Success" if synced else "Failed").encode())
     except BaseException as e:
-        with repo.svfs(_syncstatusfile, "w+") as fp:
+        with repo.svfs(_syncstatusfile, "w") as fp:
             fp.write(("Exception:\n%s" % e).encode())
         raise
     return rc
 
 
-def _hashrepostate(repo, besteffort=False) -> bytes:
+def _hashrepostate(repo) -> bytes:
     """hash repo states that affect commit cloud sync
 
     Those states are bookmarks, remotenames, visibleheads, as they are synced
@@ -136,16 +137,14 @@ def _hashrepostate(repo, besteffort=False) -> bytes:
     do not trigger a cloud sync.
 
     The hash is used to detect repo changes.
+
+    The callsite might want to call `invalidatemetalog` to force a reload of
+    the latest repo state before calling this function.
     """
     buf = []
-    with (
-        repo.wlock(wait=not besteffort),
-        repo.lock(wait=not besteffort),
-        repo.transaction("cloudsyncmetalog"),
-    ):
-        ml = repo.metalog()
+    ml = repo.metalog()
     for key in ["bookmarks", "remotenames", "visibleheads"]:
-        buf.append(ml.get(key) or b"")
+        buf.append(ml.get_hash(key) or b"")
     return hashlib.sha1(b"".join(buf)).digest()
 
 
@@ -200,7 +199,7 @@ def _sync(
     # Connect to the commit cloud service.
     serv = service.get(ui, repo)
 
-    origrepostate = _hashrepostate(repo, besteffort)
+    origrepostate = _hashrepostate(repo)
 
     remotepath = ccutil.getremotepath(ui)
 
@@ -229,12 +228,13 @@ def _sync(
             clientinfo=service.makeclientinfo(repo, lastsyncstate),
         )
 
+    lockfree = repo.config.get.as_bool("experimental", "lock-free-cloud-sync2", True)
     with (
         repo.ui.configoverride(
             {("treemanifest", "prefetchdraftparents"): False}, "cloudsync"
         ),
-        repo.wlock(wait=not besteffort),
-        repo.lock(wait=not besteffort),
+        repo.wlock(wait=not besteffort, lockfree=lockfree),
+        repo.lock(wait=not besteffort, lockfree=lockfree),
     ):
         synced = False
         attempt = 0
@@ -245,8 +245,9 @@ def _sync(
                 )
             attempt += 1
 
-            with repo.transaction("cloudsync download") as tr:
-                if besteffort and _hashrepostate(repo, besteffort) != origrepostate:
+            repo.invalidatemetalog()
+            with repo.transaction("cloudsync download", lockfree=lockfree) as tr:
+                if besteffort and _hashrepostate(repo) != origrepostate:
                     # Another transaction changed the repository while we were backing
                     # up commits. This may have introduced new commits that also need
                     # backing up.  That transaction should have started its own sync
@@ -282,7 +283,7 @@ def _sync(
 
             # We committed the transaction so that data downloaded from the cloud is
             # committed.  Start a new transaction for uploading the local changes.
-            with repo.transaction("cloudsync upload") as tr:
+            with repo.transaction("cloudsync upload", lockfree=lockfree) as tr:
                 # Send updates to the cloud.  If this fails then we have lost the race
                 # to update the server and must start again.
                 synced, cloudrefs = _submitlocalchanges(
@@ -1028,7 +1029,12 @@ def _checkomissions(repo, lastsyncstate, tr, maxage):
             newomittedremotebookmarks=list(omittedremotebookmarks),
         )
     if changes or remotechanges:
-        with repo.wlock(), repo.lock(), repo.transaction("cloudsync") as tr:
+        lockfree = tr.lockfree
+        with (
+            repo.wlock(lockfree=lockfree),
+            repo.lock(lockfree=lockfree),
+            repo.transaction("cloudsync", lockfree=lockfree) as tr,
+        ):
             if changes:
                 repo._bookmarks.applychanges(repo, tr, changes)
             if remotechanges:

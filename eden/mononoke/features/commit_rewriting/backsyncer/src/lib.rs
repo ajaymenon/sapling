@@ -62,6 +62,7 @@ use cross_repo_sync::CommitSyncData;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
 use cross_repo_sync::sync_commit;
+use dbbookmarks::SqlBookmarks;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
 use futures::Future;
@@ -117,6 +118,7 @@ pub struct Repo(
     RepoCrossRepo,
     RepoBookmarkAttrs,
     dyn Bookmarks,
+    SqlBookmarks,
     dyn BookmarkUpdateLog,
     FilestoreConfig,
     dyn MutableCounters,
@@ -149,6 +151,12 @@ pub enum BacksyncLimit {
     Limit(u64),
 }
 
+#[derive(Debug, Clone)]
+pub struct BacksyncDelayInfo {
+    pub delay_secs: i64,
+    pub remaining_entries: u64,
+}
+
 /// Block until a specific bookmark transaction (identified by its log id) is confirmed to be
 /// backsynced.
 ///
@@ -171,13 +179,10 @@ pub async fn ensure_backsynced<R>(
 where
     R: RepoLike + Send + Sync + Clone + 'static,
 {
-    let timeout = Duration::from_secs(
-        justknobs::get_as::<u64>(
-            "scm/mononoke:defer_to_backsyncer_for_backsync_timeout_seconds",
-            None,
-        )
-        .unwrap_or(60),
-    );
+    let timeout = Duration::from_secs(justknobs::get_as::<u64>(
+        "scm/mononoke:defer_to_backsyncer_for_backsync_timeout_seconds",
+        None,
+    ));
 
     let source_repo_id = commit_sync_data.get_source_repo().repo_identity().id();
     let counter_name = format_counter(&source_repo_id);
@@ -217,7 +222,13 @@ pub async fn backsync_latest<R>(
     sync_context: CommitSyncContext,
     disable_lease: bool,
     commit_only_backsync_future: Box<dyn Future<Output = ()> + Send + Unpin>,
-) -> Result<Box<dyn Future<Output = ()> + Send + Unpin>, Error>
+) -> Result<
+    (
+        BacksyncDelayInfo,
+        Box<dyn Future<Output = ()> + Send + Unpin>,
+    ),
+    Error,
+>
 where
     R: RepoLike + Send + Sync + Clone + 'static,
 {
@@ -254,18 +265,25 @@ where
         .try_collect()
         .await?;
 
+    let delay_info = BacksyncDelayInfo {
+        delay_secs: next_entries
+            .first()
+            .map_or(0, |entry| entry.timestamp.since_seconds()),
+        remaining_entries: next_entries.len() as u64,
+    };
+
     // Before syncing entries, check if cancellation has been
     // requested. If yes, then exit early.
     if cancellation_requested.load(Ordering::Relaxed) {
         info!("sync stopping due to cancellation request");
-        return Ok(commit_only_backsync_future);
+        return Ok((delay_info, commit_only_backsync_future));
     }
 
     if next_entries.is_empty() {
         debug!("nothing to sync");
-        Ok(commit_only_backsync_future)
+        Ok((delay_info, commit_only_backsync_future))
     } else {
-        sync_entries(
+        let future = sync_entries(
             ctx,
             &commit_sync_data,
             target_repo_dbs,
@@ -277,7 +295,8 @@ where
             commit_only_backsync_future,
         )
         .boxed()
-        .await
+        .await?;
+        Ok((delay_info, future))
     }
 }
 
@@ -569,7 +588,7 @@ where
                         .await?;
                     match maybe_outcome {
                         Some(outcome) => Ok(Some((outcome, cs_id))),
-                        None => Err(format_err!("{} hasn't been backsynced yet", cs_id)),
+                        None => Err(format_err!("{cs_id} hasn't been backsynced yet")),
                     }
                 }
                 None => Ok(None),
@@ -583,8 +602,7 @@ where
                 use CommitSyncOutcome::*;
                 match outcome {
                     NotSyncCandidate(_) => Err(format_err!(
-                        "invalid bookmark move: {:?} should not be synced to target repo",
-                        cs_id
+                        "invalid bookmark move: {cs_id:?} should not be synced to target repo"
                     )),
                     RewrittenAs(cs_id, _) | EquivalentWorkingCopyAncestor(cs_id, _) => {
                         Ok(Some(cs_id))
@@ -659,7 +677,7 @@ where
                             Err(err) => {
                                 ctx.scuba().clone().log_with_msg(
                                     "Failed to find draft ancestors for logging",
-                                    Some(format!("{}", err)),
+                                    Some(format!("{err}")),
                                 );
                                 vec![]
                             }

@@ -82,8 +82,8 @@ class remotefilelog:
         meta, metaoffset = filelog.parsemeta(text)
         rawtext, validatehash = self._processflags(text, flags, "write")
 
-        softlimit = self.repo.ui.configbytes("commit", "file-size-limit", "1GB")
-        hardlimit = self.repo.ui.configbytes("devel", "hard-file-size-limit", "10GB")
+        softlimit = self.repo.ui.configbytes("commit", "file-size-limit")
+        hardlimit = self.repo.ui.configbytes("devel", "hard-file-size-limit")
         limit = min(softlimit, hardlimit)
         if len(rawtext) >= limit:
             hint = None
@@ -579,7 +579,7 @@ class remotefileslog(filelog.fileslog):
         if type(self.filestore) is revisionstore.filescmstore:
             metrics = self.filestore.getmetrics()
             for metric, value in metrics:
-                ui.metrics.gauge(metric, value)
+                ui.metrics.inc(metric, value)
 
     TEN_MB = 10 * 1024**2
 

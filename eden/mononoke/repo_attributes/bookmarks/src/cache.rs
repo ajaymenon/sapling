@@ -116,13 +116,11 @@ pub struct CachedBookmarks {
 }
 
 fn ttl() -> Option<Duration> {
-    let ttl_ms = match justknobs::get_as::<i64>("scm/mononoke:bookmarks_cache_ttl_ms", None)
-        .unwrap_or(2000) // if not set use this as default
-        .try_into()
-    {
-        Ok(duration) => duration,
-        Err(_) => return None, // Negative values mean no cache.
-    };
+    let ttl_ms =
+        match justknobs::get_as::<i64>("scm/mononoke:bookmarks_cache_ttl_ms", None).try_into() {
+            Ok(duration) => duration,
+            Err(_) => return None, // Negative values mean no cache.
+        };
 
     Some(Duration::from_millis(ttl_ms))
 }
@@ -761,7 +759,7 @@ mod tests {
 
             match future::select(delay, fut).await {
                 Either::Left((_, b)) => b,
-                Either::Right((r, _)) => panic!("pending request was found: {:?}", r),
+                Either::Right((r, _)) => panic!("pending request was found: {r:?}"),
             }
         })
     }

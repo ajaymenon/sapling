@@ -21,19 +21,19 @@
   > A
   > EOS
 
-  $ hg book -r $C book-C
-  $ hg undo
+  $ sl book -r $C book-C
+  $ sl undo
   undone to *, before book -r * book-C (glob)
-  $ hg undo
+  $ sl undo
   undone to *, before debugdrawdag * (glob)
-  $ hg log -GT '{desc}'
+  $ sl log -GT '{desc}'
   o  B
   │
   o  A
   
-  $ hg redo
+  $ sl redo
   undone to *, before undo (glob)
-  $ hg log -GT '{desc}'
+  $ sl log -GT '{desc}'
   o  C
   │
   │ o  B

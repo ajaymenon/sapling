@@ -6,10 +6,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 cpython = { version = "0.7.2", features = ["python3-sys"], default-features = false }
-fs-err = { version = "3", features = ["tokio"] }
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
+fs-err = { version = "3.3.0", features = ["tokio"] }
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 pypathmatcher = { version = "0.1.0", path = "../pypathmatcher" }
 pystatus = { version = "0.1.0", path = "../pystatus" }
 pytreestate = { version = "0.1.0", path = "../pytreestate" }
@@ -20,6 +20,7 @@ sapling-pathmatcher = { version = "0.1.0", path = "../../../../lib/pathmatcher" 
 sapling-repostate = { version = "0.1.0", path = "../../../../lib/workingcopy/repostate" }
 sapling-sparse = { version = "0.1.0", path = "../../../../lib/sparse" }
 sapling-types = { version = "0.1.0", path = "../../../../lib/types" }
+sapling-vfs = { version = "0.1.0", path = "../../../../lib/vfs" }
 sapling-workingcopy = { version = "0.1.0", path = "../../../../lib/workingcopy" }
 
 [features]

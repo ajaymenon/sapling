@@ -1,5 +1,3 @@
-#debugruntest-incompatible
-(debugruntest fails under buck for some reason)
 #chg-compatible
 
   $ eagerepo
@@ -22,20 +20,20 @@ Set up test environment.
   $ showgraph() {
   >   hg log --graph -T "{desc|firstline}"
   > }
-  $ hg init nextrebase && cd nextrebase
+  $ sl init nextrebase && cd nextrebase
 
 Cannot --rebase and --merge.
-  $ hg next --rebase --merge
+  $ sl next --rebase --merge
   abort: cannot use both --merge and --rebase
   [255]
 
 Build dag with instablility
-  $ hg debugbuilddag -n +4
-  $ hg up 'desc(r1)'
+  $ sl debugbuilddag -n +4
+  $ sl up 'desc(r1)'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m "amended" --no-rebase
-  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
+  $ sl amend -m "amended" --no-rebase
+  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
 
 Check the next behaviour in case of ambiguity between obsolete and non-obsolete
   $ showgraph
@@ -49,11 +47,11 @@ Check the next behaviour in case of ambiguity between obsolete and non-obsolete
   ├─╯
   o  r0
   
-  $ hg prev
+  $ sl prev
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
   [612462] r0
-  $ hg next
-  changeset 61246295ee1e has multiple children, namely:
+  $ sl next
+  commit 61246295ee1e has multiple children, namely:
   [e8ec16] r1
   [12d1da] amended
   choosing the only non-obsolete child: 12d1da2fcedd
@@ -61,10 +59,10 @@ Check the next behaviour in case of ambiguity between obsolete and non-obsolete
   [12d1da] amended
 
 Rebasing single changeset.
-  $ hg next
-  abort: current changeset has no children
+  $ sl next
+  abort: current commit has no children
   [255]
-  $ hg next --rebase
+  $ sl next --rebase
   rebasing 776c07fa2b12 "r2"
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   [08e8e1] r2
@@ -83,18 +81,18 @@ Rebasing single changeset.
   
 Test --clean flag.
   $ touch foo
-  $ hg add foo
-  $ hg status
+  $ sl add foo
+  $ sl status
   A foo
-  $ hg next --rebase
+  $ sl next --rebase
   abort: uncommitted changes
   [255]
-  $ hg next --rebase --clean
+  $ sl next --rebase --clean
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   rebasing 137d867d71d5 "r3"
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   [5a7a75] r3
-  $ hg status
+  $ sl status
   ? foo
   $ showgraph
   @  r3
@@ -108,13 +106,13 @@ Test --clean flag.
 
 Rebasing multiple changesets at once.
   $ reset
-  $ hg debugbuilddag -n +5
-  $ hg up 'desc(r1)'
+  $ sl debugbuilddag -n +5
+  $ sl up 'desc(r1)'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m "amended" --no-rebase
-  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg next --rebase --top
+  $ sl amend -m "amended" --no-rebase
+  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl next --rebase --top
   rebasing 776c07fa2b12 "r2"
   rebasing 137d867d71d5 "r3"
   rebasing daa37004f338 "r4"
@@ -134,17 +132,17 @@ Rebasing multiple changesets at once.
 
 Rebasing a stack one changeset at a time.
   $ reset
-  $ hg debugbuilddag -n +5
-  $ hg up 'desc(r1)'
+  $ sl debugbuilddag -n +5
+  $ sl up 'desc(r1)'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m "amended" --no-rebase
-  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg next --rebase
+  $ sl amend -m "amended" --no-rebase
+  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl next --rebase
   rebasing 776c07fa2b12 "r2"
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   [08e8e1] r2
-  $ hg next --rebase
+  $ sl next --rebase
   rebasing 137d867d71d5 "r3"
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   [5a7a75] r3
@@ -166,7 +164,7 @@ Rebasing a stack one changeset at a time.
   o  r0
   
 
-  $ hg next --rebase
+  $ sl next --rebase
   rebasing daa37004f338 "r4"
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   [6d097e] r4
@@ -184,13 +182,13 @@ Rebasing a stack one changeset at a time.
 
 Rebasing a stack two changesets at a time.
   $ reset
-  $ hg debugbuilddag -n +6
-  $ hg up 'desc(r1)'
+  $ sl debugbuilddag -n +6
+  $ sl up 'desc(r1)'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m "amended" --no-rebase
-  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg next --rebase 2
+  $ sl amend -m "amended" --no-rebase
+  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl next --rebase 2
   rebasing 776c07fa2b12 "r2"
   rebasing 137d867d71d5 "r3"
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
@@ -214,7 +212,7 @@ Rebasing a stack two changesets at a time.
   ├─╯
   o  r0
   
-  $ hg next --rebase 2
+  $ sl next --rebase 2
   rebasing daa37004f338 "r4"
   rebasing 5f333e6f7274 "r5"
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
@@ -235,14 +233,14 @@ Rebasing a stack two changesets at a time.
 
 Rebasing after multiple amends.
   $ reset
-  $ hg debugbuilddag -n +5
-  $ hg up 'desc(r1)'
+  $ sl debugbuilddag -n +5
+  $ sl up 'desc(r1)'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m "amend 1" --no-rebase
-  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg amend -m "amend 2"
-  $ hg amend -m "amend 3"
+  $ sl amend -m "amend 1" --no-rebase
+  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl amend -m "amend 2"
+  $ sl amend -m "amend 3"
   $ showgraph
   @  amend 3
   │
@@ -256,7 +254,7 @@ Rebasing after multiple amends.
   ├─╯
   o  r0
   
-  $ hg next --rebase --top
+  $ sl next --rebase --top
   rebasing 776c07fa2b12 "r2"
   rebasing 137d867d71d5 "r3"
   rebasing daa37004f338 "r4"
@@ -276,13 +274,13 @@ Rebasing after multiple amends.
 
 Rebasing from below the amended changeset with the --newest flag.
   $ reset
-  $ hg debugbuilddag -n +6
-  $ hg up 'desc(r2)'
+  $ sl debugbuilddag -n +6
+  $ sl up 'desc(r2)'
   3 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m "amended" --no-rebase
-  hint[amend-restack]: descendants of 776c07fa2b12 are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 'desc(r0)'
+  $ sl amend -m "amended" --no-rebase
+  hint[amend-restack]: descendants of 776c07fa2b12 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl up 'desc(r0)'
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ showgraph
   o  amended
@@ -299,7 +297,7 @@ Rebasing from below the amended changeset with the --newest flag.
   │
   @  r0
   
-  $ hg next --rebase --top --newest
+  $ sl next --rebase --top --newest
   rebasing 137d867d71d5 "r3"
   rebasing daa37004f338 "r4"
   rebasing 5f333e6f7274 "r5"
@@ -320,16 +318,16 @@ Rebasing from below the amended changeset with the --newest flag.
   
 
 Test aborting due to ambiguity caused by a rebase. The rebase should be
-rolled back and the final state should be as it was before `hg next --rebase`.
+rolled back and the final state should be as it was before `sl next --rebase`.
   $ reset
-  $ hg debugbuilddag -n +6
-  $ hg up 'desc(r1)'
+  $ sl debugbuilddag -n +6
+  $ sl up 'desc(r1)'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m "amended" --no-rebase
-  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
+  $ sl amend -m "amended" --no-rebase
+  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
   $ mkcommit a
-  $ hg prev
+  $ sl prev
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
   [12d1da] amended
   $ showgraph
@@ -349,14 +347,14 @@ rolled back and the final state should be as it was before `hg next --rebase`.
   ├─╯
   o  r0
   
-  $ hg next --rebase
+  $ sl next --rebase
   rebasing 776c07fa2b12 "r2"
-  changeset 12d1da2fcedd has multiple children, namely:
+  commit 12d1da2fcedd has multiple children, namely:
   [ee3138] add a
   [08e8e1] r2
   transaction abort!
   rollback completed
-  abort: ambiguous next changeset
+  abort: ambiguous next commit
   (use the --newest or --towards flags to specify which child to pick)
   [255]
   $ showgraph
@@ -383,13 +381,13 @@ Test a situation where there is a conflict.
   $ mkcommit b
   $ mkcommit c
   $ mkcommit d
-  $ hg up 7c3bad9141dcb46ff89abf5f61856facd56e476c
+  $ sl up 7c3bad9141dcb46ff89abf5f61856facd56e476c
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ echo "conflict" > c
-  $ hg add c
-  $ hg amend -m "amended to add c" --no-rebase
-  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
+  $ sl add c
+  $ sl amend -m "amended to add c" --no-rebase
+  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
   $ showgraph
   @  amended to add c
   │
@@ -401,11 +399,11 @@ Test a situation where there is a conflict.
   ├─╯
   o  add a
   
-  $ hg next --rebase --top
+  $ sl next --rebase --top
   rebasing 4538525df7e2 "add c"
   merging c
-  warning: 1 conflicts while merging c! (edit, then use 'hg resolve --mark')
-  unresolved conflicts (see hg resolve, then hg rebase --continue)
+  warning: 1 conflicts while merging c! (edit, then use 'sl resolve --mark')
+  unresolved conflicts (see sl resolve, then sl rebase --continue)
   [1]
   $ showgraph
   @  amended to add c
@@ -418,19 +416,19 @@ Test a situation where there is a conflict.
   ├─╯
   o  add a
   
-In this mid-rebase state, we can't use `hg previous` or `hg next`:
-  $ hg previous
+In this mid-rebase state, we can't use `sl previous` or `sl next`:
+  $ sl previous
   abort: rebase in progress
-  (use 'hg rebase --continue' to continue or
-       'hg rebase --abort' to abort)
+  (use 'sl rebase --continue' to continue or
+       'sl rebase --abort' to abort)
   [255]
 Now resolve the conflict and resume the rebase.
   $ rm c
   $ echo "resolved" > c
-  $ hg resolve --mark c
+  $ sl resolve --mark c
   (no more unresolved files)
-  continue: hg rebase --continue
-  $ hg rebase --continue
+  continue: sl rebase --continue
+  $ sl rebase --continue
   rebasing 4538525df7e2 "add c"
   $ showgraph
   o  add c
@@ -447,22 +445,22 @@ Now resolve the conflict and resume the rebase.
   
 Rebase when other predecessors are still visible
   $ reset
-  $ hg debugbuilddag -n +4
-  $ hg up 'desc(r1)'
+  $ sl debugbuilddag -n +4
+  $ sl up 'desc(r1)'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m "amended 1" --no-rebase
-  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg next --rebase
+  $ sl amend -m "amended 1" --no-rebase
+  hint[amend-restack]: descendants of e8ec16b776b6 are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl next --rebase
   rebasing 776c07fa2b12 "r2"
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   [006981] r2
-  $ hg prev
+  $ sl prev
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
   [b97f16] amended 1
-  $ hg amend -m "amended 2" --no-rebase
-  hint[amend-restack]: descendants of b97f1630b31f are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
+  $ sl amend -m "amended 2" --no-rebase
+  hint[amend-restack]: descendants of b97f1630b31f are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
   $ showgraph
   @  amended 2
   │
@@ -478,7 +476,7 @@ Rebase when other predecessors are still visible
   ├─╯
   o  r0
   
-  $ hg next --rebase
+  $ sl next --rebase
   rebasing 006981db3170 "r2"
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   [339d4b] r2

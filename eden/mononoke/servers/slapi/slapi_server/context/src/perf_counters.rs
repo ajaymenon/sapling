@@ -79,23 +79,11 @@ define_perf_counters! {
         EdenapiTreesAuxData,
         EdenapiAugmentedTrees,
         EdenapiAugmentedTreesFallback,
-        GetbundleFilenodesTotalWeight,
         GetbundleNumCommits,
         GetbundleNumDrafts,
-        GetbundleNumFilenodes,
-        GetbundleNumManifests,
-        GetbundlePartialTraversal,
-        GetcommitdataNumCommits,
-        GetcommitdataResponseSize,
-        GetpackMaxFileSize,
-        GetpackNumFiles,
         GetpackNumPossibleLFSFiles,
         GetpackPossibleLFSFilesSumSize,
-        GetpackResponseSize,
         FilenodesTooBigHistory,
-        GettreepackDesignatedNodes,
-        GettreepackNumTreepacks,
-        GettreepackResponseSize,
         HgMutationStoreNumAdded,
         HgMutationStoreNumFetched,
         MemcacheHits,
@@ -147,7 +135,6 @@ impl PerfCounterType {
             | CachelibMisses
             | GetpackNumPossibleLFSFiles
             | GetpackPossibleLFSFilesSumSize
-            | GettreepackDesignatedNodes
             | MemcacheHits
             | MemcacheMisses
             | SqlReadsMaster
@@ -184,22 +171,11 @@ impl PerfCounterType {
             | EdenapiTreesAuxData
             | EdenapiAugmentedTrees
             | EdenapiAugmentedTreesFallback
-            | GetbundleFilenodesTotalWeight
             | GetbundleNumCommits
             | GetbundleNumDrafts
-            | GetbundleNumFilenodes
-            | GetbundleNumManifests
-            | GetbundlePartialTraversal
-            | GetcommitdataNumCommits
-            | GetcommitdataResponseSize
-            | GetpackNumFiles
             | GetpackNumPossibleLFSFiles
             | GetpackPossibleLFSFilesSumSize
-            | GetpackResponseSize
             | FilenodesTooBigHistory
-            | GettreepackDesignatedNodes
-            | GettreepackNumTreepacks
-            | GettreepackResponseSize
             | HgMutationStoreNumAdded
             | HgMutationStoreNumFetched
             | MemcacheHits
@@ -225,8 +201,7 @@ impl PerfCounterType {
             | BlobPutsMaxLatency
             | BlobUnlinksMaxLatency
             | BlobGetsMaxSize
-            | BlobPutsMaxSize
-            | GetpackMaxFileSize => PerfCounterTypeUpdateFunc::Max,
+            | BlobPutsMaxSize => PerfCounterTypeUpdateFunc::Max,
         }
     }
 }

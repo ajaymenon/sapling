@@ -11,6 +11,27 @@ import type * as vscode from 'vscode';
 import {URI} from 'vscode-uri';
 export const Uri = URI;
 
+export const env = proxyMissingFieldsWithJestFn({
+  sessionId: 'test-session-id',
+});
+export const window = proxyMissingFieldsWithJestFn({});
+export const languages = proxyMissingFieldsWithJestFn({
+  getDiagnostics: jest.fn().mockReturnValue([]),
+});
+export const commands = proxyMissingFieldsWithJestFn({
+  executeCommand: jest.fn(),
+});
+export const DiagnosticSeverity = {
+  Error: 0,
+  Warning: 1,
+  Information: 2,
+  Hint: 3,
+};
+export const ConfigurationTarget = {
+  Global: 1,
+  Workspace: 2,
+  WorkspaceFolder: 3,
+};
 export const workspace = proxyMissingFieldsWithJestFn({
   workspaceFolders: undefined,
   getConfiguration: () => ({get: jest.fn()}),
@@ -39,7 +60,20 @@ export class ThemeColor {
 }
 
 export class Disposable implements vscode.Disposable {
-  dispose = jest.fn();
+  static from(...disposables: vscode.Disposable[]): vscode.Disposable {
+    return new Disposable(() => {
+      for (const d of disposables) {
+        d.dispose();
+      }
+    });
+  }
+  private callOnDispose?: () => void;
+  constructor(callOnDispose?: () => void) {
+    this.callOnDispose = callOnDispose;
+  }
+  dispose = jest.fn(() => {
+    this.callOnDispose?.();
+  });
 }
 
 // to avoid manually writing jest.fn() for every API,

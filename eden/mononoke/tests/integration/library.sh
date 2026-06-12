@@ -25,6 +25,15 @@ fi
 
 python_fn setup_environment_variables
 
+# Redirect LLVM profiling output to $TESTTMP so coverage-instrumented binaries
+# (e.g. hg) don't write default.profraw into test repo working directories,
+# where it would be picked up by "hg commit -Am" and break test expectations.
+export LLVM_PROFILE_FILE="$TESTTMP/default_%p.profraw"
+
+# Suppress diagnostic info logs from repo initialization facets that would
+# otherwise appear in test output and break .t file expectations.
+export RUST_LOG="${RUST_LOG:-info,repo_factory=WARN,dbbookmarks=WARN,warm_bookmarks_cache=WARN,sqlphases=WARN}"
+
 function urlencode {
   python_fn urlencode "$@"
 }
@@ -63,7 +72,11 @@ function termandwait {
 }
 
 function get_free_socket {
-  "$GET_FREE_SOCKET"
+  # Redirect PAR unpacking to /tmp to avoid Permission denied errors on
+  # SandCastle workers where /dev/shm may be mounted noexec (T262741687).
+  # FB_PAR_UNPACK_BASEDIR controls where the PAR runtime binary is extracted;
+  # PAR_TEMP_DIR alone is insufficient for newer PAR formats.
+  FB_PAR_UNPACK_BASEDIR="${FB_PAR_UNPACK_BASEDIR:-/tmp}" PAR_TEMP_DIR="${PAR_TEMP_DIR:-/tmp}" "$GET_FREE_SOCKET"
 }
 
 ZELOS_PORT=$(get_free_socket)
@@ -95,6 +108,11 @@ function scs_address {
 
 function land_service_address {
   echo -n "$(mononoke_host):$LAND_SERVICE_PORT"
+}
+
+function multi_repo_land_service_address {
+  # shellcheck disable=SC2119
+  echo -n "$(mononoke_host):$MULTI_REPO_LAND_SERVICE_PORT"
 }
 
 function mononoke_git_service_address {
@@ -374,6 +392,10 @@ function flush_mononoke_bookmarks {
   sslcurl -X POST -fsS "https://localhost:$MONONOKE_SOCKET/control/drop_bookmarks_cache"
 }
 
+function sync_mononoke_warm_bookmarks_cache {
+  sslcurl -X POST -fsS "https://localhost:$MONONOKE_SOCKET/control/sync_warm_bookmarks_cache"
+}
+
 function force_update_configerator {
   sslcurl -X POST -fsS "https://localhost:$MONONOKE_SOCKET/control/force_update_configerator"
 }
@@ -533,39 +555,6 @@ function backfill_mapping {
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --tracing-test-format \
     "$@"
-}
-
-function blobimport {
-  local always_log=
-  if [[ "$1" == "--log" ]]; then
-    always_log=1
-    shift
-  fi
-  input="$1"
-  output="$2"
-  shift 2
-  #   input (repo in new format)
-  # --debugexportrevlog--> revlog (repo in old format)
-  # --blobimport--> Mononoke repo
-  local revlog="$input/revlog-export"
-  rm -rf "$revlog"
-  hg --cwd "$input" debugexportrevlog revlog-export
-  GLOG_minloglevel=5 $MONONOKE_BLOBIMPORT \
-    "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" \
-     --repo-id $REPOID \
-     --mononoke-config-path "$TESTTMP/mononoke-config" \
-     --tracing-test-format \
-     "$revlog/.hg" \
-     "$@" > "$TESTTMP/blobimport.out" 2>&1
-  BLOBIMPORT_RC="$?"
-  if [[ $BLOBIMPORT_RC -ne 0 ]]; then
-    cat "$TESTTMP/blobimport.out"
-    # set exit code, otherwise previous cat sets it to 0
-    return "$BLOBIMPORT_RC"
-  elif [[ -n "$always_log" ]]; then
-    cat "$TESTTMP/blobimport.out"
-  fi
 }
 
 function bonsai_verify {
@@ -833,9 +822,118 @@ function start_and_wait_for_land_service {
   wait_for_land_service
 }
 
+function multi_repo_land_service {
+  # Ensure the git_repositories_source_of_truth tables exist. These are normally
+  # created by gitimport but MLR tests may use testtool_drawdag instead.
+  # Schema from repo_attributes/git_source_of_truth/schemas/sqlite-git-repositories-source-of-truth.sql
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" <<'EOSQL'
+CREATE TABLE IF NOT EXISTS source_of_truth_type (
+  source_of_truth VARCHAR(20) PRIMARY KEY NOT NULL,
+  sequence INTEGER NOT NULL
+);
+INSERT OR REPLACE INTO source_of_truth_type (source_of_truth, sequence)
+  VALUES ('mononoke', 1), ('metagit', 2), ('locked', 3);
+CREATE TABLE IF NOT EXISTS git_repositories_source_of_truth (
+  id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+  repo_id INTEGER NOT NULL,
+  repo_name VARCHAR(255) NOT NULL,
+  source_of_truth VARCHAR(20) NOT NULL DEFAULT ('locked')
+    REFERENCES source_of_truth_type (source_of_truth),
+  mutation_id INTEGER DEFAULT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS repo_id_idx
+  ON git_repositories_source_of_truth (repo_id);
+CREATE UNIQUE INDEX IF NOT EXISTS repo_name_idx
+  ON git_repositories_source_of_truth (repo_name);
+CREATE INDEX IF NOT EXISTS source_of_truth_idx
+  ON git_repositories_source_of_truth (source_of_truth);
+CREATE INDEX IF NOT EXISTS mutation_id_idx
+  ON git_repositories_source_of_truth (mutation_id);
+EOSQL
+  rm -f "$TESTTMP/multi_repo_land_service_addr.txt"
+  GLOG_minloglevel=5 \
+    THRIFT_TLS_SRV_CERT="$TEST_CERTDIR/localhost.crt" \
+    THRIFT_TLS_SRV_KEY="$TEST_CERTDIR/localhost.key" \
+    THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
+    THRIFT_TLS_TICKETS="$TEST_CERTDIR/server.pem.seeds" \
+    "$MULTI_REPO_LAND_SERVICE" "$@" \
+    --host "$LOCALIP" \
+    --port 0 \
+    --log-level DEBUG \
+    --mononoke-config-path "$TESTTMP/mononoke-config" \
+    --bound-address-file "$TESTTMP/multi_repo_land_service_addr.txt" \
+    --scuba-log-file "$TESTTMP/multi_repo_land_service_scuba.json" \
+    --tracing-test-format \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" >> "$TESTTMP/multi_repo_land_service.out" 2>&1 &
+  export MULTI_REPO_LAND_SERVICE_PID=$!
+  echo "$MULTI_REPO_LAND_SERVICE_PID" >> "$DAEMON_PIDS"
+}
+
+MONONOKE_MULTI_REPO_LAND_SERVICE_DEFAULT_START_TIMEOUT=60
+
+function wait_for_multi_repo_land_service {
+  export MULTI_REPO_LAND_SERVICE_PORT
+  wait_for_server "Multi-repo land service" MULTI_REPO_LAND_SERVICE_PORT "$TESTTMP/multi_repo_land_service.out" \
+    "${MONONOKE_MULTI_REPO_LAND_SERVICE_START_TIMEOUT:-"$MONONOKE_MULTI_REPO_LAND_SERVICE_DEFAULT_START_TIMEOUT"}" "$TESTTMP/multi_repo_land_service_addr.txt" \
+    sleep 5
+}
+
+function start_and_wait_for_multi_repo_land_service {
+  multi_repo_land_service "$@"
+  wait_for_multi_repo_land_service
+}
+
+function multi_repo_land_service_client {
+  THRIFT_TLS_CL_CERT_PATH="$TEST_CERTDIR/client0.crt" \
+  THRIFT_TLS_CL_KEY_PATH="$TEST_CERTDIR/client0.key" \
+  THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
+  "$MONONOKE_MULTI_REPO_LAND_SERVICE_CLIENT" \
+    --host "$(multi_repo_land_service_address)" \
+    "$@"
+}
+
+function mock_rl_land_service {
+  rm -f "$TESTTMP/mock_rl_land_service_addr.txt"
+  GLOG_minloglevel=5 \
+    THRIFT_TLS_SRV_CERT="$TEST_CERTDIR/localhost.crt" \
+    THRIFT_TLS_SRV_KEY="$TEST_CERTDIR/localhost.key" \
+    THRIFT_TLS_CL_CERT_PATH="$TEST_CERTDIR/client0.crt" \
+    THRIFT_TLS_CL_KEY_PATH="$TEST_CERTDIR/client0.key" \
+    THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
+    THRIFT_TLS_TICKETS="$TEST_CERTDIR/server.pem.seeds" \
+    "$MOCK_RL_LAND_SERVICE" "$@" \
+    --host "$LOCALIP" \
+    --port 0 \
+    --bound-address-file "$TESTTMP/mock_rl_land_service_addr.txt" \
+    --backend-address "$(multi_repo_land_service_address)" \
+    >> "$TESTTMP/mock_rl_land_service.out" 2>&1 &
+  export MOCK_RL_LAND_SERVICE_PID=$!
+  echo "$MOCK_RL_LAND_SERVICE_PID" >> "$DAEMON_PIDS"
+}
+
+MOCK_RL_LAND_SERVICE_DEFAULT_START_TIMEOUT=60
+
+function wait_for_mock_rl_land_service {
+  export MOCK_RL_LAND_SERVICE_PORT
+  wait_for_server "Mock RL land service" MOCK_RL_LAND_SERVICE_PORT "$TESTTMP/mock_rl_land_service.out" \
+    "${MOCK_RL_LAND_SERVICE_START_TIMEOUT:-"$MOCK_RL_LAND_SERVICE_DEFAULT_START_TIMEOUT"}" "$TESTTMP/mock_rl_land_service_addr.txt" \
+    sleep 5
+}
+
+function mock_rl_land_service_address {
+  # shellcheck disable=SC2119
+  echo -n "$(mononoke_host):$MOCK_RL_LAND_SERVICE_PORT"
+}
+
+function start_and_wait_for_mock_rl_land_service {
+  mock_rl_land_service "$@"
+  wait_for_mock_rl_land_service
+}
+
 function _megarepo_async_worker_cmd {
   GLOG_minloglevel=5 \
-    RUST_LOG="warm_bookmarks_cache=WARN" \
+    RUST_LOG="warm_bookmarks_cache=WARN,dbbookmarks=WARN" \
     "$ASYNC_REQUESTS_WORKER" "$@" \
     --log-level INFO \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
@@ -853,6 +951,21 @@ function megarepo_async_worker {
 
 function megarepo_async_worker_foreground {
   _megarepo_async_worker_cmd "$@"
+}
+
+function backfill_worker {
+  GLOG_minloglevel=5 \
+    RUST_LOG="warm_bookmarks_cache=WARN,dbbookmarks=WARN" \
+    "$BACKFILL_WORKER" "$@" \
+    --log-level INFO \
+    --mononoke-config-path "$TESTTMP/mononoke-config" \
+    --scuba-log-file "$TESTTMP/async-worker.json" \
+    --tracing-test-format \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    >> "$TESTTMP/backfill_worker.out" 2>&1 &
+  export BACKFILL_WORKER_PID=$!
+  echo "$BACKFILL_WORKER_PID" >> "$DAEMON_PIDS"
 }
 
 function scsc_as {
@@ -932,7 +1045,8 @@ function lfs_server {
     elif
       [[ "$1" = "--always-wait-for-upstream" ]] ||
       [[ "$1" = "--readonly" ]] ||
-      [[ "$1" = "--git-blob-upload-allowed" ]]
+      [[ "$1" = "--git-blob-upload-allowed" ]] ||
+      [[ "$1" = "--enable-compression-sniff" ]]
     then
       opts=("${opts[@]}" "$1")
       shift
@@ -991,7 +1105,7 @@ function git_client {
 function git_client_as {
   local name="$1"
   shift
-  git -c http.sslCAInfo="$TEST_CERTDIR/root-ca.crt" -c http.sslCert="$TEST_CERTDIR/$name.crt" -c http.sslKey="$TEST_CERTDIR/$name.key" "$@"
+  git -c http.sslCAInfo="$TEST_CERTDIR/root-ca.crt" -c http.sslCert="$TEST_CERTDIR/$name.crt" -c http.sslKey="$TEST_CERTDIR/$name.key" -c push.negotiate=false "$@"
 }
 
 function mononoke_git_service {
@@ -1000,7 +1114,11 @@ function mononoke_git_service {
   bound_addr_file="$TESTTMP/mononoke_git_service_addr.txt"
   log="${TESTTMP}/mononoke_git_service.out"
   rm -f "$bound_addr_file"
-  GLOG_minloglevel=5 "$MONONOKE_GIT_SERVER" "$@" \
+  GLOG_minloglevel=5 \
+    THRIFT_TLS_CL_CERT_PATH="$TEST_CERTDIR/client0.crt" \
+    THRIFT_TLS_CL_KEY_PATH="$TEST_CERTDIR/client0.key" \
+    THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
+    "$MONONOKE_GIT_SERVER" "$@" \
     --tls-ca "$TEST_CERTDIR/root-ca.crt" \
     --tls-private-key "$TEST_CERTDIR/localhost.key" \
     --tls-certificate "$TEST_CERTDIR/localhost.crt" \
@@ -1106,46 +1224,6 @@ EOF
   start_and_wait_for_mononoke_server
 
   hg clone -q mono:"$REPONAME" repo2 --noupdate
-
-  cd repo2 || exit 1
-  cat >> .hg/hgrc <<EOF
-[extensions]
-pushrebase=
-amend=
-EOF
-}
-
-function hook_test_setup_deprecated() {
-  HOOKS_SCUBA_LOGGING_PATH="$TESTTMP/hooks-scuba.json" setup_mononoke_config
-
-  register_hooks "$@"
-
-  setup_common_hg_configs
-  cd "$TESTTMP" || exit 1
-
-  cat >> "$HGRCPATH" <<EOF
-[ui]
-ssh="$DUMMYSSH"
-EOF
-
-  hginit_treemanifest "$REPONAME"
-  cd "$REPONAME" || exit 1
-  drawdag <<EOF
-C
-|
-B
-|
-A
-EOF
-
-  hg bookmark "$HOOKBOOKMARK" -r tip
-
-  cd ..
-  blobimport "$REPONAME"/.hg "$REPONAME"
-
-  hg clone -q mono:"$REPONAME" repo2 --noupdate
-
-  start_and_wait_for_mononoke_server
 
   cd repo2 || exit 1
   cat >> .hg/hgrc <<EOF
@@ -1364,43 +1442,6 @@ function log_globalrev() {
   hg log -G -T "{desc} [{phase};globalrev={globalrev};{node|short}] {remotenames}" "$@" | sed 's/^[ \t]*$/$/'
 }
 
-# Default setup that many of the test use
-function default_setup_pre_blobimport() {
-  setup_common_config "$@"
-
-  cd "$TESTTMP" || exit 1
-
-  cat >> "$HGRCPATH" <<EOF
-[ui]
-ssh="$DUMMYSSH"
-[extensions]
-amend=
-EOF
-
-hginit_treemanifest repo
-cd repo || exit 1
-drawdag <<EOF
-C
-|
-B
-|
-A
-EOF
-
-  hg bookmark "${MASTER_BOOKMARK:-master_bookmark}" -r tip
-
-  echo "hg repo"
-  log -r ":"
-
-  cd .. || exit 1
-}
-
-function default_setup_blobimport() {
-  default_setup_pre_blobimport "$@"
-  echo "blobimporting"
-  blobimport repo/.hg "$REPONAME"
-}
-
 function default_setup() {
   default_setup_drawdag "$@"
   echo "starting Mononoke"
@@ -1471,6 +1512,7 @@ function gitimport() {
     --tls-private-key "$TEST_CERTDIR/client0.key" \
     --tls-certificate "$TEST_CERTDIR/client0.crt" \
     --tracing-test-format \
+    --persist-partial-mappings \
     "$@"
 }
 
@@ -1494,7 +1536,7 @@ function git() {
   GIT_AUTHOR_DATE="${GIT_AUTHOR_DATE:-$date}" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git -c transfer.bundleURI=false -c init.defaultBranch=master_bookmark -c protocol.file.allow=always "$@"
+  command git -c transfer.bundleURI=false -c init.defaultBranch=master_bookmark -c protocol.file.allow=always -c commit.recordPredecessor=false "$@"
 }
 
 function git_set_only_author() {
@@ -1505,7 +1547,7 @@ function git_set_only_author() {
   GIT_AUTHOR_DATE="$date" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git -c init.defaultBranch=master_bookmark -c protocol.file.allow=always "$@"
+  command git -c init.defaultBranch=master_bookmark -c protocol.file.allow=always -c commit.recordPredecessor=false "$@"
 }
 
 function summarize_scuba_json() {
@@ -1539,6 +1581,14 @@ function microwave_builder() {
     "$@"
 }
 
+function derivation_pipeline_tailer {
+  GLOG_minloglevel=5 "$DERIVATION_PIPELINE_TAILER" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --mononoke-config-path "$TESTTMP"/mononoke-config \
+    "$@"
+}
+
 function derived_data_tailer {
   GLOG_minloglevel=5 "$DERIVED_DATA_TAILER" \
     "${CACHE_ARGS[@]}" \
@@ -1558,9 +1608,9 @@ function hook_tailer() {
     "$@"
 }
 
-# quiet <command> - run command and supress all output in case of success
+# quiet <command> - run command and suppress all output in case of success
 #
-# This helper function allows to supress overly verbose logging when there
+# This helper function allows to suppress overly verbose logging when there
 # are no errors but print all the useful stacktraces when there are errors.
 #
 # The function always returns the original command return code.
@@ -1580,9 +1630,9 @@ function quiet() {
   return "$ret"
 }
 
-# quiet_grep <grep_args> -- <command> - run command and supress all output in case of success
+# quiet_grep <grep_args> -- <command> - run command and suppress all output in case of success
 #
-# This helper function allows to supress overly verbose logging when the output
+# This helper function allows to suppress overly verbose logging when the output
 # matches grep expression but display full output otherwise.
 #
 # Full command output is always printed to stderr.

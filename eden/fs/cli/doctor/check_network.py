@@ -31,8 +31,8 @@ MIN_UPLOAD_SPEED = 10.0
 class NetworkSpeedProblem(Problem):
     def __init__(self, output: str) -> None:
         super().__init__(
-            f"Failed to verify speed of connection to eden services: {output}",
-            remediation="Check the speed report in hg debugnetwork --speed",
+            f"Failed to verify speed of connection to eden services:{output}",
+            remediation="Check the speed report in sl debugnetwork --speed",
         )
 
 
@@ -92,6 +92,7 @@ def fmtProblemMessage(
         elif type(errmsg) is str:
             return errmsg
         else:
+            # pyrefly: ignore [missing-attribute]
             decoded = errmsg.decode()
             if len(decoded) == 0:
                 return "None"
@@ -134,7 +135,7 @@ class NetworkChecker:
             tracker.add_problem(
                 ConnectivityProblem(
                     fmtProblemMessage(
-                        "command 'hg debugnetworkdoctor' reported an error:", ex
+                        "command 'sl debugnetworkdoctor' reported an error:", ex
                     )
                 )
             )
@@ -142,7 +143,7 @@ class NetworkChecker:
         except subprocess.TimeoutExpired as ex:
             tracker.add_problem(
                 ConnectivityProblem(
-                    fmtProblemMessage("command 'hg debugnetworkdoctor' timed out:", ex)
+                    fmtProblemMessage("command 'sl debugnetworkdoctor' timed out:", ex)
                 )
             )
             return
@@ -159,7 +160,7 @@ class NetworkChecker:
                 tracker.add_problem(
                     ConnectivityProblem(
                         fmtProblemMessage(
-                            "command 'hg debugnetwork --connection' reported an error:",
+                            "command 'sl debugnetwork --connection' reported an error:",
                             ex,
                         )
                     )
@@ -169,7 +170,7 @@ class NetworkChecker:
                 tracker.add_problem(
                     ConnectivityProblem(
                         fmtProblemMessage(
-                            "command 'hg debugnetwork --connection' timed out:", ex
+                            "command 'sl debugnetwork --connection' timed out:", ex
                         )
                     )
                 )
@@ -189,7 +190,7 @@ class NetworkChecker:
                 tracker.add_problem(
                     ConnectivityProblem(
                         fmtProblemMessage(
-                            f"command 'hg debugnetwork --speed' exceeded timeout of {NETWORK_TIMEOUT}s.\n"
+                            f"command 'sl debugnetwork --speed' exceeded timeout of {NETWORK_TIMEOUT}s.\n"
                             "Your network might be too slow, please check the stdout for more details.\n"
                             f"There should be 2 rounds of download and upload speed tests.",
                             ex,
@@ -216,7 +217,8 @@ class NetworkChecker:
                 return
 
             speed_regex = r"Speed: \(round \d\) (uploaded|downloaded) (.*) MB in (.*) (s|ms|us) \((.*) Mbit/s, (.*) MiB/s\)"
-            speed_outputs = []
+            download_speeds = []
+            upload_speeds = []
             for entry in speed_values[1:5]:
                 speed_str = re.search(speed_regex, entry)
                 if not speed_str:
@@ -224,11 +226,21 @@ class NetworkChecker:
                         NetworkSpeedProblem("Could not get speed statistics")
                     )
                     return
-                speed_outputs.append(float(speed_str.group(5)))
+                speed_mbit = float(speed_str.group(5))
+                if speed_str.group(1) == "downloaded":
+                    download_speeds.append(speed_mbit)
+                else:
+                    upload_speeds.append(speed_mbit)
+
+            if not download_speeds or not upload_speeds:
+                tracker.add_problem(
+                    NetworkSpeedProblem("Could not get speed statistics")
+                )
+                return
 
             # speed numbers taken from fixmywindows
-            avg_download_speed = (speed_outputs[0] + speed_outputs[1]) / 2.0
-            avg_upload_speed = (speed_outputs[2] + speed_outputs[3]) / 2.0
+            avg_download_speed = sum(download_speeds) / len(download_speeds)
+            avg_upload_speed = sum(upload_speeds) / len(upload_speeds)
             if (
                 avg_download_speed < MIN_DOWNLOAD_SPEED
                 or avg_upload_speed < MIN_UPLOAD_SPEED

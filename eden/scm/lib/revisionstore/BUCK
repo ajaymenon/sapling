@@ -5,25 +5,29 @@ oncall("sapling")
 rust_library(
     name = "revisionstore",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "dependencies_override": {"dependencies": {
-            "sapling-minibytes": {"features": ["frombytes"]},
-            "sapling-version": {"path": "../version"},
-        }},
-        "features": {
-            "default": [],
-            "fb": [],
-            "for-tests": [],
+    autocargo = {
+        "cargo_toml_config": {
+            "dependencies_override": {
+                "dependencies": {
+                    "sapling-minibytes": {"features": ["frombytes"]},
+                    "sapling-version": {"path": "../version"},
+                },
+            },
+            "features": {
+                "default": [],
+                "fb": [],
+                "for-tests": [],
+            },
+            "lib": {"name": "revisionstore"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "MIT",
+                "name": "sapling-revisionstore",
+                "repository": "https://github.com/facebook/sapling",
+            },
         },
-        "lib": {"name": "revisionstore"},
-        "package": {
-            "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-            "homepage": "https://sapling-scm.com/",
-            "license": "MIT",
-            "name": "sapling-revisionstore",
-            "repository": "https://github.com/facebook/sapling",
-        },
-    }},
+    },
     crate = "revisionstore",
     features = [
         "fb",
@@ -50,11 +54,12 @@ rust_library(
         "fbsource//third-party/rust:fs-err",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:http",
+        "fbsource//third-party/rust:moka",
         "fbsource//third-party/rust:once_cell",
         "fbsource//third-party/rust:parking_lot",
         "fbsource//third-party/rust:paste",
         "fbsource//third-party/rust:quickcheck",
-        "fbsource//third-party/rust:rand_08",
+        "fbsource//third-party/rust:rand",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_derive",
         "fbsource//third-party/rust:serde_json",
@@ -80,7 +85,6 @@ rust_library(
         "//eden/scm/lib/http-client:http-client",
         "//eden/scm/lib/indexedlog:indexedlog",
         "//eden/scm/lib/lz4-pyframe:lz4-pyframe",
-        "//eden/scm/lib/manifest-augmented-tree:manifest-augmented-tree",
         "//eden/scm/lib/manifest-tree:manifest-tree",
         "//eden/scm/lib/metrics:metrics",
         "//eden/scm/lib/mincode:mincode",
@@ -128,5 +132,6 @@ rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_derive",
         "//common/rust/shed/quickcheck_arbitrary_derive:quickcheck_arbitrary_derive",
+        "//eden/scm/lib/vlqencoding:vlqencoding",
     ],
 )

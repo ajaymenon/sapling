@@ -23,11 +23,11 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use clap::Parser;
 use eden_apfs::*;
 use once_cell::sync::Lazy;
 #[cfg(target_os = "macos")]
 use serde::*;
-use structopt::StructOpt;
 
 #[cfg(feature = "fb")]
 mod facebook;
@@ -37,61 +37,61 @@ const MAX_ADDVOLUME_RETRY: u64 = 3;
 
 static MOUNT: Lazy<SystemCommandImpl> = Lazy::new(|| SystemCommandImpl(PathBuf::from(MOUNT_PATH)));
 
-#[derive(StructOpt, Debug)]
+#[derive(Parser, Debug)]
 enum Opt {
     /// List APFS volumes
-    #[structopt(name = "list")]
+    #[command(name = "list")]
     List {
-        #[structopt(long = "all")]
+        #[arg(long = "all")]
         all: bool,
     },
 
     /// List APFS volumes that are not mounted and not used by any of the active checkouts.
     /// The intent is that `all_checkouts` is produced by `edenfsctl list`.
-    #[structopt(name = "list-stale-volumes")]
+    #[command(name = "list-stale-volumes")]
     ListStaleVolumes {
         all_checkouts: Vec<String>,
-        #[structopt(long = "json")]
+        #[arg(long = "json")]
         json: bool,
     },
 
     /// Mount some space at the specified path.
     /// You must be the owner of the path.
-    #[structopt(name = "mount")]
+    #[command(name = "mount")]
     Mount { mount_point: String },
 
     /// Unmount the eden space from a specific path.
     /// This will only allow unmounting volumes that were created
     /// by this utility.
-    #[structopt(name = "unmount")]
+    #[command(name = "unmount")]
     UnMount {
         /// The mounted path that you wish to unmount
         mount_point: String,
         /// Force the unmount, even if files are open and busy
-        #[structopt(long = "force")]
+        #[arg(long = "force")]
         force: bool,
     },
 
     /// Unmount and delete a volume associated with a specific path.
     /// This will only allow deleting volumes that were created
     /// by this utility
-    #[structopt(name = "delete")]
+    #[command(name = "delete")]
     Delete {
         /// The mounted path that you wish to unmount
         mount_point: String,
     },
 
     /// Unmount and delete all APFS volumes created by this utility
-    #[structopt(name = "delete-all")]
+    #[command(name = "delete-all")]
     DeleteAll {
-        #[structopt(long = "kill_dependent_processes")]
+        #[arg(long = "kill_dependent_processes")]
         kill_dependent_processes: bool,
     },
 
     /// Unmount and delete a volume.
     /// This will only allow deleting volumes that were created
     /// by this utility
-    #[structopt(name = "delete-volume")]
+    #[command(name = "delete-volume")]
     DeleteVolume {
         /// The volume that you wish to delete
         volume: String,
@@ -146,7 +146,7 @@ fn kill_active_pids_in_mounts(mut mount_points: Vec<String>) -> Result<()> {
             output
         ));
     }
-    println!("result: {:?}", output);
+    println!("result: {output:?}");
     Ok(())
 }
 
@@ -207,7 +207,7 @@ fn make_new_volume(apfs_util: &ApfsUtil, name: &str, disk: &str) -> Result<ApfsV
             .args(["apfs", "addVolume", disk, "apfs", name, "-nomount"])
             .output()?;
         if !output.status.success() {
-            anyhow::bail!("failed to execute diskutil addVolume: {:?}", output);
+            anyhow::bail!("failed to execute diskutil addVolume: {output:?}");
         }
         let containers = apfs_util.list_containers()?;
 
@@ -216,7 +216,7 @@ fn make_new_volume(apfs_util: &ApfsUtil, name: &str, disk: &str) -> Result<ApfsV
         } else {
             tried += 1;
             if tried == MAX_ADDVOLUME_RETRY {
-                return Err(anyhow!("failed to create volume `{}`: {:#?}", name, output));
+                return Err(anyhow!("failed to create volume `{name}`: {output:#?}"));
             } else {
                 println!(
                     "APFS subvolume created, but not found in `diskutil apfs list`, retrying."
@@ -246,10 +246,9 @@ fn get_real_uid() -> Result<u32> {
     // We're really root (not just setuid root).  We may actually be
     // running under sudo so let's see what sudo says about the UID
     match std::env::var("SUDO_UID") {
-        Ok(uid) => Ok(uid.parse().context(format!(
-            "parsing the SUDO_UID={} env var as an integer",
-            uid
-        ))?),
+        Ok(uid) => Ok(uid
+            .parse()
+            .context(format!("parsing the SUDO_UID={uid} env var as an integer"))?),
         Err(std::env::VarError::NotPresent) => Ok(uid),
         Err(std::env::VarError::NotUnicode(_)) => bail!("the SUDO_UID env var is not unicode"),
     }
@@ -296,12 +295,12 @@ fn find_disk_for_eden_mount(_mount_point: &str) -> Result<String> {
 
 fn mount_scratch_space_on(apfs_util: &ApfsUtil, input_mount_point: &str) -> Result<()> {
     let mount_point = canonicalize_mount_point_path(input_mount_point)?;
-    println!("want to mount at {:?}", mount_point);
+    println!("want to mount at {mount_point:?}");
 
     // First, let's ensure that mounting at this location makes sense.
     // Inspect the directory and ensure that it is owned by us.
     let metadata = std::fs::metadata(&mount_point)
-        .context(format!("Obtaining filesystem metadata for {}", mount_point))?;
+        .context(format!("Obtaining filesystem metadata for {mount_point}"))?;
     let my_uid = get_real_uid()?;
     if metadata.uid() != my_uid {
         bail!(
@@ -369,7 +368,7 @@ fn mount_scratch_space_on(apfs_util: &ApfsUtil, input_mount_point: &str) -> Resu
             output
         );
     }
-    println!("output: {:?}", output);
+    println!("output: {output:?}");
 
     // Make sure that we own the mounted directory; the default is mounted
     // with root:wheel ownership, and that isn't desirable
@@ -384,11 +383,11 @@ fn mount_scratch_space_on(apfs_util: &ApfsUtil, input_mount_point: &str) -> Resu
 
 fn chown(path: &str, uid: u32, gid: u32) -> Result<()> {
     let cstr = std::ffi::CString::new(path)
-        .with_context(|| format!("creating a C string from path `{}`", path))?;
+        .with_context(|| format!("creating a C string from path `{path}`"))?;
     let rc = unsafe { libc::chown(cstr.as_ptr(), uid, gid) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        Err(err).with_context(|| format!("failed to chown {} to uid={}, gid={}", path, uid, gid))
+        Err(err).with_context(|| format!("failed to chown {path} to uid={uid}, gid={gid}"))
     } else {
         Ok(())
     }
@@ -401,10 +400,7 @@ fn disable_spotlight(mount_point: &str) -> Result<()> {
         .args(["-Ed", "-i", "off", mount_point])
         .output()?;
     if !output.status.success() {
-        eprintln!(
-            "failed to disable spotlight on {}: {:#?}",
-            mount_point, output
-        );
+        eprintln!("failed to disable spotlight on {mount_point}: {output:#?}");
     }
 
     let spotlight = Path::new(mount_point).join(".Spotlight-V100");
@@ -445,7 +441,7 @@ fn disable_trashcan(mount_point: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let opts = Opt::from_args();
+    let opts = Opt::parse();
 
     let apfs_util = ApfsUtil::new(DISKUTIL_PATH, MOUNT_PATH);
 
@@ -487,7 +483,7 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&stale_volume_names)?);
             } else {
                 for name in stale_volume_names.iter() {
-                    println!("{}", name);
+                    println!("{name}");
                 }
             }
             Ok(())
@@ -540,7 +536,7 @@ fn main() -> Result<()> {
                             if let Err(err) =
                                 apfs_util.unmount_scratch(&mount_point, force, &mounts)
                             {
-                                eprintln!("Failed to unmount: {}", err);
+                                eprintln!("Failed to unmount: {err}");
                                 try_delete = false;
                                 was_failure = true;
                             }
@@ -549,10 +545,10 @@ fn main() -> Result<()> {
                         if try_delete {
                             let mount_point = vol.preferred_mount_point().unwrap();
                             if let Err(err) = apfs_util.delete_scratch(&mount_point) {
-                                eprintln!("Failed to delete {:#?}: {}", vol, err);
+                                eprintln!("Failed to delete {vol:#?}: {err}");
                                 was_failure = true
                             } else {
-                                println!("Deleted {}", mount_point);
+                                println!("Deleted {mount_point}");
                             }
                         }
                     }

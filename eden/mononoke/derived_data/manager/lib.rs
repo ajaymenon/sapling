@@ -11,14 +11,19 @@ pub mod context;
 pub mod derivable;
 pub mod error;
 pub mod manager;
+pub mod stage_payload;
 
 pub use mononoke_types::DerivableType;
 
 pub use self::context::DerivationContext;
 pub use self::derivable::BonsaiDerivable;
+pub use self::derivable::DerivableUntopologically;
+pub use self::derivable::PipelineDerivable;
 pub use self::error::DerivationError;
 pub use self::error::SharedDerivationError;
 pub use self::manager::DerivedDataManager;
 pub use self::manager::derive::Rederivation;
 pub use self::manager::derive::VisitedDerivableTypesMap;
 pub use self::manager::derive::VisitedDerivableTypesMapStatic;
+pub use self::stage_payload::DerivationStagePayload;
+pub use self::stage_payload::ManifestStagePayload;

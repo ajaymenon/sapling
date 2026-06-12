@@ -8,8 +8,9 @@
 #pragma once
 
 #include <folly/Synchronized.h>
-#include <folly/coro/Task.h>
+#include <folly/coro/safe/NowTask.h>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <unordered_map>
 
@@ -18,6 +19,7 @@
 
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/RefPtr.h"
+#include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/model/BlobAuxData.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/model/RootId.h"
@@ -33,9 +35,10 @@ namespace facebook::eden {
 
 class Blob;
 class ReloadableConfig;
+class EdenConfig;
 class EdenStats;
 class ProcessInfoCache;
-class StructuredLogger;
+class EdenFsEventsLogger;
 class TreeCache;
 enum class ObjectComparison : uint8_t;
 
@@ -115,9 +118,8 @@ class ObjectStore : public IObjectStore,
       std::shared_ptr<TreeCache> treeCache,
       EdenStatsPtr stats,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
-      std::shared_ptr<StructuredLogger> structuredLogger,
+      std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
       std::shared_ptr<ReloadableConfig> edenConfig,
-      bool windowsSymlinksEnabled,
       CaseSensitivity caseSensitive);
   ~ObjectStore() override;
 
@@ -130,7 +132,7 @@ class ObjectStore : public IObjectStore,
 
   /**
    * send a FetchHeavy log event to Scuba. If either processInfoCache_
-   * or structuredLogger_ is nullptr, this function does nothing.
+   * or edenFsEventsLogger_ is nullptr, this function does nothing.
    */
   void sendFetchHeavyEvent(ProcessId pid, uint64_t fetch_count) const;
 
@@ -189,6 +191,10 @@ class ObjectStore : public IObjectStore,
       const RootId& rootId,
       const ObjectFetchContextPtr& context) const override;
 
+  folly::coro::now_task<GetRootTreeResult> co_getRootTree(
+      const RootId& rootId,
+      const ObjectFetchContextPtr& context) const;
+
   /**
    * Get a TreeEntry by ID
    *
@@ -212,6 +218,10 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const override;
 
+  folly::coro::now_task<std::shared_ptr<const Tree>> co_getTree(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
   /**
    * Get aux data about a tree.
    *
@@ -221,6 +231,10 @@ class ObjectStore : public IObjectStore,
    * other exceptions when TreeAuxData is available but other errors occurred.
    */
   ImmediateFuture<std::optional<TreeAuxData>> getTreeAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
+  folly::coro::now_task<std::optional<TreeAuxData>> co_getTreeAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
@@ -237,8 +251,14 @@ class ObjectStore : public IObjectStore,
 
   /**
    * Returns the DigestHash hash of the contents of the tree with the given ID.
+   *
+   * DEPRECATED: Use co_getTreeDigestHash instead.
    */
   ImmediateFuture<std::optional<Hash32>> getTreeDigestHash(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
+  folly::coro::now_task<std::optional<Hash32>> co_getTreeDigestHash(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
@@ -259,6 +279,10 @@ class ObjectStore : public IObjectStore,
       ObjectIdRange ids,
       const ObjectFetchContextPtr& context) const override;
 
+  folly::coro::now_task<folly::Unit> co_prefetchBlobs(
+      ObjectIdRange ids,
+      const ObjectFetchContextPtr& context) const;
+
   /**
    * Strip the ObjectId to a smaller representation for memory optimization.
    * For example, in SaplingBackingStore, this strips the path portion of the
@@ -277,16 +301,9 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const override;
 
-  /**
-   * Get a Blob by ID.
-   *
-   * This returns a Future object that will produce the Blob when it is ready.
-   * It may result in a std::domain_error if the specified blob ID does not
-   * exist, or possibly other exceptions on error.
-   */
-  folly::coro::Task<std::shared_ptr<const Blob>> co_getBlob(
+  folly::coro::now_task<std::shared_ptr<const Blob>> co_getBlob(
       const ObjectId& id,
-      const ObjectFetchContextPtr& fetchContext) const;
+      const ObjectFetchContextPtr& fetchContext) const override;
 
   /**
    * Get aux data about a Blob.
@@ -296,6 +313,11 @@ class ObjectStore : public IObjectStore,
    * blob does not exist, or possibly other exceptions on error.
    */
   ImmediateFuture<BlobAuxData> getBlobAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context,
+      bool blake3Needed = false) const;
+
+  folly::coro::now_task<BlobAuxData> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context,
       bool blake3Needed = false) const;
@@ -318,6 +340,10 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
+  folly::coro::now_task<uint64_t> co_getBlobSize(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
   /**
    * Returns the SHA-1 hash of the contents of the blob with the given ID.
    */
@@ -329,6 +355,14 @@ class ObjectStore : public IObjectStore,
    * Returns the Blake3 hash of the contents of the blob with the given ID.
    */
   ImmediateFuture<Hash32> getBlobBlake3(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
+  folly::coro::now_task<Hash20> co_getBlobSha1(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
+  folly::coro::now_task<Hash32> co_getBlobBlake3(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
@@ -352,11 +386,34 @@ class ObjectStore : public IObjectStore,
       const std::vector<std::string>& prefixes,
       const ObjectFetchContextPtr& context) const;
 
+  folly::coro::now_task<BackingStore::GetGlobFilesResult> co_getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const std::vector<std::string>& prefixes,
+      const ObjectFetchContextPtr& context) const;
+
+  /**
+   * Check whether the caller has access to the given manifest ID,
+   * but only if the TTL since lastCheck has expired. Returns true
+   * if access is allowed, false if denied or TTL not yet expired.
+   * The TTL is controlled by the acl:restricted-tree-ttl-seconds config.
+   */
+  ImmediateFuture<bool> checkPermissionIfExpired(
+      const ObjectId& manifestId,
+      std::chrono::steady_clock::time_point lastCheck) const;
+
   /**
    * Get the BackingStore used by this ObjectStore
    */
   const std::shared_ptr<BackingStore>& getBackingStore() const {
     return backingStore_;
+  }
+
+  /**
+   * Get the EdenConfig used by this ObjectStore
+   */
+  folly::ReadMostlySharedPtr<const EdenConfig> getEdenConfig() const {
+    return edenConfig_->getEdenConfig();
   }
 
   /**
@@ -404,10 +461,6 @@ class ObjectStore : public IObjectStore,
     pidFetchCounts_->clear();
   }
 
-  bool getWindowsSymlinksEnabled() const {
-    return windowsSymlinksEnabled_;
-  }
-
  private:
   FRIEND_TEST(ObjectStoreTest, caching_policies_anything);
   FRIEND_TEST(ObjectStoreTest, caching_policies_no_caching);
@@ -421,9 +474,8 @@ class ObjectStore : public IObjectStore,
       std::shared_ptr<TreeCache> treeCache,
       EdenStatsPtr stats,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
-      std::shared_ptr<StructuredLogger> structuredLogger,
+      std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
       std::shared_ptr<ReloadableConfig> edenConfig,
-      bool windowsSymlinksEnabled,
       CaseSensitivity caseSensitive);
   // Forbidden copy constructor and assignment operator
   ObjectStore(ObjectStore const&) = delete;
@@ -431,11 +483,10 @@ class ObjectStore : public IObjectStore,
 
   Hash32 computeBlake3(const Blob& blob) const;
 
-  folly::SemiFuture<BackingStore::GetTreeResult> getTreeImpl(
+  folly::coro::now_task<BackingStore::GetTreeResult> getTreeImpl(
       const ObjectId& id,
       const ObjectFetchContextPtr& context,
       folly::stop_watch<std::chrono::milliseconds> watch) const;
-
   void maybeCacheTreeAuxInMemCache(
       const ObjectId& id,
       const BackingStore::GetTreeResult& treeResult) const;
@@ -445,11 +496,16 @@ class ObjectStore : public IObjectStore,
       const ObjectFetchContextPtr& context,
       folly::stop_watch<std::chrono::milliseconds> watch) const;
 
+  folly::coro::now_task<BackingStore::GetTreeAuxResult> co_getTreeAuxDataImpl(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context,
+      folly::stop_watch<std::chrono::milliseconds> watch) const;
+
   folly::SemiFuture<BackingStore::GetBlobResult> getBlobImpl(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
-  folly::coro::Task<BackingStore::GetBlobResult> co_getBlobImpl(
+  folly::coro::now_task<BackingStore::GetBlobResult> co_getBlobImpl(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
@@ -458,7 +514,18 @@ class ObjectStore : public IObjectStore,
       const ObjectFetchContextPtr& context,
       folly::stop_watch<std::chrono::milliseconds> watch) const;
 
+  folly::coro::now_task<BackingStore::GetBlobAuxResult> co_getBlobAuxDataImpl(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context,
+      folly::stop_watch<std::chrono::milliseconds> watch) const;
+
   ImmediateFuture<BackingStore::GetGlobFilesResult> getGlobFilesImpl(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const std::vector<std::string>& prefixes,
+      const ObjectFetchContextPtr& context) const;
+
+  folly::coro::now_task<BackingStore::GetGlobFilesResult> co_getGlobFilesImpl(
       const RootId& id,
       const std::vector<std::string>& globs,
       const std::vector<std::string>& prefixes,
@@ -509,20 +576,17 @@ class ObjectStore : public IObjectStore,
    * from the beginning of the eden daemon progress */
   std::unique_ptr<PidFetchCounts> pidFetchCounts_;
 
-  /* process name cache and structured logger used for
+  /* process name cache and events logger used for
    * sending fetch heavy events, set to nullptr if not
    * initialized by create()
    */
   std::shared_ptr<ProcessInfoCache> processInfoCache_;
-  std::shared_ptr<StructuredLogger> structuredLogger_;
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
   std::shared_ptr<ReloadableConfig> edenConfig_;
 
   // Is this ObjectStore case sensitive? This only matters for methods returning
   // Tree.
   CaseSensitivity caseSensitive_;
-
-  // Whether symlinks are enabled on Windows or not
-  bool windowsSymlinksEnabled_;
 };
 
 } // namespace facebook::eden

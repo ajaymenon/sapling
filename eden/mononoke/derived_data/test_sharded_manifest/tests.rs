@@ -109,7 +109,7 @@ async fn test_for_fixture<F: TestRepoFixture + Send>(fb: FacebookInit) -> Result
         .await?;
     let all_commits = match all_commits {
         ChangesetIdsResolvedFromPrefix::Multiple(all_commits) => all_commits,
-        other => anyhow::bail!("Weird number of commits: {:?}", other),
+        other => anyhow::bail!("Weird number of commits: {other:?}"),
     };
     if let Some(master_cs_id) = repo
         .bookmarks()
@@ -152,14 +152,17 @@ async fn test_for_fixture<F: TestRepoFixture + Send>(fb: FacebookInit) -> Result
             .await?
             .into_skeleton_manifest_id();
 
-        let test_sharded_manifest_leaf_entries = test_sharded_manifest
+        let mut test_sharded_manifest_leaf_entries = test_sharded_manifest
             .list_leaf_entries(ctx.clone(), blobstore.clone())
             .try_collect::<Vec<_>>()
             .await?;
-        let skeleton_manifest_leaf_entries = skeleton_manifest
+        let mut skeleton_manifest_leaf_entries = skeleton_manifest
             .list_leaf_entries(ctx.clone(), blobstore.clone())
             .try_collect::<Vec<_>>()
             .await?;
+
+        test_sharded_manifest_leaf_entries.sort_unstable();
+        skeleton_manifest_leaf_entries.sort_unstable();
 
         assert_eq!(
             test_sharded_manifest_leaf_entries,

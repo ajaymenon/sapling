@@ -22,10 +22,10 @@
 #include <algorithm>
 #include <chrono>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/testharness/TempFile.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/TreeInode.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/testharness/TestUtil.h"
 
@@ -48,9 +48,9 @@ class OverlayFileTest : public ::testing::Test {
         kPathMapDefaultCaseSensitive,
         facebook::eden::InodeCatalogType::Legacy,
         INODE_CATALOG_DEFAULT,
-        std::make_shared<NullStructuredLogger>(),
+        makeTestEdenFsEventsLogger(),
+        /*errorLogger=*/noopErrorLogger_,
         makeRefPtr<EdenStats>(),
-        true,
         *EdenConfig::createTestEdenConfig());
     fsOverlay
         ->initialize(
@@ -63,9 +63,9 @@ class OverlayFileTest : public ::testing::Test {
         kPathMapDefaultCaseSensitive,
         facebook::eden::InodeCatalogType::LMDB,
         INODE_CATALOG_DEFAULT,
-        std::make_shared<NullStructuredLogger>(),
+        makeTestEdenFsEventsLogger(),
+        /*errorLogger=*/noopErrorLogger_,
         makeRefPtr<EdenStats>(),
-        true,
         *EdenConfig::createTestEdenConfig());
     lmdbOverlay
         ->initialize(
@@ -108,6 +108,7 @@ class OverlayFileTest : public ::testing::Test {
   }
 
   folly::test::TemporaryDirectory testDir_;
+  ErrorLogger noopErrorLogger_ = makeTestErrorLogger();
   std::shared_ptr<Overlay> fsOverlay;
   std::shared_ptr<Overlay> lmdbOverlay;
 };

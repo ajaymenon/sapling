@@ -21,6 +21,7 @@ use rustc_hash::FxBuildHasher;
 use rustc_hash::FxHashMap;
 use sha1_checked::Digest;
 use thiserror::Error;
+use weight_observer::WeightedItem;
 
 use crate::hash_writer::AsyncHashWriter;
 use crate::owned_async_writer::OwnedAsyncWrite;
@@ -99,25 +100,29 @@ impl<T: OwnedAsyncWrite> PackfileWriter<T> {
         Ok(())
     }
 
-    /// Write the stream of objects to the packfile
+    /// Write the stream of weighted items to the packfile. Each item's
+    /// RAII guard automatically calls `on_weight_removed` when the item
+    /// goes out of scope at the end of each loop iteration.
     pub async fn write(
         &mut self,
-        entries_stream: impl Stream<Item = Result<PackfileItem>>,
+        entries_stream: impl Stream<Item = Result<WeightedItem<PackfileItem>>>,
     ) -> Result<()> {
         // Write the packfile header if applicable
         self.write_header().await?;
         let mut entries_stream = Box::pin(entries_stream);
-        while let Some(entry) = entries_stream
+        while let Some(weighted_item) = entries_stream
             .try_next()
             .await
             .context("Failure in fetching Packfile Item from stream")?
         {
-            let mut entry: Entry = entry
+            let (packfile_item, _guard) = weighted_item.into_parts();
+            let mut entry: Entry = packfile_item
                 .try_into()
                 .context("Failure in converting PackfileItem to Entry")?;
             // TODO(rajshar): Add support for preventing cycles in on-disk bundle for partial repo
             // If the entry is already written to the packfile, skip writing it again
             if self.object_id_with_index.contains_key(&entry.id) {
+                // _guard drops here, removing weight for duplicate entries
                 continue;
             }
             self.record_entry(&entry);
@@ -147,8 +152,18 @@ impl<T: OwnedAsyncWrite> PackfileWriter<T> {
             self.size += compressed_data_len;
             // Increment the number of entries written in the packfile
             self.num_entries += 1;
+            // _guard drops here, removing weight after the entry is written
         }
         Ok(())
+    }
+
+    /// Write items without weight tracking.
+    pub async fn write_unweighted(
+        &mut self,
+        entries_stream: impl Stream<Item = Result<PackfileItem>>,
+    ) -> Result<()> {
+        self.write(entries_stream.map_ok(WeightedItem::untracked))
+            .await
     }
 
     /// Finish the packfile by writing the trailer at the end and returning the checksum
@@ -183,7 +198,7 @@ impl<T: OwnedAsyncWrite> PackfileWriter<T> {
                     let object_index = self
                         .object_id_with_index
                         .get(&id)
-                        .ok_or_else(|| anyhow::anyhow!("Couldn't find index for {}", id))?
+                        .ok_or_else(|| anyhow::anyhow!("Couldn't find index for {id}"))?
                         .clone();
                     let kind = DeltaRef { object_index };
                     Ok(Entry { kind, ..entry })

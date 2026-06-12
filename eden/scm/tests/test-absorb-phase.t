@@ -13,9 +13,9 @@
   > absorb=
   > EOF
 
-  $ hg init repo
+  $ sl init repo
   $ cd repo
-  $ hg debugdrawdag << 'EOS'
+  $ sl debugdrawdag << 'EOS'
   > C
   > |
   > B
@@ -23,14 +23,14 @@
   > A
   > EOS
 
-  $ hg debugmakepublic -r A
+  $ sl debugmakepublic -r A
 
-  $ hg goto C -q
+  $ sl goto C -q
   $ printf B1 > B
 
-  $ hg absorb -aq
+  $ sl absorb -aq
 
-  $ hg log -G -T '{desc} {phase}'
+  $ sl log -G -T '{desc} {phase}'
   @  C draft
   │
   o  B draft

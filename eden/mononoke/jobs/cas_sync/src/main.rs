@@ -47,6 +47,7 @@ use mutable_counters::MutableCountersArc;
 use repo_blobstore::RepoBlobstore;
 use repo_derived_data::RepoDerivedData;
 use repo_identity::RepoIdentity;
+use restricted_paths::RestrictedPaths;
 use scuba_ext::MononokeScubaSampleBuilder;
 use tracing::error;
 use tracing::info;
@@ -95,6 +96,9 @@ pub struct Repo {
 
     #[facet]
     pub repo_config: RepoConfig,
+
+    #[facet]
+    pub restricted_paths: RestrictedPaths,
 
     #[facet]
     pub bookmark_update_log: dyn BookmarkUpdateLog,
@@ -210,7 +214,7 @@ pub fn build_reporting_handler<'a>(
                     let duration =
                         maybe_stats.map_or_else(|| Duration::from_secs(0), |s| s.completion_time);
 
-                    let error = maybe_error.map(|e| format!("{:?}", e));
+                    let error = maybe_error.map(|e| format!("{e:?}"));
                     let next_id = get_id_to_search_after(&log_entries);
 
                     let n = bookmarks

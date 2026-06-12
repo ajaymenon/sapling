@@ -27,6 +27,7 @@ use parking_lot::Mutex;
 use tracing::debug;
 use tracing::error;
 
+use crate::DagItemDep;
 use crate::DerivationDagItem;
 use crate::DerivationPriority;
 use crate::DerivationQueue;
@@ -54,9 +55,9 @@ pub async fn build_underived_batched_graph<'a>(
     let repo_id = ddm.repo_id();
     let config_name = ddm.config_name();
     let commit_graph = ddm.commit_graph_arc();
-    let watch = Arc::new(Mutex::new(Some(EnqueueResponse::new(Box::new(
-        future::ok(false),
-    )))));
+    let watch = Arc::new(Mutex::new(Some(EnqueueResponse::new(
+        future::ok(false).boxed(),
+    ))));
     let _ = bounded_traversal::bounded_traversal_dag(
         100,
         head,
@@ -123,25 +124,27 @@ pub async fn build_underived_batched_graph<'a>(
                     root_cs_id,
                     head_cs_id,
                     bubble_id,
-                    deps.unique().collect(),
+                    deps.flatten().unique().collect(),
                     ctx.metadata().client_info(),
                     priority,
+                    None,
+                    None, // stage_payload (no pipeline stages in this code path)
                 )?;
 
-                let max_failed_attempts = justknobs::get_as::<u64>("scm/mononoke:build_underived_batched_graph_max_failed_attempts", None)?;
+                let max_failed_attempts = justknobs::get_as::<u64>("scm/mononoke:build_underived_batched_graph_max_failed_attempts", None);
 
-                // Upstream batch will depend on this cs
-                let mut upstream_dep = item.id().clone();
+                let mut upstream_dep: Option<DagItemDep> = Some(DagItemDep {
+                    dag_item_id: item.id().clone(),
+                    head_cs_id: item.head_cs_id(),
+                    stage_path: None, // non-pipeline derivation
+                });
                 let mut cur_item = Some(item);
                 let mut failed_attempt = 0;
                 let mut err_msg = None;
                 while let Some(item) = cur_item {
                     if failed_attempt >= max_failed_attempts {
                         return Err(anyhow!(
-                            "Couldn't enqueue item {:?} into zeus after {} attempts. Last err: {:?}",
-                            item,
-                            failed_attempt,
-                            err_msg,
+                            "Couldn't enqueue item {item:?} into zeus after {failed_attempt} attempts. Last err: {err_msg:?}",
                         ));
                     } else if failed_attempt > 0 {
                         let backoff_time = Duration::from_millis(failed_attempt * failed_attempt * 100);
@@ -169,6 +172,7 @@ pub async fn build_underived_batched_graph<'a>(
                                     // We couldn't deduplicate because rejected commits are in the existing item
                                     // set watch for existing item
                                     if maybe_dedup.is_none() {
+                                        upstream_dep = None;
                                         *watch.lock() =
                                             Some(queue.watch_existing(ctx, existing_item_id).await?);
                                     }
@@ -197,19 +201,19 @@ pub async fn build_underived_batched_graph<'a>(
                                 match underived_batch.pop() {
                                     // All changesets in the batch were derived
                                     None => {
-                                        let err_msg_str = format!("Failed to enqueue with error: {}, but the data was derived", e);
+                                        let err_msg_str = format!("Failed to enqueue with error: {e}, but the data was derived");
                                         debug!("{}", err_msg_str);
                                         err_msg = Some(err_msg_str);
                                         // derived, update ready watch and return no dependency
                                         *watch.lock() =
-                                            Some(EnqueueResponse::new(Box::new(future::ok(true))));
+                                            Some(EnqueueResponse::new(future::ok(true).boxed()));
                                         None
                                     }
                                     // None of the changesets in the batch were derived, but enqueuing failed
                                     Some(root_cs_id) if root_cs_id == item.root_cs_id() => {
                                         // return same item for enqueue and increment failures count
                                         failed_attempt += 1;
-                                        let err_msg_str = format!("Failed to enqueue into DAG: {}", e);
+                                        let err_msg_str = format!("Failed to enqueue into DAG: {e}");
                                         error!("{}", err_msg_str);
                                         err_msg = Some(err_msg_str);
                                         Some(item)
@@ -228,6 +232,8 @@ pub async fn build_underived_batched_graph<'a>(
                                                 vec![],
                                                 item.client_info(),
                                                 priority,
+                                                None,
+                                                None, // stage_payload
                                             )?
                                         )
                                     }
@@ -236,7 +242,11 @@ pub async fn build_underived_batched_graph<'a>(
                         }
                     };
                     cur_item = maybe_inserted.inspect(|item| {
-                        upstream_dep = item.id().clone();
+                        upstream_dep = Some(DagItemDep {
+                            dag_item_id: item.id().clone(),
+                            head_cs_id: item.head_cs_id(),
+                            stage_path: None, // non-pipeline derivation
+                        });
                     });
                 }
 
@@ -301,9 +311,15 @@ async fn deduplicate(
             dedup_root,
             dedup_head,
             bubble_id,
-            vec![existing.id().clone()],
+            vec![DagItemDep {
+                dag_item_id: existing.id().clone(),
+                head_cs_id: existing.head_cs_id(),
+                stage_path: existing.stage_payload().map(|p| p.path().clone()),
+            }],
             ctx.metadata().client_info(),
             rejected.info().priority(),
+            None,
+            None, // stage_payload
         )?;
         return Ok(Some(item));
     }

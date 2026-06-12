@@ -5,9 +5,9 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -18,11 +18,13 @@ use blobstore::Loadable;
 use clientinfo::ClientEntryPoint;
 use clientinfo::ClientInfo;
 use clientinfo::ClientRequestInfo;
+use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use context::SessionContainer;
 use derivation_queue_thrift::DerivationPriority;
 use fbinit::FacebookInit;
 use fsnodes::RootFsnodeId;
+use futures::StreamExt;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use manifest::ManifestOps;
@@ -30,12 +32,16 @@ use maplit::hashmap;
 use mercurial_derivation::RootHgAugmentedManifestId;
 use mercurial_derivation::derive_hg_changeset::DeriveHgChangeset;
 use mercurial_types::HgAugmentedManifestId;
+use metaconfig_types::AclManifestMode;
+use metaconfig_types::EnforcementConditionSet;
 use metaconfig_types::RestrictedPathsConfig;
 use metadata::Metadata;
+use mononoke_api::MononokeError;
 use mononoke_api::Repo as TestRepo;
 use mononoke_api::RepoContext;
 use mononoke_api_hg::HgDataId;
 use mononoke_api_hg::RepoContextHgExt;
+use mononoke_types::ChangesetId;
 use mononoke_types::MPath;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
@@ -46,20 +52,31 @@ use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
 use pretty_assertions::assert_eq;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataArc;
 use repo_derived_data::RepoDerivedDataRef;
 use restricted_paths::SqlRestrictedPathsManifestIdStoreBuilder;
 use restricted_paths::*;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sql_construct::SqlConstruct;
+use strum::Display as EnumDisplay;
+use strum::EnumIter;
+use strum::IntoEnumIterator;
 use test_repo_factory::TestRepoFactory;
 use tests_utils::CreateCommitContext;
 
 pub const TEST_CLIENT_MAIN_ID: &str = "user:myusername0";
 
+pub struct RestrictedPathsScenarioResult {
+    pub scuba_logs: Vec<ScubaAccessLogSample>,
+}
+
+struct RestrictedPathsScenario {
+    repo: TestRepo,
+    log_path: PathBuf,
+}
+
 pub struct RestrictedPathsTestData {
     pub ctx: CoreContext,
-    pub repo: TestRepo,
-    pub log_file_path: std::path::PathBuf,
     // The changes that should be made in the test's commit. Each entry represents
     // a file to be created, along with its optional content. If no content is
     // provided, the file path itself is used as the content.
@@ -68,16 +85,40 @@ pub struct RestrictedPathsTestData {
     expected_manifest_entries: Option<Vec<RestrictedPathManifestIdEntry>>,
     // The scuba logs you expect to be logged after the test runs
     expected_scuba_logs: Option<Vec<ScubaAccessLogSample>>,
+    /// Enforcement scenarios: (enforcement_condition_sets, expect_enforcement).
+    /// For each scenario, a new repo is built with those condition sets and
+    /// access APIs are called to verify whether enforcement is triggered.
+    enforcement_scenarios: Vec<(Vec<EnforcementConditionSet>, bool)>,
+    /// Config-backed restrictions written into `RestrictedPathsConfig.path_acls`.
+    config_restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
+    /// AclManifest-backed restrictions materialized as `.slacl` files.
+    acl_manifest_restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
+    acl_manifest_mode: AclManifestMode,
+    /// Repo regions config for recreating ACLs: (region_name, usernames)
+    repo_regions_config: Vec<(String, Vec<String>)>,
+    groups_config: Vec<(String, Vec<String>)>,
+    tooling_allowlist_group: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct RestrictedPathsTestDataBuilder {
-    restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
+    config_restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
+    acl_manifest_restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
+    acl_manifest_mode: AclManifestMode,
     tooling_allowlist_group: Option<String>,
+    /// Store the repo regions config for recreating ACLs in enforcement scenarios
+    repo_regions_config: Vec<(String, Vec<String>)>,
     groups_config: Vec<(String, Vec<String>)>,
-    acls: Option<Acls>,
+    server_side_tenting: bool,
+    client_identity: Option<MononokeIdentity>,
+    client_machine_tier_identity: Option<MononokeIdentity>,
     file_path_changes: Vec<(String, Option<String>)>,
     expected_manifest_entries: Option<Vec<RestrictedPathManifestIdEntry>>,
     expected_scuba_logs: Option<Vec<ScubaAccessLogSample>>,
+    /// List of (enforcement_condition_sets, expect_enforcement) tuples.
+    /// The test will run for each scenario, applying the condition sets and
+    /// verifying if enforcement is or isn't triggered as expected.
+    enforcement_scenarios: Vec<(Vec<EnforcementConditionSet>, bool)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +132,57 @@ pub struct ScubaAccessLogSample {
     client_main_id: String,
     has_authorization: bool,
     is_allowlisted_tooling: bool,
+    has_acl_access: bool,
     acls: Vec<MononokeIdentity>,
+    considered_restricted_by: Vec<String>,
+    access_enforcement_enabled: Option<bool>,
+    acl_manifest_mode: Option<String>,
+    config_error: Option<String>,
+    acl_manifest_error: Option<String>,
+    shadow_mismatch: Option<bool>,
+    shadow_mismatch_detail: Option<String>,
+}
+
+impl ScubaAccessLogSample {
+    pub fn full_path(&self) -> Option<&NonRootMPath> {
+        self.full_path.as_ref()
+    }
+
+    pub fn has_authorization(&self) -> bool {
+        self.has_authorization
+    }
+
+    pub fn manifest_type(&self) -> Option<&ManifestType> {
+        self.manifest_type.as_ref()
+    }
+
+    pub fn manifest_id(&self) -> Option<&ManifestId> {
+        self.manifest_id.as_ref()
+    }
+
+    pub fn acl_manifest_mode(&self) -> Option<&str> {
+        self.acl_manifest_mode.as_deref()
+    }
+
+    pub fn shadow_mismatch(&self) -> Option<bool> {
+        self.shadow_mismatch
+    }
+
+    pub fn shadow_mismatch_detail(&self) -> Option<&str> {
+        self.shadow_mismatch_detail.as_deref()
+    }
+
+    pub fn acl_manifest_error(&self) -> Option<&str> {
+        self.acl_manifest_error.as_deref()
+    }
+
+    pub fn considered_restricted_by(&self) -> &[String] {
+        &self.considered_restricted_by
+    }
+
+    pub fn access_enforcement_enabled(&self) -> Option<bool> {
+        self.access_enforcement_enabled
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,7 +196,15 @@ pub struct ScubaAccessLogSampleBuilder {
     client_main_id: Option<String>,
     has_authorization: Option<bool>,
     is_allowlisted_tooling: Option<bool>,
+    has_acl_access: Option<bool>,
     acls: Vec<MononokeIdentity>,
+    considered_restricted_by: Vec<String>,
+    access_enforcement_enabled: Option<bool>,
+    acl_manifest_mode: Option<String>,
+    config_error: Option<String>,
+    acl_manifest_error: Option<String>,
+    shadow_mismatch: Option<bool>,
+    shadow_mismatch_detail: Option<String>,
 }
 
 impl ScubaAccessLogSampleBuilder {
@@ -120,7 +219,15 @@ impl ScubaAccessLogSampleBuilder {
             client_main_id: None,
             has_authorization: None,
             is_allowlisted_tooling: None,
+            has_acl_access: None,
             acls: Vec::new(),
+            considered_restricted_by: vec!["manifest_db".to_string()],
+            access_enforcement_enabled: None,
+            acl_manifest_mode: Some("disabled".to_string()),
+            config_error: None,
+            acl_manifest_error: None,
+            shadow_mismatch: None,
+            shadow_mismatch_detail: None,
         }
     }
 
@@ -169,8 +276,27 @@ impl ScubaAccessLogSampleBuilder {
         self
     }
 
+    pub fn with_has_acl_access(mut self, has_acl_access: bool) -> Self {
+        self.has_acl_access = Some(has_acl_access);
+        self
+    }
+
     pub fn with_acls(mut self, acls: Vec<MononokeIdentity>) -> Self {
         self.acls = acls;
+        self
+    }
+
+    #[expect(
+        dead_code,
+        reason = "not every Scuba sample builder test sets source attribution"
+    )]
+    pub fn with_considered_restricted_by(mut self, considered_restricted_by: Vec<String>) -> Self {
+        self.considered_restricted_by = considered_restricted_by;
+        self
+    }
+
+    pub fn with_access_enforcement_enabled(mut self, access_enforcement_enabled: bool) -> Self {
+        self.access_enforcement_enabled = Some(access_enforcement_enabled);
         self
     }
 
@@ -184,6 +310,7 @@ impl ScubaAccessLogSampleBuilder {
             .ok_or_else(|| anyhow!("has_authorization is required"))?;
         // Default to false if not provided, since most tests don't have a tooling allowlist
         let is_allowlisted_tooling = self.is_allowlisted_tooling.unwrap_or(false);
+        let has_acl_access = self.has_acl_access.unwrap_or(false);
 
         Ok(ScubaAccessLogSample {
             repo_id,
@@ -195,7 +322,15 @@ impl ScubaAccessLogSampleBuilder {
             client_main_id,
             has_authorization,
             is_allowlisted_tooling,
+            has_acl_access,
             acls: self.acls,
+            considered_restricted_by: self.considered_restricted_by,
+            access_enforcement_enabled: self.access_enforcement_enabled,
+            acl_manifest_mode: self.acl_manifest_mode,
+            config_error: self.config_error,
+            acl_manifest_error: self.acl_manifest_error,
+            shadow_mismatch: self.shadow_mismatch,
+            shadow_mismatch_detail: self.shadow_mismatch_detail,
         })
     }
 }
@@ -203,13 +338,19 @@ impl ScubaAccessLogSampleBuilder {
 impl RestrictedPathsTestDataBuilder {
     pub fn new() -> Self {
         Self {
-            restricted_paths: vec![],
+            config_restricted_paths: vec![],
+            acl_manifest_restricted_paths: vec![],
+            acl_manifest_mode: AclManifestMode::Disabled,
             tooling_allowlist_group: None,
             groups_config: vec![],
-            acls: None,
+            repo_regions_config: vec![],
+            server_side_tenting: false,
+            client_identity: None,
+            client_machine_tier_identity: None,
             file_path_changes: vec![],
             expected_manifest_entries: None,
             expected_scuba_logs: None,
+            enforcement_scenarios: vec![],
         }
     }
 
@@ -217,7 +358,29 @@ impl RestrictedPathsTestDataBuilder {
         mut self,
         restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
     ) -> Self {
-        self.restricted_paths = restricted_paths;
+        self.config_restricted_paths = restricted_paths.clone();
+        self.acl_manifest_restricted_paths = restricted_paths;
+        self
+    }
+
+    pub fn with_config_restricted_paths(
+        mut self,
+        restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
+    ) -> Self {
+        self.config_restricted_paths = restricted_paths;
+        self
+    }
+
+    pub fn with_acl_manifest_restricted_paths(
+        mut self,
+        restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
+    ) -> Self {
+        self.acl_manifest_restricted_paths = restricted_paths;
+        self
+    }
+
+    pub fn with_acl_manifest_mode(mut self, acl_manifest_mode: AclManifestMode) -> Self {
+        self.acl_manifest_mode = acl_manifest_mode;
         self
     }
 
@@ -228,7 +391,27 @@ impl RestrictedPathsTestDataBuilder {
         self
     }
 
+    /// Set the client identity for the test context.
+    /// Defaults to USER:myusername0 if not specified.
+    pub fn with_client_identity(mut self, identity: &str) -> Result<Self> {
+        self.client_identity = Some(MononokeIdentity::from_str(identity)?);
+        Ok(self)
+    }
+
+    /// Adds a MACHINE_TIER identity to the simulated caller. Used by tests
+    /// that exercise the `machine_tiers` enforcement condition. Default (no
+    /// call) leaves the caller without a MACHINE_TIER identity.
+    pub fn with_machine_tier(mut self, tier: &str) -> Self {
+        self.client_machine_tier_identity = Some(MononokeIdentity::from_legacy_type_data(
+            "MACHINE_TIER",
+            tier,
+        ));
+        self
+    }
+
     /// Set up test groups for membership checking.
+    /// Each member should be a full identity string (e.g., "SERVICE_IDENTITY:service_foo"
+    /// or "USER:username").
     pub fn with_test_groups(mut self, groups_config: Vec<(&str, Vec<&str>)>) -> Self {
         self.groups_config = groups_config
             .into_iter()
@@ -242,22 +425,24 @@ impl RestrictedPathsTestDataBuilder {
         self
     }
 
-    pub fn with_test_acls(mut self, repo_regions_config: Vec<(&str, Vec<&str>)>) -> Self {
-        // Convert groups_config to the format expected by setup_test_acls_with_groups
-        let groups_config: Vec<(&str, Vec<&str>)> = self
-            .groups_config
-            .iter()
-            .map(|(name, users)| {
+    pub fn with_test_repo_region_acls(
+        mut self,
+        repo_regions_config: Vec<(&str, Vec<&str>)>,
+    ) -> Self {
+        self.repo_regions_config = repo_regions_config
+            .into_iter()
+            .map(|(repo_region, users)| {
                 (
-                    name.as_str(),
-                    users.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    repo_region.to_string(),
+                    users.into_iter().map(|s| s.to_string()).collect(),
                 )
             })
             .collect();
-        self.acls = Some(
-            setup_test_acls_with_groups(repo_regions_config, groups_config)
-                .expect("Failed to create test ACLs"),
-        );
+        self
+    }
+
+    pub fn with_server_side_tenting(mut self, server_side_tenting: bool) -> Self {
+        self.server_side_tenting = server_side_tenting;
         self
     }
 
@@ -287,12 +472,40 @@ impl RestrictedPathsTestDataBuilder {
         self
     }
 
+    #[expect(
+        dead_code,
+        reason = "scenario-matrix tests use this helper when expected rows do not vary by scenario"
+    )]
+    pub fn with_enforcement_scenarios(
+        mut self,
+        scenarios: Vec<(Vec<EnforcementConditionSet>, bool)>,
+    ) -> Self {
+        self.enforcement_scenarios = scenarios;
+        self
+    }
+
     pub async fn build(self, fb: FacebookInit) -> Result<RestrictedPathsTestData> {
+        // Use custom client identity or default to USER:myusername0
+        let client_identity = self
+            .client_identity
+            .unwrap_or_else(|| MononokeIdentity::from_legacy_type_data("USER", "myusername0"));
+        let client_main_id = format!(
+            "{}:{}",
+            client_identity.id_type().to_lowercase(),
+            client_identity.id_data()
+        );
+
         let mut cri = ClientRequestInfo::new(ClientEntryPoint::Tests);
-        cri.set_main_id(TEST_CLIENT_MAIN_ID.to_string());
+        cri.set_main_id(client_main_id);
         let client_info = ClientInfo::new_with_client_request_info(cri);
 
-        let identities = BTreeSet::from([MononokeIdentity::new("USER", "myusername0")]);
+        let identities = {
+            let mut set = BTreeSet::from([client_identity]);
+            if let Some(machine_tier_identity) = self.client_machine_tier_identity {
+                set.insert(machine_tier_identity);
+            }
+            set
+        };
         let metadata = {
             let mut md = Metadata::new(
                 Some(&"restricted_paths_test".to_string()),
@@ -304,32 +517,26 @@ impl RestrictedPathsTestDataBuilder {
             )
             .await;
             md.add_client_info(client_info);
-            md
+            Arc::new(md)
         };
         let session_container = SessionContainer::builder(fb)
-            .metadata(Arc::new(metadata))
+            .metadata(metadata)
+            .server_side_tenting(self.server_side_tenting)
             .build();
         let ctx = CoreContext::test_mock_session(session_container);
 
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let log_file_path = temp_file.into_temp_path().keep()?;
-
-        let repo = setup_test_repo(
-            &ctx,
-            self.restricted_paths,
-            self.tooling_allowlist_group,
-            self.acls,
-            log_file_path.clone(),
-        )
-        .await?;
-
         Ok(RestrictedPathsTestData {
             ctx,
-            repo,
-            log_file_path,
             file_path_changes: self.file_path_changes,
             expected_manifest_entries: self.expected_manifest_entries,
             expected_scuba_logs: self.expected_scuba_logs,
+            enforcement_scenarios: self.enforcement_scenarios,
+            config_restricted_paths: self.config_restricted_paths,
+            acl_manifest_restricted_paths: self.acl_manifest_restricted_paths,
+            acl_manifest_mode: self.acl_manifest_mode,
+            repo_regions_config: self.repo_regions_config,
+            groups_config: self.groups_config,
+            tooling_allowlist_group: self.tooling_allowlist_group,
         })
     }
 }
@@ -346,20 +553,181 @@ impl RestrictedPathsTestData {
     /// Each file path can optionally specify content. If no content is provided,
     /// the file path itself is used as the content.
     pub async fn run_restricted_paths_test(&self) -> Result<()> {
-        let mut commit_ctx = CreateCommitContext::new_root(&self.ctx, &self.repo);
-        for (path, content) in &self.file_path_changes {
-            let file_content = content.as_deref().unwrap_or(path.as_str());
-            commit_ctx = commit_ctx.add_file(path.as_str(), file_content.to_string());
+        // ACL manifest checking is enabled via the just_knobs.json default
+        // (restricted_paths_access_log_with_acl_manifest = true). This ensures spawned
+        // tasks also see the JK value, unlike with_just_knobs_async which
+        // only applies to the current thread.
+
+        // Run without enforcement scenarios
+        self.run_restricted_paths_test_inner(0, &[], false).await?;
+
+        // Run enforcement testing for each scenario
+        for (scenario_idx, (conditions, expect_enforcement)) in
+            self.enforcement_scenarios.iter().enumerate()
+        {
+            self.run_restricted_paths_test_inner(scenario_idx + 1, conditions, *expect_enforcement)
+                .await?;
         }
 
-        let blobstore = Arc::new(self.repo.repo_blobstore().clone());
+        Ok(())
+    }
 
-        let bcs_id = commit_ctx.commit().await?;
+    /// Runs exactly one restricted paths scenario.
+    ///
+    /// Use this when the same fixture needs scenario-specific expected logs,
+    /// such as Scuba rows that differ by `access_enforcement_enabled`.
+    pub async fn run_restricted_paths_test_scenario(
+        &self,
+        enforcement_condition_sets: &[EnforcementConditionSet],
+        expect_enforcement: bool,
+    ) -> Result<()> {
+        self.run_restricted_paths_test_inner(0, enforcement_condition_sets, expect_enforcement)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Runs the standard access scenario and returns the Scuba rows it emitted.
+    pub async fn observe_restricted_paths_scenario(
+        &self,
+        enforcement_condition_sets: &[EnforcementConditionSet],
+    ) -> Result<RestrictedPathsScenarioResult> {
+        self.run_restricted_paths_test_inner(0, enforcement_condition_sets, false)
+            .await
+    }
+
+    /// Calls path-based restricted paths logging directly and returns emitted Scuba rows.
+    pub async fn observe_path_access(
+        &self,
+        path: NonRootMPath,
+        cs_id: Option<ChangesetId>,
+        enforcement_condition_sets: &[EnforcementConditionSet],
+    ) -> Result<RestrictedPathsScenarioResult> {
+        let scenario = self.setup_scenario_repo(enforcement_condition_sets).await?;
+
+        scenario
+            .repo
+            .restricted_paths()
+            .log_access_by_path_if_restricted(&self.ctx, path, cs_id)
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        Ok(RestrictedPathsScenarioResult {
+            scuba_logs: deserialize_scuba_log_file(&scenario.log_path)?,
+        })
+    }
+
+    /// Calls manifest-based restricted paths logging directly and returns emitted Scuba rows.
+    pub async fn observe_manifest_access(
+        &self,
+        manifest_id: ManifestId,
+        manifest_type: ManifestType,
+        cs_id: Option<ChangesetId>,
+        enforcement_condition_sets: &[EnforcementConditionSet],
+    ) -> Result<RestrictedPathsScenarioResult> {
+        let scenario = self.setup_scenario_repo(enforcement_condition_sets).await?;
+
+        let bcs_id = self.create_configured_changeset(&scenario.repo).await?;
+        scenario.repo.derive_hg_changeset(&self.ctx, bcs_id).await?;
+        scenario
+            .repo
+            .repo_derived_data()
+            .derive::<RootHgAugmentedManifestId>(&self.ctx, bcs_id, DerivationPriority::LOW)
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        scenario
+            .repo
+            .restricted_paths()
+            .log_access_by_manifest_if_restricted(&self.ctx, manifest_id, manifest_type, cs_id)
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        Ok(RestrictedPathsScenarioResult {
+            scuba_logs: deserialize_scuba_log_file(&scenario.log_path)?,
+        })
+    }
+
+    /// Calls path-based restricted paths enforcement directly and returns true
+    /// when access was denied.
+    pub async fn observe_path_enforcement(
+        &self,
+        path: NonRootMPath,
+        enforcement_condition_sets: &[EnforcementConditionSet],
+    ) -> Result<bool> {
+        let scenario = self.setup_scenario_repo(enforcement_condition_sets).await?;
+
+        let mpath = MPath::from(path);
+        let result = spawn_enforce_restricted_path_access(
+            &self.ctx,
+            scenario.repo.restricted_paths_arc().clone(),
+            &mpath,
+            "restricted_paths_test",
+            None,
+        )
+        .await;
+        let was_denied = match result {
+            Ok(()) => false,
+            Err(RestrictedPathsError::AuthorizationError(_)) => true,
+            Err(RestrictedPathsError::InternalError(err)) => return Err(err),
+        };
+
+        Ok(was_denied)
+    }
+
+    /// Creates the configured test commit, then calls path-based restricted
+    /// paths enforcement with that commit's changeset id.
+    pub async fn observe_path_enforcement_after_commit(
+        &self,
+        path: NonRootMPath,
+        enforcement_condition_sets: &[EnforcementConditionSet],
+    ) -> Result<bool> {
+        let scenario = self.setup_scenario_repo(enforcement_condition_sets).await?;
+        let bcs_id = self.create_configured_changeset(&scenario.repo).await?;
+
+        let mpath = MPath::from(path);
+        let result = spawn_enforce_restricted_path_access(
+            &self.ctx,
+            scenario.repo.restricted_paths_arc().clone(),
+            &mpath,
+            "restricted_paths_test",
+            Some(bcs_id),
+        )
+        .await;
+        let was_denied = match result {
+            Ok(()) => false,
+            Err(RestrictedPathsError::AuthorizationError(_)) => true,
+            Err(RestrictedPathsError::InternalError(err)) => return Err(err),
+        };
+
+        Ok(was_denied)
+    }
+
+    /// Run restricted paths testing for a single scenario.
+    /// Creates a repo with the given enforcement condition sets and runs all access operations.
+    /// If expect_enforcement is true, expects an AuthorizationError from the access operations.
+    async fn run_restricted_paths_test_inner(
+        &self,
+        scenario_idx: usize,
+        enforcement_condition_sets: &[EnforcementConditionSet],
+        expect_enforcement: bool,
+    ) -> Result<RestrictedPathsScenarioResult> {
+        println!(
+            "Running scenario {scenario_idx} with expect_enforcement: {expect_enforcement} and enforcement_condition_sets: {enforcement_condition_sets:#?}"
+        );
+        // Set up a fresh repo and log file for this scenario.
+        let RestrictedPathsScenario {
+            repo: scenario_repo,
+            log_path,
+        } = self.setup_scenario_repo(enforcement_condition_sets).await?;
+
+        let blobstore = Arc::new(scenario_repo.repo_blobstore().clone());
+        let bcs_id = self.create_configured_changeset(&scenario_repo).await?;
 
         // Get the hg changeset id for the commit, to trigger hg manifest derivation
-        let hg_cs_id = self.repo.derive_hg_changeset(&self.ctx, bcs_id).await?;
+        let hg_cs_id = scenario_repo.derive_hg_changeset(&self.ctx, bcs_id).await?;
 
-        let repo = Arc::new(self.repo.clone());
+        let repo = Arc::new(scenario_repo.clone());
         let repo_ctx = RepoContext::new_test(self.ctx.clone(), repo.clone()).await?;
         let cs_ctx = repo_ctx
             .changeset(bcs_id)
@@ -367,67 +735,160 @@ impl RestrictedPathsTestData {
             .ok_or(anyhow!("failed to get changeset context"))?;
         let hg_repo_ctx = repo_ctx.clone().hg();
 
-        let _files_added = self
-            .file_path_changes
-            .iter()
-            .map(|(path, _content)| NonRootMPath::new(path))
-            .collect::<Result<Vec<_>>>()?;
-
         // Derive hg changeset to add entry for restricted paths
-        let hg_cs = hg_cs_id.load(&self.ctx, self.repo.repo_blobstore()).await?;
+        let hg_cs = hg_cs_id
+            .load(&self.ctx, scenario_repo.repo_blobstore())
+            .await?;
 
         // Then get the root manifest id, get all the trees and run
         // `HgTreeContext::new_check_exists` to simulate a directory access
         let hg_mfid = hg_cs.manifestid();
 
         // Derive HgAugmentedManifest
-        let _root_hg_aug_manifest_id = self
-            .repo
+        let _root_hg_aug_manifest_id = scenario_repo
             .repo_derived_data()
             .derive::<RootHgAugmentedManifestId>(&self.ctx, bcs_id, DerivationPriority::LOW)
             .await?;
 
         // Derive Fsnode
-        let root_fsnode_id = self
-            .repo
+        let root_fsnode_id = scenario_repo
             .repo_derived_data()
             .derive::<RootFsnodeId>(&self.ctx, bcs_id, DerivationPriority::LOW)
+            .await?;
+
+        // Derive ContentManifest
+        let root_content_manifest_id = scenario_repo
+            .repo_derived_data()
+            .derive::<RootContentManifestId>(&self.ctx, bcs_id, DerivationPriority::LOW)
             .await?;
 
         // Sleep to ensure that the restricted paths cache was updated
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let _all_directories = hg_mfid
-            // TODO(T239041722): list files as well to ensure access is logged when a file is requested
-            .list_tree_entries(self.ctx.clone(), blobstore.clone())
-            .and_then(async |(path, hg_manifest_id)| {
-                // Access HgManifest
-                let _tree_ctx = hg_manifest_id.context(hg_repo_ctx.clone()).await?;
-                let hg_aug: HgAugmentedManifestId = hg_manifest_id.into();
-                // Access HgAugmentedManifest
-                let _aug_tree_ctx = hg_aug
-                    .context(hg_repo_ctx.clone())
-                    .await?
-                    .ok_or(anyhow!("No HgAugmentedManifest for path {path:?}"))?;
-                cs_ctx.path(path.clone()).await?;
-                Ok(path)
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
+        // Type representing all the ways to access the restricted paths covered
+        // in this test, so we can ensure that all of them generate
+        // RestrictedPathsAuthorizationErrors when expected.
+        #[derive(EnumIter, EnumDisplay, Debug, Eq, PartialEq, Hash, Clone, Copy)]
+        enum AccessMethod {
+            HgManifestId,
+            HgAugmentedManifestId,
+            Path,
+            Fsnode,
+            PathsWithContent,
+            PathsWithHistory,
+            ContentManifest,
+        }
+
+        // Run all the access operations that will trigger enforcement checks.
+        // We collect RestrictedPathsAuthorizationErrors tagged by operation instead of
+        // short-circuiting, so that all operations execute and produce their
+        // log entries even when enforcement is enabled. Non-authorization
+        // errors are propagated immediately to fail the test.
+        let mut auth_errors: Vec<(AccessMethod, MononokeError)> = Vec::new();
+
+        // Access all hg manifest tree entries
+        let hg_manifest_results: Vec<Result<Vec<(AccessMethod, MononokeError)>, MononokeError>> =
+            hg_mfid
+                // TODO(T239041722): list files as well to ensure access is logged when a file is requested
+                .list_tree_entries(self.ctx.clone(), blobstore.clone())
+                .map_err(MononokeError::from)
+                .and_then(async |(path, hg_manifest_id)| {
+                    let mut errs = Vec::new();
+                    // Access HgManifest
+                    match hg_manifest_id.context(hg_repo_ctx.clone()).await {
+                        Ok(_) => {}
+                        Err(e @ MononokeError::RestrictedPathsAuthorizationError(_)) => {
+                            errs.push((AccessMethod::HgManifestId, e))
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    let hg_aug: HgAugmentedManifestId = hg_manifest_id.into();
+                    // Access HgAugmentedManifest
+                    match hg_aug.context(hg_repo_ctx.clone()).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            return Err(anyhow!("No HgAugmentedManifest for path {path:?}").into());
+                        }
+                        Err(e @ MononokeError::RestrictedPathsAuthorizationError(_)) => {
+                            errs.push((AccessMethod::HgAugmentedManifestId, e))
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // Access path
+                    match cs_ctx.path(path).await {
+                        Ok(_) => {}
+                        Err(e @ MononokeError::RestrictedPathsAuthorizationError(_)) => {
+                            errs.push((AccessMethod::Path, e))
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    Ok(errs)
+                })
+                .collect()
+                .await;
+
+        for result in hg_manifest_results {
+            match result {
+                Ok(errs) => auth_errors.extend(errs),
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         // Access all fsnode tree entries
-        let fsnode_id = root_fsnode_id.into_fsnode_id();
-        let _all_fsnode_directories = fsnode_id
-            .list_tree_entries(self.ctx.clone(), blobstore.clone())
-            .and_then(async |(path, fsnode_id)| {
-                // Access Fsnode by loading it from blobstore
-                let _tree = repo_ctx.tree(fsnode_id).await?;
-                Ok(path)
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
+        let fsnode_results: Vec<Result<Option<(AccessMethod, MononokeError)>, MononokeError>> =
+            root_fsnode_id
+                .into_fsnode_id()
+                .list_tree_entries(self.ctx.clone(), blobstore.clone())
+                .map_err(MononokeError::from)
+                .and_then(async |(_path, fsnode_id)| {
+                    // Access Fsnode by loading it from blobstore
+                    match repo_ctx.tree(fsnode_id.into()).await {
+                        Ok(_) => Ok(None),
+                        Err(e @ MononokeError::RestrictedPathsAuthorizationError(_)) => {
+                            Ok(Some((AccessMethod::Fsnode, e)))
+                        }
+                        Err(e) => Err(e),
+                    }
+                })
+                .collect()
+                .await;
 
-        // Access path contents as we do in SCS for diffing
+        for result in fsnode_results {
+            match result {
+                Ok(Some(err)) => auth_errors.push(err),
+                Ok(None) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Access all content manifest tree entries
+        let content_manifest_results: Vec<
+            Result<Option<(AccessMethod, MononokeError)>, MononokeError>,
+        > = root_content_manifest_id
+            .into_content_manifest_id()
+            .list_tree_entries(self.ctx.clone(), blobstore.clone())
+            .map_err(MononokeError::from)
+            .and_then(async |(_path, content_manifest_id)| {
+                match repo_ctx.tree(content_manifest_id.into()).await {
+                    Ok(_) => Ok(None),
+                    Err(e @ MononokeError::RestrictedPathsAuthorizationError(_)) => {
+                        Ok(Some((AccessMethod::ContentManifest, e)))
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+            .collect()
+            .await;
+
+        for result in content_manifest_results {
+            match result {
+                Ok(Some(err)) => auth_errors.push(err),
+                Ok(None) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Access path contents as we do in SCS for diffing.
         let bonsai = cs_ctx.bonsai_changeset().await?;
         let paths = bonsai
             .file_changes_map()
@@ -435,32 +896,86 @@ impl RestrictedPathsTestData {
             .map(|path| MPath::from(path.clone()))
             .collect::<BTreeSet<_>>();
 
-        let _path_contexts = cs_ctx
-            .paths_with_content(paths.clone().into_iter())
-            .await?
-            .map_ok(|path_context| (path_context.path().clone(), path_context))
-            .try_collect::<HashMap<_, _>>()
-            .await?;
+        match cs_ctx.paths_with_content(paths.clone().into_iter()).await {
+            Ok(stream) => {
+                let results: Vec<Result<_, MononokeError>> = stream.collect().await;
+                for result in results {
+                    match result {
+                        Ok(_) => {}
+                        Err(e @ MononokeError::RestrictedPathsAuthorizationError(_)) => {
+                            auth_errors.push((AccessMethod::PathsWithContent, e))
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            Err(e @ MononokeError::RestrictedPathsAuthorizationError(_)) => {
+                auth_errors.push((AccessMethod::PathsWithContent, e))
+            }
+            Err(e) => return Err(e.into()),
+        }
 
-        let _path_last_modified = cs_ctx
-            .paths_with_history(paths.iter().cloned())
-            .await?
-            .map_ok(|context| async move {
-                let context_path = context.path().clone();
-                let last_modified = context.last_modified().await?;
-                Ok::<_, _>((context_path, last_modified))
-            })
-            .try_buffer_unordered(100)
-            .try_filter_map(|(path, maybe_last_changed)| async move {
-                Ok(maybe_last_changed.map(move |last_changed| (path, last_changed.id())))
-            })
-            .try_collect::<BTreeMap<_, _>>()
-            .await?;
+        match cs_ctx.paths_with_history(paths.iter().cloned()).await {
+            Ok(stream) => {
+                let results: Vec<Result<(), MononokeError>> = stream
+                    .map(|r| async move {
+                        match r {
+                            Err(e) => Err(e),
+                            Ok(context) => {
+                                context.last_modified().await?;
+                                Ok(())
+                            }
+                        }
+                    })
+                    .buffer_unordered(100)
+                    .collect()
+                    .await;
 
-        // Get all entries in the manifest id store
-        let manifest_id_store_entries = self
-            .repo
+                for result in results {
+                    match result {
+                        Ok(()) => {}
+                        Err(e @ MononokeError::RestrictedPathsAuthorizationError(_)) => {
+                            auth_errors.push((AccessMethod::PathsWithHistory, e))
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            Err(e @ MononokeError::RestrictedPathsAuthorizationError(_)) => {
+                auth_errors.push((AccessMethod::PathsWithHistory, e))
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        // Check authorization errors based on whether enforcement was expected
+        if expect_enforcement {
+            let mut grouped: HashMap<AccessMethod, Vec<&MononokeError>> = HashMap::new();
+            for (op, err) in &auth_errors {
+                grouped.entry(*op).or_default().push(err);
+            }
+
+            for op in AccessMethod::iter() {
+                // Ensure that all access methods returned RestrictedPathsAuthorizationErrors.
+                let auth_errors = grouped.remove(&op).unwrap_or_default();
+
+                assert!(
+                    !auth_errors.is_empty(),
+                    "Scenario {scenario_idx}: expected RestrictedPathsAuthorizationError for operation '{op}' but got none.",
+                )
+            }
+        } else {
+            // When enforcement is NOT expected, no errors should have occurred
+            assert!(
+                auth_errors.is_empty(),
+                "Scenario {scenario_idx}: expected access to succeed but got authorization errors: {auth_errors:#?}"
+            );
+        }
+
+        // Only verify manifest entries and scuba logs when not expecting enforcement
+        // (i.e., when access is expected to succeed)
+        let manifest_id_store_entries = scenario_repo
             .restricted_paths()
+            .config_based()
             .manifest_id_store()
             .get_all_entries(&self.ctx)
             .await?;
@@ -469,7 +984,7 @@ impl RestrictedPathsTestData {
         // the log file
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let scuba_logs = deserialize_scuba_log_file(&self.log_file_path)?;
+        let scuba_logs = deserialize_scuba_log_file(&log_path)?;
 
         // Verify expectations if they were set
         if let Some(expected_manifest_entries) = self.expected_manifest_entries.clone() {
@@ -487,17 +1002,144 @@ impl RestrictedPathsTestData {
 
         #[cfg(fbcode_build)]
         if let Some(expected_scuba_logs) = &self.expected_scuba_logs {
-            assert_eq!(*expected_scuba_logs, scuba_logs);
+            // Sort both sides by debug representation since async logging
+            // can produce entries in non-deterministic order.
+            let mut expected_sorted = expected_scuba_logs.clone();
+            let mut actual_sorted = scuba_logs.clone();
+            expected_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            actual_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            assert_eq!(expected_sorted, actual_sorted);
+        }
+        #[cfg(not(fbcode_build))]
+        let _ = (&scuba_logs, &self.expected_scuba_logs);
+
+        println!(
+            "Scenario {scenario_idx} finished SUCCESSFULLY with expect_enforcement: {expect_enforcement} and enforcement_condition_sets: {enforcement_condition_sets:#?}"
+        );
+        Ok(RestrictedPathsScenarioResult { scuba_logs })
+    }
+
+    async fn setup_scenario_repo(
+        &self,
+        enforcement_condition_sets: &[EnforcementConditionSet],
+    ) -> Result<RestrictedPathsScenario> {
+        let log_file = tempfile::NamedTempFile::new()?;
+        let log_path = log_file.into_temp_path().keep()?;
+        let acls = self.scenario_acls()?;
+        let repo = setup_test_repo(
+            &self.ctx,
+            self.config_restricted_paths.clone(),
+            self.acl_manifest_mode,
+            self.tooling_allowlist_group.clone(),
+            acls,
+            log_path.clone(),
+            enforcement_condition_sets,
+        )
+        .await?;
+
+        Ok(RestrictedPathsScenario { repo, log_path })
+    }
+
+    async fn create_configured_changeset(&self, repo: &TestRepo) -> Result<ChangesetId> {
+        let mut commit_ctx = CreateCommitContext::new_root(&self.ctx, repo);
+        for (path, content) in &self.file_path_changes {
+            let file_content = content.as_deref().unwrap_or(path.as_str());
+            commit_ctx = commit_ctx.add_file(path.as_str(), file_content.to_string());
+        }
+        for (root, acl) in &self.acl_manifest_restricted_paths {
+            let slacl_path = format!("{root}/.slacl");
+            let slacl_content = format!("repo_region_acl = \"{acl}\"\n");
+            commit_ctx = commit_ctx.add_file(slacl_path.as_str(), slacl_content);
+        }
+        commit_ctx.commit().await
+    }
+
+    fn scenario_acls(&self) -> Result<Acls> {
+        let groups_config: Vec<(&str, Vec<&str>)> = self
+            .groups_config
+            .iter()
+            .map(|(group, users)| (group.as_str(), users.iter().map(|u| u.as_str()).collect()))
+            .collect();
+
+        if self.repo_regions_config.is_empty() {
+            return default_test_acls(groups_config);
         }
 
-        Ok(())
+        let repo_regions_config: Vec<(&str, Vec<&str>)> = self
+            .repo_regions_config
+            .iter()
+            .map(|(region, users)| (region.as_str(), users.iter().map(|u| u.as_str()).collect()))
+            .collect();
+        setup_test_acls_with_groups(repo_regions_config, groups_config)
     }
 }
 
-/// Creates an Acls structure for testing with specified repo regions and users.
-/// The ACL provides the test user access to all repos and specified repo regions.
-fn setup_test_acls(repo_regions_config: Vec<(&str, Vec<&str>)>) -> Result<Acls> {
-    setup_test_acls_with_groups(repo_regions_config, vec![])
+#[derive(Default)]
+pub(crate) struct EnforcementConditionSetBuilder {
+    always_enabled: bool,
+    entry_points: Vec<String>,
+    require_client_request_flag: bool,
+    restriction_acls: Vec<MononokeIdentity>,
+    machine_tiers: Vec<String>,
+}
+
+impl EnforcementConditionSetBuilder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn with_always_enabled(mut self, always_enabled: bool) -> Self {
+        self.always_enabled = always_enabled;
+        self
+    }
+
+    pub(crate) fn with_entry_points<I, S>(mut self, entry_points: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.entry_points = entry_points.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub(crate) fn with_require_client_request_flag(
+        mut self,
+        require_client_request_flag: bool,
+    ) -> Self {
+        self.require_client_request_flag = require_client_request_flag;
+        self
+    }
+
+    pub(crate) fn with_restriction_acls<I>(mut self, restriction_acls: I) -> Self
+    where
+        I: IntoIterator<Item = MononokeIdentity>,
+    {
+        self.restriction_acls = restriction_acls.into_iter().collect();
+        self
+    }
+
+    pub(crate) fn with_machine_tiers<I, S>(mut self, machine_tiers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.machine_tiers = machine_tiers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub(crate) fn build(self) -> EnforcementConditionSet {
+        EnforcementConditionSet {
+            always_enabled: self.always_enabled,
+            entry_points: self.entry_points,
+            require_client_request_flag: self.require_client_request_flag,
+            restriction_acls: self.restriction_acls,
+            machine_tiers: self.machine_tiers,
+            // `build_rules` matches on the server's own `build_info` build rule,
+            // which can't be set from a unit test (it's a link-time constant), so
+            // tests leave it empty. Coverage lives in the `.t` integration test.
+            build_rules: Vec::new(),
+        }
+    }
 }
 
 /// Creates an Acls structure for testing with specified repo regions, users, and groups.
@@ -506,46 +1148,38 @@ fn setup_test_acls_with_groups(
     repo_regions_config: Vec<(&str, Vec<&str>)>,
     groups_config: Vec<(&str, Vec<&str>)>,
 ) -> Result<Acls> {
-    let mut repo_regions = HashMap::new();
+    let repo_regions = repo_regions_config
+        .into_iter()
+        .map(|(region_name, usernames)| {
+            let users = usernames
+                .into_iter()
+                .map(|username| MononokeIdentity::from_str(&format!("USER:{username}")))
+                .collect::<Result<MononokeIdentitySet, _>>()?;
+            Ok((
+                region_name.to_string(),
+                Arc::new(Acl {
+                    actions: hashmap! {
+                        "read".to_string() => users,
+                    },
+                }),
+            ))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
 
-    // Add each configured repo region
-    for (region_name, usernames) in repo_regions_config {
-        let mut users = MononokeIdentitySet::new();
-        for username in usernames {
-            users.insert(MononokeIdentity::from_str(&format!("USER:{}", username))?);
-        }
-
-        repo_regions.insert(
-            region_name.to_string(),
-            Arc::new(Acl {
-                actions: hashmap! {
-                    "read".to_string() => users,
-                },
-            }),
-        );
-    }
-
-    // Add each configured group
-    let mut groups = HashMap::new();
-    for (group_name, usernames) in groups_config {
-        let mut users = MononokeIdentitySet::new();
-        for username in usernames {
-            users.insert(MononokeIdentity::from_str(&format!("USER:{}", username))?);
-        }
-        groups.insert(group_name.to_string(), Arc::new(users));
-    }
+    let groups = groups_config
+        .into_iter()
+        .map(|(group_name, identities)| {
+            let members = identities
+                .into_iter()
+                .map(MononokeIdentity::from_str)
+                .collect::<Result<MononokeIdentitySet, _>>()?;
+            Ok((group_name.to_string(), Arc::new(members)))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
 
     let default_user = MononokeIdentity::from_str("USER:myusername0")?;
-    let default_read_users = {
-        let mut users = MononokeIdentitySet::new();
-        users.insert(default_user.clone());
-        users
-    };
-    let default_write_users = {
-        let mut users = MononokeIdentitySet::new();
-        users.insert(default_user);
-        users
-    };
+    let default_read_users = MononokeIdentitySet::from([default_user.clone()]);
+    let default_write_users = MononokeIdentitySet::from([default_user]);
 
     let repos = hashmap! {
         "default".to_string() => Arc::new(Acl {
@@ -567,21 +1201,23 @@ fn setup_test_acls_with_groups(
 
 /// Creates a default Acls structure for testing.
 /// The ACL provides the test user access to all repos and appropriate repo regions.
-fn default_test_acls() -> Result<Acls> {
-    setup_test_acls(vec![
-        ("myusername_project", vec!["myusername0"]),
-        ("restricted_acl", vec!["another_user"]),
-    ])
+fn default_test_acls(groups_config: Vec<(&str, Vec<&str>)>) -> Result<Acls> {
+    setup_test_acls_with_groups(
+        vec![
+            ("myusername_project", vec!["myusername0"]),
+            ("restricted_acl", vec!["another_user"]),
+        ],
+        groups_config,
+    )
 }
 
 /// Sets up an ACL file that will be used to create an ACL checker.
 /// The ACL provides the test user access to all repos and appropriate repo regions.
-fn setup_acl_file(acls: Option<Acls>) -> Result<std::path::PathBuf> {
+fn setup_acl_file(acls: Acls) -> Result<std::path::PathBuf> {
     use std::io::Write;
 
     let mut temp_file = tempfile::NamedTempFile::new()?;
 
-    let acls = acls.unwrap_or_else(|| default_test_acls().expect("Failed to create default ACLs"));
     let acl_content = serde_json::to_string_pretty(&acls)?;
 
     temp_file.write_all(acl_content.as_bytes())?;
@@ -592,10 +1228,12 @@ fn setup_acl_file(acls: Option<Acls>) -> Result<std::path::PathBuf> {
 
 async fn setup_test_repo(
     ctx: &CoreContext,
-    restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
+    config_restricted_paths: Vec<(NonRootMPath, MononokeIdentity)>,
+    acl_manifest_mode: AclManifestMode,
     tooling_allowlist_group: Option<String>,
-    acls: Option<Acls>,
+    acls: Acls,
     log_file_path: std::path::PathBuf,
+    enforcement_condition_sets: &[EnforcementConditionSet],
 ) -> Result<TestRepo> {
     let repo_id = RepositoryId::new(0);
     let use_manifest_id_cache = true;
@@ -605,11 +1243,11 @@ async fn setup_test_repo(
     let acl_provider = InternalAclProvider::from_file(&acl_file)
         .with_context(|| format!("Failed to load ACLs from '{}'", acl_file.to_string_lossy()))?;
 
-    let path_acls = restricted_paths.into_iter().collect();
+    let path_acls = config_restricted_paths.into_iter().collect();
 
     let manifest_id_store = Arc::new(
         SqlRestrictedPathsManifestIdStoreBuilder::with_sqlite_in_memory()
-            .expect("Failed to create Sqlite connection")
+            .context("Failed to create Sqlite connection")?
             .with_repo_id(repo_id),
     );
 
@@ -618,6 +1256,9 @@ async fn setup_test_repo(
         use_manifest_id_cache,
         cache_update_interval_ms,
         tooling_allowlist_group,
+        acl_manifest_mode,
+        enforcement_condition_sets: enforcement_condition_sets.to_vec(),
+        enforcement_enabled: !enforcement_condition_sets.is_empty(),
         ..Default::default()
     };
 
@@ -634,16 +1275,29 @@ async fn setup_test_repo(
     // Create scuba builder that logs to the test file
     let scuba_builder = MononokeScubaSampleBuilder::with_discard().with_log_file(log_file_path)?;
 
-    let repo_restricted_paths = Arc::new(RestrictedPaths::new(
+    let config_based = Arc::new(RestrictedPathsConfigBased::new(
         config,
         manifest_id_store.clone(),
-        acl_provider,
         Some(cache),
-        scuba_builder,
     ));
 
-    // Create the test repo
+    // Build a repo first to get ArcRepoDerivedData. We use the same factory
+    // instance so that the final repo shares the same blobstore, ensuring
+    // that ACL manifest derivation inside spawned logging tasks can find
+    // changesets committed to this repo.
     let mut factory = TestRepoFactory::new(ctx.fb)?;
+    let repo: TestRepo = factory.build().await?;
+    let repo_derived_data = repo.repo_derived_data_arc();
+
+    let repo_restricted_paths = Arc::new(RestrictedPaths::new(
+        config_based,
+        acl_provider,
+        scuba_builder,
+        repo_derived_data,
+    )?);
+
+    // Rebuild with the custom restricted_paths, reusing the same factory
+    // so the blobstore is shared with repo_derived_data above.
     let repo = factory
         .with_restricted_paths(repo_restricted_paths)
         .build()
@@ -676,7 +1330,7 @@ fn deserialize_scuba_log_file(
         .map(|line| {
             serde_json::from_str::<serde_json::Value>(&line)
                 .map_err(anyhow::Error::from)
-                .with_context(|| format!("Failed to parse line: {}", line))
+                .with_context(|| format!("Failed to parse line: {line}"))
                 .map(|json| {
                     // Scuba groups the logs by type (e.g. int, normal), so
                     // let's remove those and flatten the sample into a single
@@ -734,6 +1388,12 @@ fn deserialize_scuba_log_file(
                         .transpose()?
                         .unwrap_or(false);
 
+                    let has_acl_access: bool = flattened_log["has_acl_access"]
+                        .as_str()
+                        .map(|st| st.parse::<bool>())
+                        .transpose()?
+                        .unwrap_or(false);
+
                     let restricted_paths: Vec<NonRootMPath> = flattened_log["restricted_paths"]
                         .as_array()
                         .map(|ids| {
@@ -770,6 +1430,29 @@ fn deserialize_scuba_log_file(
                         })
                         .unwrap_or_default();
 
+                    let considered_restricted_by: Vec<String> =
+                        flattened_log["considered_restricted_by"]
+                            .as_array()
+                            .map(|ids| {
+                                ids.iter()
+                                    .filter_map(|id| id.as_str())
+                                    .map(String::from)
+                                    .sorted()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                    let access_enforcement_enabled =
+                        optional_bool_field(&flattened_log, "access_enforcement_enabled")?;
+                    let acl_manifest_mode =
+                        optional_string_field(&flattened_log, "acl_manifest_mode");
+                    let config_error = optional_string_field(&flattened_log, "config_error");
+                    let acl_manifest_error =
+                        optional_string_field(&flattened_log, "acl_manifest_error");
+                    let shadow_mismatch = optional_bool_field(&flattened_log, "shadow_mismatch")?;
+                    let shadow_mismatch_detail =
+                        optional_string_field(&flattened_log, "shadow_mismatch_detail");
+
                     Ok(ScubaAccessLogSample {
                         repo_id,
                         restricted_paths,
@@ -779,8 +1462,16 @@ fn deserialize_scuba_log_file(
                         client_identities,
                         has_authorization,
                         is_allowlisted_tooling,
+                        has_acl_access,
                         client_main_id,
                         acls,
+                        considered_restricted_by,
+                        access_enforcement_enabled,
+                        acl_manifest_mode,
+                        config_error,
+                        acl_manifest_error,
+                        shadow_mismatch,
+                        shadow_mismatch_detail,
                     })
                 })?
         })
@@ -789,10 +1480,25 @@ fn deserialize_scuba_log_file(
     Ok(log_samples)
 }
 
-pub(crate) fn cast_to_non_root_mpaths(paths: Vec<&str>) -> Vec<NonRootMPath> {
+fn optional_string_field(flattened_log: &serde_json::Value, key: &str) -> Option<String> {
+    flattened_log[key].as_str().map(String::from)
+}
+
+fn optional_bool_field(flattened_log: &serde_json::Value, key: &str) -> Result<Option<bool>> {
+    match &flattened_log[key] {
+        serde_json::Value::Bool(value) => Ok(Some(*value)),
+        value => value
+            .as_str()
+            .map(|value| value.parse::<bool>())
+            .transpose()
+            .with_context(|| format!("failed to parse {key} as bool")),
+    }
+}
+
+pub(crate) fn cast_to_non_root_mpaths(paths: Vec<&str>) -> Result<Vec<NonRootMPath>> {
     paths
         .into_iter()
         .map(NonRootMPath::new)
         .collect::<Result<Vec<_>>>()
-        .expect("Failed to cast to NonRootMPath")
+        .context("Failed to cast to NonRootMPath")
 }

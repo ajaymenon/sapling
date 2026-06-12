@@ -219,12 +219,34 @@ void FsFileContentStoreDev::saveNextInodeNumber(InodeNumber nextInodeNumber) {
       localDir_ + PathComponentPiece{kNextInodeNumberFile};
 
   auto nextInodeVal = nextInodeNumber.get();
-  writeFileAtomic(
+  auto result = writeFileAtomic(
       nextInodeNumberPath,
       ByteRange(
           reinterpret_cast<const uint8_t*>(&nextInodeVal),
-          reinterpret_cast<const uint8_t*>(&nextInodeVal + 1)))
-      .value();
+          reinterpret_cast<const uint8_t*>(&nextInodeVal + 1)));
+  if (result.hasException()) {
+    XLOGF(
+        WARN,
+        "Failed to save next inode number to {}: {}",
+        nextInodeNumberPath,
+        folly::exceptionStr(result.exception()));
+
+    bool isENOENT = false;
+    result.exception().with_exception([&](const std::system_error& ex) {
+      isENOENT = ex.code() == std::errc::no_such_file_or_directory;
+    });
+    if (!isENOENT) {
+      // Remove the file so tryLoadNextInodeNumber() returns nullopt on next
+      // startup, triggering a full overlay scan rather than using stale data.
+      if (unlinkat(dirFile_.fd(), kNextInodeNumberFile, 0) != 0) {
+        XLOGF(
+            WARN,
+            "Failed to remove {}: {}",
+            nextInodeNumberPath,
+            folly::errnoStr(errno));
+      }
+    }
+  }
 }
 
 void FsFileContentStoreDev::validateExistingOverlay(int infoFD) {
@@ -315,7 +337,8 @@ std::optional<overlay::OverlayDir> FsInodeCatalogDev::loadAndRemoveOverlayDir(
 
 void FsInodeCatalogDev::saveOverlayDir(
     InodeNumber inodeNumber,
-    overlay::OverlayDir&& odir) {
+    overlay::OverlayDir&& odir,
+    bool /*crashSafe*/) {
   // Ask thrift to serialize it.
   auto serializedData = CompactSerializer::serialize<std::string>(odir);
 
@@ -405,15 +428,15 @@ FsFileContentStoreDev::createHeader(
   folly::io::Appender appender(&header, 0);
 
   appender.push(identifier);
-  appender.writeBE(version);
+  appender.writeBE<uint32_t>(version);
   // The overlay header used to store timestamps for inodes but that has since
   // been moved to the InodeMetadataTable. Write zeroes instead.
-  appender.writeBE<uint64_t>(0); // atime.tv_sec
-  appender.writeBE<uint64_t>(0); // atime.tv_nsec
-  appender.writeBE<uint64_t>(0); // ctime.tv_sec
-  appender.writeBE<uint64_t>(0); // ctime.tv_nsec
-  appender.writeBE<uint64_t>(0); // mtime.tv_sec
-  appender.writeBE<uint64_t>(0); // mtime.tv_nsec
+  appender.writeBE<uint64_t>(static_cast<uint64_t>(0)); // atime.tv_sec
+  appender.writeBE<uint64_t>(static_cast<uint64_t>(0)); // atime.tv_nsec
+  appender.writeBE<uint64_t>(static_cast<uint64_t>(0)); // ctime.tv_sec
+  appender.writeBE<uint64_t>(static_cast<uint64_t>(0)); // ctime.tv_nsec
+  appender.writeBE<uint64_t>(static_cast<uint64_t>(0)); // mtime.tv_sec
+  appender.writeBE<uint64_t>(static_cast<uint64_t>(0)); // mtime.tv_nsec
   auto paddingSize = kHeaderLength - header.length();
   appender.ensure(paddingSize);
   memset(appender.writableData(), 0, paddingSize);

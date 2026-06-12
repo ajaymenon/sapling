@@ -1,6 +1,6 @@
-#chg-compatible
+#chg-incompatible
+#inprocess-hg-incompatible
 #require no-fsmonitor no-eden
-#debugruntest-incompatible
 
 Setup. SCM_SAMPLING_FILEPATH needs to be cleared as some environments may
 have it set.
@@ -9,10 +9,10 @@ have it set.
 
   $ mkcommit() {
   >    echo "$1" > "$1"
-  >    hg add "$1"
+  >    sl add "$1"
   >    echo "add $1" > msg
   >    echo "" >> msg
-  >    hg ci -l msg
+  >    sl ci -l msg
   > }
 Init the repo
   $ configure modern
@@ -53,6 +53,8 @@ logged
   > EOF
   $ LOGDIR=$TESTTMP/logs
   $ mkdir $LOGDIR
+  >>> import os
+  >>> LOGDIR = os.path.join(os.environ["TESTTMP"], "logs")
   $ echo "logcommit=$TESTTMP/logcommit.py" >> $HGRCPATH
   $ echo "[sampling]" >> $HGRCPATH
   $ echo "filepath = $LOGDIR/samplingpath.txt" >> $HGRCPATH
@@ -66,7 +68,8 @@ Do a couple of commits.  We expect to log two messages per call to repo.commit.
   atexit handler executed
   atexit handler executed
   >>> import json
-  >>> with open("$LOGDIR/samplingpath.txt") as f:
+  >>> sample_path = os.path.join(LOGDIR, "samplingpath.txt")
+  >>> with open(sample_path) as f:
   ...     data = f.read()
   >>> for record in data.strip("\0").split("\0"):
   ...     parsedrecord = json.loads(record)
@@ -91,10 +94,11 @@ Do a couple of commits.  We expect to log two messages per call to repo.commit.
 Test topdir logging:
   $ setconfig sampling.logtopdir=True
   $ setconfig sampling.key.command_info=command_info
-  $ hg files c > /dev/null
+  $ sl files c > /dev/null
   atexit handler executed
   >>> from sapling import json
-  >>> with open("$LOGDIR/samplingpath.txt") as f:
+  >>> sample_path = os.path.join(LOGDIR, "samplingpath.txt")
+  >>> with open(sample_path) as f:
   ...     data = f.read().strip("\0").split("\0")
   >>> print([json.loads(d)["data"]["topdir"] for d in data if "topdir" in d])
   ['a_topdir']
@@ -104,10 +108,11 @@ Test env-var logging:
   $ setconfig sampling.key.env_vars=env_vars
   $ export TEST_VAR1=abc
   $ export TEST_VAR2=def
-  $ hg files c > /dev/null
+  $ sl files c > /dev/null
   atexit handler executed
   >>> import json, pprint
-  >>> with open("$LOGDIR/samplingpath.txt") as f:
+  >>> sample_path = os.path.join(LOGDIR, "samplingpath.txt")
+  >>> with open(sample_path) as f:
   ...     data = f.read().strip("\0").split("\0")
   >>> for jsonstr in data:
   ...     entry = json.loads(jsonstr)
@@ -121,10 +126,11 @@ Test env-var logging:
 Test rust traces make it to sampling file as well:
   $ rm $LOGDIR/samplingpath.txt
   $ setconfig sampling.key.from_rust=hello
-  $ hg debugshell -c "from sapling import tracing; tracing.info('msg', target='from_rust', hi='there')"
+  $ sl debugshell -c "from sapling import tracing; tracing.info('msg', target='from_rust', hi='there')"
   atexit handler executed
   >>> import json
-  >>> with open("$LOGDIR/samplingpath.txt") as f:
+  >>> sample_path = os.path.join(LOGDIR, "samplingpath.txt")
+  >>> with open(sample_path) as f:
   ...     data = f.read().strip("\0").split("\0")
   >>> for entry in data:
   ...     parsed = json.loads(entry)
@@ -145,8 +151,8 @@ Test command_duration is logged when ctrl-c'd:
   >         f.write(str(os.getpid()))
   >     time.sleep(3600)
   > EOF
-  $ hg sleep --config extensions.sigint_self=$TESTTMP/sleep.py &
-  $ hg debugpython <<EOF
+  $ sl sleep --config extensions.sigint_self=$TESTTMP/sleep.py &
+  $ sl debugpython <<EOF
   > import os, signal
   > while True:
   >     if os.path.exists("sleep.pid"):
@@ -155,7 +161,8 @@ Test command_duration is logged when ctrl-c'd:
   > EOF
   $ wait
   >>> import json
-  >>> with open("$LOGDIR/samplingpath.txt") as f:
+  >>> sample_path = os.path.join(LOGDIR, "samplingpath.txt")
+  >>> with open(sample_path) as f:
   ...     data = f.read().strip("\0").split("\0")
   >>> for entry in data:
   ...     parsed = json.loads(entry)
@@ -166,13 +173,13 @@ Test command_duration is logged when ctrl-c'd:
 Test ui.metrics.gauge API
   $ cat > $TESTTMP/a.py << EOF
   > def reposetup(ui, repo):
-  >     ui.metrics.gauge("test_foo_a", 1)
-  >     ui.metrics.gauge("test_foo_b", 2)
-  >     ui.metrics.gauge("test_foo_b", len(repo))
-  >     ui.metrics.gauge("test_bar")
-  >     ui.metrics.gauge("test_bar")
+  >     ui.metrics.inc("test_foo_a", 1)
+  >     ui.metrics.inc("test_foo_b", 2)
+  >     ui.metrics.inc("test_foo_b", len(repo))
+  >     ui.metrics.inc("test_bar")
+  >     ui.metrics.inc("test_bar")
   > EOF
-  $ SCM_SAMPLING_FILEPATH=$TESTTMP/a.txt hg log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py --config sampling.key.metrics=aaa
+  $ SCM_SAMPLING_FILEPATH=$TESTTMP/a.txt sl log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py --config sampling.key.metrics=aaa
   .
   atexit handler executed
   >>> import os, json
@@ -193,7 +200,7 @@ Test ui.metrics.gauge API
     test_foo_b=5
 
 Counters get logged for native commands:
-  $ SCM_SAMPLING_FILEPATH=$TESTTMP/native.txt hg debugmetrics --config sampling.key.metrics=aaa
+  $ SCM_SAMPLING_FILEPATH=$TESTTMP/native.txt sl debugmetrics --config sampling.key.metrics=aaa
   >>> import os, json
   >>> with open(os.path.join(os.environ["TESTTMP"], "native.txt"), "r") as f:
   ...     lines = filter(None, f.read().split("\0"))
@@ -205,7 +212,7 @@ Counters get logged for native commands:
     test_counter=1
 
 Metrics can be printed if devel.print-metrics is set:
-  $ hg log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py --config devel.print-metrics= --config devel.skip-metrics=scmstore,watchman
+  $ sl log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py --config devel.print-metrics= --config devel.skip-metrics=scmstore,indexedlog,watchman
   .
   atexit handler executed
   test_bar: 2
@@ -215,18 +222,18 @@ Metrics can be printed if devel.print-metrics is set:
 Metrics is logged to blackbox:
 
   $ setconfig blackbox.track=metrics
-  $ hg log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py
+  $ sl log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py
   .
   atexit handler executed
-  $ hg blackbox --no-timestamp --no-sid --pattern '{"legacy_log":{"service":"metrics"}}' | grep foo
+  $ sl blackbox --no-timestamp --no-sid --pattern '{"legacy_log":{"service":"metrics"}}' | grep foo
+  [legacy][metrics] {"metrics":*,"test":{"bar":2,"foo":{"a":1,"b":5}}}} (glob)
+  [legacy][metrics] {"metrics":*,"test":{"bar":2,"foo":{"a":1,"b":5}}}} (glob)
+  [legacy][metrics] {"metrics":*,"test":{"bar":2,"foo":{"a":1,"b":5}}}} (glob)
   atexit handler executed
-  [legacy][metrics] {"metrics":*,"test":{"bar":2,"foo":{"a":1,"b":5}}}} (glob)
-  [legacy][metrics] {"metrics":*,"test":{"bar":2,"foo":{"a":1,"b":5}}}} (glob)
-  [legacy][metrics] {"metrics":*,"test":{"bar":2,"foo":{"a":1,"b":5}}}} (glob)
 
 Invalid format strings don't crash Mercurial
 
-  $ SCM_SAMPLING_FILEPATH=$TESTTMP/invalid.txt hg --config sampling.key.invalid=invalid debugsh -c 'repo.ui.log("invalid", "invalid format %s %s", "single")'
+  $ SCM_SAMPLING_FILEPATH=$TESTTMP/invalid.txt sl --config sampling.key.invalid=invalid debugsh -c 'repo.ui.log("invalid", "invalid format %s %s", "single")'
   atexit handler executed
   >>> import os, json
   >>> with open(os.path.join(os.environ["TESTTMP"], "invalid.txt"), "r") as f:
@@ -252,16 +259,16 @@ Test command name:
   $ newclientrepo
   $ enable sparse
 Both Rust and Python use canonical "update" name:
-  $ SL_LOG=command_info=debug hg go --config checkout.use-rust=false . 2>&1 | grep command=
+  $ SL_LOG=command_info=debug sl go --config checkout.use-rust=false . 2>&1 | grep command=
   DEBUG command_info: command="update"
   DEBUG command_info: command="update"
 
-  $ SL_IDENTITY=sl SL_LOG=command_info=debug hg go --config checkout.use-rust=false . 2>&1 | grep command=
+  $ SL_IDENTITY=sl SL_LOG=command_info=debug sl go --config checkout.use-rust=false . 2>&1 | grep command=
   DEBUG command_info: command="update"
   DEBUG command_info: command="update"
 
 Sub commands work:
-  $ SL_LOG=command_info=debug hg sparse 2>&1 | grep command=
+  $ SL_LOG=command_info=debug sl sparse 2>&1 | grep command=
   DEBUG command_info: command="sparse"
-  $ SL_LOG=command_info=debug hg sparse refresh 2>&1 | grep command=
+  $ SL_LOG=command_info=debug sl sparse refresh 2>&1 | grep command=
   DEBUG command_info: command="sparse refresh"

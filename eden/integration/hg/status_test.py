@@ -6,6 +6,7 @@
 
 # pyre-unsafe
 
+import asyncio
 import binascii
 import os
 import random
@@ -326,7 +327,7 @@ class StatusTest(EdenHgTestCase):
                     any_failure = True
                     if time.monotonic() >= deadline:
                         raise e
-                    time.sleep(poll_interval_seconds)
+                    await asyncio.sleep(poll_interval_seconds)
                     continue
             if not any_failure:
                 break
@@ -529,7 +530,7 @@ class StatusTest(EdenHgTestCase):
                 break
             if time.monotonic() >= deadline:
                 raise Exception("timeout waiting for the block hit")
-            time.sleep(poll_interval_seconds)
+            await asyncio.sleep(poll_interval_seconds)
 
     async def test_status_shared_among_requests(self) -> None:
         """Test that status requests with the same parameters will
@@ -624,6 +625,9 @@ class StatusTest(EdenHgTestCase):
 
         async with self.get_async_thrift_client() as client:
             self.touch("world.txt")
+            await client.synchronizeWorkingCopy(
+                self.mount.encode("utf-8"), SynchronizeWorkingCopyParams()
+            )
             await client.injectFault(
                 FaultDefinition(
                     keyClass="scmStatusCache",
@@ -645,6 +649,9 @@ class StatusTest(EdenHgTestCase):
 
                 # touching a new file should advance the journal sequence number
                 self.touch("peace.txt")
+                await client.synchronizeWorkingCopy(
+                    self.mount.encode("utf-8"), SynchronizeWorkingCopyParams()
+                )
                 thread_expect_two_entries = Thread(
                     target=thread_worker,
                     # no matter where is the previous thread blocked, this thread

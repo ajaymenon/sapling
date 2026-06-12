@@ -50,7 +50,6 @@
       "CachelibMisses": 0,
       "GetpackNumPossibleLFSFiles": 0,
       "GetpackPossibleLFSFilesSumSize": 0,
-      "GettreepackDesignatedNodes": 0,
       "MemcacheHits": 0,
       "MemcacheMisses": 0,
       "SqlReadsMaster": 0,
@@ -77,11 +76,14 @@
     "normal": {
       "client_atlas": null,
       "client_atlas_env_id": null,
+      "client_atlas_rl": null,
       "client_correlator": "*", (glob)
       "client_entry_point": "sapling",
-      "client_hostname": "localhost",
+      "client_hostname": "localhost*", (glob)
       "client_ip": "$LOCALIP",
       "client_main_id": "*", (glob)
+      "client_tw_job": null,
+      "client_tw_task": null,
       "fetch_cause": null,
       "fetch_from_cas_attempted": "false",
       "http_host": "*", (glob)
@@ -94,10 +96,12 @@
       "request_id": "*", (glob)
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
-      "sandcastle_vcs": null
+      "sandcastle_vcs": null,
+      "session_uuid": "*" (glob)
     },
     "normvector": {
-      "client_identities": []
+      "client_identities": [],
+      "client_identities_typed": []
     }
   }
   {
@@ -120,7 +124,6 @@
       "CachelibMisses": 0,
       "GetpackNumPossibleLFSFiles": 0,
       "GetpackPossibleLFSFilesSumSize": 0,
-      "GettreepackDesignatedNodes": 0,
       "MemcacheHits": 0,
       "MemcacheMisses": 0,
       "SqlReadsMaster": 0,
@@ -143,11 +146,14 @@
     "normal": {
       "client_atlas": null,
       "client_atlas_env_id": null,
+      "client_atlas_rl": null,
       "client_correlator": "*", (glob)
       "client_entry_point": "sapling",
-      "client_hostname": "localhost",
+      "client_hostname": "localhost*", (glob)
       "client_ip": "$LOCALIP",
       "client_main_id": "*", (glob)
+      "client_tw_job": null,
+      "client_tw_task": null,
       "fetch_cause": null,
       "fetch_from_cas_attempted": "false",
       "http_host": "*", (glob)
@@ -161,10 +167,12 @@
       "request_id": "*", (glob)
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
-      "sandcastle_vcs": null
+      "sandcastle_vcs": null,
+      "session_uuid": "*" (glob)
     },
     "normvector": {
-      "client_identities": []
+      "client_identities": [],
+      "client_identities_typed": []
     }
   }
   {
@@ -187,7 +195,6 @@
       "CachelibMisses": 0,
       "GetpackNumPossibleLFSFiles": 0,
       "GetpackPossibleLFSFilesSumSize": 0,
-      "GettreepackDesignatedNodes": 0,
       "MemcacheHits": 0,
       "MemcacheMisses": 0,
       "SqlReadsMaster": 0,
@@ -215,12 +222,15 @@
       "batch_order": "*", (glob)
       "client_atlas": null,
       "client_atlas_env_id": null,
+      "client_atlas_rl": null,
       "client_correlator": "*", (glob)
       "client_entry_point": "sapling",
-      "client_hostname": "localhost",
+      "client_hostname": "localhost*", (glob)
       "client_ip": "$LOCALIP",
       "client_main_id": "*", (glob)
-      "fetch_cause": "unspecified",
+      "client_tw_job": null,
+      "client_tw_task": null,
+      "fetch_cause": "sl-unknown",
       "fetch_from_cas_attempted": "false",
       "http_host": "*", (glob)
       "http_method": "POST",
@@ -232,11 +242,13 @@
       "request_id": "*", (glob)
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
-      "sandcastle_vcs": null
+      "sandcastle_vcs": null,
+      "session_uuid": "*" (glob)
     },
     "normvector": {
       "batch_internal_missing_blobs": [],
-      "client_identities": []
+      "client_identities": [],
+      "client_identities_typed": []
     }
   }
   {
@@ -259,7 +271,6 @@
       "CachelibMisses": 0,
       "GetpackNumPossibleLFSFiles": 0,
       "GetpackPossibleLFSFilesSumSize": 0,
-      "GettreepackDesignatedNodes": 0,
       "MemcacheHits": 0,
       "MemcacheMisses": 0,
       "SqlReadsMaster": 0,
@@ -273,7 +284,7 @@
       "error_count": 0,
       "headers_duration_ms": *, (glob)
       "http_status": 2*, (glob)
-      "response_bytes_sent": 18,
+      "response_bytes_sent": *, (glob)
       "seq": 0,
       "stream_completed": *, (glob)
       "stream_completion_time_us": *, (glob)
@@ -287,12 +298,15 @@
     "normal": {
       "client_atlas": null,
       "client_atlas_env_id": null,
+      "client_atlas_rl": null,
       "client_correlator": "*", (glob)
       "client_entry_point": "sapling",
-      "client_hostname": "localhost",
+      "client_hostname": "localhost*", (glob)
       "client_ip": "$LOCALIP",
       "client_main_id": "*", (glob)
-      "fetch_cause": "unspecified",
+      "client_tw_job": null,
+      "client_tw_task": null,
+      "fetch_cause": "sl-unknown",
       "fetch_from_cas_attempted": "false",
       "http_host": "*", (glob)
       "http_method": "GET",
@@ -306,10 +320,12 @@
       "response_content_encoding": "zstd",
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
-      "sandcastle_vcs": null
+      "sandcastle_vcs": null,
+      "session_uuid": "*" (glob)
     },
     "normvector": {
-      "client_identities": []
+      "client_identities": [],
+      "client_identities_typed": []
     }
   }
   {
@@ -332,7 +348,6 @@
       "CachelibMisses": 0,
       "GetpackNumPossibleLFSFiles": 0,
       "GetpackPossibleLFSFilesSumSize": 0,
-      "GettreepackDesignatedNodes": 0,
       "MemcacheHits": 0,
       "MemcacheMisses": 0,
       "SqlReadsMaster": 0,
@@ -348,11 +363,14 @@
     "normal": {
       "client_atlas": null,
       "client_atlas_env_id": null,
+      "client_atlas_rl": null,
       "client_correlator": "*", (glob)
       "client_entry_point": "curl_test",
-      "client_hostname": "localhost",
+      "client_hostname": "localhost*", (glob)
       "client_ip": "$LOCALIP",
       "client_main_id": "*", (glob)
+      "client_tw_job": null,
+      "client_tw_task": null,
       "fetch_cause": null,
       "fetch_from_cas_attempted": "false",
       "http_host": *, (glob)
@@ -364,10 +382,12 @@
       "request_id": "*", (glob)
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
-      "sandcastle_vcs": null
+      "sandcastle_vcs": null,
+      "session_uuid": "*" (glob)
     },
     "normvector": {
-      "client_identities": []
+      "client_identities": [],
+      "client_identities_typed": []
     }
   }
 

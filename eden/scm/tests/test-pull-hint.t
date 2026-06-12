@@ -5,13 +5,13 @@
 #chg-compatible
 
 
-  $ hg init test
+  $ sl init test
   $ cd test
 
-Test config-driven hints on `hg pull
+Test config-driven hints on `sl pull
 
-  $ hg pull --config hint-definitions.pull:important_announcement="Important announcement text." .
+  $ sl pull --config hint-definitions.pull:important_announcement="Important announcement text." .
   pulling from .
   hint[pull:important_announcement]: Important announcement text.
-  hint[hint-ack]: use 'hg hint --ack pull:important_announcement' to silence these hints
+  hint[hint-ack]: use 'sl hint --ack pull:important_announcement' to silence these hints
 

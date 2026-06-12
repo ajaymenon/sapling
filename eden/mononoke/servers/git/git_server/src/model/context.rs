@@ -28,6 +28,7 @@ use super::Pushvars;
 use super::method::GitMethod;
 use crate::GitRepos;
 use crate::Repo;
+use crate::UpstreamLfsUrlFormat;
 use crate::errors::GitServerContextErrorKind;
 
 define_stats! {
@@ -73,12 +74,26 @@ impl RepositoryRequestContext {
 pub struct GitServerContextInner {
     repos: GitRepos,
     enforce_auth: bool,
-    // Upstream LFS server to fetch missing LFS objects from
+    // Upstream LFS server to fetch missing LFS objects from. Used only when
+    // `internal_lfs` is false.
     upstream_lfs_server: Option<String>,
+    // URL pattern used to construct per-object fetch URLs against the upstream LFS server
+    upstream_lfs_url_format: UpstreamLfsUrlFormat,
+    // Whether to resolve LFS pointers from the local Mononoke filestore (by
+    // SHA256 alias) instead of fetching them over HTTP from the upstream LFS
+    // server. The caller is responsible for the precedence: when set true,
+    // the upstream URL is ignored. The CLI defaults this to `true` whenever
+    // `--upstream-lfs-server` is not provided, so a git_server with no LFS
+    // flags at all behaves as if `--internal-lfs` was passed.
+    internal_lfs: bool,
     // Used for communicating with upstream LFS server
     tls_args: Option<TLSArgs>,
     // ACL provider for checking group membership
     acl_provider: Arc<dyn AclProvider>,
+    // Optional address (host:port) for the RL Land Service
+    multi_repo_land_service_address: Option<String>,
+    // See `GitimportPreferences::persist_partial_mappings`.
+    persist_partial_mappings: bool,
 }
 
 impl GitServerContextInner {
@@ -86,15 +101,23 @@ impl GitServerContextInner {
         repos: GitRepos,
         enforce_auth: bool,
         upstream_lfs_server: Option<String>,
+        upstream_lfs_url_format: UpstreamLfsUrlFormat,
+        internal_lfs: bool,
         tls_args: Option<TLSArgs>,
         acl_provider: Arc<dyn AclProvider>,
+        multi_repo_land_service_address: Option<String>,
+        persist_partial_mappings: bool,
     ) -> Self {
         Self {
             repos,
             enforce_auth,
             upstream_lfs_server,
+            upstream_lfs_url_format,
+            internal_lfs,
             tls_args,
             acl_provider,
+            multi_repo_land_service_address,
+            persist_partial_mappings,
         }
     }
 }
@@ -102,24 +125,45 @@ impl GitServerContextInner {
 #[derive(Clone, StateData)]
 pub struct GitServerContext {
     inner: Arc<RwLock<GitServerContextInner>>,
+    fb: fbinit::FacebookInit,
 }
 
 impl GitServerContext {
     pub fn new(
+        fb: fbinit::FacebookInit,
         repos: GitRepos,
         enforce_auth: bool,
         upstream_lfs_server: Option<String>,
+        upstream_lfs_url_format: UpstreamLfsUrlFormat,
+        internal_lfs: bool,
         tls_args: Option<TLSArgs>,
         acl_provider: Arc<dyn AclProvider>,
+        multi_repo_land_service_address: Option<String>,
+        persist_partial_mappings: bool,
     ) -> Self {
         let inner = Arc::new(RwLock::new(GitServerContextInner::new(
             repos,
             enforce_auth,
             upstream_lfs_server,
+            upstream_lfs_url_format,
+            internal_lfs,
             tls_args,
             acl_provider,
+            multi_repo_land_service_address,
+            persist_partial_mappings,
         )));
-        Self { inner }
+        Self { inner, fb }
+    }
+
+    pub fn persist_partial_mappings(&self) -> bool {
+        self.inner
+            .read()
+            .expect("poisoned lock in git server context")
+            .persist_partial_mappings
+    }
+
+    pub fn fb(&self) -> fbinit::FacebookInit {
+        self.fb
     }
 
     pub fn acl_provider(&self) -> Arc<dyn AclProvider> {
@@ -157,14 +201,18 @@ impl GitServerContext {
                     inner.repos.repo_configs(),
                 )),
                 None => {
-                    // Check if the repo exists in the global configuration
+                    // Check if the repo exists in the global configuration.
+                    // Route through `get_or_load_repo_config` so split-loaded
+                    // repos (only present in the per-tier RepoSpec manifest)
+                    // are recognized — otherwise we'd return `Err(None)`
+                    // ("repo does not exist") instead of falling through to
+                    // the on-demand load path.
                     let repo_exists_in_config = inner
                         .repos
                         .repo_mgr
                         .configs()
-                        .repo_configs()
-                        .repos
-                        .contains_key(&method_info.repo);
+                        .get_or_load_repo_config(&method_info.repo)
+                        .is_ok();
                     if repo_exists_in_config {
                         // Repo exists but is not loaded, we'll need to add it
                         Err(Some(inner.repos.repo_mgr.clone()))
@@ -182,8 +230,7 @@ impl GitServerContext {
                 // Repo exists in config but not loaded
                 // Check if dynamic repo loading is enabled via JustKnobs
                 let dynamic_loading_enabled =
-                    justknobs::eval("scm/mononoke:git_server_dynamic_repo_loading", None, None)
-                        .unwrap_or(false);
+                    justknobs::eval("scm/mononoke:git_server_dynamic_repo_loading", None, None);
 
                 if !dynamic_loading_enabled {
                     // Dynamic loading is disabled, return the old behavior
@@ -244,12 +291,34 @@ impl GitServerContext {
         Ok(inner.upstream_lfs_server.clone())
     }
 
+    pub fn upstream_lfs_url_format(&self) -> UpstreamLfsUrlFormat {
+        self.inner
+            .read()
+            .expect("poisoned lock in git server context")
+            .upstream_lfs_url_format
+    }
+
+    pub fn internal_lfs(&self) -> bool {
+        self.inner
+            .read()
+            .expect("poisoned lock in git server context")
+            .internal_lfs
+    }
+
     pub fn tls_args(&self) -> Result<Option<TLSArgs>> {
         let inner = self
             .inner
             .read()
             .expect("poisoned lock in git server context");
         Ok(inner.tls_args.clone())
+    }
+
+    pub fn multi_repo_land_service_address(&self) -> Option<String> {
+        self.inner
+            .read()
+            .expect("poisoned lock in git server context")
+            .multi_repo_land_service_address
+            .clone()
     }
 
     pub fn repo_as_mononoke_api(&self) -> Result<Mononoke<mononoke_api::Repo>> {

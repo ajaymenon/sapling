@@ -19,12 +19,12 @@ name = "tests"
 path = "tests/gitexport_tools/lib.rs"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bookmarks_types = { version = "0.1.0", path = "../../repo_attributes/bookmarks/bookmarks_types" }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 changeset_info = { version = "0.1.0", path = "../../derived_data/changeset_info" }
-clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 commit_id = { version = "0.1.0", path = "../../cmdlib/commit_id" }
 commit_transformation = { version = "0.1.0", path = "../../features/commit_transformation/commit_transformation" }
@@ -37,8 +37,7 @@ futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_symbolic_refs = { version = "0.1.0", path = "../../repo_attributes/git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../git_types" }
-indicatif = { version = "0.18.3", features = ["futures", "improved_unicode", "rayon", "tokio"] }
-itertools = "0.14.0"
+indicatif = { version = "0.18.4", features = ["futures", "improved_unicode", "rayon", "tokio"] }
 maplit = "1.0"
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 mononoke_api = { version = "0.1.0", path = "../../mononoke_api" }
@@ -49,7 +48,7 @@ mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 packfile = { version = "0.1.0", path = "../packfile" }
 print_graph = { version = "0.1.0", path = "../../cmdlib/displaying/graph" }
 protocol = { version = "0.1.0", path = "../protocol" }
-rand = { version = "0.9", features = ["small_rng"] }
+rand = "0.10.1"
 repo_authorization = { version = "0.1.0", path = "../../repo_authorization" }
 repo_blobstore = { version = "0.1.0", path = "../../repo_attributes/repo_blobstore" }
 repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_derived_data" }
@@ -59,7 +58,7 @@ serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unodes = { version = "0.1.0", path = "../../derived_data/unodes" }
 warm_bookmarks_cache = { version = "0.1.0", path = "../../repo_attributes/bookmarks/warm_bookmarks_cache" }

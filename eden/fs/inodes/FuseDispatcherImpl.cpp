@@ -30,7 +30,6 @@ namespace facebook::eden {
 
 namespace {
 
-/** Compute a fuse_entry_out */
 fuse_entry_out computeEntryParam(const FuseDispatcher::Attr& attr) {
   XDCHECK(attr.st.st_ino) << "We should never return a 0 inode to FUSE";
   fuse_entry_out entry = {};
@@ -60,15 +59,32 @@ FuseDispatcherImpl::FuseDispatcherImpl(EdenMount* mount)
       mount_(mount),
       inodeMap_(mount_->getInodeMap()) {}
 
+uint64_t FuseDispatcherImpl::computeTtl() const {
+  auto config = mount_->getEdenConfig();
+  if (!config->enablePressureBasedGc.getValue()) {
+    return std::numeric_limits<int32_t>::max();
+  }
+  auto policy = mount_->getInodePressurePolicy();
+  auto inodeCount = inodeMap_->getTotalInodeCountFast();
+  return static_cast<uint64_t>(policy->getFuseTtl(inodeCount).count());
+}
+
+uint64_t FuseDispatcherImpl::computeNegativeEntryTtl() const {
+  return mount_->getEdenConfig()->fuseNegativeDcacheTtlSeconds.getValue();
+}
+
 ImmediateFuture<FuseDispatcher::Attr> FuseDispatcherImpl::getattr(
     InodeNumber ino,
     const ObjectFetchContextPtr& context) {
+  auto ttl = computeTtl();
   return inodeMap_->lookupInode(ino)
       .thenValue([context = context.copy()](const InodePtr& inode) {
+        inode->updateLastFsRequestTime();
         return inode->stat(context);
       })
-      .thenValue(
-          [](const struct stat& st) { return FuseDispatcher::Attr{st}; });
+      .thenValue([ttl](const struct stat& st) {
+        return FuseDispatcher::Attr{st, ttl};
+      });
 }
 
 ImmediateFuture<uint64_t> FuseDispatcherImpl::opendir(
@@ -102,13 +118,15 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::lookup(
                   context = context.copy()](const TreeInodePtr& tree) {
         return tree->getOrLoadChild(name, context);
       })
-      .thenValue([context = context.copy()](const InodePtr& inode) {
+      .thenValue([this, context = context.copy()](const InodePtr& inode) {
+        inode->updateLastFsRequestTime();
+        auto ttl = computeTtl();
         return makeImmediateFutureWith([&]() { return inode->stat(context); })
-            .thenTry([inode](folly::Try<struct stat> maybeStat) {
+            .thenTry([inode, ttl](folly::Try<struct stat> maybeStat) {
               if (maybeStat.hasValue()) {
                 inode->incFsRefcount();
                 return computeEntryParam(
-                    FuseDispatcher::Attr{maybeStat.value()});
+                    FuseDispatcher::Attr{maybeStat.value(), ttl});
               } else {
                 // The most common case for stat() failing is if this file is
                 // materialized but the data for it in the overlay is missing
@@ -136,17 +154,27 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::lookup(
               }
             });
       })
-      .thenTry([](folly::Try<fuse_entry_out> try_) {
+      .thenTry([this](folly::Try<fuse_entry_out> try_) {
         if (auto* err = try_.tryGetExceptionObject<std::system_error>()) {
           if (isEnoent(*err)) {
-            // Translate ENOENT into a successful response with an
-            // inode number of 0 and a large entry_valid time, to let the kernel
-            // cache this negative lookup result.
+            // Translate ENOENT into a successful response with an inode
+            // number of 0 so the kernel can cache the negative lookup result.
+            //
+            // Note: if this negative dcache entry becomes incorrect for a
+            // name that is still returned by readdir, the kernel will stop
+            // asking EdenFS for that name and return ENOENT directly to
+            // user-space `stat`; `ls -l` will then show "?????????" because
+            // the name is visible but its metadata cannot be refreshed.
+            //
+            // This has happened in production, may be caused by a race, and is
+            // tricky to reproduce. A shorter TTL mitigates the issue by
+            // reducing how long a negative dcache entry can remain incorrect.
+            //
+            // Example report: https://fburl.com/workplace/329ni6ek
             fuse_entry_out entry = {};
-            entry.attr_valid =
-                std::numeric_limits<decltype(entry.attr_valid)>::max();
-            entry.entry_valid =
-                std::numeric_limits<decltype(entry.entry_valid)>::max();
+            auto ttl = computeNegativeEntryTtl();
+            entry.attr_valid = ttl;
+            entry.entry_valid = ttl;
             return folly::Try<fuse_entry_out>{entry};
           }
         }
@@ -237,13 +265,14 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::create(
   // (and thus can be zero)
   mode = S_IFREG | (07777 & mode);
   return inodeMap_->lookupTreeInode(parent).thenValue(
-      [mode, childName = PathComponent{name}, context = context.copy()](
+      [this, mode, childName = PathComponent{name}, context = context.copy()](
           const TreeInodePtr& inode) {
         auto child = inode->mknod(childName, mode, 0, InvalidationRequired::No);
+        auto ttl = computeTtl();
         return child->stat(context).thenValue(
-            [child](struct stat st) -> fuse_entry_out {
+            [child, ttl](struct stat st) -> fuse_entry_out {
               child->incFsRefcount();
-              return computeEntryParam(FuseDispatcher::Attr{st});
+              return computeEntryParam(FuseDispatcher::Attr{st, ttl});
             });
       });
 }
@@ -255,6 +284,7 @@ ImmediateFuture<BufVec> FuseDispatcherImpl::read(
     const ObjectFetchContextPtr& context) {
   return inodeMap_->lookupFileInode(ino).thenValue(
       [context = context.copy(), size, off](FileInodePtr&& inode) {
+        inode->updateLastFsRequestTime();
         return inode->read(size, off, context)
             .thenValue([](std::tuple<BufVec, bool>&& readRes) {
               return std::get<BufVec>(std::move(readRes));
@@ -317,6 +347,7 @@ ImmediateFuture<std::string> FuseDispatcherImpl::readlink(
   return inodeMap_->lookupFileInode(ino).thenValue(
       [kernelCachesReadlink,
        context = context.copy()](const FileInodePtr& inode) {
+        inode->updateLastFsRequestTime();
         // Only release the symlink blob after it's loaded if we can assume the
         // FUSE will cache the result in the kernel's page cache.
         return inode->readlink(
@@ -335,6 +366,7 @@ ImmediateFuture<FuseDirList> FuseDispatcherImpl::readdir(
   return inodeMap_->lookupTreeInode(ino).thenValue(
       [dirList = std::move(dirList), offset, context = context.copy()](
           TreeInodePtr inode) mutable {
+        inode->updateLastFsRequestTime();
         return inode->fuseReaddir(std::move(dirList), offset, context);
       });
 }
@@ -346,14 +378,18 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::mknod(
     dev_t rdev,
     const ObjectFetchContextPtr& context) {
   return inodeMap_->lookupTreeInode(parent).thenValue(
-      [childName = PathComponent{name}, mode, rdev, context = context.copy()](
-          const TreeInodePtr& inode) {
+      [this,
+       childName = PathComponent{name},
+       mode,
+       rdev,
+       context = context.copy()](const TreeInodePtr& inode) {
         auto child =
             inode->mknod(childName, mode, rdev, InvalidationRequired::No);
+        auto ttl = computeTtl();
         return child->stat(context).thenValue(
-            [child](struct stat st) -> fuse_entry_out {
+            [child, ttl](struct stat st) -> fuse_entry_out {
               child->incFsRefcount();
-              return computeEntryParam(FuseDispatcher::Attr{st});
+              return computeEntryParam(FuseDispatcher::Attr{st, ttl});
             });
       });
 }
@@ -364,12 +400,13 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::mkdir(
     mode_t mode,
     const ObjectFetchContextPtr& context) {
   return inodeMap_->lookupTreeInode(parent).thenValue(
-      [childName = PathComponent{name}, mode, context = context.copy()](
+      [this, childName = PathComponent{name}, mode, context = context.copy()](
           const TreeInodePtr& inode) {
         auto child = inode->mkdir(childName, mode, InvalidationRequired::No);
-        return child->stat(context).thenValue([child](struct stat st) {
+        auto ttl = computeTtl();
+        return child->stat(context).thenValue([child, ttl](struct stat st) {
           child->incFsRefcount();
-          return computeEntryParam(FuseDispatcher::Attr{st});
+          return computeEntryParam(FuseDispatcher::Attr{st, ttl});
         });
       });
 }
@@ -404,15 +441,17 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::symlink(
     StringPiece link,
     const ObjectFetchContextPtr& context) {
   return inodeMap_->lookupTreeInode(parent).thenValue(
-      [linkContents = link.str(),
+      [this,
+       linkContents = link.str(),
        childName = PathComponent{name},
        context = context.copy()](const TreeInodePtr& inode) {
         auto symlinkInode =
             inode->symlink(childName, linkContents, InvalidationRequired::No);
         symlinkInode->incFsRefcount();
+        auto ttl = computeTtl();
         return symlinkInode->stat(context).thenValue(
-            [symlinkInode](struct stat st) {
-              return computeEntryParam(FuseDispatcher::Attr{st});
+            [symlinkInode, ttl](struct stat st) {
+              return computeEntryParam(FuseDispatcher::Attr{st, ttl});
             });
       });
 }
@@ -461,13 +500,16 @@ ImmediateFuture<string> FuseDispatcherImpl::getxattr(
     const ObjectFetchContextPtr& context) {
   return inodeMap_->lookupInode(ino).thenValue(
       [attrName = name.str(), context = context.copy()](const InodePtr& inode) {
+        inode->updateLastFsRequestTime();
         return inode->getxattr(attrName, context);
       });
 }
 
 ImmediateFuture<vector<string>> FuseDispatcherImpl::listxattr(InodeNumber ino) {
-  return inodeMap_->lookupInode(ino).thenValue(
-      [](const InodePtr& inode) { return inode->listxattr(); });
+  return inodeMap_->lookupInode(ino).thenValue([](const InodePtr& inode) {
+    inode->updateLastFsRequestTime();
+    return inode->listxattr();
+  });
 }
 
 ImmediateFuture<struct fuse_kstatfs> FuseDispatcherImpl::statfs(

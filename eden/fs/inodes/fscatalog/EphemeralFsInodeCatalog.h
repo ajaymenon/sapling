@@ -46,6 +46,10 @@ class EphemeralFsInodeCatalog : public InodeCatalog {
     return true;
   }
 
+  bool supportsWal() const override {
+    return false;
+  }
+
   std::vector<InodeNumber> getAllParentInodeNumbers() override;
 
   /**
@@ -72,8 +76,10 @@ class EphemeralFsInodeCatalog : public InodeCatalog {
   std::optional<overlay::OverlayDir> loadAndRemoveOverlayDir(
       InodeNumber inodeNumber) override;
 
-  void saveOverlayDir(InodeNumber inodeNumber, overlay::OverlayDir&& odir)
-      override;
+  void saveOverlayDir(
+      InodeNumber inodeNumber,
+      overlay::OverlayDir&& odir,
+      bool crashSafe = true) override;
 
   /**
    * Remove the overlay directory data associated with the passed InodeNumber.

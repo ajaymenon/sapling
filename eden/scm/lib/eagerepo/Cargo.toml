@@ -13,14 +13,14 @@ license = "MIT"
 name = "eagerepo"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
 blob = { version = "0.1.0", path = "../blob" }
-fail = { version = "0.4", features = ["failpoints"] }
+fail = { version = "0.5.1", features = ["failpoints"] }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
-http = "0.2"
+http = "=1.4.0"
 manifest-augmented-tree = { version = "0.1.0", path = "../manifest-augmented-tree" }
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-dag = { version = "0.1.0", path = "../dag" }
 sapling-eagerepo-trait = { version = "0.1.0", path = "trait" }
 sapling-edenapi_trait = { version = "0.1.0", path = "../edenapi/trait" }
@@ -44,5 +44,5 @@ thiserror = "2.0.18"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-tempfile = "3.22"
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }

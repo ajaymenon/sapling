@@ -1,6 +1,6 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "async_requests",
@@ -23,12 +23,13 @@ rust_library(
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
         ":requests_table",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//common/rust/shed/stats:stats",
         "//eden/mononoke/blobstore:blobstore",
         "//eden/mononoke/blobstore:memblob",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/sql_construct:sql_construct",
         "//eden/mononoke/features/async_requests/if:async_requests_types-thrift-rust",
+        "//eden/mononoke/features/async_requests/types:async_requests_types",
         "//eden/mononoke/megarepo_api:megarepo_config",
         "//eden/mononoke/megarepo_api:megarepo_error",
         "//eden/mononoke/mononoke_api:mononoke_api",
@@ -54,7 +55,7 @@ rust_library(
         "//eden/mononoke/blobstore:blobstore_factory",
         "//eden/mononoke/cmdlib/mononoke_app:mononoke_app",
         "//eden/mononoke/common/sql_construct:sql_construct",
-        "//eden/mononoke/mononoke_api:mononoke_api",
+        "//eden/mononoke/mononoke_types:mononoke_types",
     ],
 )
 
@@ -76,8 +77,14 @@ rust_library(
     visibility = [
         ":async_requests",
         ":client",
+        "//eden/mononoke/features/async_requests/backfill_worker:backfill_worker",
+        "//eden/mononoke/features/async_requests/backfill_worker:backfill_worker-unittest",
         "//eden/mononoke/features/async_requests/worker:worker",
         "//eden/mononoke/features/async_requests/worker:worker-unittest",
+        "//eden/mononoke/features/async_requests/worker_lib:worker_lib",
+        "//eden/mononoke/features/async_requests/worker_lib:worker_lib-unittest",
+        "//eden/mononoke/tools/admin:admin",
+        "//eden/mononoke/tools/admin:admin-unittest",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -86,6 +93,7 @@ rust_library(
         "//common/rust/shed/sql:sql",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",
         "//eden/mononoke/common/sql_construct:sql_construct",
+        "//eden/mononoke/features/async_requests/types:async_requests_types",
         "//eden/mononoke/metaconfig:metaconfig_types",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/servers/slapi/slapi_server/context:context",

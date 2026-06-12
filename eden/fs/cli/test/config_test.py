@@ -14,7 +14,7 @@ import sys
 import unittest
 from collections import namedtuple
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Union
 from unittest.mock import MagicMock, Mock, patch
 
 import toml
@@ -27,6 +27,39 @@ from eden.test_support.testcase import EdenTestCaseBase
 from .. import config as config_mod, configutil
 from ..configinterpolator import EdenConfigInterpolator
 from ..configutil import EdenConfigParser, UnexpectedType
+
+FakeConfigValue = Union[str, bool]
+
+
+class FakeFuseTransportInstance(config_mod.AbstractEdenInstance):
+    def __init__(
+        self,
+        config: Dict[str, FakeConfigValue],
+        mounts: Dict[Path, config_mod.ListMountInfo],
+    ) -> None:
+        self._config = config
+        self._mounts = mounts
+
+    def get_config_value(self, key: str, default: str) -> str:
+        value = self._config.get(key, default)
+        if isinstance(value, str):
+            return value
+        section, option = key.split(".", 1)
+        raise configutil.UnexpectedType(
+            section=section, option=option, value=value, expected_type=str
+        )
+
+    def get_config_bool(self, key: str, default: bool) -> bool:
+        value = self._config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        section, option = key.split(".", 1)
+        raise configutil.UnexpectedType(
+            section=section, option=option, value=value, expected_type=bool
+        )
+
+    def get_mounts(self) -> Dict[Path, config_mod.ListMountInfo]:
+        return self._mounts
 
 
 def get_toml_test_file_invalid() -> str:
@@ -295,6 +328,32 @@ prefetching-enable = true
 
     def write_user_config(self, content: str) -> None:
         (self._home_dir / ".edenrc").write_text(content)
+
+    def test_combine_mount_info_skips_missing_configured_checkout_state(self) -> None:
+        cfg = self.get_config()
+        checkout = config_mod.EdenCheckout(
+            cfg,
+            self.tmp_dir / "stale-mount",
+            self._state_dir / "clients" / "stale-client",
+        )
+
+        mounts = config_mod.EdenInstance._combine_mount_info([], [checkout])
+
+        self.assertEqual({}, mounts)
+
+    def test_combine_mount_info_preserves_invalid_config_errors(self) -> None:
+        cfg = self.get_config()
+        client_dir = self._state_dir / "clients" / "broken-client"
+        client_dir.mkdir(parents=True)
+        (client_dir / "config.toml").write_text("not valid toml")
+        checkout = config_mod.EdenCheckout(
+            cfg,
+            self.tmp_dir / "broken-mount",
+            client_dir,
+        )
+
+        with self.assertRaises(config_mod.CheckoutConfigCorruptedError):
+            config_mod.EdenInstance._combine_mount_info([], [checkout])
 
 
 class EdenConfigParserTest(unittest.TestCase):
@@ -902,3 +961,102 @@ protocol = "{initial_mount_protocol}"
     def test_multiple_nfs_fuse(self) -> None:
         mounts = {"test1": "nfs", "test2": "fuse", "test3": "fuse", "test4": "nfs"}
         self.check_migrate_nfs(mounts)
+
+
+class FuseTransportMismatchTest(unittest.TestCase):
+    def make_instance(
+        self,
+        config: Dict[str, FakeConfigValue],
+        transports: Dict[str, str],
+    ) -> FakeFuseTransportInstance:
+        mounts = {
+            Path(path): config_mod.ListMountInfo(
+                path=Path(path),
+                data_dir=Path(f"/eden/client{path}"),
+                state=None,
+                configured=True,
+                backing_repo=None,
+                fs_channel_type="fuse",
+                fuse_transport=transport,
+            )
+            for path, transport in transports.items()
+        }
+        return FakeFuseTransportInstance(config, mounts)
+
+    @patch("os.uname")
+    def test_detects_devfuse_to_iouring_mismatch(self, mock_uname: MagicMock) -> None:
+        FakeUname = namedtuple("FakeUname", ["release"])
+        mock_uname.return_value = FakeUname(release="6.13.2-0_fbk7")
+        instance = self.make_instance(
+            {
+                "fuse.use-io-uring": True,
+                "fuse.io-uring-kernel-release-regex": r"^6\.13\.",
+            },
+            {"/mnt/eden": "devfuse"},
+        )
+
+        with patch("sys.platform", "linux"):
+            mismatches = config_mod.get_fuse_transport_mismatches(instance)
+
+        self.assertEqual(
+            [
+                config_mod.FuseTransportMismatch(
+                    mount=Path("/mnt/eden"),
+                    active_transport="devfuse",
+                    desired_transport="io_uring",
+                )
+            ],
+            mismatches,
+        )
+
+    @patch("os.uname")
+    def test_detects_iouring_to_devfuse_mismatch(self, mock_uname: MagicMock) -> None:
+        FakeUname = namedtuple("FakeUname", ["release"])
+        mock_uname.return_value = FakeUname(release="6.13.2-0_fbk7")
+        instance = self.make_instance(
+            {"fuse.use-io-uring": False},
+            {"/mnt/eden": "io_uring"},
+        )
+
+        with patch("sys.platform", "linux"):
+            mismatches = config_mod.get_fuse_transport_mismatches(instance)
+
+        self.assertEqual(
+            [
+                config_mod.FuseTransportMismatch(
+                    mount=Path("/mnt/eden"),
+                    active_transport="io_uring",
+                    desired_transport="devfuse",
+                )
+            ],
+            mismatches,
+        )
+
+    @patch("os.uname")
+    def test_disallowed_kernel_desires_devfuse(self, mock_uname: MagicMock) -> None:
+        FakeUname = namedtuple("FakeUname", ["release"])
+        mock_uname.return_value = FakeUname(release="6.16.1-0_fbk2")
+        instance = self.make_instance(
+            {
+                "fuse.use-io-uring": True,
+                "fuse.io-uring-kernel-release-regex": r"^6\.13\.",
+            },
+            {"/mnt/eden": "devfuse"},
+        )
+
+        with patch("sys.platform", "linux"):
+            self.assertEqual("devfuse", config_mod.get_desired_fuse_transport(instance))
+            self.assertEqual([], config_mod.get_fuse_transport_mismatches(instance))
+
+    def test_non_linux_has_no_desired_fuse_transport(self) -> None:
+        instance = self.make_instance(
+            {
+                "fuse.use-io-uring": True,
+                "fuse.io-uring-kernel-release-regex": r"^6\.13\.",
+            },
+            {"/mnt/eden": "devfuse"},
+        )
+
+        with patch("sys.platform", "darwin"):
+            self.assertIsNone(config_mod.get_desired_fuse_transport(instance))
+            self.assertEqual([], config_mod.get_fuse_transport_mismatches(instance))

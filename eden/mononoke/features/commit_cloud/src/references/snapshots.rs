@@ -14,12 +14,13 @@ use crate::CommitCloudContext;
 use crate::SqlCommitCloud;
 use crate::sql::ops::Delete;
 use crate::sql::ops::Insert;
+use crate::sql::ops::InsertMany;
 use crate::sql::snapshots_ops::DeleteArgs;
 
 pub async fn update_snapshots(
     sql_commit_cloud: &SqlCommitCloud,
     mut txn: Transaction,
-    ctx: &CoreContext,
+    _ctx: &CoreContext,
     cc_ctx: &CommitCloudContext,
     new_snapshots: Vec<CloudChangesetId>,
     removed_snapshots: Vec<CloudChangesetId>,
@@ -30,23 +31,38 @@ pub async fn update_snapshots(
         txn = Delete::<WorkspaceSnapshot>::delete(
             sql_commit_cloud,
             txn,
-            ctx,
             cc_ctx.reponame.clone(),
             cc_ctx.workspace.clone(),
             delete_args,
         )
         .await?;
     }
-    for snapshot in new_snapshots {
-        txn = Insert::<WorkspaceSnapshot>::insert(
-            sql_commit_cloud,
-            txn,
-            ctx,
-            cc_ctx.reponame.clone(),
-            cc_ctx.workspace.clone(),
-            WorkspaceSnapshot { commit: snapshot },
-        )
-        .await?;
+    if !new_snapshots.is_empty() {
+        if justknobs::eval("scm/mononoke:commitcloud_bulk_inserts", None, None) {
+            let snapshots: Vec<WorkspaceSnapshot> = new_snapshots
+                .into_iter()
+                .map(|commit| WorkspaceSnapshot { commit })
+                .collect();
+            txn = InsertMany::<WorkspaceSnapshot>::insert_many(
+                sql_commit_cloud,
+                txn,
+                cc_ctx.reponame.clone(),
+                cc_ctx.workspace.clone(),
+                snapshots,
+            )
+            .await?;
+        } else {
+            for snapshot in new_snapshots {
+                txn = Insert::<WorkspaceSnapshot>::insert(
+                    sql_commit_cloud,
+                    txn,
+                    cc_ctx.reponame.clone(),
+                    cc_ctx.workspace.clone(),
+                    WorkspaceSnapshot { commit: snapshot },
+                )
+                .await?;
+            }
+        }
     }
 
     Ok(txn)

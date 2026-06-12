@@ -8,8 +8,10 @@
 //! Base types used throughout Mononoke.
 #![feature(debug_closure_helpers)]
 
+pub mod acl_manifest;
 pub mod basename_suffix_skeleton_manifest_v3;
 pub mod blame_v2;
+pub mod blame_v3;
 pub mod blob;
 pub mod bonsai_changeset;
 pub mod case_conflict_skeleton_manifest;
@@ -21,6 +23,7 @@ pub mod debug;
 pub mod deleted_manifest_common;
 pub mod deleted_manifest_v2;
 pub mod derivable_type;
+pub mod directory_branch_cluster_manifest;
 pub mod errors;
 pub mod fastlog_batch;
 pub mod file_change;
@@ -29,6 +32,7 @@ pub mod fsnode;
 pub mod generation;
 pub mod globalrev;
 pub mod hash;
+pub mod history_manifest;
 pub mod inferred_copy_from;
 pub mod path;
 pub mod prefix_tree;
@@ -74,6 +78,8 @@ pub use content_metadata_v2::newline_count;
 pub use datetime::DateTime;
 pub use datetime::Timestamp;
 pub use derivable_type::DerivableType;
+pub use derivable_type::DerivableUntopologicallyVariant;
+pub use derivable_type::PipelineDerivableVariant;
 pub use file_change::BasicFileChange;
 pub use file_change::FileChange;
 pub use file_change::FileType;
@@ -92,6 +98,7 @@ pub use path::NonRootMPath;
 pub use path::PrefixTrie;
 pub use path::RepoPath;
 pub use path::check_case_conflicts;
+pub use path::find_path_conflicts;
 pub use path::mpath_element::MPathElement;
 pub use path::mpath_element::MPathElementPrefix;
 pub use path::mpath_element_iter;
@@ -120,6 +127,9 @@ pub use typed_hash::DeletedManifestV2Id;
 pub use typed_hash::FastlogBatchId;
 pub use typed_hash::FileUnodeId;
 pub use typed_hash::FsnodeId;
+pub use typed_hash::HistoryManifestDeletedNodeId;
+pub use typed_hash::HistoryManifestDirectoryId;
+pub use typed_hash::HistoryManifestFileId;
 pub use typed_hash::InferredCopyFromId;
 pub use typed_hash::ManifestUnodeId;
 pub use typed_hash::MononokeId;
@@ -133,6 +143,7 @@ mod macros;
 
 pub mod thrift {
     pub use derived_data_type_if::DerivedDataType;
+    pub use mononoke_types_serialization::acl_manifest;
     pub use mononoke_types_serialization::blame;
     pub use mononoke_types_serialization::bonsai;
     pub use mononoke_types_serialization::bssm;
@@ -142,8 +153,10 @@ pub mod thrift {
     pub use mononoke_types_serialization::content_manifest;
     pub use mononoke_types_serialization::data;
     pub use mononoke_types_serialization::deleted_manifest;
+    pub use mononoke_types_serialization::directory_branch_cluster_manifest;
     pub use mononoke_types_serialization::fastlog;
     pub use mononoke_types_serialization::fsnodes;
+    pub use mononoke_types_serialization::history_manifest;
     pub use mononoke_types_serialization::id;
     pub use mononoke_types_serialization::inferred_copy_from;
     pub use mononoke_types_serialization::path;

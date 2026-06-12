@@ -3,7 +3,7 @@
 # fix the mercurial code to use fbcode-relative includes.
 #
 
-load("@fbcode//eden/scm:targets.bzl", "gen_hgpython", "hg_binary")
+load("@fbcode//eden/scm:targets.bzl", "gen_hgpython", "gen_slpython", "hg_binary", "sl_binary")
 load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
 load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
 load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
@@ -12,6 +12,7 @@ load("@fbcode_macros//build_defs:native_rules.bzl", "buck_command_alias", "buck_
 load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbcode_macros//build_defs:python_library.bzl", "python_library")
 load("@fbcode_macros//build_defs:rust_universal_binary.bzl", "rust_universal_binary")
+load("@fbsource//tools/build_defs:check_dependencies_test.bzl", "check_dependencies_test")
 
 oncall("sapling")
 
@@ -110,6 +111,15 @@ gen_hgpython(
     suffix = "_test",
 )
 
+# Similar to "sl".
+# The main executable uses argv[0] to decide to run as a Python interpreter.
+gen_slpython(sl_target = "fbcode//eden/scm:sl")
+
+gen_slpython(
+    sl_target = "fbcode//eden/scm:sl_test",
+    suffix = "_test",
+)
+
 export_file(
     name = "windows-manifest",
     src = "exec/hgmain/manifest.xml",
@@ -122,62 +132,7 @@ hg_binary(
         "cargo_toml_config": {
             "dependencies_override": {
                 "dependencies": {
-                    "commands": {
-                        "default-features": False,
-                        "path": "../../lib/commands",
-                    },
-                    "pyblackbox": {"path": "../../saplingnative/bindings/modules/pyblackbox"},
-                    "sapling-atexit": {"path": "../../lib/util/atexit"},
-                    "sapling-clidispatch": {"path": "../../lib/clidispatch"},
-                    "sapling-configloader": {"path": "../../lib/config/loader"},
-                    "tracing": {
-                        "features": [
-                            "attributes",
-                            "valuable",
-                        ],
-                        "version": "0.1.41",
-                    },
-                },
-                "target": {
-                    '\'cfg(target_os = "linux")\'': {"dependencies": {
-                        "dirs": {
-                            "optional": True,
-                            "version": "6.0",
-                        },
-                        "libc": {"version": "0.2.139"},
-                        "sapling-configmodel": {"path": "../../lib/config/model"},
-                        "sapling-encoding": {"path": "../../lib/encoding"},
-                        "sapling-identity": {
-                            "optional": True,
-                            "path": "../../lib/identity",
-                        },
-                        "sapling-version": {"path": "../../lib/version"},
-                    }},
-                    '\'cfg(target_os = "macos")\'': {"dependencies": {
-                        "dirs": {
-                            "optional": True,
-                            "version": "6.0",
-                        },
-                        "libc": {"version": "0.2.139"},
-                        "sapling-configmodel": {"path": "../../lib/config/model"},
-                        "sapling-encoding": {"path": "../../lib/encoding"},
-                        "sapling-identity": {
-                            "optional": True,
-                            "path": "../../lib/identity",
-                        },
-                        "sapling-version": {"path": "../../lib/version"},
-                        "sapling-webview-app": {"path": "../../lib/webview-app"},
-                    }},
-                    '\'cfg(target_os = "windows")\'': {"dependencies": {
-                        "anyhow": {"version": "1.0.98"},
-                        "winapi": {
-                            "features": [
-                                "everything",
-                                "std",
-                            ],
-                            "version": "0.3",
-                        },
-                    }},
+                    "commands": {"default-features": False},
                 },
             },
             "extra_buck_dependencies": {
@@ -186,6 +141,7 @@ hg_binary(
                     "fbsource//third-party/rust:cc",
                 ],
                 "dependencies": [
+                    # drop fbinit dependency.
                     (None, "//common/rust/shed/fbinit:fbinit"),
                 ],
             },
@@ -209,11 +165,13 @@ hg_binary(
                 "build": "build.rs",
                 "name": "hgmain",
             },
-            "profile": {"release": {
-                "debug": True,
-                "incremental": True,
-                "lto": False,
-            }},
+            "profile": {
+                "release": {
+                    "debug": True,
+                    "incremental": True,
+                    "lto": False,
+                },
+            },
         },
         "cargo_toml_dir": "exec/hgmain",
     },
@@ -239,6 +197,49 @@ rust_universal_binary(
     visibility = ["PUBLIC"],
 )
 
+sl_binary(
+    name = "sl",
+    autocargo = {"ignore_rule": True},
+    link_group_map = select({
+        "DEFAULT": None,
+        "ovr_config//build_mode/constraints:dev": EVICT_FBCODE_DEFAULT_DEV_GROUP_MAP,
+    }),
+    link_group_min_binary_node_count = select({
+        "DEFAULT": None,
+        "ovr_config//build_mode/constraints:dev": PYTHON_EXTREME_LINK_GROUP_THRESHOLD,
+    }),
+)
+
+sl_binary(
+    name = "sl_test",
+    allow_oss_build = False,
+    autocargo = {"ignore_rule": True},
+)
+
+rust_universal_binary(
+    name = "sl_universal_binary",
+    source = ":sl",
+    visibility = ["PUBLIC"],
+)
+
+# Sapling is a performance sensitive CLI tool. It must not pull in heavyweight C++ infra
+# like ServiceRouter, Thrift server, etc., because they perform relatively slow global
+# initialization and destruction operations, and bloat the sl binary. Prefer instead a
+# sidecar binary like sl-acl-checker.
+check_dependencies_test(
+    name = "sl_heavyweight_deps_audit",
+    blocklist_patterns = [
+        "//servicerouter/client/.*",
+        "//thrift/lib/cpp2:server",
+    ],
+    compatible_with = [
+        "ovr_config//os:linux",
+    ],
+    contacts = ["oncall+sapling@xmail.facebook.com"],
+    mode = "blocklist",
+    target = ":sl",
+)
+
 cpp_library(
     # @autodeps-skip
     name = "chg",
@@ -262,6 +263,11 @@ cpp_library(
 buck_command_alias(
     name = "runhg",
     exe = ":hg",
+)
+
+buck_command_alias(
+    name = "runsl",
+    exe = ":sl",
 )
 
 buck_sh_binary(

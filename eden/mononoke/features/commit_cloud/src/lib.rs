@@ -320,7 +320,6 @@ impl CommitCloud {
             .storage
             .insert(
                 txn,
-                &self.ctx,
                 cc_ctx.reponame.clone(),
                 cc_ctx.workspace.clone(),
                 args.clone(),
@@ -343,7 +342,6 @@ impl CommitCloud {
             .storage
             .insert(
                 txn,
-                &self.ctx,
                 cc_ctx.reponame.clone(),
                 cc_ctx.workspace.clone(),
                 history_entry,
@@ -353,14 +351,12 @@ impl CommitCloud {
 
         if latest_version >= HISTORY_KEEP_VERSIONS {
             let delete_limit =
-                justknobs::get_as::<u64>("scm/mononoke:commitcloud_history_gc_chunk_size", None)
-                    .unwrap_or(0);
+                justknobs::get_as::<u64>("scm/mononoke:commitcloud_history_gc_chunk_size", None);
 
             // Delete old history entries
             txn = Delete::<WorkspaceHistory>::delete(
                 &self.storage,
                 txn,
-                &self.ctx,
                 cc_ctx.reponame.clone(),
                 cc_ctx.workspace.clone(),
                 HistoryDeleteArgs {
@@ -457,7 +453,7 @@ impl CommitCloud {
         let acl_name = make_workspace_acl_name(&ctx.workspace, &ctx.reponame);
 
         #[cfg(fbcode_build)]
-        let link = format!("[{}{}]", ACL_LINK, acl_name);
+        let link = format!("[{ACL_LINK}{acl_name}]");
         #[cfg(not(fbcode_build))]
         let link = String::new();
 
@@ -479,9 +475,20 @@ impl CommitCloud {
             );
         }
 
+        // Stamp both the workspace owner and the sharer (e.g. a manager
+        // recovering a departed report's workspace) onto the new ACL so the
+        // sharer also becomes a maintainer and retains access afterwards.
+        let acl_identities = ctx
+            .owner
+            .iter()
+            .flatten()
+            .chain(self.ctx.metadata().identities().iter())
+            .cloned()
+            .collect();
+
         match self
             .acl_provider
-            .commitcloud_workspace_acl(&acl_name, &ctx.owner)
+            .commitcloud_workspace_acl(&acl_name, &Some(acl_identities))
             .await
         {
             Err(e) => bail!(
@@ -519,10 +526,7 @@ impl CommitCloud {
             )
             .await?
             .is_none(),
-            format!(
-                "'rename_workspace' failed: workspace {} already exists",
-                new_workspace
-            ),
+            format!("'rename_workspace' failed: workspace {new_workspace} already exists"),
         );
 
         let (txn, affected_rows) =
@@ -611,7 +615,7 @@ impl CommitCloud {
             !history.is_empty(),
             "'get_smartlog_by_version' failed: no smartlog found for {}",
             match args {
-                GetType::GetHistoryVersion { version } => format!("version {}", version),
+                GetType::GetHistoryVersion { version } => format!("version {version}"),
                 GetType::GetHistoryDate { timestamp, .. } =>
                     format!("timestamp {}", DateTime::from(timestamp)),
                 _ => unreachable!(),
@@ -688,10 +692,7 @@ impl CommitCloud {
 
         ensure!(
             !result.is_empty(),
-            format!(
-                "'rollback_workspace' failed: no record found for version {}",
-                version
-            )
+            format!("'rollback_workspace' failed: no record found for version {version}")
         );
 
         let destination_workspace = match result.first().unwrap() {

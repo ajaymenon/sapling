@@ -15,14 +15,18 @@ use blobstore::KeyedBlobstore;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use cacheblob::MemWritesKeyedBlobstore;
+use commit_derived_data_mapping::CommitDerivedDataMapping;
 use context::CoreContext;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
 use futures::future::try_join_all;
+use metaconfig_types::DerivationPipelineConfig;
 use metaconfig_types::DerivedDataTypesConfig;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
-use restricted_paths::ArcRestrictedPaths;
+use mononoke_types::DerivableType;
+use mononoke_types::RepositoryId;
+use restricted_paths_common::config_based::ArcRestrictedPathsConfigBased;
 
 use crate::derivable::BonsaiDerivable;
 use crate::manager::derive::Rederivation;
@@ -40,6 +44,8 @@ pub struct DerivationContext {
     config_name: String,
     config: DerivedDataTypesConfig,
     pub(crate) rederivation: Option<Arc<dyn Rederivation>>,
+    repo_id: RepositoryId,
+    repo_name: String,
     pub(crate) blobstore: Arc<dyn KeyedBlobstore>,
     filestore_config: FilestoreConfig,
 
@@ -50,7 +56,9 @@ pub struct DerivationContext {
         Arc<dyn KeyedBlobstore>,
         Arc<MemWritesKeyedBlobstore<Arc<dyn KeyedBlobstore>>>,
     )>,
-    restricted_paths: ArcRestrictedPaths,
+    restricted_paths: ArcRestrictedPathsConfigBased,
+    pipeline_config: Option<DerivationPipelineConfig>,
+    commit_derived_data_mapping: Option<Arc<CommitDerivedDataMapping>>,
 }
 
 impl DerivationContext {
@@ -58,11 +66,15 @@ impl DerivationContext {
         bonsai_hg_mapping: Arc<dyn BonsaiHgMapping>,
         bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
         filenodes: Arc<dyn Filenodes>,
+        repo_id: RepositoryId,
+        repo_name: String,
         config_name: String,
         config: DerivedDataTypesConfig,
         blobstore: Arc<dyn KeyedBlobstore>,
         filestore_config: FilestoreConfig,
-        restricted_paths: ArcRestrictedPaths,
+        restricted_paths: ArcRestrictedPathsConfigBased,
+        pipeline_config: Option<DerivationPipelineConfig>,
+        commit_derived_data_mapping: Arc<CommitDerivedDataMapping>,
     ) -> Self {
         // Start with None. Use with_rederivation later if needed
         let rederivation = None;
@@ -70,6 +82,8 @@ impl DerivationContext {
             bonsai_hg_mapping: Some(bonsai_hg_mapping),
             bonsai_git_mapping: Some(bonsai_git_mapping),
             filenodes: Some(filenodes),
+            repo_id,
+            repo_name,
             config_name,
             config,
             rederivation,
@@ -77,6 +91,8 @@ impl DerivationContext {
             filestore_config,
             blobstore_write_cache: None,
             restricted_paths,
+            pipeline_config,
+            commit_derived_data_mapping: Some(commit_derived_data_mapping),
         }
     }
 
@@ -135,6 +151,17 @@ impl DerivationContext {
     pub(crate) fn with_replaced_blobstore(&self, blobstore: Arc<dyn KeyedBlobstore>) -> Self {
         Self {
             blobstore,
+            ..self.clone()
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_replaced_commit_derived_data_mapping(
+        &self,
+        commit_derived_data_mapping: Arc<CommitDerivedDataMapping>,
+    ) -> Self {
+        Self {
+            commit_derived_data_mapping: Some(commit_derived_data_mapping),
             ..self.clone()
         }
     }
@@ -264,6 +291,23 @@ impl DerivationContext {
         self.fetch_dependency(ctx, csid).await
     }
 
+    /// Like `fetch_unknown_dependency`, but returns `None` instead of an error
+    /// when the derived data has not been derived yet.
+    pub async fn fetch_unknown<Derivable>(
+        &self,
+        ctx: &CoreContext,
+        known: Option<&HashMap<ChangesetId, Derivable>>,
+        csid: ChangesetId,
+    ) -> Result<Option<Derivable>>
+    where
+        Derivable: BonsaiDerivable,
+    {
+        if let Some(value) = known.and_then(|k| k.get(&csid)) {
+            return Ok(Some(value.clone()));
+        }
+        self.fetch_derived(ctx, csid).await
+    }
+
     /// The blobstore that should be used for storing and retrieving blobs.
     pub fn blobstore(&self) -> &Arc<dyn KeyedBlobstore> {
         match &self.blobstore_write_cache {
@@ -296,13 +340,46 @@ impl DerivationContext {
         self.config_name.clone()
     }
 
-    pub fn restricted_paths(&self) -> ArcRestrictedPaths {
+    pub fn repo_id(&self) -> RepositoryId {
+        self.repo_id
+    }
+
+    pub fn repo_name(&self) -> &str {
+        &self.repo_name
+    }
+
+    pub fn restricted_paths(&self) -> ArcRestrictedPathsConfigBased {
         self.restricted_paths.clone()
+    }
+
+    pub fn commit_derived_data_mapping(&self) -> Result<&CommitDerivedDataMapping> {
+        self.commit_derived_data_mapping
+            .as_deref()
+            .context("Missing CommitDerivedDataMapping")
+    }
+
+    /// The XDB shard ID for a given derived data type.
+    pub fn xdb_shard_id(&self, variant: DerivableType) -> Result<usize> {
+        self.config
+            .xdb_mapping_shard_ids
+            .get(&variant)
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "xdb_mapping_shard_ids not configured for {}",
+                    variant.name()
+                )
+            })
     }
 
     /// The config that should be used for derivation.
     pub fn config(&self) -> &DerivedDataTypesConfig {
         &self.config
+    }
+
+    /// Repo-level pipeline configuration.
+    pub fn pipeline_config(&self) -> Option<&DerivationPipelineConfig> {
+        self.pipeline_config.as_ref()
     }
 
     /// Mapping key prefix for a particular derived data type.
@@ -342,10 +419,22 @@ impl DerivationContext {
     }
 
     /// Flush any pending writes for this derivation context.
-    pub(crate) async fn flush(&self, ctx: &CoreContext) -> Result<()> {
+    pub async fn flush(&self, ctx: &CoreContext) -> Result<()> {
         if let Some((_, blobstore)) = &self.blobstore_write_cache {
             blobstore.persist(ctx).await?;
         }
         Ok(())
+    }
+
+    /// Remove all entries from the write cache whose blobstore keys start
+    /// with the given prefix. This prevents them from being flushed to
+    /// persistent storage on the next `flush()`. The entries remain
+    /// readable until the next `flush()`. Returns the number of entries
+    /// removed, or 0 if write batching is not enabled.
+    pub fn remove_write_cache_by_prefix(&self, prefix: &str) -> usize {
+        match &self.blobstore_write_cache {
+            Some((_, blobstore)) => blobstore.remove_by_prefix(prefix),
+            None => 0,
+        }
     }
 }

@@ -14,12 +14,13 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/testharness/TempFile.h"
 #include "eden/common/utils/FileUtils.h"
 #include "eden/fs/inodes/fscatalog/FsInodeCatalog.h"
+#include "eden/fs/inodes/fscatalog/InodePath.h"
 #include "eden/fs/inodes/overlay/OverlayChecker.h"
 #include "eden/fs/inodes/sqlitecatalog/SqliteInodeCatalog.h"
+#include "eden/fs/inodes/test/OverlayTestUtil.h"
 #include "eden/fs/model/ObjectId.h"
 #include "eden/fs/testharness/TestUtil.h"
 
@@ -218,7 +219,7 @@ TestOverlay::TestOverlay(InodeCatalogType type)
       testConfig_{EdenConfig::createTestEdenConfig()} {
   if (type != InodeCatalogType::Legacy) {
     inodeCatalog_ = std::make_unique<SqliteInodeCatalog>(
-        tmpDirPath_ + "overlay"_pc, std::make_shared<NullStructuredLogger>());
+        tmpDirPath_ + "overlay"_pc, makeTestEdenFsEventsLogger());
   } else {
     inodeCatalog_ = std::make_unique<FsInodeCatalog>(&fcs_);
   }
@@ -227,7 +228,7 @@ TestOverlay::TestOverlay(InodeCatalogType type)
 void TestOverlay::recreateSqliteInodeCatalog() {
   if (type_ != InodeCatalogType::Legacy) {
     inodeCatalog_ = std::make_unique<SqliteInodeCatalog>(
-        tmpDirPath_ + "overlay"_pc, std::make_shared<NullStructuredLogger>());
+        tmpDirPath_ + "overlay"_pc, makeTestEdenFsEventsLogger());
   }
 }
 
@@ -777,3 +778,263 @@ INSTANTIATE_TEST_SUITE_P(
         InodeCatalogType::Legacy,
         InodeCatalogType::Sqlite,
         InodeCatalogType::InMemory));
+
+namespace {
+
+// Run fsck repair on a Legacy overlay. The catalog is left open so callers can
+// inspect the post-repair state.
+void runFsckRepair(
+    TestOverlay& testOverlay,
+    std::optional<InodeNumber> nextInode,
+    CaseSensitivity caseSensitive = CaseSensitivity::Sensitive) {
+  InodeCatalog::LookupCallback lookup = [](auto&&, auto&&) {
+    return makeImmediateFuture<InodeCatalog::LookupCallbackValue>(
+        std::runtime_error("no lookup callback"));
+  };
+  OverlayChecker checker(
+      testOverlay.inodeCatalog(),
+      &testOverlay.fcs(),
+      nextInode,
+      lookup,
+      testOverlay.getTestConfig()->fsckNumErrorDiscoveryThreads.getValue(),
+      caseSensitive);
+  checker.repairErrors();
+}
+
+} // namespace
+
+TEST(FsckWalTest, repairReplaysWalAfterReadOnlyScan) {
+  auto testOverlay = std::make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  auto root = testOverlay->init();
+  // Materialize root so it has a real overlay file on disk for fsck to
+  // load.
+  root.save();
+  testOverlay->closeCleanly();
+
+  // Reopen catalog (init only, no fsck) and append a WAL entry adding a
+  // child name without modifying the base file.
+  auto nextInode =
+      testOverlay->inodeCatalog()->initOverlay(/*createIfNonExisting=*/false);
+  ASSERT_TRUE(nextInode.has_value());
+  auto childIno = testOverlay->allocateInodeNumber();
+  overlay::OverlayEntry entry;
+  entry.mode() = S_IFREG | 0644;
+  entry.inodeNumber() = childIno.get();
+  testOverlay->fcs().appendWalEntry(
+      kRootNodeId, WalOpType::ADD, PathComponentPiece{"walAdded"}, &entry);
+  ASSERT_TRUE(testOverlay->fcs().hasWal(kRootNodeId));
+
+  runFsckRepair(*testOverlay, nextInode);
+
+  // The WAL must have been applied + removed.
+  EXPECT_FALSE(testOverlay->fcs().hasWal(kRootNodeId));
+  auto reload = testOverlay->inodeCatalog()->loadOverlayDir(kRootNodeId);
+  ASSERT_TRUE(reload.has_value());
+  EXPECT_EQ(1u, reload->entries()->count("walAdded"));
+  testOverlay->inodeCatalog()->close(std::nullopt);
+}
+
+TEST(FsckWalTest, danglingWalIsRemoved) {
+  auto testOverlay = std::make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  testOverlay->init();
+  testOverlay->closeCleanly();
+
+  auto nextInode =
+      testOverlay->inodeCatalog()->initOverlay(/*createIfNonExisting=*/false);
+  ASSERT_TRUE(nextInode.has_value());
+
+  // Pick an inode number that has no overlay file on disk and write a
+  // WAL entry for it. The pre-pass should observe nothing to merge into
+  // and unlink the WAL.
+  auto orphan = testOverlay->allocateInodeNumber();
+  testOverlay->fcs().appendWalEntry(
+      orphan, WalOpType::REMOVE, PathComponentPiece{"x"}, nullptr);
+  ASSERT_TRUE(testOverlay->fcs().hasWal(orphan));
+
+  runFsckRepair(*testOverlay, nextInode);
+
+  EXPECT_FALSE(testOverlay->fcs().hasWal(orphan));
+  // A REMOVE WAL on a missing base must not synthesize an empty base file,
+  // which would just give fsck a new orphan inode to quarantine.
+  EXPECT_FALSE(testOverlay->inodeCatalog()->loadOverlayDir(orphan).has_value());
+  testOverlay->inodeCatalog()->close(std::nullopt);
+}
+
+TEST(FsckWalTest, corruptWalDoesNotCrashFsck) {
+  auto testOverlay = std::make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  auto root = testOverlay->init();
+  root.save();
+  testOverlay->closeCleanly();
+
+  auto nextInode =
+      testOverlay->inodeCatalog()->initOverlay(/*createIfNonExisting=*/false);
+  ASSERT_TRUE(nextInode.has_value());
+
+  // Hand-craft an invalid WAL file (declared entryLen larger than the
+  // file). replayWal stops at the first bad entry; fsck must not throw.
+  auto walPath = FsFileContentStore::getWalPath(kRootNodeId);
+  auto fullPath = testOverlay->overlayPath() + RelativePathPiece{walPath};
+  std::string corrupt;
+  uint32_t bad = 100;
+  corrupt.append(reinterpret_cast<const char*>(&bad), sizeof(bad));
+  corrupt.push_back(static_cast<char>(WalOpType::ADD));
+  ASSERT_TRUE(folly::writeFile(corrupt, fullPath.c_str()));
+
+  EXPECT_NO_THROW(runFsckRepair(*testOverlay, nextInode));
+  testOverlay->inodeCatalog()->close(std::nullopt);
+}
+
+TEST(FsckWalTest, scanForErrorsLeavesWalUntouched) {
+  // Regression for `eden fsck --dry-run` mutating the overlay. scanForErrors()
+  // must not merge or unlink any WAL file.
+  auto testOverlay = std::make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  auto root = testOverlay->init();
+  root.save();
+  testOverlay->closeCleanly();
+
+  auto nextInode =
+      testOverlay->inodeCatalog()->initOverlay(/*createIfNonExisting=*/false);
+  ASSERT_TRUE(nextInode.has_value());
+
+  auto childIno = testOverlay->allocateInodeNumber();
+  overlay::OverlayEntry entry;
+  entry.mode() = S_IFREG | 0644;
+  entry.inodeNumber() = childIno.get();
+  testOverlay->fcs().appendWalEntry(
+      kRootNodeId, WalOpType::ADD, PathComponentPiece{"walAdded"}, &entry);
+  ASSERT_TRUE(testOverlay->fcs().hasWal(kRootNodeId));
+
+  // Snapshot the base directory so we can detect any rewrite.
+  auto baseBefore = testOverlay->inodeCatalog()->loadOverlayDir(kRootNodeId);
+  ASSERT_TRUE(baseBefore.has_value());
+  EXPECT_EQ(0u, baseBefore->entries()->count("walAdded"));
+
+  // Materialize the child file on disk so that scanForErrors sees an
+  // inode with no parent (the WAL ADD that would link it to root is
+  // intentionally NOT merged by a read-only scan).
+  overlay::OverlayDir emptyChild;
+  testOverlay->inodeCatalog()->saveOverlayDir(
+      childIno, std::move(emptyChild), /*crashSafe=*/true);
+
+  InodeCatalog::LookupCallback lookup = [](auto&&, auto&&) {
+    return makeImmediateFuture<InodeCatalog::LookupCallbackValue>(
+        std::runtime_error("no lookup callback"));
+  };
+  OverlayChecker checker(
+      testOverlay->inodeCatalog(),
+      &testOverlay->fcs(),
+      nextInode,
+      lookup,
+      testOverlay->getTestConfig()->fsckNumErrorDiscoveryThreads.getValue());
+  auto childInoStr = std::to_string(childIno.get());
+  auto hasOrphanReport = [&] {
+    for (const auto& err : checker.getErrors()) {
+      auto msg = err->getMessage(&checker);
+      if (msg.find("orphan") != std::string::npos &&
+          msg.find(childInoStr) != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  checker.scanForErrors();
+  EXPECT_TRUE(hasOrphanReport())
+      << "expected orphan report for inode " << childInoStr;
+
+  checker.scanForErrors(
+      /*progressCallback=*/[](auto) {}, /*includeWalChildren=*/true);
+  EXPECT_FALSE(hasOrphanReport())
+      << "unexpected orphan report for inode " << childInoStr;
+
+  EXPECT_TRUE(testOverlay->fcs().hasWal(kRootNodeId));
+  auto baseAfter = testOverlay->inodeCatalog()->loadOverlayDir(kRootNodeId);
+  ASSERT_TRUE(baseAfter.has_value());
+  EXPECT_EQ(0u, baseAfter->entries()->count("walAdded"));
+
+  testOverlay->inodeCatalog()->close(std::nullopt);
+}
+
+TEST(FsckWalTest, repairReplaysWalOntoMissingBase) {
+  // When fsck encounters an inode whose base file is missing but whose WAL
+  // is present (e.g. daemon crashed between appendWalEntry and the first
+  // saveOverlayDir), the WAL must be replayed onto an empty base so its
+  // ADD'd children don't become orphans.
+  auto testOverlay = std::make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  auto root = testOverlay->init();
+  // Allocate a directory inode and link it into root, but do not save its
+  // base file - simulates a crash between appendWalEntry and the first
+  // saveOverlayDir for that directory.
+  auto missingBase = root.mkdir("missingBase");
+  auto missingBaseDir = missingBase.number();
+  root.save();
+  testOverlay->closeCleanly();
+
+  auto nextInode =
+      testOverlay->inodeCatalog()->initOverlay(/*createIfNonExisting=*/false);
+  ASSERT_TRUE(nextInode.has_value());
+
+  // Append a WAL ADD for the missing-base directory. fsck will create an
+  // empty replacement overlay file for the materialized child during repair;
+  // that's incidental - what matters here is that the parent's base ends up
+  // containing the WAL-ADD'd entry.
+  auto walChildIno = testOverlay->allocateInodeNumber();
+  overlay::OverlayEntry entry;
+  entry.mode() = S_IFREG | 0644;
+  entry.inodeNumber() = walChildIno.get();
+  testOverlay->fcs().appendWalEntry(
+      missingBaseDir, WalOpType::ADD, PathComponentPiece{"walChild"}, &entry);
+  ASSERT_TRUE(testOverlay->fcs().hasWal(missingBaseDir));
+  ASSERT_FALSE(
+      testOverlay->inodeCatalog()->loadOverlayDir(missingBaseDir).has_value());
+
+  runFsckRepair(*testOverlay, nextInode);
+
+  // Base now exists and contains the WAL-ADD'd entry; WAL is gone.
+  EXPECT_FALSE(testOverlay->fcs().hasWal(missingBaseDir));
+  auto recovered = testOverlay->inodeCatalog()->loadOverlayDir(missingBaseDir);
+  ASSERT_TRUE(recovered.has_value());
+  ASSERT_EQ(1u, recovered->entries()->count("walChild"));
+  EXPECT_EQ(
+      walChildIno.get(), *recovered->entries()->at("walChild").inodeNumber());
+  testOverlay->inodeCatalog()->close(std::nullopt);
+}
+
+TEST(FsckWalTest, caseInsensitiveCollapsedAddRekeysBaseEntry) {
+  // Regression for case-only rename replay on case-insensitive mounts.
+  // Without CaseSensitivity threaded through to replayWal, fsck would
+  // collapse REMOVE "foo" + ADD "FOO" using std::map's default sensitive
+  // ordering, applying them as independent entries; the REMOVE would then
+  // erase the freshly-inserted FOO and saveOverlayDir would persist a
+  // missing entry on macOS/Windows mounts.
+  auto testOverlay = std::make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  auto root = testOverlay->init();
+  auto baseChildIno = testOverlay->allocateInodeNumber();
+  auto walChildIno = testOverlay->allocateInodeNumber();
+  root.linkFile(baseChildIno, "foo", std::nullopt, 0644);
+  root.save();
+  testOverlay->closeCleanly();
+
+  auto nextInode =
+      testOverlay->inodeCatalog()->initOverlay(/*createIfNonExisting=*/false);
+  ASSERT_TRUE(nextInode.has_value());
+
+  testOverlay->fcs().appendWalEntry(
+      kRootNodeId, WalOpType::REMOVE, PathComponentPiece{"foo"}, nullptr);
+  overlay::OverlayEntry walEntry;
+  walEntry.mode() = S_IFREG | 0644;
+  walEntry.inodeNumber() = walChildIno.get();
+  testOverlay->fcs().appendWalEntry(
+      kRootNodeId, WalOpType::ADD, PathComponentPiece{"FOO"}, &walEntry);
+  ASSERT_TRUE(testOverlay->fcs().hasWal(kRootNodeId));
+
+  runFsckRepair(*testOverlay, nextInode, CaseSensitivity::Insensitive);
+
+  EXPECT_FALSE(testOverlay->fcs().hasWal(kRootNodeId));
+  auto reload = testOverlay->inodeCatalog()->loadOverlayDir(kRootNodeId);
+  ASSERT_TRUE(reload.has_value());
+  EXPECT_EQ(0u, reload->entries()->count("foo"));
+  ASSERT_EQ(1u, reload->entries()->count("FOO"));
+  EXPECT_EQ(walChildIno.get(), *reload->entries()->at("FOO").inodeNumber());
+  testOverlay->inodeCatalog()->close(std::nullopt);
+}

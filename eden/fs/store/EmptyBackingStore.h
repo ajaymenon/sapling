@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/coro/Task.h>
+#include <folly/coro/safe/NowTask.h>
 #include "eden/fs/model/RootId.h"
 #include "eden/fs/store/BackingStore.h"
 #include "eden/fs/store/ObjectFetchContext.h"
@@ -40,6 +41,11 @@ class EmptyBackingStore final : public BijectiveBackingStore {
   ImmediateFuture<GetRootTreeResult> getRootTree(
       const RootId& rootId,
       const ObjectFetchContextPtr& context) override;
+  folly::coro::now_task<GetRootTreeResult> co_getRootTree(
+      const RootId& /* rootId */,
+      const ObjectFetchContextPtr& /* context */) override {
+    throw std::domain_error("empty backing store");
+  }
   ImmediateFuture<std::shared_ptr<TreeEntry>> getTreeEntryForObjectId(
       const ObjectId& /* objectId */,
       TreeEntryType /* treeEntryType */,
@@ -49,9 +55,15 @@ class EmptyBackingStore final : public BijectiveBackingStore {
   folly::SemiFuture<GetTreeResult> getTree(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
+  folly::coro::now_task<GetTreeResult> co_getTree(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
   folly::SemiFuture<GetTreeAuxResult> getTreeAuxData(
       const ObjectId& /*id*/,
       const ObjectFetchContextPtr& /*context*/) override;
+  folly::coro::now_task<GetTreeAuxResult> co_getTreeAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
   folly::SemiFuture<GetBlobResult> getBlob(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
@@ -61,8 +73,15 @@ class EmptyBackingStore final : public BijectiveBackingStore {
   folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
       const ObjectId& /*id*/,
       const ObjectFetchContextPtr& /*context*/) override;
+  folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
 
   ImmediateFuture<GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const std::vector<std::string>& prefixes) override;
+  folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
       const RootId& id,
       const std::vector<std::string>& globs,
       const std::vector<std::string>& prefixes) override;

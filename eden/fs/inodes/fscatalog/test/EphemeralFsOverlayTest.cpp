@@ -21,9 +21,10 @@
 #include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/TreeInode.h"
+#include "eden/fs/inodes/test/OverlayTestUtil.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/testharness/TestMount.h"
 
@@ -48,9 +49,9 @@ class EphemeralFsOverlayTest : public ::testing::Test {
         kPathMapDefaultCaseSensitive,
         InodeCatalogType::LegacyEphemeral,
         INODE_CATALOG_DEFAULT,
-        std::make_shared<NullStructuredLogger>(),
+        makeTestEdenFsEventsLogger(),
+        /*errorLogger=*/noopErrorLogger_,
         makeRefPtr<EdenStats>(),
-        true,
         *edenConfig);
     overlay
         ->initialize(std::make_shared<ReloadableConfig>(std::move(edenConfig)))
@@ -62,6 +63,7 @@ class EphemeralFsOverlayTest : public ::testing::Test {
   }
 
   folly::test::TemporaryDirectory testDir;
+  ErrorLogger noopErrorLogger_ = makeTestErrorLogger();
   std::shared_ptr<Overlay> overlay;
 };
 

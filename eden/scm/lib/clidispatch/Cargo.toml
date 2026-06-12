@@ -13,15 +13,17 @@ license = "MIT"
 name = "clidispatch"
 
 [dependencies]
-anyhow = "1.0.98"
-erased-serde = "0.4.9"
+anyhow = "1.0.102"
+erased-serde = "0.4.10"
 hostname = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+sapling-agentdetect = { version = "0.1.0", path = "../agentdetect" }
 sapling-blackbox = { version = "0.1.0", path = "../blackbox" }
 sapling-cliparser = { version = "0.1.0", path = "../cliparser" }
 sapling-configloader = { version = "0.1.0", path = "../config/loader" }
 sapling-configmodel = { version = "0.1.0", path = "../config/model" }
 sapling-context = { version = "0.1.0", path = "../context" }
 sapling-gitcompat = { version = "0.1.0", path = "../gitcompat" }
+sapling-grepocompat = { version = "0.1.0", path = "../grepocompat" }
 sapling-hgplain = { version = "0.1.0", path = "../util/hgplain" }
 sapling-hgtime = { version = "0.1.0", path = "../hgtime" }
 sapling-hook = { version = "0.1.0", path = "../hook" }
@@ -33,12 +35,16 @@ sapling-repo = { version = "0.1.0", path = "../repo", features = ["wdir"] }
 sapling-repourl = { version = "0.1.0", path = "../repo/url" }
 sapling-sampling = { version = "0.1.0", path = "../sampling" }
 sapling-termlogger = { version = "0.1.0", path = "../io/term/logger" }
+sapling-termstyle = { version = "0.1.0", path = "../io/term/style" }
 sapling-thrift-types = { version = "0.1.0", path = "../thrift-types", optional = true }
 sapling-types = { version = "0.1.0", path = "../types" }
 sapling-util = { version = "0.1.0", path = "../util" }
 sapling-workingcopy = { version = "0.1.0", path = "../workingcopy" }
 thiserror = "2.0.18"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
+
+[dev-dependencies]
+sapling-configset = { version = "0.1.0", path = "../config/set" }
 
 [features]
 eden = ["sapling-thrift-types", "sapling-workingcopy/eden"]

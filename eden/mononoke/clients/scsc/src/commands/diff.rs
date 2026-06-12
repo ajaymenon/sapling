@@ -78,6 +78,9 @@ pub(super) struct CommandArgs {
     context: i64,
     #[clap(flatten)]
     scheme_args: SchemeArgs,
+    #[clap(long)]
+    /// Follow mutable overrides to the history that make it more user friendly and 'correct'
+    follow_mutable_history: bool,
 }
 
 #[derive(Serialize)]
@@ -193,10 +196,10 @@ impl Render for SubtreeChangeOutput {
     fn render(&self, _args: &Self::Args, w: &mut dyn Write) -> Result<()> {
         write!(w, "subtree {} ", self.change_type)?;
         if let Some(source_url) = &self.source_url {
-            write!(w, "{} ", source_url)?;
+            write!(w, "{source_url} ")?;
         }
         if let Some(source_commit_id) = &self.source_commit_id {
-            write!(w, "{}", source_commit_id)?;
+            write!(w, "{source_commit_id}")?;
         }
         if let Some(source_commit_ids) = &self.source_commit_ids {
             render_commit_id(
@@ -303,6 +306,7 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
         compare_items: btreeset! {thrift::CommitCompareItem::FILES},
         ordered_params,
         compare_with_subtree_copy_sources: Some(args.compare_with_subtree_copy_sources),
+        follow_mutable_file_history: Some(args.follow_mutable_history),
         ..Default::default()
     };
     let response = conn

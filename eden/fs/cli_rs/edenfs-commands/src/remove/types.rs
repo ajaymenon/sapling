@@ -9,6 +9,7 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::style::Stylize;
@@ -99,6 +100,7 @@ pub struct RemoveContext {
     pub preserve_mount_point: bool,
     pub no_force: bool,
     pub io: Arc<Messenger>,
+    pub timeout: Duration,
 }
 
 impl RemoveContext {
@@ -109,6 +111,7 @@ impl RemoveContext {
         preserve_mount_point: bool,
         no_force: bool,
         io: Arc<Messenger>,
+        timeout: Duration,
     ) -> RemoveContext {
         RemoveContext {
             original_path,
@@ -117,6 +120,7 @@ impl RemoveContext {
             preserve_mount_point,
             no_force,
             io,
+            timeout,
         }
     }
 }

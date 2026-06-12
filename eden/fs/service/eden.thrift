@@ -279,6 +279,10 @@ struct MountInfo {
   2: PathString edenClientPath;
   3: MountState state;
   4: optional PathString backingRepoPath;
+  // The filesystem channel type: "fuse", "nfs3", or "prjfs".
+  5: optional string fsChannelType;
+  // The FUSE transport type: "devfuse" or "io_uring". Only set for FUSE mounts.
+  6: optional string fuseTransport;
 }
 
 struct MountArgument {
@@ -415,6 +419,24 @@ enum FileAttributes {
    * Returns the mode of a file.
    */
   MODE = 256,
+
+  /**
+   * Returns whether any ACL applies to this path. Resolved from tree
+   * metadata — only tree fetches are needed, avoiding the separate
+   * access-check endpoint. Tree fetches may still require network
+   * calls if the path is not yet cached. For directories, indicates
+   * the directory has an ACL at or above it. For files and symlinks,
+   * indicates the containing directory is under an ACL.
+   */
+  UNDER_ACL = 512,
+
+  /**
+   * Returns rich access control metadata for this path, including the
+   * restriction root, ACL region names, and the groups to request
+   * access through. Requires hitting a separate endpoint for ACL
+   * metadata; use UNDER_ACL for the cheaper tree-only check.
+   */
+  ACLs = 1024,
 /* NEXT_ATTR = 2^x */
 }
 
@@ -450,7 +472,7 @@ union Sha1OrError {
  * 2. Directories: POSIX_ERROR, EISDIR
  * 3. Non-source-control file types (FIFO, socket, char, block, whiteout, etc.): POSIX_ERROR, EINVAL
  * 4. Non-existent files: POSIX_ERROR, ENOENT
- * 5. Files that that lack blake3 hashes: ATTRIBUTES_UNAVAILABLE, ENOENT
+ * 5. Files that lack blake3 hashes: ATTRIBUTES_UNAVAILABLE, ENOENT
  */
 union Blake3OrError {
   1: BinaryHash blake3;
@@ -504,7 +526,7 @@ union ObjectIdOrError {
  * 1. Symlinks: POSIX_ERROR, EINVAL
  * 2. Non-source-control file types (FIFO, socket, char, block, whiteout, etc.): POSIX_ERROR, EINVAL
  * 3. Non-existent files: POSIX_ERROR, ENOENT
- * 4. Files that that lack digest sizes: ATTRIBUTES_UNAVAILABLE, ENOENT
+ * 4. Files that lack digest sizes: ATTRIBUTES_UNAVAILABLE, ENOENT
  * 5. Materialized (locally modified) directories: ATTRIBUTES_UNAVAILABLE, ENOENT
  */
 union DigestSizeOrError {
@@ -518,7 +540,7 @@ union DigestSizeOrError {
  * 1. Symlinks: POSIX_ERROR, EINVAL
  * 2. Non-source-control file types (FIFO, socket, char, block, whiteout, etc.): POSIX_ERROR, EINVAL
  * 3. Non-existent files: POSIX_ERROR, ENOENT
- * 4. Files/dirs that that lack digest hashes: ATTRIBUTES_UNAVAILABLE, ENOENT
+ * 4. Files/dirs that lack digest hashes: ATTRIBUTES_UNAVAILABLE, ENOENT
  * 5. Materialized (locally modified) directories: ATTRIBUTES_UNAVAILABLE, ENOENT
  */
 union DigestHashOrError {
@@ -547,6 +569,76 @@ union ModeOrError {
 }
 
 /**
+ * Whether any ACL applies to a path, or information about an error
+ * encountered when checking.
+ *
+ * Errors:
+ * 1. Attribute not populated: ATTRIBUTE_UNAVAILABLE, ENOENT
+ * 2. Tree fetch failure: GENERIC_ERROR
+ */
+union UnderAclOrError {
+  1: bool underAcl;
+  2: EdenError error;
+}
+
+/**
+ * A single ACL entry governing a path. Each entry is self-describing:
+ * it carries the path where the ACL is defined, the region identifier,
+ * and optionally the group for requesting access.
+ */
+struct AclEntry {
+  /**
+   * The ancestor path (or the path itself) where this ACL restriction
+   * is defined.
+   */
+  1: string restrictionRoot;
+
+  /** The ACL region identifier (e.g., a repo region ACL string). */
+  2: string repoRegionAcl;
+
+  /**
+   * The group through which access can be requested. Callers can use
+   * this to render "Request Access" links. Absent if no request
+   * mechanism exists for this ACL.
+   */
+  3: optional string requestAcl;
+}
+
+/**
+ * Rich access control metadata for a path. Returned when ACLs (1024)
+ * is requested.
+ */
+struct AclInfo {
+  /**
+   * Whether this path is under any ACL restriction. Included so callers
+   * requesting only ACLs don't need to also request UNDER_ACL.
+   * Always equals !acls.empty() when this attribute is successfully
+   * resolved.
+   */
+  1: bool underAcl;
+
+  /**
+   * The ACL entries governing this path, ordered from nearest to
+   * farthest ancestor. A path can be under multiple nested ACLs.
+   * Empty list if not restricted.
+   */
+  2: list<AclEntry> acls;
+}
+
+/**
+ * Access control metadata or information about an error encountered
+ * when fetching it.
+ *
+ * Errors:
+ * 1. Attribute not populated: ATTRIBUTE_UNAVAILABLE, ENOENT
+ * 2. Network failure: GENERIC_ERROR
+ */
+union AclInfoOrError {
+  1: AclInfo aclInfo;
+  2: EdenError error;
+}
+
+/**
  * Subset of attributes for a single file returned by getAttributesFromFilesV2()
  *
  * When an attribute was not requested the field will be a null optional value.
@@ -566,6 +658,10 @@ struct FileAttributeDataV2 {
   7: optional DigestHashOrError digestHash;
   8: optional MtimeOrError mtime;
   9: optional ModeOrError mode;
+  /** Present when UNDER_ACL (bit 10) is requested. */
+  10: optional UnderAclOrError underAcl;
+  /** Present when ACLs (bit 11) is requested. */
+  11: optional AclInfoOrError aclInfo;
 }
 
 /**
@@ -824,19 +920,20 @@ enum CheckoutMode {
 
 enum ConflictType {
   /**
-   * We failed to update this particular path due to an error
+   * We failed to update this particular path due to an error.
    */
   ERROR = 0,
   /**
-   * A locally modified file was deleted in the new Tree
+   * A locally modified file was deleted in the new Tree.
    */
   MODIFIED_REMOVED = 1,
   /**
-   * An untracked local file exists in the new Tree
+   * An untracked local file exists in the new Tree.
+   * The new entry may be a file or directory.
    */
   UNTRACKED_ADDED = 2,
   /**
-   * The file was removed locally, but modified in the new Tree
+   * The file was removed locally, but modified in the new Tree.
    */
   REMOVED_MODIFIED = 3,
   /**
@@ -844,7 +941,7 @@ enum ConflictType {
    */
   MISSING_REMOVED = 4,
   /**
-   * A locally modified file was modified in the new Tree
+   * A locally modified file was modified in the new Tree.
    * This may be contents modifications, or a file type change (directory to
    * file or vice-versa), or permissions changes.
    */
@@ -2041,6 +2138,14 @@ struct ChangesSinceV2Result {
   2: list<ChangeNotification> changes;
 }
 
+struct PeekCurrentJournalPositionRequest {
+  1: MountId mountId;
+}
+
+struct PeekCurrentJournalPositionResponse {
+  1: JournalPosition position;
+}
+
 /**
  * Argument to changesSinceV2 API
  *
@@ -2447,6 +2552,14 @@ service EdenService extends fb303_core.BaseService {
   JournalPosition getCurrentJournalPosition(1: PathString mountPoint) throws (
     1: EdenError ex,
   );
+
+  /** Like getCurrentJournalPosition but does not mark the journal as observed.
+   * Use this when you only need the current position and don't want to
+   * affect subscriber notification coalescing.
+   */
+  PeekCurrentJournalPositionResponse peekCurrentJournalPosition(
+    1: PeekCurrentJournalPositionRequest params,
+  ) throws (1: EdenError ex);
 
   /** Returns the set of files (and dirs) that changed since a prior point.
    * If fromPosition.mountGeneration is mismatched with the current
@@ -3123,4 +3236,13 @@ service EdenService extends fb303_core.BaseService {
    * can be cancelled.
    */
   GetActiveRequestsResponse getActiveRequests() throws (1: EdenError ex);
+
+  /**
+   * Debug endpoint to test the structured error logging pipeline end-to-end.
+   * Throws a test exception, catches it, and logs it via ErrorLogger to
+   * perfpipe_edenfs_errors. Returns true if the event was logged, false if
+   * error logging is not configured or disabled.
+   * Use: eden debug thrift debugLogError
+   */
+  bool debugLogError() throws (1: EdenError ex);
 }

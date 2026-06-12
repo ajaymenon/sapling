@@ -15,21 +15,47 @@ use configmodel::Config;
 use configmodel::Text;
 use types::RepoPathBuf;
 use util::file::atomic_write;
+use util::fs_err;
 
 pub fn filter_paths_from_config(config: &dyn Config) -> Option<HashSet<Text>> {
-    // Get unique set of filter paths
-    let filter_paths = config
+    let disabled_paths: HashSet<String> = config
         .keys("clone")
         .iter()
-        .filter_map(|k| {
-            if k.starts_with("eden-sparse-filter") {
-                tracing::debug!("found filter config key: {}", k);
-                config.get("clone", k)
+        .filter_map(|key| {
+            if key.starts_with("disabled-eden-sparse-filter") {
+                config.get("clone", key).map(|value| {
+                    let path = value.to_string();
+                    tracing::debug!("filter path disabled: {}", path);
+                    path
+                })
             } else {
                 None
             }
         })
-        .collect::<HashSet<_>>();
+        .collect();
+
+    let enabled_filters: Vec<Text> = config
+        .keys("clone")
+        .iter()
+        .filter(|key| key.starts_with("eden-sparse-filter"))
+        .filter_map(|key| config.get("clone", key))
+        .collect();
+
+    // Filter out enabled entries whose paths are in the disabled set
+    let filter_paths: HashSet<Text> = enabled_filters
+        .into_iter()
+        .filter(|path| {
+            let is_disabled = disabled_paths.contains(path.as_ref());
+            if is_disabled {
+                tracing::debug!(
+                    "filter path {} is disabled by explicit disable config",
+                    path.as_ref()
+                );
+            }
+            !is_disabled
+        })
+        .collect();
+
     if filter_paths.is_empty() {
         None
     } else if filter_paths.len() > 1 {
@@ -48,7 +74,7 @@ pub fn filter_paths_from_config(config: &dyn Config) -> Option<HashSet<Text>> {
 
 // Parses the filter file and returns a list of active filter paths. Returns an error when the
 // filter file is malformed or can't be read.
-pub(crate) fn read_filter_config(dot_dir: &Path) -> anyhow::Result<Option<HashSet<RepoPathBuf>>> {
+pub fn read_filter_config(dot_dir: &Path) -> anyhow::Result<Option<HashSet<RepoPathBuf>>> {
     // The filter file may be in 3 different states:
     //
     // 1) It may not exist, which indicates FilteredFS is not active
@@ -81,8 +107,7 @@ pub(crate) fn read_filter_config(dot_dir: &Path) -> anyhow::Result<Option<HashSe
                 continue;
             } else if !trimmed.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "Unexpected edensparse config format: {}",
-                    line
+                    "Unexpected edensparse config format: {line}"
                 ));
             }
         }
@@ -103,11 +128,11 @@ pub(crate) fn write_filter_config(
     } else {
         let content = filter_paths
             .iter()
-            .map(|p| format!("%include {}", p))
+            .map(|p| format!("%include {p}"))
             .collect::<Vec<String>>()
             .join("\n");
         if let Some(header) = header {
-            format!("{}\n\n{}", header, content)
+            format!("{header}\n\n{content}")
         } else {
             content
         }
@@ -120,6 +145,22 @@ pub(crate) fn write_filter_config(
 
 pub(crate) fn filter_config_path(dot_dir: &Path) -> PathBuf {
     dot_dir.join("sparse")
+}
+
+pub(crate) fn backup_filter_config(dot_dir: &Path) -> anyhow::Result<()> {
+    let sparse_path = filter_config_path(dot_dir);
+    let backup_path = dot_dir.join("sparse.bak");
+    if sparse_path.exists() {
+        let contents = fs_err::read(&sparse_path)?;
+        atomic_write(&backup_path, |f| f.write_all(&contents)).with_context(|| {
+            format!(
+                "backing up filter config from {} to {}",
+                sparse_path.display(),
+                backup_path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -292,5 +333,118 @@ pub(crate) mod tests {
                     .contains("Unexpected edensparse config format")
             ),
         };
+    }
+
+    #[test]
+    fn test_multiple_filters_with_null_filter() {
+        // Test that the null filter (empty string) is removed when other filters are present.
+        // The null filter cannot be combined with other filters.
+        let mut config: BTreeMap<String, String> = BTreeMap::new();
+        // Enable the null filter (no suffix, empty value)
+        config.insert("clone.eden-sparse-filter".to_string(), "".to_string());
+        // Enable two other filters
+        config.insert(
+            "clone.eden-sparse-filter.filter1".to_string(),
+            "path/to/filter1".to_string(),
+        );
+        config.insert(
+            "clone.eden-sparse-filter.filter2".to_string(),
+            "path/to/filter2".to_string(),
+        );
+
+        let result = filter_paths_from_config(&config);
+        let paths = result.unwrap();
+        // The null filter should be removed, leaving only the two real filters
+        assert_eq!(paths.len(), 2);
+        assert!(!paths.contains("")); // null filter removed
+        assert!(paths.contains("path/to/filter1"));
+        assert!(paths.contains("path/to/filter2"));
+    }
+
+    #[test]
+    fn test_disable_overrides_enable() {
+        // When a filter is both enabled and disabled via the dedicated section,
+        // the disable entry should take precedence.
+        let mut config: BTreeMap<String, String> = BTreeMap::new();
+        // Enable filter with alias "tent" pointing to "tools/tent/path1"
+        config.insert(
+            "clone.eden-sparse-filter.tent".to_string(),
+            "tools/tent/path1".to_string(),
+        );
+        // Disable the same path via dedicated section
+        config.insert(
+            "clone.disabled-eden-sparse-filter.tent".to_string(),
+            "tools/tent/path1".to_string(),
+        );
+
+        let result = filter_paths_from_config(&config);
+        // The filter should be disabled, so result should be None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_multiple_filters_with_one_disabled() {
+        // When multiple filters exist and one is disabled, only the non-disabled ones
+        // should be returned.
+        let mut config: BTreeMap<String, String> = BTreeMap::new();
+        // Enable two filters
+        config.insert(
+            "clone.eden-sparse-filter.filter1".to_string(),
+            "path/to/filter1".to_string(),
+        );
+        config.insert(
+            "clone.eden-sparse-filter.filter2".to_string(),
+            "path/to/filter2".to_string(),
+        );
+        // Disable filter1 via dedicated section
+        config.insert(
+            "clone.disabled-eden-sparse-filter.filter1".to_string(),
+            "path/to/filter1".to_string(),
+        );
+
+        let result = filter_paths_from_config(&config);
+        let paths = result.unwrap();
+        // Only filter2 should remain
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains("path/to/filter2"));
+        assert!(!paths.contains("path/to/filter1"));
+    }
+
+    #[test]
+    fn test_disable_does_not_affect_other_paths() {
+        // Disabling one path should not affect filters with different paths.
+        let mut config: BTreeMap<String, String> = BTreeMap::new();
+        // Enable a filter
+        config.insert(
+            "clone.eden-sparse-filter.myfilter".to_string(),
+            "path/to/myfilter".to_string(),
+        );
+        // Disable a completely different path via dedicated section
+        config.insert(
+            "clone.disabled-eden-sparse-filter.other".to_string(),
+            "other/path/here".to_string(),
+        );
+
+        let result = filter_paths_from_config(&config);
+        let paths = result.unwrap();
+        // myfilter should still be enabled
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains("path/to/myfilter"));
+    }
+
+    #[test]
+    fn test_eden_sparse_filter_with_path_value() {
+        // Test that "clone.eden-sparse-filter=path" (no suffix, non-empty path value)
+        // is correctly parsed and returns the path.
+        let mut config: BTreeMap<String, String> = BTreeMap::new();
+        config.insert(
+            "clone.eden-sparse-filter".to_string(),
+            "path/to/filter".to_string(),
+        );
+
+        let result = filter_paths_from_config(&config);
+        let paths = result.unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains("path/to/filter"));
     }
 }

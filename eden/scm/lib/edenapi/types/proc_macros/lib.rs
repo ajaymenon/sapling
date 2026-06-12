@@ -84,8 +84,18 @@ fn extract_id(
     spanned: &impl Spanned,
     ids: &mut HashSet<u16>,
 ) -> Result<(u16, Vec<Attribute>)> {
-    let (id, other_attrs): (Vec<_>, Vec<_>) =
-        attrs.into_iter().partition(|attr| attr.path.is_ident(ID));
+    let mut id = Vec::new();
+    let mut other_attrs = Vec::new();
+    for attr in attrs {
+        if attr.path.is_ident(ID) {
+            id.push(attr);
+        } else if !attr.path.is_ident("default") {
+            // Omit #[default] from the wire data structure when it is present
+            // on a variant of the original data structure, because we do not
+            // derive Default for the wire one.
+            other_attrs.push(attr);
+        }
+    }
     if id.len() != 1 {
         return Err(Error::new(
             spanned.span(),
@@ -163,7 +173,7 @@ fn get_wire_struct(original: &mut ItemStruct) -> Result<TokenStream> {
             else {
                 field.ty = parse_quote!( <#ty as crate::ToWire>::Wire );
             }
-            let name = format!("{}", id);
+            let name = format!("{id}");
 
             if extract_no_default(&mut field.attrs) {
                 has_no_default_field = true;
@@ -277,7 +287,7 @@ fn get_wire_enum(original: &mut ItemEnum) -> Result<TokenStream> {
         if id == 0 {
             return Err(Error::new(variant.span(), "Variant id can't be 0"));
         }
-        let name = format!("{}", id);
+        let name = format!("{id}");
         variant.attrs.push(parse_quote!( #[serde(rename=#name)]));
         let unit = match &mut variant.fields {
             Fields::Unit => true,

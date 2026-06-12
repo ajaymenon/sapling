@@ -5,9 +5,14 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::TryStreamExt;
+use futures::stream;
 use mercurial_types::HgAugmentedManifestEntry;
 use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgBlobEnvelope;
@@ -24,7 +29,9 @@ use mononoke_api::errors::MononokeError;
 use mononoke_types::MPathElement;
 use mononoke_types::hash::Blake3;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_identity::RepoIdentityRef;
 use restricted_paths::ManifestId;
+use restricted_paths::ManifestRestrictionCheckResult;
 use restricted_paths::ManifestType;
 use restricted_paths::RestrictedPathsArc;
 use revisionstore_types::Metadata;
@@ -32,6 +39,9 @@ use revisionstore_types::Metadata;
 use super::HgDataContext;
 use super::HgDataId;
 use super::HgRepoContext;
+
+const USE_RESTRICTED_PATHS_FOR_AUGMENTED_TREE_ACL_METADATA: &str =
+    "scm/mononoke:use_restricted_paths_for_augmented_tree_acl_metadata";
 
 #[derive(Clone)]
 pub struct HgTreeContext<R> {
@@ -70,6 +80,7 @@ impl<R: MononokeRepo> HgTreeContext<R> {
             manifest_id,
             ManifestType::Hg,
             "hg_tree_context_new_check_exists",
+            None,
         )
         .await?;
 
@@ -92,6 +103,7 @@ pub struct HgAugmentedTreeContext<R> {
     #[allow(dead_code)]
     repo_ctx: HgRepoContext<R>,
     preloaded_manifest: HgPreloadedAugmentedManifest,
+    restriction_ctx: HgAugmentedTreeRestrictionContext<R>,
 }
 
 impl<R: MononokeRepo> HgAugmentedTreeContext<R> {
@@ -112,6 +124,7 @@ impl<R: MononokeRepo> HgAugmentedTreeContext<R> {
             manifest_id,
             ManifestType::HgAugmented,
             "hg_augmented_tree_context_new_check_exists",
+            None,
         )
         .await?;
 
@@ -119,6 +132,10 @@ impl<R: MononokeRepo> HgAugmentedTreeContext<R> {
             let preloaded_manifest =
                 HgPreloadedAugmentedManifest::load_from_sharded(envelope, ctx, blobstore).await?;
             Ok(Some(Self {
+                restriction_ctx: HgAugmentedTreeRestrictionContext::new(
+                    repo_ctx.clone(),
+                    augmented_manifest_id,
+                )?,
                 repo_ctx,
                 preloaded_manifest,
             }))
@@ -133,6 +150,62 @@ impl<R: MononokeRepo> HgAugmentedTreeContext<R> {
 
     pub fn augmented_manifest_size(&self) -> u64 {
         self.preloaded_manifest.augmented_manifest_size
+    }
+
+    /// Whether this directory itself is a restriction root (has a `.slacl` file).
+    /// Waypoints (ancestors of restriction roots) return `false`.
+    pub async fn is_restricted(&self) -> Result<bool, MononokeError> {
+        self.restriction_ctx
+            .is_restricted(&self.preloaded_manifest)
+            .await
+    }
+
+    pub async fn children_restrictions(
+        &self,
+        max_concurrent_fetches: usize,
+    ) -> Result<HashMap<MPathElement, bool>, MononokeError> {
+        if !self.restriction_ctx.use_restricted_paths_for_acl_metadata {
+            return Ok(self.preloaded_manifest.child_restriction_map.clone());
+        }
+
+        if !self
+            .repo_ctx
+            .repo()
+            .restricted_paths_arc()
+            .may_have_restricted_paths()
+        {
+            return Ok(HashMap::new());
+        }
+
+        let child_restriction_data = self
+            .augmented_children_entries()
+            .filter_map(|(name, child_entry)| match child_entry {
+                HgAugmentedManifestEntry::DirectoryNode(tree) => Some((
+                    name.clone(),
+                    self.preloaded_manifest
+                        .child_restriction_map
+                        .get(name)
+                        .copied(),
+                    HgAugmentedManifestId::new(tree.treenode),
+                )),
+                HgAugmentedManifestEntry::FileNode(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        let child_restrictions = stream::iter(child_restriction_data)
+            .map(|(name, preloaded_child_is_restricted, child_mfid)| {
+                let restriction_ctx = self.restriction_ctx.clone();
+                async move {
+                    restriction_ctx
+                        .child_is_restricted(name, preloaded_child_is_restricted, child_mfid)
+                        .await
+                }
+            })
+            .buffer_unordered(max_concurrent_fetches)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        Ok(child_restrictions.into_iter().collect())
     }
 
     pub fn augmented_children_entries(
@@ -253,21 +326,199 @@ impl<R: MononokeRepo> HgDataId<R> for HgAugmentedManifestId {
     }
 }
 
+/// Context for querying restriction metadata about an Hg manifest node.
+///
+/// Like `ChangesetPathRestrictionContext` in mononoke_api, this type does NOT
+/// enforce Path ACL access checks in its constructor. This avoids the circular
+/// dependency where callers would need permission to instantiate the context
+/// that checks permissions.
+///
+/// This type never returns manifest content — only restriction metadata
+/// (ACLs, access checks).
+#[derive(Clone)]
+pub struct HgAugmentedTreeRestrictionContext<R> {
+    repo_ctx: HgRepoContext<R>,
+    manifest_id: HgAugmentedManifestId,
+    // Whether the restricted_paths facet primitives should be used to get
+    // restriction information or it should just be fetched directly from the
+    // HgAugmentedManifest information (populated from the AclManifest data).
+    // This is set by a JK to ensure that we can roll-back in case there are any
+    // performance regressions.
+    use_restricted_paths_for_acl_metadata: bool,
+}
+
+impl<R: MononokeRepo> HgAugmentedTreeRestrictionContext<R> {
+    /// Create a new restriction context for the given manifest ID.
+    ///
+    /// Checks repo read access but does NOT enforce Path ACL checks.
+    pub async fn new_check_exists(
+        repo_ctx: HgRepoContext<R>,
+        manifest_id: HgAugmentedManifestId,
+    ) -> Result<Self, MononokeError> {
+        repo_ctx
+            .repo_ctx()
+            .authorization_context()
+            .require_full_repo_read(repo_ctx.ctx(), repo_ctx.repo_ctx().repo())
+            .await?;
+
+        Ok(Self::new(repo_ctx, manifest_id)?)
+    }
+
+    fn new(repo_ctx: HgRepoContext<R>, manifest_id: HgAugmentedManifestId) -> Result<Self> {
+        let repo_name = repo_ctx.repo().repo_identity().name();
+        let use_restricted_paths_for_acl_metadata = justknobs::eval(
+            USE_RESTRICTED_PATHS_FOR_AUGMENTED_TREE_ACL_METADATA,
+            None,
+            Some(repo_name),
+        );
+
+        Ok(Self {
+            repo_ctx,
+            manifest_id,
+            use_restricted_paths_for_acl_metadata,
+        })
+    }
+
+    async fn is_restricted(
+        &self,
+        preloaded_manifest: &HgPreloadedAugmentedManifest,
+    ) -> Result<bool, MononokeError> {
+        if !self.use_restricted_paths_for_acl_metadata {
+            return Ok(preloaded_manifest.is_restricted);
+        }
+
+        self.is_manifest_restricted(preloaded_manifest.is_restricted)
+            .await
+    }
+
+    async fn child_is_restricted(
+        &self,
+        name: MPathElement,
+        preloaded_child_is_restricted: Option<bool>,
+        child_mfid: HgAugmentedManifestId,
+    ) -> Result<(MPathElement, bool), MononokeError> {
+        let child_ctx = self.child_ctx(child_mfid);
+        let is_restricted = child_ctx
+            .is_manifest_restricted(preloaded_child_is_restricted.unwrap_or(false))
+            .await?;
+        Ok((name, is_restricted))
+    }
+
+    /// Query restriction and authorization check results for this manifest node.
+    ///
+    /// Returns the restriction info for this specific manifest, or an empty
+    /// vector if the manifest is not at a restricted path.
+    ///
+    /// Unlike `ChangesetPathRestrictionContext::restriction_info`,
+    /// which can traverse the AclManifest from the root path and aggregate all
+    /// path restrictions, this primitive can only access the AclManifest from
+    /// the given manifest ids. It doesn't have visibility into its parents,
+    /// so it will only return `ManifestRestrictionInfo` if the manifest
+    /// belongs to a restriction root.
+    ///
+    /// This is acceptable **under an important assumption**: in order to fetch
+    /// any child manifest, the client must already have access to the parent
+    /// manifest, which means they have permission to access the directory.
+    pub async fn restriction_check(
+        &self,
+    ) -> Result<Vec<ManifestRestrictionCheckResult>, MononokeError> {
+        let restricted_paths = self.repo_ctx.repo().restricted_paths_arc();
+
+        if !restricted_paths.may_have_restricted_paths() {
+            return Ok(vec![]);
+        }
+
+        let manifest_id_bytes = ManifestId::new(self.manifest_id.as_bytes().into());
+        restricted_paths
+            .get_manifest_restriction_check(
+                self.repo_ctx.ctx(),
+                &manifest_id_bytes,
+                &ManifestType::HgAugmented,
+            )
+            .await
+            .map_err(MononokeError::from)
+    }
+
+    /// Query restriction metadata for this manifest node without checking authorization.
+    async fn is_manifest_restricted(
+        &self,
+        preloaded_is_restricted: bool,
+    ) -> Result<bool, MononokeError> {
+        let restricted_paths = self.repo_ctx.repo().restricted_paths_arc();
+
+        let manifest_id_bytes = ManifestId::new(self.manifest_id.as_bytes().into());
+        restricted_paths
+            .is_restricted_manifest(
+                self.repo_ctx.ctx(),
+                &manifest_id_bytes,
+                &ManifestType::HgAugmented,
+                preloaded_is_restricted,
+            )
+            .await
+            .map_err(MononokeError::from)
+    }
+
+    /// Create a restriction context for a child directory after repo read access was checked.
+    fn child_ctx(&self, child_mfid: HgAugmentedManifestId) -> Self {
+        Self {
+            repo_ctx: self.repo_ctx.clone(),
+            manifest_id: child_mfid,
+            use_restricted_paths_for_acl_metadata: self.use_restricted_paths_for_acl_metadata,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::collections::BTreeSet;
+    use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
 
+    use acl_manifest::RootAclManifestId;
+    use anyhow::Context;
     use blobstore::Loadable;
+    use clientinfo::ClientEntryPoint;
+    use clientinfo::ClientInfo;
+    use clientinfo::ClientRequestInfo;
     use context::CoreContext;
+    use context::SessionContainer;
     use fbinit::FacebookInit;
     use fixtures::Linear;
     use fixtures::TestRepoFixture;
+    use maplit::hashmap;
+    use mercurial_derivation::DeriveHgChangeset;
+    use mercurial_derivation::MappedHgChangesetId;
+    use mercurial_derivation::RootHgAugmentedManifestId;
+    use mercurial_types::HgAugmentedManifestEnvelope;
     use mercurial_types::NULL_HASH;
+    use metaconfig_types::AclManifestMode;
+    use metaconfig_types::RestrictedPathsConfig;
+    use metadata::Metadata;
     use mononoke_api::repo::Repo;
     use mononoke_api::repo::RepoContext;
     use mononoke_api::specifiers::HgChangesetId;
     use mononoke_macros::mononoke;
+    use mononoke_types::ChangesetId;
+    use mononoke_types::NonRootMPath;
+    use mononoke_types::RepositoryId;
+    use mononoke_types::path::MPath;
+    use permission_checker::Acl;
+    use permission_checker::Acls;
+    use permission_checker::InternalAclProvider;
+    use permission_checker::MononokeIdentity;
+    use permission_checker::MononokeIdentitySet;
+    use pretty_assertions::assert_eq;
+    use repo_derived_data::RepoDerivedDataArc;
+    use repo_derived_data::RepoDerivedDataRef;
+    use restricted_paths::RestrictedPaths;
+    use restricted_paths::RestrictedPathsConfigBased;
+    use restricted_paths::SqlRestrictedPathsManifestIdStoreBuilder;
+    use scuba_ext::MononokeScubaSampleBuilder;
+    use sql_construct::SqlConstruct;
+    use test_repo_factory::TestRepoFactory;
+    use tests_utils::CreateCommitContext;
 
     use super::*;
     use crate::RepoContextHgExt;
@@ -307,5 +558,636 @@ mod tests {
         assert!(null_tree.is_none());
 
         Ok(())
+    }
+
+    // ---- restriction context test helpers ----
+
+    /// Create a CoreContext with a test user identity for ACL checking.
+    async fn create_test_ctx(fb: FacebookInit) -> CoreContext {
+        let client_identity = MononokeIdentity::from_legacy_type_data("USER", "myusername0");
+        let mut cri = ClientRequestInfo::new(ClientEntryPoint::Tests);
+        cri.set_main_id("user:myusername0".to_string());
+        let client_info = ClientInfo::new_with_client_request_info(cri);
+
+        let identities = BTreeSet::from([client_identity]);
+        let metadata = {
+            let mut md = Metadata::new(
+                Some(&"restricted_paths_test".to_string()),
+                identities,
+                false,
+                false,
+                None,
+                None,
+            )
+            .await;
+            md.add_client_info(client_info);
+            Arc::new(md)
+        };
+        let session_container = SessionContainer::builder(fb).metadata(metadata).build();
+        CoreContext::test_mock_session(session_container)
+    }
+
+    /// Create an ACL config where myusername0 has access to myusername_project
+    /// but NOT to restricted_acl.
+    fn create_test_acls() -> anyhow::Result<Acls> {
+        let default_user = MononokeIdentity::from_str("USER:myusername0")?;
+        let default_users = {
+            let mut users = MononokeIdentitySet::new();
+            users.insert(default_user);
+            users
+        };
+
+        Ok(Acls {
+            repos: hashmap! {
+                "default".to_string() => Arc::new(Acl {
+                    actions: hashmap! {
+                        "read".to_string() => default_users.clone(),
+                        "write".to_string() => default_users,
+                    },
+                }),
+            },
+            repo_regions: hashmap! {
+                "myusername_project".to_string() => Arc::new(Acl {
+                    actions: hashmap! {
+                        "read".to_string() => {
+                            let mut users = MononokeIdentitySet::new();
+                            users.insert(MononokeIdentity::from_str("USER:myusername0")?);
+                            users
+                        },
+                    },
+                }),
+                "restricted_acl".to_string() => Arc::new(Acl {
+                    actions: hashmap! {
+                        "read".to_string() => {
+                            let mut users = MononokeIdentitySet::new();
+                            users.insert(MononokeIdentity::from_str("USER:another_user")?);
+                            users
+                        },
+                    },
+                }),
+            },
+            tiers: HashMap::new(),
+            workspaces: HashMap::new(),
+            groups: HashMap::new(),
+        })
+    }
+
+    /// Build a test repo with restricted paths, real ACL checking, and ManifestIdStore.
+    async fn setup_restricted_repo(
+        ctx: &CoreContext,
+        path_acls: Vec<(&str, &str)>,
+    ) -> anyhow::Result<Repo> {
+        setup_restricted_repo_with_mode(ctx, path_acls, AclManifestMode::Both).await
+    }
+
+    async fn setup_restricted_repo_with_mode(
+        ctx: &CoreContext,
+        path_acls: Vec<(&str, &str)>,
+        acl_manifest_mode: AclManifestMode,
+    ) -> anyhow::Result<Repo> {
+        let repo_id = RepositoryId::new(0);
+
+        let path_acls_map: HashMap<NonRootMPath, MononokeIdentity> = path_acls
+            .into_iter()
+            .map(|(path, acl_str)| {
+                (
+                    NonRootMPath::new(path).expect("Failed to create NonRootMPath"),
+                    MononokeIdentity::from_str(acl_str).expect("Failed to parse MononokeIdentity"),
+                )
+            })
+            .collect();
+
+        let manifest_id_store = Arc::new(
+            SqlRestrictedPathsManifestIdStoreBuilder::with_sqlite_in_memory()
+                .expect("Failed to create Sqlite connection")
+                .with_repo_id(repo_id),
+        );
+
+        let config = RestrictedPathsConfig {
+            path_acls: path_acls_map,
+            use_manifest_id_cache: false,
+            cache_update_interval_ms: 5,
+            acl_manifest_mode,
+            ..Default::default()
+        };
+
+        // Write ACLs to temp file for InternalAclProvider
+        let acls = create_test_acls()?;
+        let mut temp_file = tempfile::NamedTempFile::new()?;
+        std::io::Write::write_all(
+            &mut temp_file,
+            serde_json::to_string_pretty(&acls)?.as_bytes(),
+        )?;
+        std::io::Write::flush(&mut temp_file)?;
+        let acl_path = temp_file.into_temp_path().keep()?;
+        let acl_provider = InternalAclProvider::from_file(&acl_path)?;
+
+        let scuba = MononokeScubaSampleBuilder::with_discard();
+
+        // Build a repo first to get ArcRepoDerivedData. Reuse the same
+        // factory below so the final test repo shares the same blobstore.
+        let mut repo_factory = TestRepoFactory::new(ctx.fb)?;
+        let repo: Repo = repo_factory.build().await?;
+        let repo_derived_data = repo.repo_derived_data_arc();
+        let config_based = Arc::new(RestrictedPathsConfigBased::new(
+            config,
+            manifest_id_store,
+            None,
+        ));
+
+        let restricted_paths = Arc::new(RestrictedPaths::new(
+            config_based,
+            acl_provider,
+            scuba,
+            repo_derived_data,
+        )?);
+
+        let repo: Repo = repo_factory
+            .with_restricted_paths(restricted_paths)
+            .build()
+            .await?;
+
+        Ok(repo)
+    }
+
+    // ---- restriction context tests ----
+
+    #[mononoke::fbinit_test]
+    async fn test_check_manifest_permission_no_restrictions_configured(
+        fb: FacebookInit,
+    ) -> Result<(), MononokeError> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
+        let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
+        let hg = repo_ctx.hg();
+
+        // Use a dummy manifest ID — no restrictions configured, so early return
+        let dummy_manifest_id: HgAugmentedManifestId = HgManifestId::new(
+            HgNodeHash::from_static_str("0000000000000000000000000000000000000000")?,
+        )
+        .into();
+
+        let restriction_ctx =
+            HgAugmentedTreeRestrictionContext::new_check_exists(hg, dummy_manifest_id).await?;
+        let result = restriction_ctx.restriction_check().await?;
+        assert!(
+            result.is_empty(),
+            "expected empty result when no restrictions configured"
+        );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_check_manifest_permission_manifest_not_in_store(
+        fb: FacebookInit,
+    ) -> anyhow::Result<()> {
+        let ctx = create_test_ctx(fb).await;
+        let repo =
+            setup_restricted_repo(&ctx, vec![("restricted/dir", "REPO_REGION:restricted_acl")])
+                .await?;
+
+        // Create commit touching only unrestricted paths
+        let bcs_id = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("public/file.txt", "content")
+            .commit()
+            .await?;
+
+        // Derive Hg manifest to populate ManifestIdStore, then load the
+        // augmented manifest ID used by restriction_check().
+        let _hg_cs_id = repo.derive_hg_changeset(&ctx, bcs_id).await?;
+        let (root_mfid, _) = derive_and_load_hg_augmented_manifest(&ctx, &repo, bcs_id).await?;
+
+        let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
+        let hg = repo_ctx.hg();
+
+        // Root manifest is unrestricted, so not in the ManifestIdStore
+        let restriction_ctx =
+            HgAugmentedTreeRestrictionContext::new_check_exists(hg, root_mfid).await?;
+        let result = restriction_ctx.restriction_check().await?;
+        assert!(
+            result.is_empty(),
+            "expected empty result for unrestricted manifest"
+        );
+
+        Ok(())
+    }
+
+    /// Helper: create a restricted repo, commit a file, derive Hg manifest,
+    /// find the manifest ID for `target_manifest_path`, and call restriction_check().
+    async fn get_restriction_check_for_manifest(
+        fb: FacebookInit,
+        path_acls: Vec<(&str, &str)>,
+        file_to_add: (&str, &str),
+        target_manifest_path: &str,
+    ) -> anyhow::Result<Vec<ManifestRestrictionCheckResult>> {
+        let ctx = create_test_ctx(fb).await;
+        let repo = setup_restricted_repo(&ctx, path_acls.clone()).await?;
+
+        let mut commit_ctx =
+            CreateCommitContext::new_root(&ctx, &repo).add_file(file_to_add.0, file_to_add.1);
+        for (root, acl) in path_acls {
+            let slacl_path = format!("{root}/.slacl");
+            let slacl_content = format!("repo_region_acl = \"{acl}\"\n");
+            commit_ctx = commit_ctx.add_file(slacl_path.as_str(), slacl_content);
+        }
+        let bcs_id = commit_ctx.commit().await?;
+
+        let _hg_cs_id = repo.derive_hg_changeset(&ctx, bcs_id).await?;
+        let (_, root_envelope) = derive_and_load_hg_augmented_manifest(&ctx, &repo, bcs_id).await?;
+
+        let target_path = MPath::try_from(target_manifest_path)?;
+        let target_mfid =
+            load_hg_augmented_manifest_id_at_path(&ctx, &repo, &root_envelope, &target_path)
+                .await?;
+
+        let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
+        let hg = repo_ctx.hg();
+
+        let restriction_ctx =
+            HgAugmentedTreeRestrictionContext::new_check_exists(hg, target_mfid).await?;
+        restriction_ctx
+            .restriction_check()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_both_mode_restriction_check_for_manifest(
+        fb: FacebookInit,
+        config_path_acls: Vec<(&str, &str)>,
+        acl_manifest_path_acls: Vec<(&str, &str)>,
+        file_to_add: (&str, &str),
+        target_manifest_path: &str,
+    ) -> anyhow::Result<Vec<ManifestRestrictionCheckResult>> {
+        let ctx = create_test_ctx(fb).await;
+        let repo =
+            setup_restricted_repo_with_mode(&ctx, config_path_acls, AclManifestMode::Both).await?;
+
+        let mut commit_ctx =
+            CreateCommitContext::new_root(&ctx, &repo).add_file(file_to_add.0, file_to_add.1);
+        for (root, acl) in acl_manifest_path_acls {
+            let slacl_path = format!("{root}/.slacl");
+            let slacl_content = format!("repo_region_acl = \"{acl}\"\n");
+            commit_ctx = commit_ctx.add_file(slacl_path.as_str(), slacl_content);
+        }
+        let bcs_id = commit_ctx.commit().await?;
+
+        let _hg_cs_id = repo.derive_hg_changeset(&ctx, bcs_id).await?;
+        let (_, root_envelope) = derive_and_load_hg_augmented_manifest(&ctx, &repo, bcs_id).await?;
+
+        let target_path = MPath::try_from(target_manifest_path)?;
+        let target_mfid =
+            load_hg_augmented_manifest_id_at_path(&ctx, &repo, &root_envelope, &target_path)
+                .await?;
+
+        let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
+        let hg = repo_ctx.hg();
+
+        let restriction_ctx =
+            HgAugmentedTreeRestrictionContext::new_check_exists(hg, target_mfid).await?;
+        restriction_ctx
+            .restriction_check()
+            .await
+            .map_err(Into::into)
+    }
+
+    // What it tests: Hg manifest restriction metadata should include
+    // AclManifest-only restrictions in Both mode after manifest metadata uses
+    // the AclManifest source.
+    // Expected: AclManifest-only manifest restrictions are returned.
+    #[mononoke::fbinit_test]
+    async fn test_check_manifest_permission_both_mode_acl_manifest_only_root(
+        fb: FacebookInit,
+    ) -> anyhow::Result<()> {
+        let result = get_both_mode_restriction_check_for_manifest(
+            fb,
+            vec![],
+            vec![("acl_manifest_only", "REPO_REGION:restricted_acl")],
+            ("acl_manifest_only/file.txt", "secret"),
+            "acl_manifest_only",
+        )
+        .await?;
+
+        let check = result.first().ok_or_else(|| {
+            anyhow::anyhow!("expected AclManifest-only restriction info for Both mode")
+        })?;
+        let info = check.restriction_info();
+        assert_eq!(info.restriction_root, None);
+        assert_eq!(info.repo_region_acl, "REPO_REGION:restricted_acl");
+        assert_eq!(
+            check.has_authorization(),
+            false,
+            "user should not have access to restricted_acl"
+        );
+
+        Ok(())
+    }
+
+    // What it tests: Hg manifest restriction metadata should still include
+    // config-only restrictions in Both mode.
+    // Expected: config-backed manifest restrictions are returned.
+    #[mononoke::fbinit_test]
+    async fn test_check_manifest_permission_both_mode_config_only_root(
+        fb: FacebookInit,
+    ) -> anyhow::Result<()> {
+        let result = get_both_mode_restriction_check_for_manifest(
+            fb,
+            vec![("config_only", "REPO_REGION:restricted_acl")],
+            vec![],
+            ("config_only/file.txt", "secret"),
+            "config_only",
+        )
+        .await?;
+
+        let check = result.first().ok_or_else(|| {
+            anyhow::anyhow!("expected config-only restriction info for Both mode")
+        })?;
+        let info = check.restriction_info();
+        assert_eq!(
+            info.restriction_root.as_ref(),
+            Some(&NonRootMPath::new("config_only")?)
+        );
+        assert_eq!(info.repo_region_acl, "REPO_REGION:restricted_acl");
+
+        Ok(())
+    }
+
+    // What it tests: Both mode should preserve same-root disagreements between
+    // config and AclManifest manifest metadata.
+    // Expected: both source results are returned, with config carrying the
+    // restriction root and AclManifest carrying only the ACL.
+    #[mononoke::fbinit_test]
+    async fn test_check_manifest_permission_both_mode_same_root_disagreement(
+        fb: FacebookInit,
+    ) -> anyhow::Result<()> {
+        let result = get_both_mode_restriction_check_for_manifest(
+            fb,
+            vec![("shared", "REPO_REGION:config_acl")],
+            vec![("shared", "REPO_REGION:acl_manifest_acl")],
+            ("shared/file.txt", "secret"),
+            "shared",
+        )
+        .await?;
+
+        let mut roots_and_acls = result
+            .iter()
+            .map(|check| {
+                let info = check.restriction_info();
+                (
+                    info.restriction_root.as_ref().map(ToString::to_string),
+                    info.repo_region_acl.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        roots_and_acls.sort();
+
+        assert_eq!(
+            roots_and_acls,
+            vec![
+                (None, "REPO_REGION:acl_manifest_acl".to_string()),
+                (
+                    Some("shared".to_string()),
+                    "REPO_REGION:config_acl".to_string()
+                ),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_check_manifest_permission_restricted_path_with_access(
+        fb: FacebookInit,
+    ) -> anyhow::Result<()> {
+        let result = get_restriction_check_for_manifest(
+            fb,
+            vec![("user_project/foo", "REPO_REGION:myusername_project")],
+            ("user_project/foo/bar/a", "content"),
+            "user_project/foo",
+        )
+        .await?;
+
+        let check = result.first().ok_or_else(|| {
+            anyhow::anyhow!("expected restriction info for restricted root manifest")
+        })?;
+        let info = check.restriction_info();
+        assert_eq!(
+            info.restriction_root, None,
+            "AclManifest-backed manifest metadata does not include the path root"
+        );
+        assert_eq!(
+            check.has_authorization(),
+            true,
+            "user should have access to myusername_project"
+        );
+        assert_eq!(info.repo_region_acl, "REPO_REGION:myusername_project");
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_check_manifest_permission_restricted_path_without_access(
+        fb: FacebookInit,
+    ) -> anyhow::Result<()> {
+        let result = get_restriction_check_for_manifest(
+            fb,
+            vec![("restricted/dir", "REPO_REGION:restricted_acl")],
+            ("restricted/dir/a", "secret"),
+            "restricted/dir",
+        )
+        .await?;
+
+        let check = result.first().ok_or_else(|| {
+            anyhow::anyhow!("expected restriction info for restricted root manifest")
+        })?;
+        let info = check.restriction_info();
+        assert_eq!(
+            info.restriction_root, None,
+            "AclManifest-backed manifest metadata does not include the path root"
+        );
+        assert_eq!(
+            check.has_authorization(),
+            false,
+            "user should not have access to restricted_acl"
+        );
+        assert_eq!(info.repo_region_acl, "REPO_REGION:restricted_acl");
+
+        Ok(())
+    }
+
+    /// When nested restriction roots exist (e.g. `foo/` and `foo/bar/`),
+    /// querying the manifest at the inner root should return the inner root's
+    /// ACL — matching AclManifest behavior where each directory has exactly
+    /// one ACL.
+    #[mononoke::fbinit_test]
+    async fn test_check_manifest_permission_nested_roots(fb: FacebookInit) -> anyhow::Result<()> {
+        // Query the manifest at foo/bar, which is covered by both roots.
+        // restriction_check should return foo/bar's ACL (the most specific).
+        let result = get_restriction_check_for_manifest(
+            fb,
+            vec![
+                ("foo", "REPO_REGION:myusername_project"),
+                ("foo/bar", "REPO_REGION:restricted_acl"),
+            ],
+            ("foo/bar/qux/file.txt", "content"),
+            "foo/bar",
+        )
+        .await?;
+
+        let check = result.first().ok_or_else(|| {
+            anyhow::anyhow!("expected restriction info for nested restricted root")
+        })?;
+        let info = check.restriction_info();
+        assert_eq!(
+            info.restriction_root, None,
+            "AclManifest-backed manifest metadata does not include the path root"
+        );
+        assert_eq!(
+            check.has_authorization(),
+            false,
+            "user should not have access to restricted_acl"
+        );
+        assert_eq!(info.repo_region_acl, "REPO_REGION:restricted_acl");
+
+        Ok(())
+    }
+
+    /// Edge case: When two directories with identical content are both
+    /// restriction roots, they share a single Hg manifest ID.
+    /// In the long-term solution, this will only happen if they have the same
+    /// ACL file, which means they also share `PathAccessInfo`.
+    #[mononoke::fbinit_test]
+    async fn test_check_manifest_permission_same_manifest_multiple_paths(
+        fb: FacebookInit,
+    ) -> anyhow::Result<()> {
+        let ctx = create_test_ctx(fb).await;
+        let repo = setup_restricted_repo(
+            &ctx,
+            vec![
+                ("dir_a", "REPO_REGION:restricted_acl"),
+                ("dir_b", "REPO_REGION:restricted_acl"),
+            ],
+        )
+        .await?;
+
+        // Create two directories with identical content and identical ACL files.
+        // Identical content produces the same Hg augmented manifest ID.
+        let bcs_id = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("dir_a/file.txt", "same content")
+            .add_file(
+                "dir_a/.slacl",
+                "repo_region_acl = \"REPO_REGION:restricted_acl\"\n",
+            )
+            .add_file("dir_b/file.txt", "same content")
+            .add_file(
+                "dir_b/.slacl",
+                "repo_region_acl = \"REPO_REGION:restricted_acl\"\n",
+            )
+            .commit()
+            .await?;
+
+        let _hg_cs_id = repo.derive_hg_changeset(&ctx, bcs_id).await?;
+        let (_, root_envelope) = derive_and_load_hg_augmented_manifest(&ctx, &repo, bcs_id).await?;
+
+        let dir_a = MPath::try_from("dir_a")?;
+        let dir_a_mfid =
+            load_hg_augmented_manifest_id_at_path(&ctx, &repo, &root_envelope, &dir_a).await?;
+
+        let dir_b = MPath::try_from("dir_b")?;
+        let dir_b_mfid =
+            load_hg_augmented_manifest_id_at_path(&ctx, &repo, &root_envelope, &dir_b).await?;
+
+        // Verify they share the same manifest ID (identical content)
+        assert_eq!(
+            dir_a_mfid, dir_b_mfid,
+            "identical directories should produce the same manifest ID"
+        );
+
+        let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
+        let hg = repo_ctx.hg();
+
+        // Query the shared manifest ID. The AclManifest metadata for both roots
+        // is identical, so the check should return that shared ACL.
+        let restriction_ctx =
+            HgAugmentedTreeRestrictionContext::new_check_exists(hg, dir_a_mfid).await?;
+        let result = restriction_ctx.restriction_check().await?;
+
+        let check = result.first().ok_or_else(|| {
+            anyhow::anyhow!("expected restriction info when manifest maps to restricted root paths")
+        })?;
+        let info = check.restriction_info();
+        assert_eq!(
+            check.has_authorization(),
+            false,
+            "user should not have access to restricted_acl"
+        );
+        assert_eq!(info.repo_region_acl, "REPO_REGION:restricted_acl");
+
+        Ok(())
+    }
+
+    async fn derive_and_load_hg_augmented_manifest(
+        ctx: &CoreContext,
+        repo: &Repo,
+        bcs_id: ChangesetId,
+    ) -> anyhow::Result<(HgAugmentedManifestId, HgAugmentedManifestEnvelope)> {
+        let manager = repo.repo_derived_data().manager();
+        manager
+            .derive_exactly_batch::<MappedHgChangesetId>(ctx, vec![bcs_id], None)
+            .await?;
+        manager
+            .derive_exactly_batch::<RootAclManifestId>(ctx, vec![bcs_id], None)
+            .await?;
+        manager
+            .derive_exactly_batch::<RootHgAugmentedManifestId>(ctx, vec![bcs_id], None)
+            .await?;
+
+        let root_hg_augmented_manifest_id = manager
+            .fetch_derived::<RootHgAugmentedManifestId>(ctx, bcs_id, None)
+            .await?
+            .with_context(|| format!("Missing RootHgAugmentedManifestId for {bcs_id}"))?
+            .hg_augmented_manifest_id();
+        let root_envelope = root_hg_augmented_manifest_id
+            .clone()
+            .load(ctx, repo.repo_blobstore())
+            .await?;
+        Ok((root_hg_augmented_manifest_id, root_envelope))
+    }
+
+    async fn load_hg_augmented_manifest_id_at_path(
+        ctx: &CoreContext,
+        repo: &Repo,
+        root_envelope: &HgAugmentedManifestEnvelope,
+        path: &MPath,
+    ) -> anyhow::Result<HgAugmentedManifestId> {
+        let elements: Vec<_> = path.into_iter().collect();
+        anyhow::ensure!(!elements.is_empty(), "path must have at least one segment");
+
+        let mut current_envelope = Cow::Borrowed(root_envelope);
+        for (index, element) in elements.iter().enumerate() {
+            let entry = current_envelope
+                .augmented_manifest
+                .subentries
+                .lookup(ctx, repo.repo_blobstore(), element.as_ref())
+                .await?
+                .with_context(|| format!("{element} should exist at depth {index}"))?;
+            match entry {
+                HgAugmentedManifestEntry::DirectoryNode(directory) => {
+                    let hg_augmented_manifest_id = HgAugmentedManifestId::new(directory.treenode);
+                    if index == elements.len() - 1 {
+                        return Ok(hg_augmented_manifest_id);
+                    }
+                    current_envelope = Cow::Owned(
+                        hg_augmented_manifest_id
+                            .load(ctx, repo.repo_blobstore())
+                            .await?,
+                    );
+                }
+                HgAugmentedManifestEntry::FileNode(_) => {
+                    anyhow::bail!("{element} should be a directory node");
+                }
+            }
+        }
+        unreachable!("non-empty path traversal returns from the final element")
     }
 }

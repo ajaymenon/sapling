@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 cpython = { version = "0.7.2", features = ["python3-sys"], default-features = false }
 flume = "0.11.1"
 pyrevisionstore = { version = "0.1.0", path = "../pyrevisionstore" }
@@ -19,7 +19,7 @@ sapling-vfs = { version = "0.1.0", path = "../../../../lib/vfs" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-memmap2 = "0.9.5"
-quickcheck = "1.0"
+memmap2 = "0.9.10"
+quickcheck = "1.1"
 sapling-minibytes = { version = "0.1.0", path = "../../../../lib/minibytes" }
-tempfile = "3.22"
+tempfile = "3.27.0"

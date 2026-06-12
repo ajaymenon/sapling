@@ -9,6 +9,8 @@
 
 #include "eden/common/utils/Match.h"
 #include "eden/common/utils/StatTimes.h"
+#include "eden/fs/config/EdenConfig.h"
+#include "eden/fs/inodes/ChildEntryAttributes.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeError.h"
 #include "eden/fs/inodes/TreeInode.h"
@@ -18,7 +20,29 @@
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/utils/EdenError.h"
 
+#include <folly/coro/Collect.h>
+#include <folly/coro/CurrentExecutor.h>
+#include <folly/coro/Invoke.h>
+
 namespace facebook::eden {
+
+VirtualInode VirtualInode::makeRestricted(
+    const TreeEntry& entry,
+    CaseSensitivity caseSensitivity) {
+  return makeRestricted(
+      entry.getObjectId(),
+      modeFromTreeEntryType(entry.getType()),
+      caseSensitivity);
+}
+
+VirtualInode VirtualInode::makeRestricted(
+    const ObjectId& id,
+    mode_t mode,
+    CaseSensitivity caseSensitivity) {
+  auto restrictedTree = std::make_shared<const Tree>(
+      Tree::Restricted{}, Tree::container{caseSensitivity}, id);
+  return VirtualInode{std::move(restrictedTree), mode};
+}
 
 InodePtr VirtualInode::asInodePtr() const {
   return std::get<InodePtr>(variant_);
@@ -79,10 +103,14 @@ ImmediateFuture<Hash32> VirtualInode::getBlake3(
     RelativePathPiece path,
     const std::shared_ptr<ObjectStore>& objectStore,
     const ObjectFetchContextPtr& fetchContext) const {
+  // DEPRECATED: use co_getBlake3 directly. Kept only because
+  // EdenServiceHandler and getDigestHash still call this via
+  // ImmediateFuture chains; delete once those paths are migrated
+  // to coroutines.
+
   // Ensure this is a regular file.
   // We intentionally want to refuse to compute the blake3 of symlinks
-  switch (filteredEntryDtype(
-      getDtype(), objectStore->getWindowsSymlinksEnabled())) {
+  switch (getDtype()) {
     case dtype_t::Dir:
       return makeImmediateFuture<Hash32>(PathError(EISDIR, path));
     case dtype_t::Symlink:
@@ -120,14 +148,60 @@ ImmediateFuture<Hash32> VirtualInode::getBlake3(
       });
 }
 
+folly::coro::now_task<Hash32> VirtualInode::co_getBlake3(
+    RelativePathPiece path,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext) const {
+  // Ensure this is a regular file.
+  // We intentionally want to refuse to compute the blake3 of symlinks
+  const auto dtype = getDtype();
+  if (dtype == dtype_t::Dir) {
+    co_yield folly::coro::co_error(PathError(EISDIR, path));
+  } else if (dtype == dtype_t::Symlink) {
+    co_yield folly::coro::co_error(
+        PathError(EINVAL, path, std::string_view{"file is a symlink"}));
+  } else if (dtype != dtype_t::Regular) {
+    co_yield folly::coro::co_error(PathError(
+        EINVAL, path, std::string_view{"variant is of unhandled type"}));
+  }
+
+  // This is now guaranteed to be a dtype_t::Regular file. This means there's no
+  // need for a Tree case, as Trees are always directories.
+  //
+  // std::get_if is used instead of match because coroutine lambda captures are
+  // stored in the lambda object, not the coroutine frame. If the coroutine
+  // suspends, match destroys the lambda temporaries, and resuming accesses
+  // dangling captures.
+  static_assert(
+      std::variant_size_v<detail::VariantVirtualInode> == 4,
+      "New variant type added to VariantVirtualInode - update co_getBlake3");
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+    co_return co_await inode->asFilePtr()->co_getBlake3(fetchContext);
+  } else if (
+      auto* entry =
+          std::get_if<UnmaterializedUnloadedBlobDirEntry>(&variant_)) {
+    co_return co_await objectStore->co_getBlobBlake3(
+        entry->getObjectId(), fetchContext);
+  } else if (auto* treeEntry = std::get_if<TreeEntry>(&variant_)) {
+    const auto& hash = treeEntry->getContentBlake3();
+    if (hash.has_value()) {
+      co_return hash.value();
+    }
+    co_return co_await objectStore->co_getBlobBlake3(
+        treeEntry->getObjectId(), fetchContext);
+  } else {
+    // TreePtr - directories cannot have blake3
+    co_yield folly::coro::co_error(PathError(EISDIR, path));
+  }
+}
+
 ImmediateFuture<std::optional<Hash32>> VirtualInode::getDigestHash(
     RelativePathPiece path,
     const std::shared_ptr<ObjectStore>& objectStore,
     const ObjectFetchContextPtr& fetchContext) const {
   // Ensure this is a regular file or directory.
   // We intentionally want to refuse to compute the digestHash of symlinks
-  switch (filteredEntryDtype(
-      getDtype(), objectStore->getWindowsSymlinksEnabled())) {
+  switch (getDtype()) {
     case dtype_t::Symlink:
       return makeImmediateFuture<std::optional<Hash32>>(
           PathError(EINVAL, path, std::string_view{"file is a symlink"}));
@@ -166,14 +240,59 @@ ImmediateFuture<std::optional<Hash32>> VirtualInode::getDigestHash(
       });
 }
 
+folly::coro::now_task<std::optional<Hash32>> VirtualInode::co_getDigestHash(
+    RelativePathPiece path,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext) const {
+  const auto dtype = getDtype();
+  if (dtype == dtype_t::Symlink) {
+    co_yield folly::coro::co_error(
+        PathError(EINVAL, path, std::string_view{"file is a symlink"}));
+  } else if (dtype != dtype_t::Regular && dtype != dtype_t::Dir) {
+    co_yield folly::coro::co_error(PathError(
+        EINVAL, path, std::string_view{"variant is of unhandled type"}));
+  }
+
+  // Use std::get_if instead of match because coroutine lambda captures are
+  // stored in the lambda object, not the coroutine frame. If the coroutine
+  // suspends, match destroys the lambda temporaries, and resuming accesses
+  // dangling captures.
+  static_assert(
+      std::variant_size_v<detail::VariantVirtualInode> == 4,
+      "New variant type added to VariantVirtualInode - update co_getDigestHash");
+
+  if (dtype == dtype_t::Regular) {
+    // DigestHash of a file is its Blake3 hash.
+    co_return std::optional<Hash32>{
+        co_await co_getBlake3(path, objectStore, fetchContext)};
+  }
+
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+    co_return co_await inode->asTreePtr()->co_getDigestHash(fetchContext);
+  } else if (
+      auto* entry =
+          std::get_if<UnmaterializedUnloadedBlobDirEntry>(&variant_)) {
+    co_return co_await objectStore->co_getTreeDigestHash(
+        entry->getObjectId(), fetchContext);
+  } else if (auto* tree = std::get_if<TreePtr>(&variant_)) {
+    co_return co_await objectStore->co_getTreeDigestHash(
+        (*tree)->getObjectId(), fetchContext);
+  } else if (auto* treeEntry = std::get_if<TreeEntry>(&variant_)) {
+    co_return co_await objectStore->co_getTreeDigestHash(
+        treeEntry->getObjectId(), fetchContext);
+  } else {
+    co_yield folly::coro::co_error(PathError(
+        EINVAL, path, std::string_view{"variant is of unhandled type"}));
+  }
+}
+
 ImmediateFuture<Hash20> VirtualInode::getSHA1(
     RelativePathPiece path,
     const std::shared_ptr<ObjectStore>& objectStore,
     const ObjectFetchContextPtr& fetchContext) const {
   // Ensure this is a regular file.
   // We intentionally want to refuse to compute the SHA1 of symlinks
-  switch (filteredEntryDtype(
-      getDtype(), objectStore->getWindowsSymlinksEnabled())) {
+  switch (getDtype()) {
     case dtype_t::Dir:
       return makeImmediateFuture<Hash20>(PathError(EISDIR, path));
     case dtype_t::Symlink:
@@ -211,10 +330,46 @@ ImmediateFuture<Hash20> VirtualInode::getSHA1(
       });
 }
 
+folly::coro::now_task<Hash20> VirtualInode::co_getSHA1(
+    RelativePathPiece path,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext) const {
+  const auto dtype = getDtype();
+  if (dtype == dtype_t::Dir) {
+    co_yield folly::coro::co_error(PathError(EISDIR, path));
+  } else if (dtype == dtype_t::Symlink) {
+    co_yield folly::coro::co_error(
+        PathError(EINVAL, path, std::string_view{"file is a symlink"}));
+  } else if (dtype != dtype_t::Regular) {
+    co_yield folly::coro::co_error(PathError(
+        EINVAL, path, std::string_view{"variant is of unhandled type"}));
+  }
+
+  static_assert(
+      std::variant_size_v<detail::VariantVirtualInode> == 4,
+      "New variant type added to VariantVirtualInode - update co_getSHA1");
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+    co_return co_await inode->asFilePtr()->co_getSha1(fetchContext);
+  } else if (
+      auto* entry =
+          std::get_if<UnmaterializedUnloadedBlobDirEntry>(&variant_)) {
+    co_return co_await objectStore->co_getBlobSha1(
+        entry->getObjectId(), fetchContext);
+  } else if (auto* treeEntry = std::get_if<TreeEntry>(&variant_)) {
+    const auto& hash = treeEntry->getContentSha1();
+    if (hash.has_value()) {
+      co_return hash.value();
+    }
+    co_return co_await objectStore->co_getBlobSha1(
+        treeEntry->getObjectId(), fetchContext);
+  } else {
+    co_yield folly::coro::co_error(PathError(EISDIR, path));
+  }
+}
+
 ImmediateFuture<std::optional<TreeEntryType>> VirtualInode::getTreeEntryType(
     RelativePathPiece path,
-    const ObjectFetchContextPtr& fetchContext,
-    bool windowsSymlinksEnabled) const {
+    const ObjectFetchContextPtr& fetchContext) const {
   using R = ImmediateFuture<std::optional<TreeEntryType>>;
   return match(
       variant_,
@@ -239,9 +394,40 @@ ImmediateFuture<std::optional<TreeEntryType>> VirtualInode::getTreeEntryType(
         });
       },
       [&](const TreePtr&) -> R { return TreeEntryType::TREE; },
-      [&](const TreeEntry& entry) -> R {
-        return filteredEntryType(entry.getType(), windowsSymlinksEnabled);
-      });
+      [&](const TreeEntry& entry) -> R { return entry.getType(); });
+}
+
+folly::coro::now_task<std::optional<TreeEntryType>>
+VirtualInode::co_getTreeEntryType(
+    RelativePathPiece path,
+    const ObjectFetchContextPtr& fetchContext) const {
+  // std::get_if is used instead of match because coroutine lambda captures are
+  // stored in the lambda object, not the coroutine frame. If the coroutine
+  // suspends, match destroys the lambda temporaries, and resuming accesses
+  // dangling captures.
+  static_assert(
+      std::variant_size_v<detail::VariantVirtualInode> == 4,
+      "New variant type added to VariantVirtualInode - update co_getTreeEntryType");
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+#ifdef _WIN32
+    (void)fetchContext;
+    co_return treeEntryTypeFromMode((*inode)->getInitialMode());
+#else
+    (void)path;
+    auto st = co_await (*inode)->co_stat(fetchContext);
+    co_return treeEntryTypeFromMode(st.st_mode);
+#endif
+  } else if (
+      auto* entry =
+          std::get_if<UnmaterializedUnloadedBlobDirEntry>(&variant_)) {
+    co_return treeEntryTypeFromMode(entry->getInitialMode());
+  } else if (std::holds_alternative<TreePtr>(variant_)) {
+    co_return TreeEntryType::TREE;
+  } else if (auto* treeEntry = std::get_if<TreeEntry>(&variant_)) {
+    co_return treeEntry->getType();
+  }
+  co_yield folly::coro::co_error(
+      std::runtime_error("VirtualInode: unexpected variant type"));
 }
 
 ImmediateFuture<BlobAuxData> VirtualInode::getBlobAuxData(
@@ -277,6 +463,31 @@ ImmediateFuture<std::optional<TreeAuxData>> VirtualInode::getTreeAuxData(
       [&](auto& entry) {
         return objectStore->getTreeAuxData(entry.getObjectId(), fetchContext);
       });
+}
+
+folly::coro::now_task<std::optional<TreeAuxData>>
+VirtualInode::co_getTreeAuxData(
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext) const {
+  static_assert(
+      std::variant_size_v<detail::VariantVirtualInode> == 4,
+      "New variant type added to VariantVirtualInode - update co_getTreeAuxData");
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+    co_return co_await inode->asTreePtr()->co_getTreeAuxData(fetchContext);
+  } else if (auto* tree = std::get_if<TreePtr>(&variant_)) {
+    co_return co_await objectStore->co_getTreeAuxData(
+        (*tree)->getObjectId(), fetchContext);
+  } else if (
+      auto* entry =
+          std::get_if<UnmaterializedUnloadedBlobDirEntry>(&variant_)) {
+    co_return co_await objectStore->co_getTreeAuxData(
+        entry->getObjectId(), fetchContext);
+  } else if (auto* treeEntry = std::get_if<TreeEntry>(&variant_)) {
+    co_return co_await objectStore->co_getTreeAuxData(
+        treeEntry->getObjectId(), fetchContext);
+  }
+  co_yield folly::coro::co_error(
+      std::runtime_error("VirtualInode: unexpected variant type"));
 }
 
 namespace {
@@ -383,6 +594,87 @@ void populateStatAttributes(
         ? folly::Try<mode_t>{statTry.exception()}
         : folly::Try<mode_t>{statTry.value().st_mode};
   }
+}
+
+/**
+ * Coroutine version of getEntryAttributesForNonFile.
+ */
+folly::coro::now_task<EntryAttributes> co_getEntryAttributesForNonFile(
+    const VirtualInode& vi,
+    EntryAttributeFlags requestedAttributes,
+    RelativePathPiece path,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    timespec lastCheckoutTime,
+    const ObjectFetchContextPtr& fetchContext,
+    std::optional<TreeEntryType> entryType,
+    int errorCode,
+    std::string_view additionalErrorContext) {
+  auto attributes = EntryAttributes{};
+
+  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE)) {
+    attributes.type = folly::Try<std::optional<TreeEntryType>>{entryType};
+  }
+
+  auto isMat = false;
+  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_OBJECT_ID)) {
+    attributes.objectId = folly::Try<std::optional<ObjectId>>{vi.getObjectId()};
+    isMat = !attributes.objectId.value().value().has_value();
+  } else {
+    isMat = vi.isMaterialized();
+  }
+
+  populateInvalidNonFileAttributes(
+      attributes,
+      requestedAttributes,
+      errorCode,
+      path,
+      entryType,
+      additionalErrorContext);
+
+  std::optional<folly::Try<struct stat>> statTry;
+  std::optional<folly::Try<std::optional<TreeAuxData>>> treeAuxTry;
+  std::vector<folly::coro::Task<void>> tasks;
+
+  if (shouldRequestStatForEntry(requestedAttributes)) {
+    tasks.emplace_back(
+        // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+        folly::coro::co_invoke(
+            [&vi,
+             &statTry,
+             &lastCheckoutTime,
+             objectStore = objectStore,
+             fetchContext = fetchContext.copy()]() -> folly::coro::Task<void> {
+              statTry = co_await co_awaitTry(
+                  vi.co_stat(lastCheckoutTime, objectStore, fetchContext));
+            }));
+  }
+
+  if (shouldRequestTreeAuxDataForEntry(entryType, requestedAttributes, isMat)) {
+    tasks.emplace_back(
+        // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+        folly::coro::co_invoke(
+            [&vi,
+             &treeAuxTry,
+             objectStore = objectStore,
+             fetchContext = fetchContext.copy()]() -> folly::coro::Task<void> {
+              treeAuxTry = co_await co_awaitTry(
+                  vi.co_getTreeAuxData(objectStore, fetchContext));
+            }));
+  }
+
+  if (!tasks.empty()) {
+    co_await folly::coro::collectAllRange(std::move(tasks));
+  }
+
+  if (statTry.has_value()) {
+    populateStatAttributes(attributes, requestedAttributes, *statTry);
+  }
+
+  if (treeAuxTry.has_value()) {
+    populateTreeAuxAttributes(attributes, requestedAttributes, *treeAuxTry);
+  }
+
+  co_return attributes;
 }
 } // namespace
 
@@ -509,10 +801,9 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
     const std::shared_ptr<ObjectStore>& objectStore,
     timespec lastCheckoutTime,
     const ObjectFetchContextPtr& fetchContext) const {
-  bool windowsSymlinksEnabled = objectStore->getWindowsSymlinksEnabled();
   // For non regular files we return errors for hashes and sizes.
   // We intentionally want to refuse to compute the SHA1 of symlinks.
-  auto dtype = filteredEntryDtype(getDtype(), windowsSymlinksEnabled);
+  auto dtype = getDtype();
   switch (dtype) {
     case dtype_t::Regular:
       break;
@@ -557,8 +848,7 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
   auto entryTypeFuture =
       ImmediateFuture<std::optional<TreeEntryType>>::makeEmpty();
   if (requestedAttributes.contains(ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE)) {
-    entryTypeFuture =
-        getTreeEntryType(path, fetchContext, windowsSymlinksEnabled);
+    entryTypeFuture = getTreeEntryType(path, fetchContext);
   }
 
   auto blobAuxdataFuture = ImmediateFuture<BlobAuxData>::makeEmpty();
@@ -624,6 +914,128 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
           });
 }
 
+folly::coro::now_task<EntryAttributes> VirtualInode::co_getEntryAttributes(
+    EntryAttributeFlags requestedAttributes,
+    RelativePathPiece path,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    timespec lastCheckoutTime,
+    const ObjectFetchContextPtr& fetchContext) const {
+  auto dtype = getDtype();
+  switch (dtype) {
+    case dtype_t::Regular:
+      break;
+    case dtype_t::Dir:
+      co_return co_await co_getEntryAttributesForNonFile(
+          *this,
+          requestedAttributes,
+          path,
+          objectStore,
+          lastCheckoutTime,
+          fetchContext,
+          TreeEntryType::TREE,
+          EISDIR,
+          {});
+    case dtype_t::Symlink:
+      co_return co_await co_getEntryAttributesForNonFile(
+          *this,
+          requestedAttributes,
+          path,
+          objectStore,
+          lastCheckoutTime,
+          fetchContext,
+          TreeEntryType::SYMLINK,
+          EINVAL,
+          "file is a symlink");
+    default:
+      co_return co_await co_getEntryAttributesForNonFile(
+          *this,
+          requestedAttributes,
+          path,
+          objectStore,
+          lastCheckoutTime,
+          fetchContext,
+          std::nullopt,
+          EINVAL,
+          fmt::format(
+              "file is a non-source-control type: {}",
+              folly::to_underlying(dtype)));
+  }
+
+  auto attributes = EntryAttributes{};
+
+  std::optional<folly::Try<std::optional<TreeEntryType>>> entryTypeTry;
+  std::optional<folly::Try<BlobAuxData>> blobAuxTry;
+  std::optional<folly::Try<struct stat>> statTry;
+
+  std::vector<folly::coro::Task<void>> tasks;
+
+  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE)) {
+    tasks.emplace_back(
+        // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+        folly::coro::co_invoke(
+            [this, &entryTypeTry, path, fetchContext = fetchContext.copy()]()
+                -> folly::coro::Task<void> {
+              entryTypeTry =
+                  co_await co_awaitTry(co_getTreeEntryType(path, fetchContext));
+            }));
+  }
+
+  if (shouldRequestBlobAuxDataForEntry(requestedAttributes)) {
+    tasks.emplace_back(
+        // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+        folly::coro::co_invoke(
+            [this,
+             &blobAuxTry,
+             path,
+             objectStore = objectStore,
+             fetchContext = fetchContext.copy(),
+             blake3Required = requestedAttributes.containsAnyOf(
+                 ENTRY_ATTRIBUTE_BLAKE3 |
+                 ENTRY_ATTRIBUTE_DIGEST_HASH)]() -> folly::coro::Task<void> {
+              blobAuxTry = co_await folly::coro::co_awaitTry(
+                  getBlobAuxData(
+                      path, objectStore, fetchContext, blake3Required)
+                      .semi());
+            }));
+  }
+
+  if (shouldRequestStatForEntry(requestedAttributes)) {
+    tasks.emplace_back(
+        // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+        folly::coro::co_invoke(
+            [this,
+             &statTry,
+             &lastCheckoutTime,
+             objectStore = objectStore,
+             fetchContext = fetchContext.copy()]() -> folly::coro::Task<void> {
+              statTry = co_await co_awaitTry(
+                  co_stat(lastCheckoutTime, objectStore, fetchContext));
+            }));
+  }
+
+  if (!tasks.empty()) {
+    co_await folly::coro::collectAllRange(std::move(tasks));
+  }
+
+  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE)) {
+    attributes.type = std::move(entryTypeTry);
+  }
+
+  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_OBJECT_ID)) {
+    attributes.objectId = folly::Try<std::optional<ObjectId>>{getObjectId()};
+  }
+
+  if (blobAuxTry.has_value()) {
+    populateBlobAuxAttributes(attributes, requestedAttributes, *blobAuxTry);
+  }
+
+  if (statTry.has_value()) {
+    populateStatAttributes(attributes, requestedAttributes, *statTry);
+  }
+
+  co_return attributes;
+}
+
 // Returns a subset of `struct stat` required by
 // EdenServiceHandler::semifuture_getFileInformation()
 ImmediateFuture<struct stat> VirtualInode::stat(
@@ -681,8 +1093,7 @@ ImmediateFuture<struct stat> VirtualInode::stat(
           return st;
         } else if constexpr (std::is_same_v<T, TreeEntry>) {
           objectId = arg.getObjectId();
-          mode = modeFromTreeEntryType(filteredEntryType(
-              arg.getType(), objectStore->getWindowsSymlinksEnabled()));
+          mode = modeFromTreeEntryType(arg.getType());
           // fallthrough
         } else {
           static_assert(always_false_v<T>, "non-exhaustive visitor!");
@@ -707,6 +1118,61 @@ ImmediateFuture<struct stat> VirtualInode::stat(
       variant_);
 }
 
+folly::coro::now_task<struct stat> VirtualInode::co_stat(
+    const struct timespec& lastCheckoutTime,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext) const {
+  static_assert(
+      std::variant_size_v<detail::VariantVirtualInode> == 4,
+      "New variant type added to VariantVirtualInode - update co_stat");
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+    co_return co_await (*inode)->co_stat(fetchContext);
+  } else if (auto* tree = std::get_if<TreePtr>(&variant_)) {
+    (void)tree;
+    struct stat st = {};
+    st.st_mode = static_cast<decltype(st.st_mode)>(treeMode_);
+    stMtime(st, lastCheckoutTime);
+#ifdef _WIN32
+    st.st_mode = static_cast<decltype(st.st_mode)>(0);
+    {
+      struct timespec ts0{};
+      stMtime(st, ts0);
+    }
+#endif
+    st.st_size = 0U;
+    co_return st;
+  } else {
+    // UnmaterializedUnloadedBlobDirEntry or TreeEntry
+    ObjectId objectId;
+    mode_t mode;
+    if (auto* entry =
+            std::get_if<UnmaterializedUnloadedBlobDirEntry>(&variant_)) {
+      objectId = entry->getObjectId();
+      mode = entry->getInitialMode();
+    } else if (auto* treeEntry = std::get_if<TreeEntry>(&variant_)) {
+      objectId = treeEntry->getObjectId();
+      mode = modeFromTreeEntryType(treeEntry->getType());
+    } else {
+      co_yield folly::coro::co_error(
+          std::runtime_error("VirtualInode: unexpected variant type"));
+    }
+    auto auxData =
+        co_await objectStore->co_getBlobAuxData(objectId, fetchContext);
+    struct stat st = {};
+    st.st_mode = static_cast<decltype(st.st_mode)>(mode);
+    stMtime(st, lastCheckoutTime);
+#ifdef _WIN32
+    st.st_mode = static_cast<decltype(st.st_mode)>(0);
+    {
+      struct timespec ts0{};
+      stMtime(st, ts0);
+    }
+#endif
+    st.st_size = static_cast<decltype(st.st_size)>(auxData.size);
+    co_return st;
+  }
+}
+
 namespace {
 /**
  * Helper function for getChildren when the current node is a Tree.
@@ -722,13 +1188,21 @@ getChildrenHelper(
   for (auto& child : *tree) {
     const auto* treeEntry = &child.second;
     if (treeEntry->isTree()) {
-      result.emplace_back(
-          child.first,
-          objectStore->getTree(treeEntry->getObjectId(), fetchContext)
-              .thenValue([mode = modeFromTreeEntryType(treeEntry->getType())](
-                             TreePtr tree) {
-                return VirtualInode{std::move(tree), mode};
-              }));
+      if (treeEntry->isRestricted()) {
+        // Skip fetch — return restricted empty tree
+        result.emplace_back(
+            child.first,
+            VirtualInode::makeRestricted(
+                *treeEntry, tree->getCaseSensitivity()));
+      } else {
+        result.emplace_back(
+            child.first,
+            objectStore->getTree(treeEntry->getObjectId(), fetchContext)
+                .thenValue([mode = modeFromTreeEntryType(treeEntry->getType())](
+                               TreePtr tree) {
+                  return VirtualInode{std::move(tree), mode};
+                }));
+      }
     } else {
       // This is a file, return the TreeEntry for it
       result.emplace_back(child.first, VirtualInode{*treeEntry});
@@ -736,6 +1210,66 @@ getChildrenHelper(
   }
 
   return result;
+}
+
+folly::coro::now_task<
+    std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>>
+co_getChildrenHelper(
+    const TreePtr& tree,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext) {
+  // Async entries get a placeholder Try; the matching task back-fills
+  // by index after collectAllTryRange so result preserves iteration order.
+  std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>> result;
+  result.reserve(tree->size());
+  std::vector<folly::coro::Task<VirtualInode>> tasks;
+  std::vector<size_t> taskIdx;
+
+  for (auto& child : *tree) {
+    const auto* treeEntry = &child.second;
+    if (treeEntry->isTree()) {
+      if (treeEntry->isRestricted()) {
+        // Restricted child: synthesize a placeholder; never fetch its contents.
+        result.emplace_back(
+            child.first,
+            folly::Try<VirtualInode>{VirtualInode::makeRestricted(
+                *treeEntry, tree->getCaseSensitivity())});
+      } else {
+        taskIdx.push_back(result.size());
+        result.emplace_back(
+            child.first, folly::Try<VirtualInode>{folly::FutureNotReady{}});
+        tasks.emplace_back(
+            // @lint-ignore CLANGTIDY
+            // facebook-folly-coro-return-captures-local-var
+            folly::coro::co_invoke(
+                [](ObjectId oid,
+                   mode_t mode,
+                   std::shared_ptr<ObjectStore> store,
+                   ObjectFetchContextPtr ctx)
+                    -> folly::coro::Task<VirtualInode> {
+                  co_await folly::coro::co_reschedule_on_current_executor;
+                  auto childTree = co_await store->co_getTree(oid, ctx);
+                  co_return VirtualInode{std::move(childTree), mode};
+                },
+                treeEntry->getObjectId(),
+                modeFromTreeEntryType(treeEntry->getType()),
+                objectStore,
+                fetchContext.copy()));
+      }
+    } else {
+      result.emplace_back(
+          child.first, folly::Try<VirtualInode>{VirtualInode{*treeEntry}});
+    }
+  }
+
+  if (!tasks.empty()) {
+    auto tries = co_await folly::coro::collectAllTryRange(std::move(tasks));
+    XCHECK_EQ(tries.size(), taskIdx.size());
+    for (size_t i = 0; i < tries.size(); ++i) {
+      result.at(taskIdx.at(i)).second = std::move(tries[i]);
+    }
+  }
+  co_return result;
 }
 } // namespace
 
@@ -766,12 +1300,47 @@ VirtualInode::getChildren(
             inode.asTreePtr()->getChildren(fetchContext, false)};
       },
       [&](const TreePtr& tree) {
+        if (tree->isRestricted()) {
+          return folly::Try<std::vector<
+              std::pair<PathComponent, ImmediateFuture<VirtualInode>>>>{
+              PathError(EACCES, path)};
+        }
         return folly::Try<std::vector<
             std::pair<PathComponent, ImmediateFuture<VirtualInode>>>>{
             getChildrenHelper(tree, objectStore, fetchContext)};
       },
       [&](const UnmaterializedUnloadedBlobDirEntry&) { return notDirectory(); },
       [&](const TreeEntry&) { return notDirectory(); });
+}
+
+folly::coro::now_task<
+    std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>>
+VirtualInode::co_getChildren(
+    RelativePathPiece path,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext) {
+  if (!isDirectory()) {
+    co_yield folly::coro::co_error(PathError(ENOTDIR, path));
+  }
+
+  static_assert(
+      std::variant_size_v<detail::VariantVirtualInode> == 4,
+      "New variant type added to VariantVirtualInode - update co_getChildren");
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+    co_return co_await inode->asTreePtr()->co_getChildren(
+        fetchContext, /*loadInodes=*/false);
+  } else if (auto* tree = std::get_if<TreePtr>(&variant_)) {
+    // Restricted unloaded tree denies enumeration outright.
+    if ((*tree)->isRestricted()) {
+      co_yield folly::coro::co_error(PathError(EACCES, path));
+    }
+    co_return co_await co_getChildrenHelper(*tree, objectStore, fetchContext);
+  } else {
+    // File variants (UnmaterializedUnloadedBlobDirEntry / TreeEntry) — the
+    // !isDirectory() guard above has already returned ENOTDIR; this is a
+    // defensive fallthrough kept honest by the static_assert above.
+    co_yield folly::coro::co_error(PathError(ENOTDIR, path));
+  }
 }
 
 ImmediateFuture<
@@ -831,16 +1400,110 @@ VirtualInode::getChildrenAttributes(
           });
 }
 
+folly::coro::now_task<
+    std::vector<std::pair<PathComponent, folly::Try<EntryAttributes>>>>
+VirtualInode::co_getChildrenAttributes(
+    EntryAttributeFlags requestedAttributes,
+    RelativePath path,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    timespec lastCheckoutTime,
+    const ObjectFetchContextPtr& fetchContext) {
+  if (!isDirectory()) {
+    co_yield folly::coro::co_error(PathError(ENOTDIR, path));
+  }
+
+  static_assert(
+      std::variant_size_v<detail::VariantVirtualInode> == 4,
+      "New variant type added to VariantVirtualInode - "
+      "update co_getChildrenAttributes");
+
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+    co_return co_await inode->asTreePtr()->co_getChildrenAttributes(
+        requestedAttributes,
+        std::move(path),
+        objectStore,
+        lastCheckoutTime,
+        fetchContext);
+  }
+
+  // Past the !isDirectory() guard, the static_assert above pins the variant
+  // to {InodePtr, TreePtr, UnmaterializedUnloadedBlobDirEntry, TreeEntry};
+  // the latter two are non-directories so we must hold a TreePtr here.
+  auto* tree = std::get_if<TreePtr>(&variant_);
+  XCHECK(tree != nullptr);
+
+  if ((*tree)->isRestricted()) {
+    co_yield folly::coro::co_error(PathError(EACCES, path));
+  }
+
+  std::vector<PathComponent> names;
+  std::vector<folly::coro::Task<EntryAttributes>> tasks;
+  names.reserve((*tree)->size());
+  tasks.reserve((*tree)->size());
+
+  for (auto& child : **tree) {
+    auto subPath = path + child.first;
+    names.push_back(child.first);
+    const auto& treeEntry = child.second;
+    if (treeEntry.isTree()) {
+      if (treeEntry.isRestricted()) {
+        // Restricted child: synthesize a placeholder; never fetch its contents.
+        tasks.emplace_back(coFetchEntryAttributesFromVI(
+            VirtualInode::makeRestricted(
+                treeEntry, (*tree)->getCaseSensitivity()),
+            requestedAttributes,
+            std::move(subPath),
+            objectStore,
+            lastCheckoutTime,
+            fetchContext.copy()));
+      } else {
+        tasks.emplace_back(coFetchTreeEntryAttributes(
+            treeEntry.getObjectId(),
+            modeFromTreeEntryType(treeEntry.getType()),
+            requestedAttributes,
+            std::move(subPath),
+            objectStore,
+            lastCheckoutTime,
+            fetchContext.copy()));
+      }
+    } else {
+      tasks.emplace_back(coFetchEntryAttributesFromVI(
+          VirtualInode{treeEntry},
+          requestedAttributes,
+          std::move(subPath),
+          objectStore,
+          lastCheckoutTime,
+          fetchContext.copy()));
+    }
+  }
+
+  auto tries = co_await folly::coro::collectAllTryRange(std::move(tasks));
+
+  std::vector<std::pair<PathComponent, folly::Try<EntryAttributes>>> result;
+  result.reserve(tries.size());
+  XCHECK_EQ(tries.size(), names.size())
+      << "Missing/too many attributes for the names.";
+  for (size_t i = 0; i < tries.size(); ++i) {
+    result.emplace_back(std::move(names.at(i)), std::move(tries[i]));
+  }
+  co_return result;
+}
+
 namespace {
+
 /**
- * Helper function for getOrFindChild when the current node is a Tree.
+ * Coroutine helper for getOrFindChild when the current node is a Tree.
  */
-ImmediateFuture<VirtualInode> getOrFindChildHelper(
+folly::coro::now_task<VirtualInode> co_getOrFindChildHelper(
     TreePtr tree,
     PathComponentPiece childName,
     RelativePathPiece path,
     const std::shared_ptr<ObjectStore>& objectStore,
     const ObjectFetchContextPtr& fetchContext) {
+  if (tree->isRestricted()) {
+    co_yield folly::coro::co_error(
+        std::system_error(EACCES, std::generic_category()));
+  }
   // Lookup the next child
   const auto it = tree->find(childName);
   if (it == tree->cend()) {
@@ -851,23 +1514,26 @@ ImmediateFuture<VirtualInode> getOrFindChildHelper(
         "attempted to find non-existent TreeEntry \"{}\" in {}",
         childName,
         path);
-    return makeImmediateFuture<VirtualInode>(
+    co_yield folly::coro::co_error(
         std::system_error(ENOENT, std::generic_category()));
   }
-
   // Always descend if the treeEntry is a Tree
   const auto* treeEntry = &it->second;
   if (treeEntry->isTree()) {
-    return objectStore->getTree(treeEntry->getObjectId(), fetchContext)
-        .thenValue(
-            [mode = modeFromTreeEntryType(treeEntry->getType())](TreePtr tree) {
-              return VirtualInode{std::move(tree), mode};
-            });
+    if (treeEntry->isRestricted()) {
+      co_return VirtualInode::makeRestricted(
+          *treeEntry, tree->getCaseSensitivity());
+    }
+    auto treeResult = co_await objectStore->co_getTree(
+        treeEntry->getObjectId(), fetchContext);
+    auto mode = modeFromTreeEntryType(treeEntry->getType());
+    co_return VirtualInode{std::move(treeResult), mode};
   } else {
     // This is a file, return the TreeEntry for it
-    return VirtualInode{*treeEntry};
+    co_return VirtualInode{*treeEntry};
   }
 }
+
 } // namespace
 
 ImmediateFuture<VirtualInode> VirtualInode::getOrFindChild(
@@ -875,26 +1541,46 @@ ImmediateFuture<VirtualInode> VirtualInode::getOrFindChild(
     RelativePathPiece path,
     const std::shared_ptr<ObjectStore>& objectStore,
     const ObjectFetchContextPtr& fetchContext) const {
+  // DEPRECATED: use co_getOrFindChild directly. Kept only because
+  // EdenMount::VirtualInodeLookupProcessor::next and VirtualInodeLoader
+  // still consume ImmediateFuture chains; delete once those are migrated.
+  return ImmediateFuture{
+      // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+      folly::coro::co_invoke(
+          [](auto&& self, auto&&... args) -> folly::coro::Task<VirtualInode> {
+            co_return co_await self.co_getOrFindChild(
+                std::forward<decltype(args)>(args)...);
+          },
+          *this,
+          childName.copy(),
+          path.copy(),
+          std::shared_ptr<ObjectStore>(objectStore),
+          fetchContext.copy())
+          .semi()};
+}
+
+folly::coro::now_task<VirtualInode> VirtualInode::co_getOrFindChild(
+    PathComponentPiece childName,
+    RelativePathPiece path,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext) const {
   if (!isDirectory()) {
-    return makeImmediateFuture<VirtualInode>(PathError(ENOTDIR, path));
+    co_yield folly::coro::co_error(PathError(ENOTDIR, path));
   }
-  auto notDirectory = [&] {
+
+  // Use std::get_if instead of match to avoid potential issues with
+  // coroutine lambdas and std::visit
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+    co_return co_await inode->asTreePtr()->co_getOrFindChild(
+        childName, fetchContext, false);
+  } else if (auto* tree = std::get_if<TreePtr>(&variant_)) {
+    co_return co_await co_getOrFindChildHelper(
+        *tree, childName, path, objectStore, fetchContext);
+  } else {
     // These represent files in VirtualInode, and can't be descended
-    return makeImmediateFuture<VirtualInode>(PathError(
+    co_yield folly::coro::co_error(PathError(
         ENOTDIR, path, std::string_view{"variant is of unhandled type"}));
-  };
-  return match(
-      variant_,
-      [&](const InodePtr& inode) {
-        return inode.asTreePtr()->getOrFindChild(
-            childName, fetchContext, false);
-      },
-      [&](const TreePtr& tree) {
-        return getOrFindChildHelper(
-            tree, childName, path, objectStore, fetchContext);
-      },
-      [&](const UnmaterializedUnloadedBlobDirEntry&) { return notDirectory(); },
-      [&](const TreeEntry&) { return notDirectory(); });
+  }
 }
 
 ImmediateFuture<std::string> VirtualInode::getBlob(
@@ -920,6 +1606,36 @@ ImmediateFuture<std::string> VirtualInode::getBlob(
         return makeImmediateFuture<std::string>(
             std::system_error(EISDIR, std::generic_category()));
       });
+}
+
+folly::coro::now_task<std::string> VirtualInode::co_getBlob(
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext) const {
+  // std::get_if is used instead of match because coroutine lambda captures are
+  // stored in the lambda object, not the coroutine frame. If the coroutine
+  // suspends, match destroys the lambda temporaries, and resuming accesses
+  // dangling captures.
+  static_assert(
+      std::variant_size_v<detail::VariantVirtualInode> == 4,
+      "New variant type added to VariantVirtualInode - update co_getBlob");
+  if (auto* inode = std::get_if<InodePtr>(&variant_)) {
+    auto content = co_await inode->asFilePtr()->co_readAll(fetchContext);
+    co_return std::move(content);
+  } else if (
+      auto* entry =
+          std::get_if<UnmaterializedUnloadedBlobDirEntry>(&variant_)) {
+    auto blob =
+        co_await objectStore->co_getBlob(entry->getObjectId(), fetchContext);
+    co_return blob->asString();
+  } else if (auto* treeEntry = std::get_if<TreeEntry>(&variant_)) {
+    auto blob = co_await objectStore->co_getBlob(
+        treeEntry->getObjectId(), fetchContext);
+    co_return blob->asString();
+  } else {
+    // TreePtr - directories cannot be read as blobs
+    co_yield folly::coro::co_error(
+        std::system_error(EISDIR, std::generic_category()));
+  }
 }
 
 } // namespace facebook::eden

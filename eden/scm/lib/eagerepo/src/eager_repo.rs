@@ -18,6 +18,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -31,7 +33,9 @@ use dag::ops::DagAddHeads;
 use dag::ops::DagPersistent;
 use eagerepo_trait::EagerRepoExtension;
 use format_util::commit_text_to_root_tree_id;
+use format_util::git_sha1_deserialize;
 use format_util::git_sha1_serialize;
+use format_util::hg_sha1_deserialize;
 use format_util::hg_sha1_serialize;
 use futures::lock::Mutex;
 use futures::lock::MutexGuard;
@@ -70,6 +74,10 @@ use zstore::Id20;
 
 const HG_PARENTS_LEN: usize = HgId::len() * 2;
 const HG_LEN: usize = HgId::len();
+const METALOG_DIR: &str = "metalog";
+
+/// Test-only ACL name used when eagerepo simulates PermissionDenied.
+pub(crate) const EAGER_PLACEHOLDER_ACL: &str = "some-acl";
 
 /// Non-lazy, pure Rust, local repo implementation.
 ///
@@ -103,8 +111,10 @@ pub struct EagerRepo {
     pub(crate) store: EagerRepoStore,
     metalog: RwLock<MetaLog>,
     pub(crate) dir: PathBuf,
+    store_dir: PathBuf,
     pub(crate) mut_store: Mutex<MutationStore>,
     pub(crate) ext: OnceLock<Arc<dyn EagerRepoExtension>>,
+    enforce_server_acls: AtomicBool,
 }
 
 /// Storage used by `EagerRepo`. See [`Id20Store`] for details.
@@ -148,6 +158,32 @@ impl EagerRepoStore {
     /// Read SHA1 blob from zstore for augmented data.
     pub fn get_augmented_blob(&self, id: Id20) -> Result<Option<Bytes>> {
         self.get_sha1_blob(augmented_id(id))
+    }
+
+    /// Check whether a tree contains `.slacl`.
+    pub(crate) fn tree_has_slacl(&self, tree_id: Id20) -> Result<bool> {
+        let tree_data = match self.get_sha1_blob(tree_id)? {
+            None => return Ok(false),
+            Some(data) => data,
+        };
+        let format = self.format();
+        let data = match format {
+            SerializationFormat::Hg => {
+                let (body, _, _) = hg_sha1_deserialize(&tree_data)?;
+                tree_data.slice_to_bytes(body)
+            }
+            SerializationFormat::Git => {
+                let (body, _) = git_sha1_deserialize(&tree_data)?;
+                tree_data.slice_to_bytes(body)
+            }
+        };
+        let tree_entry = manifest_tree::TreeEntry(data, format);
+        for child in tree_entry.elements() {
+            if child?.component.as_str() == ".slacl" {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Check files and trees referenced by the `id` are present.
@@ -241,7 +277,7 @@ impl EagerRepo {
         let store_dir = hg_dir.join("store");
         let dag = Dag::open(store_dir.join("segments").join("v1"))?;
         let store = EagerRepoStore::open(&store_dir.join("hgcommits").join("v1"), format)?;
-        let metalog = MetaLog::open(store_dir.join("metalog"), None)?;
+        let metalog = MetaLog::open(store_dir.join(METALOG_DIR), None)?;
         let mut_store = MutationStore::open(store_dir.join("mutation"))?;
 
         let repo = Self {
@@ -249,8 +285,10 @@ impl EagerRepo {
             store,
             metalog: RwLock::new(metalog),
             dir: dir.to_path_buf(),
+            store_dir,
             mut_store: Mutex::new(mut_store),
             ext: Default::default(),
+            enforce_server_acls: AtomicBool::new(true),
         };
 
         // If EagerRepoStore picks up an extension, also enable it for the EagerRepo.
@@ -261,7 +299,7 @@ impl EagerRepo {
         // "eagercompat" is a revlog repo secretly using an eager store under the hood.
         // It's requirements don't match our expectations, so return early. This is mainly
         // so we can access the EagerRepo SaplingRemoteApi trait implementation.
-        if has_eagercompat_requirement(&store_dir) {
+        if has_eagercompat_requirement(&repo.store_dir) {
             return Ok(repo);
         }
 
@@ -280,7 +318,7 @@ impl EagerRepo {
         if repo.store.ext_name() == Some("virtual-repo") {
             store_requires.push("invalid-hash");
         }
-        write_requires(&store_dir, &store_requires)?;
+        write_requires(&repo.store_dir, &store_requires)?;
 
         // Update metalog to prevent migrating from vfs.
         {
@@ -487,10 +525,14 @@ impl EagerRepo {
 
                             sapling_tree_blob_size += HgId::hex_len() + 1;
 
+                            // Check if the subtree contains a .slacl file
+                            let has_acl = self.tree_has_slacl(hgid)?;
+
                             AugmentedTreeEntry::DirectoryNode(AugmentedDirectoryNode {
                                 treenode: hgid,
                                 augmented_manifest_id: hash,
                                 augmented_manifest_size: size,
+                                has_acl,
                             })
                         }
                         Flag::File(file_type) => {
@@ -550,6 +592,18 @@ impl EagerRepo {
                 Ok(Some(Bytes::from(buf)))
             }
         }
+    }
+
+    pub(crate) fn tree_has_slacl(&self, tree_id: Id20) -> Result<bool> {
+        self.store.tree_has_slacl(tree_id)
+    }
+
+    pub fn set_enforce_server_acls(&self, val: bool) {
+        self.enforce_server_acls.store(val, Ordering::Relaxed);
+    }
+
+    pub fn enforce_server_acls(&self) -> bool {
+        self.enforce_server_acls.load(Ordering::Relaxed)
     }
 
     /// Insert a commit. Return the commit hash.
@@ -701,6 +755,14 @@ impl EagerRepo {
         self.metalog.read()
     }
 
+    /// Re-open the metalog from disk to pick up changes made by other
+    /// EagerRepo instances pointing at the same directory.
+    pub(crate) fn refresh_metalog(&self) -> Result<()> {
+        let new_metalog = MetaLog::open(self.store_dir.join(METALOG_DIR), None)?;
+        *self.metalog.write() = new_metalog;
+        Ok(())
+    }
+
     /// Obtain an instance to the store.
     pub fn store(&self) -> EagerRepoStore {
         self.store.clone()
@@ -816,6 +878,17 @@ mod tests {
         assert_eq!(repo2.get_sha1_blob(id).unwrap().as_deref(), Some(text));
     }
 
+    #[test]
+    fn test_acl_enforcement_defaults_to_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = EagerRepo::open(dir.path()).unwrap();
+
+        assert!(repo.enforce_server_acls());
+
+        repo.set_enforce_server_acls(false);
+        assert!(!repo.enforce_server_acls());
+    }
+
     #[tokio::test]
     async fn test_add_commit() {
         let dir = tempfile::tempdir().unwrap();
@@ -902,7 +975,7 @@ mod tests {
                 assert_eq!(unsupported, &["remotefilelog"]);
                 assert_eq!(missing, &["treestate", "windowssymlinks"]);
             }
-            _ => panic!("expect RequirementsMismatch, got {:?}", err),
+            _ => panic!("expect RequirementsMismatch, got {err:?}"),
         }
     }
 

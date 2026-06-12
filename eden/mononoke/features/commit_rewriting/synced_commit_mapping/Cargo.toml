@@ -12,23 +12,23 @@ name = "synced_commit_mapping_test"
 path = "test/main.rs"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
-auto_impl = "1.2.1"
+auto_impl = "1.3.0"
 bincode = { version = "2", features = ["serde"] }
 bytes = { version = "1.11.1", features = ["serde"] }
 caching_ext = { version = "0.1.0", path = "../../../common/rust/caching_ext" }
 context = { version = "0.1.0", path = "../../../servers/slapi/slapi_server/context" }
-dashmap = { version = "5.5.3", features = ["rayon", "serde"] }
-facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+dashmap = { version = "6.2.1", features = ["rayon", "serde"] }
+facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 fbthrift = { version = "0.0.1+unstable", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
 memcache = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 metaconfig_types = { version = "0.1.0", path = "../../../metaconfig/types" }
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
-quickcheck = "1.0"
+quickcheck = "1.1"
 rendezvous = { version = "0.1.0", path = "../../../common/rendezvous" }
 scuba_ext = { version = "0.1.0", path = "../../../common/scuba_ext" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

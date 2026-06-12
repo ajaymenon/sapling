@@ -136,13 +136,13 @@ test missing files will trigger fallback
 
 
 watchman with not d file type expression will use edenAPI
-  $ hg checkout $A > /dev/null
+  $ sl checkout $A > /dev/null
   $ touch foo.txt
   $ touch baz.txt
-  $ hg add foo.txt
-  $ hg add baz.txt
-  $ hg amend 2> /dev/null
-  $ hg checkout 4c6d6cef04fa > /dev/null
+  $ sl add foo.txt
+  $ sl add baz.txt
+  $ sl amend 2> /dev/null
+  $ sl checkout 4c6d6cef04fa > /dev/null
   $ watchman -j <<-EOT
   > ["query", "$TESTTMP/repo1", {
   > "glob": ["**/*.txt"],

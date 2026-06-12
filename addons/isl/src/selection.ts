@@ -6,17 +6,19 @@
  */
 
 import type React from 'react';
+import type {Comparison} from 'shared/Comparison';
 import type {ISLCommandName} from './ISLShortcuts';
 
 import {isMac} from 'isl-components/OperatingSystem';
 import {atom} from 'jotai';
 import {useCallback} from 'react';
+import {ComparisonType} from 'shared/Comparison';
 import {commitMode} from './CommitInfoView/CommitInfoState';
 import {useCommand} from './ISLShortcuts';
 import {useSelectAllCommitsShortcut} from './SelectAllCommits';
 import {successionTracker} from './SuccessionTracker';
 import {YOU_ARE_HERE_VIRTUAL_COMMIT} from './dag/virtualCommit';
-import {islDrawerState} from './drawerState';
+import {expandCommitInfoView} from './drawerState';
 import {findPublicBaseAncestor} from './getCommitTree';
 import {t} from './i18n';
 import {readAtom, useAtomHas, writeAtom} from './jotaiUtils';
@@ -29,7 +31,7 @@ import {dagWithPreviews} from './previews';
 import {latestDag} from './serverAPIState';
 import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
 import {exactRevset, type CommitInfo, type Hash} from './types';
-import {firstOfIterable, registerCleanup} from './utils';
+import {registerCleanup} from './utils';
 
 /**
  * The name of the key to toggle individual selection.
@@ -88,6 +90,35 @@ export const selectedCommitInfos = atom(get => {
     const info = dag.get(h);
     return info === undefined ? [] : [info];
   });
+});
+
+/**
+ * If the selected commits form a continuous ancestry chain (single root, single head,
+ * no gaps), returns a CommitRange comparison. Otherwise returns null.
+ * This is a derived atom so it auto-memoizes and only recomputes when deps change.
+ */
+export const selectedCommitsRangeComparison = atom<Comparison | null>(get => {
+  const selected = get(selectedCommitInfos);
+  if (selected.length < 2) {
+    return null;
+  }
+  const dag = get(dagWithPreviews);
+  const selectedSet = dag.present(new Set(selected.map(c => c.hash)));
+  const roots = dag.roots(selectedSet);
+  const heads = dag.heads(selectedSet);
+  if (roots.size === 1 && heads.size === 1) {
+    const rangeSet = dag.range(roots, heads);
+    if (rangeSet.size === selectedSet.size && rangeSet.subtract(selectedSet).size === 0) {
+      const rootHash = [...roots][0];
+      const headHash = [...heads][0];
+      return {
+        type: ComparisonType.CommitRange as const,
+        hashFrom: rootHash,
+        hashTo: headHash,
+      };
+    }
+  }
+  return null;
 });
 
 export function useCommitSelection(hash: string): {
@@ -209,13 +240,7 @@ export function useCommitCallbacks(commit: CommitInfo): {
       }
     }
     // Show the drawer.
-    writeAtom(islDrawerState, state => ({
-      ...state,
-      right: {
-        ...state.right,
-        collapsed: false,
-      },
-    }));
+    expandCommitInfoView();
     if (commit.isDot) {
       // if we happened to be in commit mode, swap to amend mode so you see the details instead
       writeAtom(commitMode, 'amend');
@@ -227,13 +252,7 @@ export function useCommitCallbacks(commit: CommitInfo): {
 export function useArrowKeysToChangeSelection() {
   const cb = useCallback((which: ISLCommandName) => {
     if (which === 'OpenDetails') {
-      writeAtom(islDrawerState, previous => ({
-        ...previous,
-        right: {
-          ...previous.right,
-          collapsed: false,
-        },
-      }));
+      expandCommitInfoView();
     }
 
     const dag = readAtom(dagWithPreviews);
@@ -320,31 +339,22 @@ export function useArrowKeysToChangeSelection() {
 
 export function useBackspaceToHideSelected(): void {
   const cb = useCallback(() => {
-    // Though you can select multiple commits, our preview system doesn't handle that very well.
-    // Just preview hiding the most recently selected commit.
-    // Another sensible behavior would be to inspect the tree of commits selected
-    // and find if there's a single common ancestor to hide. That won't work in all cases though.
-    const mostRecent = readAtom(previouslySelectedCommit);
-    let hashToHide = mostRecent;
-    if (hashToHide == null) {
-      const selection = readAtom(selectedCommits);
-      if (selection != null) {
-        hashToHide = firstOfIterable(selection.values());
-      }
-    }
-    if (hashToHide == null) {
+    const selection = readAtom(selectedCommits);
+    if (selection == null || selection.size === 0) {
       return;
     }
 
-    const commitToHide = readAtom(latestDag).get(hashToHide);
-    if (commitToHide == null) {
+    const dag = readAtom(latestDag);
+    const sources = [...selection].flatMap(hash => {
+      const info = dag.get(hash);
+      return info == null ? [] : [latestSuccessorUnlessExplicitlyObsolete(info)];
+    });
+
+    if (sources.length === 0) {
       return;
     }
 
-    writeAtom(
-      operationBeingPreviewed,
-      new HideOperation(latestSuccessorUnlessExplicitlyObsolete(commitToHide)),
-    );
+    writeAtom(operationBeingPreviewed, new HideOperation(sources));
   }, []);
 
   useCommand('HideSelectedCommits', cb);

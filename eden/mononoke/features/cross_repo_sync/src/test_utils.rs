@@ -31,6 +31,7 @@ use commit_transformation::git_submodules::SubmoduleExpansionData;
 use commit_transformation::rewrite_commit;
 use commit_transformation::upload_commits;
 use context::CoreContext;
+use dbbookmarks::SqlBookmarks;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
 use git_source_of_truth::GitSourceOfTruthConfig;
@@ -80,6 +81,9 @@ use crate::types::Repo;
 pub struct TestRepo {
     #[facet]
     bookmarks: dyn Bookmarks,
+
+    #[facet]
+    sql_bookmarks: SqlBookmarks,
 
     #[facet]
     bookmark_update_log: dyn BookmarkUpdateLog,
@@ -422,10 +426,7 @@ where
     )
     .await?;
 
-    println!(
-        "small master: {}, large master: {}",
-        small_master_bcs_id, large_master_bcs_id
-    );
+    println!("small master: {small_master_bcs_id}, large master: {large_master_bcs_id}");
     println!(
         "{:?}",
         small_to_large_commit_syncer

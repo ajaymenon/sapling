@@ -19,12 +19,12 @@
   > A
   > EOS
 
-  $ hg up -q $C
+  $ sl up -q $C
 
 # rename should support absolute path
 
-  $ ROOT=$(hg root)
-  $ hg rebase -r $C -d $D --config=ui.interactive=1 --config copytrace.dagcopytrace=False << EOS
+  $ ROOT=$(sl root)
+  $ sl rebase -r $C -d $D --config=ui.interactive=1 --config copytrace.dagcopytrace=False << EOS
   > r
   > $ROOT/Renamed
   > EOS
@@ -36,7 +36,7 @@
   merging Renamed
 
 
-  $ hg log -Gp -T '{desc}\n' --git Renamed A
+  $ sl log -Gp -T '{desc}\n' --git Renamed A
   @  C
   ╷  diff --git a/Renamed b/Renamed
   ╷  --- a/Renamed
@@ -69,4 +69,4 @@
 
 # status should not show "! A"
 
-  $ hg status
+  $ sl status

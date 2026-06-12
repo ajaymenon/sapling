@@ -48,8 +48,7 @@ use std::ops::RangeBounds;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
@@ -74,12 +73,14 @@ use crate::index::RangeIter;
 use crate::index::ReadonlyBuffer;
 use crate::lock::READER_LOCK_OPTS;
 use crate::lock::ScopedDirLock;
+use crate::metrics::Counter;
 use crate::utils;
 use crate::utils::mmap_bytes;
 use crate::utils::mmap_path;
 use crate::utils::xxhash;
 use crate::utils::xxhash32;
 
+mod appendable;
 mod fold;
 mod meta;
 mod open_options;
@@ -89,6 +90,11 @@ mod repair;
 pub(crate) mod tests;
 mod wait;
 
+static LOG_WRITE_MS: Counter = Counter::new_counter("indexedlog.log.write_ms");
+static SYNC_COUNT: Counter = Counter::new_counter("indexedlog.sync");
+static AUTO_SYNC_COUNT: Counter = Counter::new_counter("indexedlog.auto_sync");
+
+pub use appendable::Appendable;
 pub use open_options::ChecksumType;
 pub use open_options::FlushFilterContext;
 pub use open_options::FlushFilterFunc;
@@ -115,9 +121,6 @@ const ENTRY_FLAG_HAS_XXHASH32: u32 = 2;
 
 // 1MB index checksum. This makes checksum file within one block (4KB) for 512MB index.
 const INDEX_CHECKSUM_CHUNK_SIZE_LOGARITHM: u32 = 20;
-
-pub static SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
-pub static AUTO_SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// An append-only storage with indexes and integrity checks.
 ///
@@ -271,39 +274,16 @@ impl Log {
     /// the change immediately.
     ///
     /// To write in-memory entries and indexes to disk, call [`Log::sync`].
-    pub fn append<T: AsRef<[u8]>>(&mut self, data: T) -> crate::Result<()> {
-        self.append_internal::<crate::Error>(
-            |buf| {
-                buf.extend_from_slice(data.as_ref());
-                Ok::<_, crate::Error>(())
-            },
-            Some(data.as_ref().len()),
-        )
-        .context(|| {
-            let data = data.as_ref();
-            if data.len() < 128 {
-                format!("in Log::append({:?})", data)
-            } else {
-                format!("in Log::append(<a {}-byte long slice>)", data.len())
-            }
-        })
-    }
-
-    /// Similar to [`Log::append`], but data is written via a callback. This allows the caller to
-    /// reduce allocations by serializing directly to the [`Log`]'s internal buffer. The `cb` is
-    /// called twice, first to get the data length, second to write the data. It must produce the
-    /// same data.
     ///
-    /// If `cb` returns an error, the operation is undone and the error is propagated.
-    pub fn append_direct<E>(
-        &mut self,
-        cb: impl Fn(&mut dyn ExtendWrite) -> Result<(), E>,
-    ) -> crate::Result<()>
-    where
-        // This works for anyhow::Error and crate::Error. Other error types will need to box.
-        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
-    {
-        self.append_internal(cb, None)
+    /// [`Appendable`] supports a callback to reduce allocation on the caller side.
+    /// The callback is called twice, first to get the data length, second to
+    /// write the data. It must produce the same data.
+    /// If the callback returns an error, the operation is undone and the error
+    /// is propagated.
+    pub fn append(&mut self, data: impl Appendable) -> crate::Result<()> {
+        let data_len = data.data_len();
+        self.append_internal::<crate::Error>(|buf| data.write_to(buf), data_len)
+            .context(|| format!("in Log::append(len={data_len:?})"))
     }
 
     /// Append data written by `cb` to the [`Log`].
@@ -327,7 +307,7 @@ impl Log {
 
                     if let Err(err) = cb(&mut counter) {
                         return Err(crate::Error::blank()
-                            .message("append_direct callback error")
+                            .message("append callback error")
                             .source_dyn(err.into()));
                     }
 
@@ -398,7 +378,7 @@ impl Log {
                 // User error producing the bytes to serialize - undo whatever we've done so far.
                 self.mem_buf.truncate(mem_buf_start_len);
                 return Err(crate::Error::blank()
-                    .message("append_direct callback error")
+                    .message("append callback error")
                     .source_dyn(err.into()));
             }
 
@@ -406,7 +386,9 @@ impl Log {
             let apparent_len = self.mem_buf.len() - data_offset;
             if data_len != apparent_len {
                 self.mem_buf.truncate(mem_buf_start_len);
-                return Err(crate::Error::blank().message(format!("append_direct length mismatch: {data_len} (expected) != {apparent_len} (apparent)")));
+                return Err(crate::Error::blank().message(format!(
+                    "append length mismatch: {data_len} (expected) != {apparent_len} (apparent)"
+                )));
             }
 
             match checksum_type {
@@ -440,7 +422,7 @@ impl Log {
 
             if let Some(threshold) = self.open_options.auto_sync_threshold {
                 if self.mem_buf.len() as u64 >= threshold {
-                    AUTO_SYNC_COUNT.fetch_add(1, Ordering::Relaxed);
+                    AUTO_SYNC_COUNT.add(1);
                     self.sync()
                         .context("sync triggered by auto_sync_threshold")?;
                 }
@@ -567,7 +549,7 @@ impl Log {
     ///
     /// For in-memory-only Logs, this function does nothing, and returns 0.
     pub fn sync(&mut self) -> crate::Result<u64> {
-        SYNC_COUNT.fetch_add(1, Ordering::Relaxed);
+        SYNC_COUNT.add(1);
 
         let result: crate::Result<_> = (|| {
             let span = debug_span!("Log::sync", dirty_bytes = self.mem_buf.len());
@@ -731,7 +713,13 @@ impl Log {
                 return Err(err);
             }
 
+            tracing::debug!(
+                mem_buf_len = self.mem_buf.len(),
+                "writing to primary log file"
+            );
+
             // Actually write the primary log. Once it's written, we can remove the in-memory buffer.
+            let start = Instant::now();
             primary_file
                 .write_all(&self.mem_buf)
                 .context(&primary_path, || {
@@ -743,6 +731,7 @@ impl Log {
                     .sync_all()
                     .context(&primary_path, "cannot fsync")?;
             }
+            LOG_WRITE_MS.add(start.elapsed().as_millis() as usize);
 
             meta.primary_len += self.mem_buf.len() as u64;
             self.mem_buf.clear();
@@ -980,8 +969,8 @@ impl Log {
         })(self);
 
         result
-            .context(|| format!("in Log::rebuild_indexes(force={})", force))
-            .context(|| format!("  Log.dir = {:?}", dir))
+            .context(|| format!("in Log::rebuild_indexes(force={force})"))
+            .context(|| format!("  Log.dir = {dir:?}"))
     }
 
     fn rebuild_indexes_with_lock(
@@ -1004,17 +993,16 @@ impl Log {
                                 Ok(len) => {
                                     if len > self.meta.primary_len {
                                         message += &format!(
-                                            "Index {:?} is incompatible with (truncated) log\n",
-                                            name
+                                            "Index {name:?} is incompatible with (truncated) log\n"
                                         );
                                         false
                                     } else if index.verify().is_ok() {
                                         message +=
-                                            &format!("Index {:?} passed integrity check\n", name);
+                                            &format!("Index {name:?} passed integrity check\n");
                                         true
                                     } else {
                                         message +=
-                                            &format!("Index {:?} failed integrity check\n", name);
+                                            &format!("Index {name:?} failed integrity check\n");
                                         false
                                     }
                                 }
@@ -1035,7 +1023,7 @@ impl Log {
                     }
 
                     let tmp = tempfile::NamedTempFile::new_in(dir).context(dir, || {
-                        format!("cannot create tempfile for rebuilding index {:?}", name)
+                        format!("cannot create tempfile for rebuilding index {name:?}")
                     })?;
                     let index_len = {
                         let mut index = index::OpenOptions::new()
@@ -1057,22 +1045,22 @@ impl Log {
                     self.meta.indexes.insert(def.metaname(), 0);
                     self.meta
                         .write_file(&meta_path, self.open_options.fsync)
-                        .context(|| format!("  before replacing index {:?})", name))?;
+                        .context(|| format!("  before replacing index {name:?})"))?;
 
                     let _ = utils::fix_perm_file(tmp.as_file(), false);
 
                     let path = dir.join(def.filename());
                     tmp.persist(&path).map_err(|e| {
                         crate::Error::wrap(Box::new(e), || {
-                            format!("cannot persist tempfile to replace index {:?}", name)
+                            format!("cannot persist tempfile to replace index {name:?}")
                         })
                     })?;
 
                     self.meta.indexes.insert(def.metaname(), index_len);
                     self.meta
                         .write_file(&meta_path, self.open_options.fsync)
-                        .context(|| format!("  after replacing index {:?}", name))?;
-                    message += &format!("Rebuilt index {:?}\n", name);
+                        .context(|| format!("  after replacing index {name:?}"))?;
+                    message += &format!("Rebuilt index {name:?}\n");
                 }
             }
         }
@@ -1138,7 +1126,7 @@ impl Log {
             })
         })();
         result
-            .context(|| format!("in Log::lookup_prefix({}, {:?})", index_id, prefix))
+            .context(|| format!("in Log::lookup_prefix({index_id}, {prefix:?})"))
             .context(|| format!("  Log.dir = {:?}", self.dir))
     }
 
@@ -1168,12 +1156,7 @@ impl Log {
             })
         })();
         result
-            .context(|| {
-                format!(
-                    "in Log::lookup_range({}, {:?} to {:?})",
-                    index_id, start, end,
-                )
-            })
+            .context(|| format!("in Log::lookup_range({index_id}, {start:?} to {end:?})",))
             .context(|| format!("  Log.dir = {:?}", self.dir))
     }
 
@@ -1200,7 +1183,7 @@ impl Log {
             })
         })();
         result
-            .context(|| format!("in Log::lookup_prefix_hex({}, {:?})", index_id, prefix))
+            .context(|| format!("in Log::lookup_prefix_hex({index_id}, {prefix:?})"))
             .context(|| format!("  Log.dir = {:?}", self.dir))
     }
 
@@ -1224,6 +1207,11 @@ impl Log {
         }
     }
 
+    /// Returns `true` if there are in-memory changes that haven't been flushed to disk.
+    pub fn is_dirty(&self) -> bool {
+        !self.mem_buf.is_empty()
+    }
+
     /// Applies the given index function to the entry data and returns the index keys.
     pub fn index_func<'a>(
         &self,
@@ -1236,7 +1224,7 @@ impl Log {
             result.push(
                 output
                     .into_cow(entry)
-                    .context(|| format!("index_id = {}", index_id))?,
+                    .context(|| format!("index_id = {index_id}"))?,
             );
         }
 
@@ -1646,7 +1634,7 @@ impl Log {
 
         let (entry_flags, vlq_len): (u32, _) = buf.read_vlq_at(offset as usize).map_err(|e| {
             crate::Error::wrap(Box::new(e), || {
-                format!("cannot read entry_flags at {}", offset)
+                format!("cannot read entry_flags at {offset}")
             })
             .mark_corruption()
         })?;
@@ -1654,10 +1642,8 @@ impl Log {
 
         // For now, data_len is the next field regardless of entry flags.
         let (data_len, vlq_len): (u64, _) = buf.read_vlq_at(offset as usize).map_err(|e| {
-            crate::Error::wrap(Box::new(e), || {
-                format!("cannot read data_len at {}", offset)
-            })
-            .mark_corruption()
+            crate::Error::wrap(Box::new(e), || format!("cannot read data_len at {offset}"))
+                .mark_corruption()
         })?;
         let offset = offset + vlq_len as u64;
 
@@ -1667,9 +1653,7 @@ impl Log {
             ENTRY_FLAG_HAS_XXHASH64 => {
                 let checksum = LittleEndian::read_u64(
                     buf.get(offset as usize..offset as usize + 8)
-                        .ok_or_else(|| {
-                            data_error(format!("xxhash cannot be read at {}", offset))
-                        })?,
+                        .ok_or_else(|| data_error(format!("xxhash cannot be read at {offset}")))?,
                 );
                 (checksum, offset + 8)
             }
@@ -1677,15 +1661,14 @@ impl Log {
                 let checksum = LittleEndian::read_u32(
                     buf.get(offset as usize..offset as usize + 4)
                         .ok_or_else(|| {
-                            data_error(format!("xxhash32 cannot be read at {}", offset))
+                            data_error(format!("xxhash32 cannot be read at {offset}"))
                         })?,
                 ) as u64;
                 (checksum, offset + 4)
             }
             _ => {
                 return Err(data_error(format!(
-                    "entry at {} has malformed checksum metadata",
-                    offset
+                    "entry at {offset} has malformed checksum metadata"
                 )));
             }
         };
@@ -1693,7 +1676,7 @@ impl Log {
         // Read the actual payload
         let end = offset + data_len;
         if end > buf.len() as u64 {
-            return Err(data_error(format!("incomplete entry data at {}", offset)));
+            return Err(data_error(format!("incomplete entry data at {offset}")));
         }
         let data = &buf[offset as usize..end as usize];
 
@@ -1711,7 +1694,7 @@ impl Log {
                 next_offset: end,
             }))
         } else {
-            Err(data_error(format!("integrity check failed at {}", offset)))
+            Err(data_error(format!("integrity check failed at {offset}")))
         }
     }
 
@@ -1720,7 +1703,7 @@ impl Log {
     #[inline]
     fn maybe_set_index_out_of_sync<T>(&mut self, result: crate::Result<T>) -> crate::Result<T> {
         if let (Err(e), None) = (&result, &self.index_out_of_sync) {
-            self.index_out_of_sync = Some(format!("{} ({:?})", e, e));
+            self.index_out_of_sync = Some(format!("{e} ({e:?})"));
         }
         result
     }
@@ -1730,7 +1713,7 @@ impl Log {
     #[inline]
     fn maybe_return_index_error(&self) -> crate::Result<()> {
         if let Some(msg) = &self.index_out_of_sync {
-            let msg = format!("index was out of sync: {}", msg);
+            let msg = format!("index was out of sync: {msg}");
             Err(self.corruption(msg))
         } else {
             Ok(())
@@ -1970,11 +1953,11 @@ impl Debug for Log {
                     if count > 1 {
                         write!(f, "\n")?;
                     }
-                    write!(f, "# Entry {}:\n", count)?;
+                    write!(f, "# Entry {count}:\n")?;
                     for (i, chunk) in bytes.chunks(bytes_per_line).enumerate() {
                         write!(f, "{:08x}:", offset as usize + i * bytes_per_line)?;
                         for b in chunk {
-                            write!(f, " {:02x}", b)?;
+                            write!(f, " {b:02x}")?;
                         }
                         for _ in chunk.len()..bytes_per_line {
                             write!(f, "   ")?;
@@ -1985,12 +1968,12 @@ impl Debug for Log {
                                 0x20..=0x7e => b as char, // printable
                                 _ => '.',
                             };
-                            write!(f, "{}", ch)?;
+                            write!(f, "{ch}")?;
                         }
                         write!(f, "\n")?;
                     }
                 }
-                Some(Err(err)) => writeln!(f, "# Error: {:?}", err)?,
+                Some(Err(err)) => writeln!(f, "# Error: {err:?}")?,
             }
         }
         Ok(())

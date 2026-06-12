@@ -14,7 +14,7 @@ class Sapling < Formula
   version "%VERSION%"
   sha256 "%SHA256%"
 
-  depends_on "python@3.11"
+  depends_on "python@3.12"
   depends_on "node"
   depends_on "openssl@3"
   depends_on "gh"
@@ -30,21 +30,21 @@ class Sapling < Formula
     # variable. This is necessary since the installed OpenSSL library
     # might not match the architecture of the destination one.
     ENV["OPENSSL_DIR"] = Formula["openssl@3"].opt_prefix
-    ENV["PYTHON_SYS_EXECUTABLE"] = Formula["python@3.11"].opt_prefix/"bin/python3.11"
-    ENV["PYTHON"] = Formula["python@3.11"].opt_prefix/"bin/python3.11"
-    ENV["PYTHON3"] = Formula["python@3.11"].opt_prefix/"bin/python3.11"
-    ENV["SAPLING_VERSION"] = "%VERSION%"
     ENV["CFLAGS"] = "--target=%TARGET%"
-    ENV["RUST_TARGET"] = "%TARGET%"
     # The line below is necessary, since otherwise homebrew somehow injects
     # -march=... into clang
     ENV["HOMEBREW_OPTFLAGS"] = ""
+
+    python = Formula["python@3.12"].opt_prefix/"bin/python3.12"
 
     cd "eden/scm" do
       system "rustup-init -y"
       system "source %CACHEDIR%/cargo_cache/env && rustup target add %TARGET%"
       system "source %CACHEDIR%/cargo_cache/env && "\
-             "make PREFIX=#{prefix} install-oss"
+             "#{python} ./build.py --oss --with-python #{python} "\
+             "--with-version %VERSION% --rust-target %TARGET%"
+      bin.install "out/sl"
+      lib.install "out/isl-dist.tar.xz"
     end
   end
 end

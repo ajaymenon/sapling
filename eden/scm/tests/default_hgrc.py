@@ -3,7 +3,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
 
 """
 Default config file for testing
@@ -61,7 +61,6 @@ ack = smartlog-default-command commitcloud-update-on-move
 
 [experimental]
 use-rust-changelog=True
-windows-symlinks=True
 narrow-heads=true
 
 [tweakdefaults]
@@ -93,6 +92,9 @@ min-path-depth=2
 
 [pull]
 buffer-commit-count = 5
+
+[grep]
+use-rust=true
 """
     if use_watchman:
         content += """

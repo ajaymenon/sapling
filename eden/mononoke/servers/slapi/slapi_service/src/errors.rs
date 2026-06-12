@@ -60,8 +60,8 @@ pub enum ErrorKind {
     TreeFetchFailed(Key),
     #[error("Failed to fetch history for key: {0:?}")]
     HistoryFetchFailed(Key),
-    #[error("Failed to fetch HgId for bookmark: {0:?}")]
-    BookmarkResolutionFailed(String),
+    #[error("Failed to fetch HgId for bookmark: {0:?}. Err: {1:#}")]
+    BookmarkResolutionFailed(String, Error),
     #[error("Dag location to hash request failed")]
     CommitLocationToHashRequestFailed,
     #[error("Commit data request failed")]
@@ -107,6 +107,7 @@ impl MononokeErrorExt for MononokeError {
             NonFastForwardMove { .. } => HttpError::e400,
             PushrebaseConflicts(_) => HttpError::e400,
             AuthorizationError(_) => HttpError::e403,
+            RestrictedPathsAuthorizationError(_) => HttpError::e403,
             InternalError(_) => HttpError::e500,
             MergeConflicts { .. } => HttpError::e400,
             LargeRepoNotFound(_) => HttpError::e400,

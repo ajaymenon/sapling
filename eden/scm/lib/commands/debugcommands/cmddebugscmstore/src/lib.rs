@@ -89,9 +89,8 @@ pub fn run(ctx: ReqCtx<DebugScmStoreOpts>, repo: &Repo) -> Result<u8> {
     let keys: Vec<Key> = if let Some(path) = ctx.opts.requests_file {
         block_on_stream(block_on(file_to_async_key_stream(path.into()))?).collect()
     } else {
-        let wc = repo.working_copy()?;
-        let commit =
-            repo.resolve_commit(Some(&wc.read().treestate().lock()), &ctx.opts.rev.unwrap())?;
+        let rev = ctx.opts.rev.unwrap();
+        let commit = repo.resolve_commit(&rev)?.local()?;
         let manifest = repo.tree_resolver()?.get(&commit)?;
         ctx.opts
             .args
@@ -173,7 +172,7 @@ fn fetch_files(
 
             let (found, missing, _errors) = fetch_result.consume();
             for (_, file) in found.into_iter() {
-                let _ = write!(stdout, "Successfully fetched file: {:#?}\n", file);
+                let _ = write!(stdout, "Successfully fetched file: {file:#?}\n");
             }
 
             missing
@@ -250,9 +249,9 @@ fn fetch_trees(
 
             writeln!(stdout, "Tree '{}' file aux", key.path)?;
             let mut file_aux = tree.file_aux_iter()?.collect::<Result<Vec<_>>>()?;
-            file_aux.sort_by(|a, b| a.0.cmp(&b.0));
+            file_aux.sort_by_key(|a| a.0);
             for entry in file_aux {
-                writeln!(stdout, "  {:?}", entry)?;
+                writeln!(stdout, "  {entry:?}")?;
             }
         }
     } else {
@@ -260,10 +259,10 @@ fn fetch_trees(
 
         let (found, missing, _errors) = fetch_result.consume();
         for complete in found.into_iter() {
-            write!(stdout, "Successfully fetched tree: {:#?}\n", complete)?;
+            write!(stdout, "Successfully fetched tree: {complete:#?}\n")?;
         }
         for incomplete in missing.into_iter() {
-            write!(stdout, "Failed to fetch tree: {:#?}\n", incomplete)?;
+            write!(stdout, "Failed to fetch tree: {incomplete:#?}\n")?;
         }
     }
 

@@ -50,7 +50,7 @@ pub async fn summary(
     let derivation_queue = repo
         .repo_derivation_queues()
         .queue(config_name)
-        .ok_or_else(|| anyhow!("Missing derivation queue for config {}", config_name))?;
+        .ok_or_else(|| anyhow!("Missing derivation queue for config {config_name}"))?;
 
     let summary = derivation_queue.summary(ctx).await?;
 
@@ -92,6 +92,8 @@ async fn print_table(
 
     let mut titles = row![
         "time in queue",
+        "time ready",
+        "time deriving",
         "retry count",
         "type",
         "priority",
@@ -122,19 +124,33 @@ async fn print_table(
                 DerivationPriority::LOW => "low",
                 _ => "unknown",
             };
+            let time_ready_str = match item.ready_timestamp() {
+                Some(ts) => format!("{}s{}ms", ts.since_seconds(), ts.since_millis() % 1000),
+                None => "-".to_string(),
+            };
+            let time_deriving_str = match item.deriving_timestamp() {
+                Some(ts) => format!("{}s{}ms", ts.since_seconds(), ts.since_millis() % 1000),
+                None => "-".to_string(),
+            };
+            let type_cell = match item.stage_payload() {
+                Some(payload) => format!("{} (stage: {})", dd_type, payload.path()),
+                None => format!("{dd_type}"),
+            };
             let mut row = row![
                 format!(
                     "{}s{}ms",
                     timestamp.since_seconds(),
                     timestamp.since_millis() % 1000
                 ),
+                time_ready_str,
+                time_deriving_str,
                 item.retry_count(),
-                dd_type,
+                type_cell,
                 priority_str,
                 format!("{:?}", item.bubble_id()),
                 item.head_cs_id(),
                 item.root_cs_id(),
-                item.is_ready()
+                item.is_ready(),
             ];
             if args.client_info {
                 row.add_cell(cell![format!("{:?}", item.client_info())]);

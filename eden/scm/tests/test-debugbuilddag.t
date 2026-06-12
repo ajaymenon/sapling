@@ -12,8 +12,8 @@
 # plain
 
   $ setconfig devel.segmented-changelog-rev-compat=true
-  $ hg init
-  $ hg debugbuilddag '+2:f +3:p2 <f+4 /p2 +2' --config 'extensions.progress=' --config 'progress.debug=true'
+  $ sl init
+  $ sl debugbuilddag '+2:f +3:p2 <f+4 /p2 +2' --config 'extensions.progress=' --config 'progress.debug=true'
   progress: building: 0/12 revisions (0.00%)
   progress: building: 1/12 revisions (8.33%)
   progress: building: 1/12 revisions (8.33%)
@@ -32,19 +32,19 @@
 
 # dag
 
-  $ hg debugdag --bookmarks
+  $ sl debugdag --bookmarks
   +2:f
   +3:p2
   *f+3*/p2+2
 
 # tip
 
-  $ hg id
+  $ sl id
   000000000000
 
 # glog
 
-  $ hg log -G --template '{rev}: {desc} [{branches}] @ {date}\n'
+  $ sl log -G --template '{rev}: {desc} [{branches}] @ {date}\n'
   o  11: r11 [] @ 11.00
   │
   o  10: r10 [] @ 10.00
@@ -71,25 +71,25 @@
 
 # overwritten files, starting on a non-default branch
 
-  $ rm -r .hg
-  $ hg init
-  $ hg debugbuilddag '..:f +3:p2 @temp <f+4 /p2 +2' -q -o
+  $ rm -r .sl
+  $ sl init
+  $ sl debugbuilddag '..:f +3:p2 @temp <f+4 /p2 +2' -q -o
 
 # dag
 
-  $ hg debugdag --bookmarks -b
+  $ sl debugdag --bookmarks -b
   +2:f
   +3:p2
   *f+3*/p2+2
 
 # tip
 
-  $ hg id
+  $ sl id
   000000000000
 
 # glog
 
-  $ hg log -G --template '{rev}: {desc} [{branches}] @ {date}\n'
+  $ sl log -G --template '{rev}: {desc} [{branches}] @ {date}\n'
   o  11: r11 [] @ 11.00
   │
   o  10: r10 [] @ 10.00
@@ -116,7 +116,7 @@
 
 # glog of
 
-  $ hg log -G --template '{rev}: {desc} [{branches}]\n' of
+  $ sl log -G --template '{rev}: {desc} [{branches}]\n' of
   o  11: r11 []
   │
   o  10: r10 []
@@ -143,30 +143,30 @@
 
 # cat of
 
-  $ hg cat of --rev tip
+  $ sl cat of --rev tip
   r11
 
 # new and mergeable files
 
-  $ rm -r .hg
-  $ hg init
-  $ hg debugbuilddag '+2:f +3:p2 <f+4 @default /p2 +2' -q -mn
+  $ rm -r .sl
+  $ sl init
+  $ sl debugbuilddag '+2:f +3:p2 <f+4 @default /p2 +2' -q -mn
 
 # dag
 
-  $ hg debugdag --bookmarks -b
+  $ sl debugdag --bookmarks -b
   +2:f
   +3:p2
   *f+3*/p2+2
 
 # tip
 
-  $ hg id
+  $ sl id
   000000000000
 
 # glog
 
-  $ hg log -G --template '{rev}: {desc} [{branches}] @ {date}\n'
+  $ sl log -G --template '{rev}: {desc} [{branches}] @ {date}\n'
   o  11: r11 [] @ 11.00
   │
   o  10: r10 [] @ 10.00
@@ -193,7 +193,7 @@
 
 # glog mf
 
-  $ hg log -G --template '{rev}: {desc} [{branches}]\n' mf
+  $ sl log -G --template '{rev}: {desc} [{branches}]\n' mf
   o  11: r11 []
   │
   o  10: r10 []
@@ -220,7 +220,7 @@
 
 # man r4
 
-  $ hg manifest -r4
+  $ sl manifest -r4
   mf
   nf0
   nf1
@@ -230,7 +230,7 @@
 
 # cat r4 mf
 
-  $ hg cat -r4 mf
+  $ sl cat -r4 mf
   0 r0
   1
   2 r1
@@ -258,7 +258,7 @@
 
 # man r8
 
-  $ hg manifest -r8
+  $ sl manifest -r8
   mf
   nf0
   nf1
@@ -269,7 +269,7 @@
 
 # cat r8 mf
 
-  $ hg cat -r8 mf
+  $ sl cat -r8 mf
   0 r0
   1
   2 r1
@@ -297,7 +297,7 @@
 
 # man
 
-  $ hg manifest --rev tip
+  $ sl manifest --rev tip
   mf
   nf0
   nf1
@@ -314,7 +314,7 @@
 
 # cat mf
 
-  $ hg cat mf --rev tip
+  $ sl cat mf --rev tip
   0 r0
   1
   2 r1

@@ -68,7 +68,7 @@ use fbinit::FacebookInit;
 use mercurial_derivation::RootHgAugmentedManifestId;
 use mononoke_types::ChangesetId;
 use rand::Rng;
-use rand::thread_rng;
+use rand::RngExt as _;
 use repo_derived_data::RepoDerivedDataRef;
 use tests_utils::CreateCommitContext;
 
@@ -137,7 +137,7 @@ fn gen_realistic_path(rng: &mut impl Rng, commit_index: usize, mode: BenchmarkMo
     const SUBDIRS: &[&str] = &["src", "lib", "tests", "bin", "common", "features", "utils"];
     const EXTENSIONS: &[&str] = &["rs", "py", "js", "cpp", "h", "java", "go", "ts"];
 
-    let depth = rng.gen_range(2..=5);
+    let depth = rng.random_range(2..=5);
     let mut components = Vec::with_capacity(depth + 2);
 
     match mode {
@@ -145,29 +145,29 @@ fn gen_realistic_path(rng: &mut impl Rng, commit_index: usize, mode: BenchmarkMo
             // Use shared top-level directories across all commits
             // This simulates realistic monorepo patterns where commits
             // touch files in the same project directories
-            let top_level = TOP_LEVEL_DIRS[rng.gen_range(0..TOP_LEVEL_DIRS.len())];
+            let top_level = TOP_LEVEL_DIRS[rng.random_range(0..TOP_LEVEL_DIRS.len())];
             components.push(top_level.to_string());
-            components.push(SUBDIRS[rng.gen_range(0..SUBDIRS.len())].to_string());
+            components.push(SUBDIRS[rng.random_range(0..SUBDIRS.len())].to_string());
         }
         BenchmarkMode::Isolated => {
             // Add commit-specific prefix to ensure no overlap between commits
             // This creates the worst-case scenario for batch derivation
-            components.push(format!("commit_{:03}", commit_index));
-            components.push(SUBDIRS[rng.gen_range(0..SUBDIRS.len())].to_string());
+            components.push(format!("commit_{commit_index:03}"));
+            components.push(SUBDIRS[rng.random_range(0..SUBDIRS.len())].to_string());
         }
     }
 
     // Add random subdirectories
     for _ in 0..depth {
-        let len = rng.gen_range(3..=12);
+        let len = rng.random_range(3..=12);
         components.push(gen_filename(rng, len));
     }
 
     // Add filename with extension
-    let filename_len = rng.gen_range(5..=20);
+    let filename_len = rng.random_range(5..=20);
     let filename = gen_filename(rng, filename_len);
-    let ext = EXTENSIONS[rng.gen_range(0..EXTENSIONS.len())];
-    components.push(format!("{}.{}", filename, ext));
+    let ext = EXTENSIONS[rng.random_range(0..EXTENSIONS.len())];
+    components.push(format!("{filename}.{ext}"));
 
     components.join("/")
 }
@@ -183,7 +183,7 @@ async fn create_linear_commit_stack(
 
     for commit_index in 0..args.stack_size {
         let mut paths = BTreeSet::new();
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
         while paths.len() < args.files {
             paths.insert(gen_realistic_path(&mut rng, commit_index, args.mode));
@@ -196,7 +196,7 @@ async fn create_linear_commit_stack(
         };
 
         for path in paths.iter() {
-            create = create.add_file(path.as_str(), format!("content of {}", path));
+            create = create.add_file(path.as_str(), format!("content of {path}"));
         }
 
         let csid = create.commit().await?;
@@ -227,10 +227,7 @@ async fn main(fb: FacebookInit) -> Result<()> {
     println!("  Stack size: {} commits", args.stack_size);
     println!("  Files per commit: {}", args.files);
     if use_delay {
-        println!(
-            "  I/O latency: {:.0}ms GET / {:.0}ms PUT",
-            GET_LATENCY_MS, PUT_LATENCY_MS
-        );
+        println!("  I/O latency: {GET_LATENCY_MS:.0}ms GET / {PUT_LATENCY_MS:.0}ms PUT");
     } else {
         println!("  I/O latency: disabled");
     }
@@ -263,7 +260,8 @@ async fn main(fb: FacebookInit) -> Result<()> {
         .await?;
 
     let derive_time = derive_start.elapsed();
-    let (total_gets, total_puts, _) = counters.snapshot();
+    let snap = counters.snapshot();
+    let (total_gets, total_puts) = (snap.gets, snap.puts);
 
     // Print results
     println!();
@@ -277,7 +275,7 @@ async fn main(fb: FacebookInit) -> Result<()> {
         "Throughput: {:.2} commits/sec",
         csids.len() as f64 / derive_time.as_secs_f64()
     );
-    println!("Blobstore: {} GETs, {} PUTs", total_gets, total_puts);
+    println!("Blobstore: {total_gets} GETs, {total_puts} PUTs");
     println!(
         "Average per commit: {:.3}s, {:.0} GETs, {:.0} PUTs",
         derive_time.as_secs_f64() / csids.len() as f64,

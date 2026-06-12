@@ -41,6 +41,7 @@ use scuba_ext::FutureStatsScubaExt;
 use scuba_ext::MononokeScubaSampleBuilder;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
+use weight_observer::WeightedItem;
 
 use crate::OptionalWeightObserver;
 use crate::Repo;
@@ -80,8 +81,6 @@ use crate::utils::filter_object;
 use crate::utils::tag_entries_to_hashes;
 use crate::utils::to_git_object_stream;
 
-const DEFAULT_GIT_GENERATOR_BUFFER_BYTES: usize = 104_857_600; // 100 MB
-
 /// Fetch and collect the tree and blob objects that are expressed as full objects
 /// for the boundary commits of a shallow fetch
 async fn boundary_trees_and_blobs(
@@ -105,7 +104,7 @@ async fn boundary_trees_and_blobs(
                 .await
                 .context("Error in fetching boundary commit")?
                 .with_parsed_as_commit(|commit| GitTreeId(commit.tree()))
-                .ok_or_else(|| anyhow::anyhow!("Git object {:?} is not a commit", git_commit_id))?;
+                .ok_or_else(|| anyhow::anyhow!("Git object {git_commit_id:?} is not a commit"))?;
             let objects = root_tree.list_all_entries((*ctx).clone(), blobstore.clone()).try_collect::<Vec<_>>().await?;
             let objects = stream::iter(objects).map(async |(path, entry)| {
                 // If the entry is a submodule OR if the request has no filter or doesn't care about size, then let's assume size as 0
@@ -253,8 +252,7 @@ async fn trees_and_blobs_count(
                 .await
                 .with_context(|| {
                     format!(
-                        "Error while listing entries from GitDeltaManifest for changeset {:?}",
-                        changeset_id,
+                        "Error while listing entries from GitDeltaManifest for changeset {changeset_id:?}",
                     )
                 })?;
             Ok(objects)
@@ -370,7 +368,7 @@ fn packfile_stream_from_changesets<'a, T: GDMEntryProvider + Send + 'static>(
     base_set: Arc<FxHashSet<ObjectId>>,
     changesets_or_groups: Vec<T>,
     weight_observer: OptionalWeightObserver,
-) -> BoxStream<'a, Result<PackfileItem>> {
+) -> BoxStream<'a, Result<WeightedItem<PackfileItem>>> {
     let FetchContainer {
         ctx,
         blobstore,
@@ -398,7 +396,7 @@ fn packfile_stream_from_changesets<'a, T: GDMEntryProvider + Send + 'static>(
     >(2 * concurrency.trees_and_blobs);
 
     let (packfile_item_sender, packfile_item_receiver) =
-        mpsc::channel::<Result<PackfileItem>>(2 * concurrency.trees_and_blobs);
+        mpsc::channel::<Result<WeightedItem<PackfileItem>>>(2 * concurrency.trees_and_blobs);
 
     mononoke::spawn_task(async move {
         let mut stream = stream::iter(changesets_or_groups)
@@ -439,17 +437,19 @@ fn packfile_stream_from_changesets<'a, T: GDMEntryProvider + Send + 'static>(
 
     mononoke::spawn_task(async move {
         let max_buffer =
-            justknobs::get_as::<usize>("scm/mononoke:git_generator_buffer_bytes", None)
-                .unwrap_or(DEFAULT_GIT_GENERATOR_BUFFER_BYTES);
+            justknobs::get_as::<usize>("scm/mononoke:git_generator_buffer_bytes", None);
 
         let weighted_stream =
             tokio_stream::wrappers::ReceiverStream::new(gdm_receiver).filter_map({
                 let error_sender = packfile_item_sender.clone();
                 move |entry_result| {
-                    let filter = filter.clone();
-                    let fetch_container = fetch_container.clone();
-                    let base_set = base_set.clone();
-                    let error_sender = error_sender.clone();
+                    cloned!(
+                        fetch_container,
+                        base_set,
+                        filter,
+                        error_sender,
+                        weight_observer
+                    );
                     async move {
                         let entry = match entry_result {
                             Ok(entry) => entry,
@@ -472,6 +472,7 @@ fn packfile_stream_from_changesets<'a, T: GDMEntryProvider + Send + 'static>(
                             fetch_container.clone(),
                             base_set.clone(),
                             entry,
+                            weight_observer.clone(),
                         );
 
                         Some((weight, future))
@@ -479,8 +480,12 @@ fn packfile_stream_from_changesets<'a, T: GDMEntryProvider + Send + 'static>(
                 }
             });
 
+        // Pass None to buffered_weighted — it handles flow control internally.
+        // Weight is added inside packfile_item_for_delta_manifest_entry when
+        // items are created (filtered-out items never get weight added).
+        // Weight is removed in PackfileWriter::write after each item is written.
         let mut stream = weighted_stream
-            .buffered_weighted(max_buffer, weight_observer)
+            .buffered_weighted(max_buffer, None)
             .try_filter_map(futures::future::ok)
             .boxed();
 
@@ -504,7 +509,7 @@ async fn tree_and_blob_packfile_stream<'a>(
     base_set: Arc<FxHashSet<ObjectId>>,
     tree_and_blob_shas: Vec<ObjectId>,
     weight_observer: OptionalWeightObserver,
-) -> Result<BoxStream<'a, Result<PackfileItem>>> {
+) -> Result<BoxStream<'a, Result<WeightedItem<PackfileItem>>>> {
     // Get the packfile items corresponding to blob and tree objects in the repo. Where applicable, use delta to represent them
     // efficiently in the packfile/bundle
     let FetchContainer {
@@ -515,14 +520,21 @@ async fn tree_and_blob_packfile_stream<'a>(
         ..
     } = fetch_container.clone();
 
+    let boundary_observer = weight_observer.clone();
     let boundary_packfile_item_stream = boundary_stream(fetch_container.clone())
         .await?
         .map_ok({
             cloned!(fetch_container, base_set);
             move |(_changeset_id, entry)| {
-                cloned!(fetch_container, base_set);
+                cloned!(fetch_container, base_set, boundary_observer);
                 async move {
-                    packfile_item_for_delta_manifest_entry(fetch_container, base_set, entry).await
+                    packfile_item_for_delta_manifest_entry(
+                        fetch_container,
+                        base_set,
+                        entry,
+                        boundary_observer,
+                    )
+                    .await
                 }
             }
         })
@@ -537,6 +549,7 @@ async fn tree_and_blob_packfile_stream<'a>(
         weight_observer.clone(),
     );
 
+    let requested_observer = weight_observer.clone();
     let individual_cs_ids_packfile_item_stream = packfile_stream_from_changesets(
         fetch_container,
         base_set,
@@ -560,6 +573,10 @@ async fn tree_and_blob_packfile_stream<'a>(
             }
         })
         .try_buffered(concurrency.trees_and_blobs)
+        .map_ok(move |item| {
+            let weight = item.weight();
+            WeightedItem::tracked(item, &requested_observer, weight)
+        })
         .boxed();
     Ok(boundary_packfile_item_stream
         .chain(groups_packfile_item_stream)
@@ -574,7 +591,8 @@ async fn commit_packfile_stream<'a>(
     fetch_container: FetchContainer,
     repo: &'a impl Repo,
     divided_changesets: CGDMDividedChangesets,
-) -> Result<(BoxStream<'a, Result<PackfileItem>>, usize)> {
+    weight_observer: OptionalWeightObserver,
+) -> Result<(BoxStream<'a, Result<WeightedItem<PackfileItem>>>, usize)> {
     let mut commit_count = divided_changesets.individual_cs_ids.len();
     let mut final_commits = divided_changesets.individual_cs_ids;
     let mut cgdm_commits_ids = vec![];
@@ -650,17 +668,22 @@ async fn commit_packfile_stream<'a>(
             }
         })
         .try_buffered(concurrency.commits);
-    Ok((
-        groups_commit_stream.chain(commit_stream).boxed(),
-        commit_count,
-    ))
+    let combined = groups_commit_stream
+        .chain(commit_stream)
+        .map_ok(move |item| {
+            let weight = item.weight();
+            WeightedItem::tracked(item, &weight_observer, weight)
+        })
+        .boxed();
+    Ok((combined, commit_count))
 }
 
 /// Convert the provided tag entries into a stream of packfile items
 fn tag_entries_to_stream<'a>(
     fetch_container: FetchContainer,
     tag_entries: FxHashSet<GitSha1>,
-) -> BoxStream<'a, Result<PackfileItem>> {
+    weight_observer: OptionalWeightObserver,
+) -> BoxStream<'a, Result<WeightedItem<PackfileItem>>> {
     let FetchContainer {
         ctx,
         blobstore,
@@ -684,6 +707,10 @@ fn tag_entries_to_stream<'a>(
             }
         })
         .try_buffered(concurrency.tags)
+        .map_ok(move |item| {
+            let weight = item.weight();
+            WeightedItem::tracked(item, &weight_observer, weight)
+        })
         .boxed()
 }
 
@@ -694,7 +721,8 @@ async fn tag_packfile_stream<'a>(
     fetch_container: FetchContainer,
     repo: &'a impl Repo,
     bookmarks: &GitBookmarks,
-) -> Result<(BoxStream<'a, Result<PackfileItem>>, usize)> {
+    weight_observer: OptionalWeightObserver,
+) -> Result<(BoxStream<'a, Result<WeightedItem<PackfileItem>>>, usize)> {
     // Since we need the count of items, we would have to consume the stream either for counting or collecting the items.
     // This is fine, since unlike commits, blobs and trees there will only be thousands of tags in the worst case.
     let annotated_tags = stream::iter(bookmarks.entries.keys())
@@ -714,10 +742,7 @@ async fn tag_packfile_stream<'a>(
                 )
                 .await
                 .with_context(|| {
-                    format!(
-                        "Error in getting bonsai_tag_mapping entry for tag name {}",
-                        tag_name
-                    )
+                    format!("Error in getting bonsai_tag_mapping entry for tag name {tag_name}")
                 })
                 .transpose()
         })
@@ -731,7 +756,7 @@ async fn tag_packfile_stream<'a>(
     )
     .await?;
     let tags_count = annotated_tags.len();
-    let tag_stream = tag_entries_to_stream(fetch_container, annotated_tags);
+    let tag_stream = tag_entries_to_stream(fetch_container, annotated_tags, weight_observer);
     Ok((tag_stream, tags_count))
 }
 
@@ -743,7 +768,8 @@ async fn tags_packfile_stream<'a>(
     requested_commits: Vec<ChangesetId>,
     requested_tag_names: Arc<FxHashSet<String>>,
     refs_source: RefsSource,
-) -> Result<(BoxStream<'a, Result<PackfileItem>>, usize)> {
+    weight_observer: OptionalWeightObserver,
+) -> Result<(BoxStream<'a, Result<WeightedItem<PackfileItem>>>, usize)> {
     let (ctx, filter, blobstore, concurrency) = (
         fetch_container.ctx.clone(),
         fetch_container.filter.clone(),
@@ -795,7 +821,8 @@ async fn tags_packfile_stream<'a>(
         tag_entries_to_hashes(tag_entries, ctx, blobstore, concurrency.tags).await?;
 
     let tags_count = exhaustive_tag_entries.len();
-    let tag_stream = tag_entries_to_stream(fetch_container, exhaustive_tag_entries);
+    let tag_stream =
+        tag_entries_to_stream(fetch_container, exhaustive_tag_entries, weight_observer);
     Ok((tag_stream, tags_count))
 }
 
@@ -885,21 +912,21 @@ pub async fn generate_pack_item_stream<'a>(
     // STEP 4: Get the stream of commit packfile items to include in the pack/bundle. Note that we have already counted these items
     // as part of object count.
     let (commit_stream, commits_count) =
-        commit_packfile_stream(fetch_container.clone(), repo, divided_changesets)
+        commit_packfile_stream(fetch_container.clone(), repo, divided_changesets, None)
             .await
             .context("Error while generating commit packfile item stream")?;
 
     // STEP 5: Get the stream of tag packfile items to include in the pack/bundle. Note that we have not yet included the tag count in the
     // total object count so we will need the stream + count of elements in the stream
     let (tag_stream, tags_count) =
-        tag_packfile_stream(ctx.as_ref(), fetch_container.clone(), repo, bookmarks)
+        tag_packfile_stream(ctx.as_ref(), fetch_container.clone(), repo, bookmarks, None)
             .await
             .context("Error while generating tag packfile item stream")?;
     // Compute the overall object count by summing the trees, blobs, tags and commits count
     let object_count = commits_count + trees_and_blobs_count + tags_count;
 
     // STEP 6: Combine all streams together and return the response. The ordering of the streams in this case is irrelevant since the commit
-    // and tag stream include full objects and the tree_and_blob_stream has deltas in the correct order
+    // and tag stream include full objects and the tree_and_blob_stream has deltas in the correct order.
     let packfile_stream = tag_stream
         .chain(commit_stream)
         .chain(tree_and_blob_stream)
@@ -985,27 +1012,29 @@ pub async fn fetch_response<'a>(
     progress_writer
         .send("Converting HAVE Git commits to Bonsais\n".to_string())
         .await?;
-    let translated_sha_bases = git_shas_to_bonsais(&ctx, repo, request.bases.iter())
-        .try_timed()
-        .await
-        .context("Error converting base Git commits to Bonsai during fetch")?
-        .log_future_stats(
-            perf_scuba.clone(),
-            "Converted HAVE Git commits to Bonsais",
-            "Read".to_string(),
-        );
+    let translated_sha_bases =
+        git_shas_to_bonsais(&ctx, repo, request.bases.iter(), request.refs_source)
+            .try_timed()
+            .await
+            .context("Error converting base Git commits to Bonsai during fetch")?
+            .log_future_stats(
+                perf_scuba.clone(),
+                "Converted HAVE Git commits to Bonsais",
+                "Read".to_string(),
+            );
     progress_writer
         .send("Converting WANT Git commits to Bonsais\n".to_string())
         .await?;
-    let translated_sha_heads = git_shas_to_bonsais(&ctx, repo, request.heads.iter())
-        .try_timed()
-        .await
-        .context("Error converting head Git commits to Bonsai during fetch")?
-        .log_future_stats(
-            perf_scuba.clone(),
-            "Converted WANT Git commits to Bonsais",
-            "Read".to_string(),
-        );
+    let translated_sha_heads =
+        git_shas_to_bonsais(&ctx, repo, request.heads.iter(), request.refs_source)
+            .try_timed()
+            .await
+            .context("Error converting head Git commits to Bonsai during fetch")?
+            .log_future_stats(
+                perf_scuba.clone(),
+                "Converted WANT Git commits to Bonsais",
+                "Read".to_string(),
+            );
     // Get the stream of commits between the bases and heads
     // NOTE: Another Git magic. The filter spec includes an option that the client can use to exclude commit-type objects. But, even if the client
     // uses that filter, we just ignore it and send all the commits anyway :)
@@ -1053,6 +1082,8 @@ pub async fn fetch_response<'a>(
     progress_writer
         .send("Generating trees and blobs stream\n".to_string())
         .await?;
+    let weight_observer_for_commits = weight_observer.clone();
+    let weight_observer_for_tags = weight_observer.clone();
     let tree_and_blob_stream = tree_and_blob_packfile_stream(
         fetch_container.clone(),
         divided_changesets.clone(),
@@ -1073,16 +1104,20 @@ pub async fn fetch_response<'a>(
     progress_writer
         .send("Generating commits stream\n".to_string())
         .await?;
-    let (commit_stream, commits_count) =
-        commit_packfile_stream(fetch_container.clone(), repo, divided_changesets)
-            .try_timed()
-            .await
-            .context("Error while generating commit packfile item stream during fetch")?
-            .log_future_stats(
-                perf_scuba.clone(),
-                "Generated commits stream",
-                "Read".to_string(),
-            );
+    let (commit_stream, commits_count) = commit_packfile_stream(
+        fetch_container.clone(),
+        repo,
+        divided_changesets,
+        weight_observer_for_commits,
+    )
+    .try_timed()
+    .await
+    .context("Error while generating commit packfile item stream during fetch")?
+    .log_future_stats(
+        perf_scuba.clone(),
+        "Generated commits stream",
+        "Read".to_string(),
+    );
     // Get the stream of all annotated tag items in the repo
     progress_writer
         .send("Generating tags stream\n".to_string())
@@ -1093,6 +1128,7 @@ pub async fn fetch_response<'a>(
         target_commits,
         translated_sha_heads.tag_names.clone(),
         request.refs_source,
+        weight_observer_for_tags,
     )
     .try_timed()
     .await
@@ -1103,7 +1139,8 @@ pub async fn fetch_response<'a>(
         "Read".to_string(),
     );
     // Combine all streams together and return the response. The ordering of the streams in this case is irrelevant since the commit
-    // and tag stream include full objects and the tree_and_blob_stream has deltas in the correct order
+    // and tag stream include full objects and the tree_and_blob_stream has deltas in the correct order.
+    // Weight tracking happens in PackfileWriter::write — add when item arrives, remove after written.
     let packfile_stream = tag_stream
         .chain(commit_stream)
         .chain(tree_and_blob_stream)
@@ -1127,17 +1164,32 @@ pub async fn shallow_info(
 ) -> Result<ShallowInfoResponse> {
     let ctx = Arc::new(ctx);
     // Convert the requested head object ids to bonsais so that we can use Mononoke commit graph
-    let translated_sha_heads = git_shas_to_bonsais(&ctx, repo, request.heads.iter())
-        .await
-        .context("Error converting head Git commits to Bonsai during shallow-info")?;
+    let translated_sha_heads = git_shas_to_bonsais(
+        &ctx,
+        repo,
+        request.heads.iter(),
+        RefsSource::WarmBookmarksCache,
+    )
+    .await
+    .context("Error converting head Git commits to Bonsai during shallow-info")?;
     // Convert the requested shallow object ids to bonsais so that we can use Mononoke commit graph
-    let translated_shallow_commits = git_shas_to_bonsais(&ctx, repo, request.shallow.iter())
-        .await
-        .context("Error converting shallow Git commits to Bonsai during shallow-info")?;
+    let translated_shallow_commits = git_shas_to_bonsais(
+        &ctx,
+        repo,
+        request.shallow.iter(),
+        RefsSource::WarmBookmarksCache,
+    )
+    .await
+    .context("Error converting shallow Git commits to Bonsai during shallow-info")?;
     // Convert the provided have object ids to bonsais so that we can use Mononoke commit graph
-    let translated_sha_bases = git_shas_to_bonsais(&ctx, repo, request.bases.iter())
-        .await
-        .context("Error converting base Git commits to Bonsai during shallow-info")?;
+    let translated_sha_bases = git_shas_to_bonsais(
+        &ctx,
+        repo,
+        request.bases.iter(),
+        RefsSource::WarmBookmarksCache,
+    )
+    .await
+    .context("Error converting base Git commits to Bonsai during shallow-info")?;
     let shallow_commits = ordered_bonsai_git_mappings_by_bonsai(
         &ctx,
         repo,

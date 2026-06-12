@@ -15,13 +15,10 @@ use manifest::FileMetadata;
 use manifest::FileType;
 use manifest::FsNodeMetadata;
 use minibytes::Bytes;
-use storemodel::InsertOpts;
-use storemodel::Kind;
 use storemodel::SerializationFormat;
 pub use storemodel::TreeStore;
 use types::FetchContext;
 use types::HgId;
-use types::Key;
 use types::PathComponent;
 use types::PathComponentBuf;
 use types::RepoPath;
@@ -37,6 +34,10 @@ impl InnerStore {
         InnerStore { tree_store }
     }
 
+    pub fn record_permission_denied(&self, err: types::errors::PermissionDenied) {
+        self.tree_store.record_permission_denied(err);
+    }
+
     pub fn format(&self) -> SerializationFormat {
         self.tree_store.format()
     }
@@ -49,33 +50,65 @@ impl InnerStore {
         .in_scope(|| {
             let blob = self
                 .tree_store
-                .get_content(FetchContext::default(), path, hgid)?;
+                .get_content(FetchContext::default(), path, hgid)
+                .map_err(|err| convert_permission_denied(err, path))?;
             Ok(Entry(blob.into_bytes(), self.tree_store.format()))
         })
     }
 
-    pub(crate) fn insert_entry(&self, path: &RepoPath, entry: Entry) -> Result<HgId> {
-        tracing::debug_span!("tree::store::insert", path = path.as_str(),).in_scope(|| {
-            let opts = InsertOpts {
-                kind: Kind::Tree,
-                ..Default::default()
-            };
-            let id = self.tree_store.insert_data(opts, path, entry.0.as_ref())?;
-            Ok(id)
+    pub fn get_tree_entry(
+        &self,
+        path: &RepoPath,
+        hgid: HgId,
+    ) -> Result<Arc<dyn storemodel::TreeEntry>> {
+        tracing::debug_span!(
+            "tree::store::get",
+            id = AsRef::<str>::as_ref(&hgid.to_hex())
+        )
+        .in_scope(|| {
+            self.tree_store
+                .get_tree(FetchContext::default(), path, hgid)
+                .map_err(|err| convert_permission_denied(err, path))
         })
     }
 
-    pub fn prefetch(&self, keys: Vec<Key>) -> Result<()> {
-        tracing::debug_span!(
-            "tree::store::prefetch",
-            ids = keys
-                .iter()
-                .map(|k| k.hgid.to_hex())
-                .collect::<Vec<String>>()
-                .join(" ")
-        )
-        .in_scope(|| self.tree_store.prefetch(keys))
+    pub(crate) fn insert_entry(
+        &self,
+        path: &RepoPath,
+        entry: Entry,
+        parents: Vec<HgId>,
+        acl_children_indices: Option<Vec<u32>>,
+    ) -> Result<HgId> {
+        tracing::debug_span!("tree::store::insert", path = path.as_str(),).in_scope(|| {
+            let opts = crate::InsertOpts {
+                kind: crate::Kind::Tree,
+                parents,
+                acl_children_indices,
+                ..Default::default()
+            };
+            let id = self.tree_store.insert_data(opts, path, entry.0.into())?;
+            Ok(id)
+        })
     }
+}
+
+fn convert_permission_denied(err: anyhow::Error, path: &RepoPath) -> anyhow::Error {
+    if let Some(slapi_err) = edenapi_types::errors::find_permission_denied(&err) {
+        if let edenapi_types::SaplingRemoteApiServerErrorKind::PermissionDenied {
+            tree_id,
+            request_acl,
+        } = &slapi_err.err
+        {
+            crate::acl_metrics::ACL_DENIED.increment();
+            return types::errors::PermissionDenied {
+                path: path.to_owned(),
+                hgid: *tree_id,
+                request_acl: request_acl.clone(),
+            }
+            .into();
+        }
+    }
+    err
 }
 
 impl Deref for InnerStore {
@@ -547,7 +580,7 @@ fn parse_hg_flag(flag_byte: Option<&u8>) -> Result<Flag> {
         Some(b'x') => Flag::File(FileType::Executable),
         Some(b'l') => Flag::File(FileType::Symlink),
         Some(b't') => Flag::Directory,
-        Some(bad_flag) => return Err(format_err!("invalid flag {}", bad_flag)),
+        Some(bad_flag) => return Err(format_err!("invalid flag {bad_flag}")),
     };
     Ok(flag)
 }

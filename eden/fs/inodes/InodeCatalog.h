@@ -7,7 +7,11 @@
 
 #pragma once
 
+#include <map>
 #include <optional>
+#include <string>
+
+#include <folly/Function.h>
 
 #include "eden/common/utils/Bug.h"
 #include "eden/common/utils/ImmediateFuture.h"
@@ -49,6 +53,60 @@ class NonEmptyError : public std::exception {
 };
 
 /**
+ * The type of a WAL (write-ahead log) entry — the per-child mutation a
+ * WAL-capable catalog appends instead of rewriting the full directory.
+ */
+enum class WalOpType : uint8_t {
+  ADD = 1,
+  REMOVE = 2,
+  MATERIALIZE = 3,
+};
+
+/**
+ * A collapsed WAL delta for a single child name. Represents the net
+ * effect of all WAL entries for that name.
+ */
+struct WalDelta {
+  WalOpType type{};
+  overlay::OverlayEntry entry; // only meaningful for ADD
+};
+
+struct WalDeltaNameCompare {
+  explicit WalDeltaNameCompare(
+      CaseSensitivity caseSensitive = CaseSensitivity::Sensitive)
+      : caseSensitive_{caseSensitive} {}
+
+  bool operator()(const std::string& left, const std::string& right) const {
+    return isPathPieceLess(
+        PathComponentPiece{left}, PathComponentPiece{right}, caseSensitive_);
+  }
+
+ private:
+  CaseSensitivity caseSensitive_;
+};
+
+/**
+ * Result of a WAL load: the collapsed delta plus the count of raw WAL
+ * entries that were successfully decoded (before collapse). The raw
+ * count is preserved so callers driving the
+ * `OverlayStats::walEntriesReplayed` counter can report entries-as-
+ * written, not unique names net-affected.
+ */
+struct LoadWalResult {
+  explicit LoadWalResult(
+      CaseSensitivity caseSensitive = CaseSensitivity::Sensitive)
+      : delta{WalDeltaNameCompare{caseSensitive}} {}
+
+  std::map<std::string, WalDelta, WalDeltaNameCompare> delta;
+  size_t rawEntriesParsed = 0;
+  // Count of entries that hit a structural-bounds break or an unknown
+  // opcode skip. Surfaced so callers can bump a single
+  // `OverlayStats::wal_parse_failure` counter and triage torn / forward-
+  // incompatible WAL files without per-category counters.
+  size_t parseErrors = 0;
+};
+
+/**
  * Interface for tracking inode relationships.
  */
 class InodeCatalog {
@@ -70,6 +128,18 @@ class InodeCatalog {
   // This method is used to indicate if the implementation supports these type
   // of operations (`*Child` methods).
   virtual bool supportsSemanticOperations() const = 0;
+
+  /**
+   * Whether this catalog can use the directory write-ahead log (WAL) to
+   * defer full `saveOverlayDir` writes. The WAL is a file-system based
+   * mechanism specific to the legacy `Fs*` catalogs; other backends
+   * (LMDB, Sqlite, in-memory) manage their own durability and do not
+   * use it.
+   *
+   * Pure virtual so adding a new `InodeCatalog` subclass forces an explicit
+   * decision instead of silently inheriting WAL behavior.
+   */
+  virtual bool supportsWal() const = 0;
 
   /**
    * Get all of the `InodeNumber`s corresponding to directories. This is only
@@ -121,11 +191,51 @@ class InodeCatalog {
       InodeNumber inodeNumber) = 0;
 
   /**
-   * Save a directory content to overlay with the given `InodeNumber`
+   * Save a directory content to overlay with the given `InodeNumber`.
+   * When crashSafe is true, uses temp-file + rename for atomicity.
+   * When false, writes directly to the final path for better performance
+   * (suitable when the data is recoverable from the backing store).
    */
   virtual void saveOverlayDir(
       InodeNumber inodeNumber,
-      overlay::OverlayDir&& odir) = 0;
+      overlay::OverlayDir&& odir,
+      bool crashSafe = true) = 0;
+
+  using OverlayEntryVisitor = folly::FunctionRef<
+      void(const std::string& name, const overlay::OverlayEntry& entry)>;
+  using OverlayEntrySource =
+      folly::FunctionRef<void(OverlayEntryVisitor visitor)>;
+
+  /**
+   * Save a directory to overlay by iterating over entries provided by the
+   * source callback. The count parameter gives the number of entries that
+   * will be emitted. This avoids constructing an intermediate OverlayDir.
+   *
+   * Default implementation builds an OverlayDir from the entries and
+   * delegates to saveOverlayDir().
+   */
+  virtual void saveOverlayEntries(
+      InodeNumber inodeNumber,
+      size_t count,
+      OverlayEntrySource source,
+      bool crashSafe = true);
+
+  /**
+   * Load a directory from overlay. The catalog calls the loader with the
+   * entry count and an iterate function. The loader can pre-allocate storage
+   * based on count, then call iterate with a visitor to receive each entry.
+   * Returns false if no overlay exists for this inode.
+   *
+   * Default implementation calls loadOverlayDir() and iterates the result.
+   */
+  using OverlayEntryIterator =
+      folly::FunctionRef<void(OverlayEntryVisitor visitor)>;
+  using OverlayEntryLoader =
+      folly::FunctionRef<void(size_t count, OverlayEntryIterator iterate)>;
+
+  virtual bool loadOverlayEntries(
+      InodeNumber inodeNumber,
+      OverlayEntryLoader loader);
 
   /**
    * Remove the overlay directory record associated with the passed InodeNumber.
@@ -187,12 +297,63 @@ class InodeCatalog {
   virtual InodeNumber scanLocalChanges(
       [[maybe_unused]] std::shared_ptr<ReloadableConfig> config,
       [[maybe_unused]] AbsolutePathPiece mountPath,
-      [[maybe_unused]] bool windowsSymlinksEnabled,
       [[maybe_unused]] LookupCallback& callback) {
     EDEN_BUG() << "UNIMPLEMENTED";
   }
 
   virtual void maintenance() {
+    EDEN_BUG() << "UNIMPLEMENTED";
+  }
+
+  // WAL operations. Only implemented by catalogs that return
+  // `supportsWal() == true`; the default bodies abort.
+
+  /**
+   * Append a single WAL entry for `parent`. For `ADD`, `entry` must be
+   * non-null and contains the child's overlay data. For `REMOVE` and
+   * `MATERIALIZE`, `entry` must be nullptr. The caller is responsible
+   * for serializing calls for a given parent (the Overlay holds the
+   * parent `TreeInode`'s contents lock).
+   *
+   * Returns the new on-disk WAL file size (in bytes) after the append.
+   */
+  virtual uint64_t appendWalEntry(
+      InodeNumber /* parent */,
+      WalOpType /* op */,
+      PathComponentPiece /* childName */,
+      const overlay::OverlayEntry* /* entry */) {
+    EDEN_BUG() << "UNIMPLEMENTED";
+  }
+
+  /** Returns true iff a WAL file exists for `parent`. */
+  virtual bool hasWal(InodeNumber /* parent */) {
+    EDEN_BUG() << "UNIMPLEMENTED";
+  }
+
+  /** Remove the WAL file for `parent`. Missing files are not an error. */
+  virtual void removeWal(InodeNumber /* parent */) {
+    EDEN_BUG() << "UNIMPLEMENTED";
+  }
+
+  /**
+   * Pre-process the WAL file for `parent` into a collapsed net delta.
+   * Returns an empty `LoadWalResult` if no WAL file exists.
+   */
+  virtual LoadWalResult loadWalDelta(
+      InodeNumber /* parent */,
+      CaseSensitivity /* caseSensitive */ = CaseSensitivity::Sensitive) {
+    EDEN_BUG() << "UNIMPLEMENTED";
+  }
+
+  /**
+   * Replay WAL entries into `dir`. Returns the full LoadWalResult
+   * (rawEntriesParsed + parseErrors) so cold-path callers can bump the
+   * same OverlayStats counters that the hot loadWalDelta path bumps.
+   */
+  virtual LoadWalResult replayWal(
+      InodeNumber /* parent */,
+      overlay::OverlayDir& /* dir */,
+      CaseSensitivity /* caseSensitive */ = CaseSensitivity::Sensitive) {
     EDEN_BUG() << "UNIMPLEMENTED";
   }
 };

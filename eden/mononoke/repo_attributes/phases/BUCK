@@ -1,18 +1,18 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "phases",
     srcs = glob([
         "src/**/*.rs",
     ]),
-    named_deps = {"bincode": "fbsource//third-party/rust:bincode-2"},
     test_deps = ["//eden/mononoke/common/mononoke_macros:mononoke_macros"],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:thiserror",
         "//common/rust/shed/facet:facet",
         "//eden/mononoke/mononoke_types:mononoke_types",
@@ -34,7 +34,6 @@ rust_library(
         },
         "cargo_toml_dir": "sqlphases",
     },
-    named_deps = {"bincode": "fbsource//third-party/rust:bincode-2"},
     test_deps = [
         "fbsource//third-party/rust:maplit",
         "//common/rust/shed/fbinit:fbinit",
@@ -46,10 +45,12 @@ rust_library(
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:ascii",
         "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:bytes",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:maplit",
         "fbsource//third-party/rust:thiserror",
+        "fbsource//third-party/rust:tracing",
         ":phases",
         "//common/rust/shed/memcache_stub:memcache",
         "//common/rust/shed/sql:sql",

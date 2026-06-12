@@ -7,8 +7,13 @@
 
 import type {ReactNode, RefObject} from 'react';
 
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
 import {TextArea} from 'isl-components/TextArea';
+import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
+import {useAtomValue} from 'jotai';
 import {useEffect, useRef} from 'react';
+import {InternalFieldName} from 'shared/constants';
 import {
   FilePicker,
   ImageDropZone,
@@ -16,6 +21,8 @@ import {
   useUploadFilesCallback,
 } from '../ImageUpload';
 import {Internal} from '../Internal';
+import {copyFromParentCommit, parentCommitContextAtom} from './CommitInfoState';
+import {isFieldNonEmpty} from './CommitMessageFields';
 import {MinHeightTextField} from './MinHeightTextField';
 import {convertFieldNameToKey} from './utils';
 
@@ -112,13 +119,35 @@ export function EditorToolbar({
 }: {
   fieldName: string;
   uploadFiles?: (files: Array<File>) => unknown;
-  textAreaRef: RefObject<HTMLTextAreaElement>;
+  textAreaRef: RefObject<HTMLTextAreaElement | null>;
 }) {
   const parts: Array<ReactNode> = [];
   if (uploadFiles != null) {
     parts.push(
       <PendingImageUploads fieldName={fieldName} key="pending-uploads" textAreaRef={textAreaRef} />,
     );
+  }
+  if (fieldName === InternalFieldName.TestPlan && Internal.RecommendTestPlanButton) {
+    parts.push(<Internal.RecommendTestPlanButton key="recommend-test-plan" />);
+  }
+  if (fieldName === InternalFieldName.Summary && Internal.GenerateSummaryButton) {
+    parts.push(<Internal.GenerateSummaryButton key="generate-summary" />);
+  }
+  const parentFields = useAtomValue(parentCommitContextAtom)?.parentFields;
+  if (
+    parentFields &&
+    isFieldNonEmpty(parentFields[fieldName]) &&
+    (fieldName === InternalFieldName.Summary || fieldName === InternalFieldName.TestPlan)
+  ) {
+    parts.push(
+      <Tooltip title="Copy from previous commit" key="copy-parent" delayMs={DOCUMENTATION_DELAY}>
+        <Button icon onClick={() => copyFromParentCommit(fieldName)}>
+          <Icon icon="clippy" />
+        </Button>
+      </Tooltip>,
+    );
+  }
+  if (uploadFiles != null) {
     parts.push(<FilePicker key="picker" uploadFiles={uploadFiles} />);
   }
   if (parts.length === 0) {

@@ -98,7 +98,6 @@ from ..remotefilelog import (
     wirepack,
 )
 from ..remotefilelog.contentstore import unioncontentstore
-from ..remotefilelog.datapack import memdatapack
 from ..remotefilelog.historypack import memhistorypack
 from ..remotefilelog.metadatastore import unionmetadatastore
 
@@ -120,14 +119,6 @@ RECEIVEDNODE_RECORD = "receivednodes"
 # When looking for a recent manifest to consider our base during tree
 # prefetches, this constant defines how far back we should search.
 BASENODESEARCHMAX = 25000
-
-
-def treeenabled(ui):
-    return (
-        ui.config("extensions", "treemanifest") not in (None, "!")
-        or "treemanifest" in extensions.DEFAULT_EXTENSIONS
-        or "treemanifest" in extensions.ALWAYS_ON_EXTENSIONS
-    )
 
 
 def usehttpfetching(repo):
@@ -250,7 +241,7 @@ def uisetup(ui):
         else:
             orig(self, dpack, hpack, nname, nnode, ntext, np1, np2, linknode)
 
-    extensions.wrapfunction(basetreemanifestlog, "_addtreeentry", addtreeentry)
+    extensions.wrapfunction(treemanifestlog, "_addtreeentry", addtreeentry)
 
     def changelogadd(orig, self, *args):
         oldlen = len(self)
@@ -292,23 +283,17 @@ def showmanifest(orig, **args):
 
 def getrepocaps(orig, repo, *args, **kwargs):
     caps = orig(repo, *args, **kwargs)
-    if treeenabled(repo.ui):
-        caps["treemanifest"] = ("True",)
-        caps["treeonly"] = ("True",)
+    caps["treemanifest"] = ("True",)
+    caps["treeonly"] = ("True",)
     return caps
 
 
 def _collectmanifest(orig, repo, striprev):
-    if treeenabled(repo.ui):
-        return []
-    return orig(repo, striprev)
+    return []
 
 
 def stripmanifest(orig, repo, striprev, tr, files):
-    if treeenabled(repo.ui):
-        repair.striptrees(repo, tr, striprev, files)
-        return
-    orig(repo, striprev, tr, files)
+    repair.striptrees(repo, tr, striprev, files)
 
 
 def _addtreecaps(caps):
@@ -340,7 +325,7 @@ def wraprepo(repo):
     class treerepository(repo.__class__):
         @perftrace.tracefunc("Prefetch Trees")
         def prefetchtrees(self, mfnodes, basemfnodes=None):
-            if not treeenabled(self.ui) or eagerepo.iseagerepo(self):
+            if eagerepo.iseagerepo(self):
                 return
             if self.storage_format() == "revlog":
                 return
@@ -383,10 +368,8 @@ def wraprepo(repo):
 
 def setuptreestores(repo, mfl):
     if git.isgitstore(repo):
-        mfl._use_abstraction = True
         mfl.datastore = git.openstore(repo)
     elif eagerepo.iseagerepo(repo) or repo.storage_format() == "revlog":
-        mfl._use_abstraction = True
         store = repo.fileslog.filestore
         mfl._raw_store = store
         mfl.datastore = EagerDataStore(store)
@@ -396,26 +379,55 @@ def setuptreestores(repo, mfl):
                 "incompatible eagerrepo store: %r (expect EagerRepoStore)" % store
             )
     else:
-        # "historystore" related logic does not yet have confident
-        # abstraction-friendly alternative yet.
-        mfl._use_abstraction = False
-        mfl.makeruststore()
+        mask = os.umask(0o002)
+        try:
+            mfl.treescmstore = repo._rsrepo.treescmstore()
+            mfl.datastore = mfl.treescmstore
+            mfl.historystore = mfl.treescmstore.metadatastore()
+        finally:
+            os.umask(mask)
 
 
-class basetreemanifestlog:
-    def __init__(self, repo):
-        self.recentlinknode = None
+class treemanifestlog:
+    def __init__(self, opener, repo):
         cachesize = 4
         self._treemanifestcache = util.lrucachedict(cachesize)
         # store object used to construct storemodel.TreeStore
         self._raw_store = None
-        # whether to use the "storemodel" abstraction for write paths
-        self._use_abstraction = False
+
+        self._repo = repo
+        self._opener = opener
+        self.ui = repo.ui
+
+        setuptreestores(repo, self)
+
+    def clearcaches(self):
+        pass
+
+    def _maplinknode(self, linknode):
+        """Turns a linknode into a linkrev. Only needed for revlog backed
+        manifestlogs."""
+        return self._repo.changelog.rev(linknode)
+
+    def _maplinkrev(self, linkrev):
+        """Turns a linkrev into a linknode. Only needed for revlog backed
+        manifestlogs."""
+        return self._repo.changelog.node(linkrev)
 
     def abstract_store(self):
         """returns storemodel.TreeStore backed by Rust trait object"""
         return bindings.storemodel.TreeStore.from_store(
             self._raw_store or self.datastore
+        )
+
+    def buildtree(self, node=None):
+        """Create a tree manifest from a root tree node.
+
+        Goes through the Rust tree resolver chain by default.
+        Overridden by bundlemanifestlog to use the Python datastore.
+        """
+        return self._repo._rsrepo.manifest_by_root_id(
+            node if node is not None else nullid
         )
 
     @util.propertycache
@@ -437,17 +449,7 @@ class basetreemanifestlog:
         linkrev=None,
     ):
         """Writes the given tree into the manifestlog."""
-        assert not self._isgit, (
-            "do not use add() for git tree, use tree.flush() instead"
-        )
-        return self._addtopack(
-            ui,
-            newtree,
-            p1node,
-            p2node,
-            linknode,
-            linkrev=linkrev,
-        )
+        return _finalize(self, newtree, p1node, p2node)
 
     def _getmutablelocalpacks(self):
         """Returns a tuple containing a data pack and a history pack."""
@@ -469,50 +471,9 @@ class basetreemanifestlog:
         dpack.add(nname, nnode, revlog.nullid, ntext)
         hpack.add(nname, nnode, np1, np2, linknode, "")
 
-    def _addtopack(
-        self,
-        ui,
-        newtree,
-        p1node,
-        p2node,
-        linknode,
-        linkrev=None,
-    ):
-        newtreeiter = _finalize(self, newtree, p1node, p2node)
-
-        if self._use_abstraction:
-            store = self.abstract_store()
-            rootnode = None
-            for nname, nnode, ntext, _np1text, np1, np2 in newtreeiter:
-                # ntext is the raw text of either git or hg format
-                node = store.insert_data({"parents": (np1, np2)}, nname, ntext)
-                assert node == nnode, f"{node} == {nnode}"
-                if rootnode is None and nname == "":
-                    rootnode = node
-            return rootnode
-
-        dpack, hpack = self._getmutablelocalpacks()
-
-        node = None
-        for nname, nnode, ntext, _np1text, np1, np2 in newtreeiter:
-            self._addtreeentry(
-                dpack, hpack, nname, nnode, ntext, np1, np2, linknode, linkrev
-            )
-            if node is None and nname == "":
-                node = nnode
-
-        return node
-
     def commitsharedpacks(self):
         """Persist the dirty trees written to the shared packs."""
-        if self._use_abstraction:
-            self.abstract_store().flush()
-            return
-
-        self.datastore.markforrefresh()
-        self.historystore.markforrefresh()
-        self.datastore.flush()
-        self.historystore.flush()
+        self.abstract_store().flush()
 
     def commitpending(self):
         self.commitsharedpacks()
@@ -537,8 +498,9 @@ class basetreemanifestlog:
         # git store does not have the Python `.get(path, node)` method.
         # it can only be accessed via the Rust treemanifest.
         # eager store does not require remote lookup.
-        if node == nullid or self._use_abstraction:
+        if node == nullid or "remotefilelog" not in self._repo.requirements:
             return treemanifestctx(self, dir, node)
+
         if node in self._treemanifestcache:
             m = self._treemanifestcache[node]
             if m.dirty():
@@ -576,39 +538,13 @@ class basetreemanifestlog:
             return edenapi.treestore()
         return None
 
-    def makeruststore(self):
-        assert not self._use_abstraction
-        mask = os.umask(0o002)
-        try:
-            self.treescmstore = self._repo._rsrepo.treescmstore()
-            self.datastore = self.treescmstore
-            self.historystore = self.treescmstore.metadatastore()
-        finally:
-            os.umask(mask)
 
+def _buildtree_from_store(manifestlog, node=None):
+    """Create a tree manifest from the Python datastore.
 
-class treeonlymanifestlog(basetreemanifestlog):
-    def __init__(self, opener, repo):
-        self._repo = repo
-        super(treeonlymanifestlog, self).__init__(self._repo)
-        self._opener = opener
-        self.ui = repo.ui
-
-    def clearcaches(self):
-        pass
-
-    def _maplinknode(self, linknode):
-        """Turns a linknode into a linkrev. Only needed for revlog backed
-        manifestlogs."""
-        return self._repo.changelog.rev(linknode)
-
-    def _maplinkrev(self, linkrev):
-        """Turns a linkrev into a linknode. Only needed for revlog backed
-        manifestlogs."""
-        return self._repo.changelog.node(linkrev)
-
-
-def _buildtree(manifestlog, node=None):
+    Used by bundlemanifestlog where the datastore has bundle overlays
+    that the Rust store doesn't see.
+    """
     # this code seems to belong in manifestlog but I have no idea how
     # manifestlog objects work
     # XXX: This breaks abstraction. But we want the "native" store, instead of a
@@ -656,7 +592,7 @@ class treemanifestctx:
 
     def read(self):
         if self._tree is None:
-            self._tree = _buildtree(self._manifestlog, self._node)
+            self._tree = self._manifestlog.buildtree(self._node)
         return self._tree
 
     def node(self):
@@ -667,7 +603,7 @@ class treemanifestctx:
             raise RuntimeError(
                 "native tree manifestlog doesn't support subdir creation: '%s'" % dir
             )
-        return _buildtree(self._manifestlog)
+        return self._manifestlog.buildtree()
 
     def copy(self):
         memmf = memtreemanifestctx(self._manifestlog, dir=self._dir)
@@ -695,7 +631,7 @@ class treemanifestctx:
         """
         p1, p2 = self.parents
         mf = self.read()
-        parentmf = _buildtree(self._manifestlog, p1)
+        parentmf = self._manifestlog.buildtree(p1)
 
         if shallow:
             # This appears to only be used for changegroup creation in
@@ -703,7 +639,7 @@ class treemanifestctx:
             # tree exchanges, we shouldn't need to implement this.
             raise NotImplemented("native trees don't support shallow readdelta yet")
         else:
-            md = _buildtree(self._manifestlog)
+            md = self._manifestlog.buildtree()
             for f, ((n1, fl1), (n2, fl2)) in parentmf.diff(mf).items():
                 if n2:
                     md[f] = n2
@@ -722,7 +658,7 @@ class memtreemanifestctx:
     def __init__(self, manifestlog, dir=""):
         self._manifestlog = manifestlog
         self._dir = dir
-        self._treemanifest = _buildtree(manifestlog)
+        self._treemanifest = manifestlog.buildtree()
 
     def new(self, dir=""):
         return memtreemanifestctx(self._manifestlog, dir=dir)
@@ -735,68 +671,25 @@ class memtreemanifestctx:
     def read(self):
         return self._treemanifest
 
-    def writegit(self):
-        newtree = self._treemanifest
-        return newtree.flush()
-
     def write(self, tr, linkrev, p1, p2, added, removed):
         mfl = self._manifestlog
-        assert not mfl._isgit, "do not use write() for git tree, use writegit() instead"
-
         newtree = self._treemanifest
-
-        # linknode=None because the linkrev is provided
-        node = mfl.add(
-            mfl.ui,
-            newtree,
-            p1,
-            p2,
-            None,
-            tr=tr,
-            linkrev=linkrev,
-        )
-        return node
+        return _finalize(mfl, newtree, p1, p2)
 
 
-def getmanifestlog(orig, self):
-    if not treeenabled(self.ui):
-        return orig(self)
-
-    mfl = treeonlymanifestlog(self.svfs, self)
-    setuptreestores(self, mfl)
-
-    return mfl
+def getmanifestlog(orig, repo):
+    return treemanifestlog(repo.svfs, repo)
 
 
 def getbundlemanifestlog(orig, self):
     mfl = orig(self)
-    if not treeenabled(self.ui):
-        return mfl
 
     wrapmfl = mfl
 
-    class pendingmempack:
-        def __init__(self):
-            self._mutabledpack = None
-            self._mutablehpack = None
-
-        def getmutabledpack(self, read=False):
-            if self._mutabledpack is None and not read:
-                self._mutabledpack = memdatapack()
-            return self._mutabledpack
-
-        def getmutablehpack(self, read=False):
-            if self._mutablehpack is None and not read:
-                self._mutablehpack = memhistorypack()
-            return self._mutablehpack
-
-        def getmutablepack(self):
-            dpack = self.getmutabledpack()
-            hpack = self.getmutablehpack()
-
-            return dpack, hpack
-
     class bundlemanifestlog(wrapmfl.__class__):
+        def buildtree(self, node=None):
+            return _buildtree_from_store(self, node)
+
         def add(
             self,
             ui,
@@ -807,25 +700,16 @@ def getbundlemanifestlog(orig, self):
             tr=None,
             linkrev=None,
         ):
-            return self._addtopack(
-                ui,
-                newtree,
-                p1node,
-                p2node,
-                linknode,
-                linkrev=linkrev,
-            )
+            return _finalize(self, newtree, p1node, p2node)
 
         def commitpending(self):
             pass
 
         def abortpending(self):
-            self._mutabelocalpacks = None
-            self._mutablesharedpacks = None
+            pass
 
     wrapmfl.__class__ = bundlemanifestlog
-    wrapmfl._mutablelocalpacks = pendingmempack()
-    wrapmfl._mutablesharedpacks = pendingmempack()
+
     return mfl
 
 
@@ -836,9 +720,6 @@ def debuggetroottree(ui, repo, rootnode):
 
 
 def _unpackmanifestscg3(orig, self, repo, *args, **kwargs):
-    if not treeenabled(repo.ui):
-        return orig(self, repo, *args, **kwargs)
-
     self.manifestheader()
     for chunk in self.deltaiter():
         raise error.ProgrammingError(
@@ -850,9 +731,6 @@ def _unpackmanifestscg3(orig, self, repo, *args, **kwargs):
 
 
 def _unpackmanifestscg1(orig, self, repo, revmap, trp, numchanges):
-    if not treeenabled(repo.ui):
-        return orig(self, repo, revmap, trp, numchanges)
-
     self.manifestheader()
     for chunk in self.deltaiter():
         raise error.ProgrammingError(
@@ -960,7 +838,7 @@ def _registerbundle2parts():
     @perftrace.tracefunc("gettreepackpart2")
     def gettreepackpart2(pushop, bundler):
         """add parts containing trees being pushed"""
-        if "treepack" in pushop.stepsdone or not treeenabled(pushop.repo.ui):
+        if "treepack" in pushop.stepsdone:
             return
         pushop.stepsdone.add("treepack")
 
@@ -986,11 +864,7 @@ def _registerbundle2parts():
         **kwargs,
     ):
         """add parts containing trees being pulled"""
-        if (
-            "True" not in b2caps.get("treemanifest", [])
-            or not treeenabled(repo.ui)
-            or not kwargs.get("cg", True)
-        ):
+        if "True" not in b2caps.get("treemanifest", []) or not kwargs.get("cg", True):
             return
 
         outgoing = exchange._computeoutgoing(repo, heads, common)
@@ -1052,18 +926,19 @@ def createtreepackpart(repo, outgoing, partname, sendtrees=shallowbundle.AllTree
 
 def pull(orig, ui, repo, *pats, **opts):
     result = orig(ui, repo, *pats, **opts)
-    if treeenabled(repo.ui):
-        try:
-            _postpullprefetch(ui, repo)
-        except Exception as ex:
-            # Errors are not fatal.
-            ui.warn(_("failed to prefetch trees after pull: %s\n") % ex)
-            ui.log_exception(
-                exception_type=type(ex).__name__,
-                exception_msg=str(ex),
-                fatal="false",
-                source="post_pull_prefetch",
-            )
+
+    try:
+        _postpullprefetch(ui, repo)
+    except Exception as ex:
+        # Errors are not fatal.
+        ui.warn(_("failed to prefetch trees after pull: %s\n") % ex)
+        ui.log_exception(
+            exception_type=type(ex).__name__,
+            exception_msg=str(ex),
+            fatal="false",
+            source="post_pull_prefetch",
+        )
+
     return result
 
 
@@ -1119,9 +994,9 @@ def clientgettreepack(remote, rootdir, mfnodes, basemfnodes, directories, depth)
     opts["depth"] = str(depth)
 
     ui = remote.ui
-    ui.metrics.gauge("ssh_gettreepack_basemfnodes", len(basemfnodes))
-    ui.metrics.gauge("ssh_gettreepack_mfnodes", len(mfnodes))
-    ui.metrics.gauge("ssh_gettreepack_calls", 1)
+    ui.metrics.inc("ssh_gettreepack_basemfnodes", len(basemfnodes))
+    ui.metrics.inc("ssh_gettreepack_mfnodes", len(mfnodes))
+    ui.metrics.inc("ssh_gettreepack_calls", 1)
 
     f = remote._callcompressable("gettreepack", **opts)
     return bundle2.getunbundler(remote.ui, f)
@@ -1487,9 +1362,6 @@ def _debugbundle2part(orig, ui, part, all, **opts):
 
 def collectfiles(orig, repo, striprev):
     """find out the filelogs affected by the strip"""
-    if not treeenabled(repo.ui):
-        return orig(repo, striprev)
-
     files = set()
 
     for x in range(striprev, len(repo)):
@@ -1517,16 +1389,14 @@ def _addpartsfromopts(orig, ui, repo, bundler, source, outgoing, *args, **kwargs
 
     # Only add trees to bundles for tree enabled clients. Servers use revlogs
     # and therefore will use changegroup tree storage.
-    if treeenabled(repo.ui):
-        # Only add trees if we have them
-        sendtrees = shallowbundle.cansendtrees(
-            repo, outgoing.missing, b2caps=bundler.capabilities
+    sendtrees = shallowbundle.cansendtrees(
+        repo, outgoing.missing, b2caps=bundler.capabilities
+    )
+    if sendtrees != shallowbundle.NoTrees:
+        part = createtreepackpart(
+            repo, outgoing, TREEGROUP_PARTTYPE2, sendtrees=sendtrees
         )
-        if sendtrees != shallowbundle.NoTrees:
-            part = createtreepackpart(
-                repo, outgoing, TREEGROUP_PARTTYPE2, sendtrees=sendtrees
-            )
-            bundler.addpart(part)
+        bundler.addpart(part)
 
 
 def _handlebundle2part(orig, self, bundle, part):
@@ -1599,7 +1469,5 @@ class cachestoreserializer:
 
 
 def pullbundle2extraprepare(orig, pullop, kwargs):
-    repo = pullop.repo
-    if treeenabled(repo.ui):
-        bundlecaps = kwargs.get("bundlecaps", set())
-        bundlecaps.add("treeonly")
+    bundlecaps = kwargs.get("bundlecaps", set())
+    bundlecaps.add("treeonly")

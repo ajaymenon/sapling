@@ -37,12 +37,21 @@ use cpython::Python;
 ///   It typically respects the `PYTHON_SYS_EXECUTABLE` env var.
 /// - `sys_path` will be inserted to Python's `sys.path[0:0]`.
 ///   If None, then pycompile.py reads $SYS_ARG0.
-pub fn generate_code(sys_path: Option<&Path>) -> PyResult<String> {
+pub fn generate_code(sys_path: Option<&Path>) -> Result<String, ()> {
+    let gil = Python::acquire_gil();
+    let py = gil.python();
+    match generate_code_py(py, sys_path) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            e.print(py);
+            Err(())
+        }
+    }
+}
+fn generate_code_py(py: Python, sys_path: Option<&Path>) -> PyResult<String> {
     let is_cargo = is_cargo();
 
     // Prepare the module.
-    let gil = Python::acquire_gil();
-    let py = gil.python();
     let module = PyModule::new(py, "sapling_codegen")?;
     let globals = module.dict(py);
     py.run(PYCOMPILE_SCRIPT, Some(&globals), None)?;
@@ -83,12 +92,10 @@ pub fn generate_code(sys_path: Option<&Path>) -> PyResult<String> {
     let mut generated_lines = Vec::<String>::new();
     generated_lines.push(format!("// {}enerated by python-modules/codegen.", "@g"));
     generated_lines.push(format!(
-        "pub static VERSION_MAJOR: usize = {};",
-        version_major
+        "pub static VERSION_MAJOR: usize = {version_major};"
     ));
     generated_lines.push(format!(
-        "pub static VERSION_MINOR: usize = {};",
-        version_minor
+        "pub static VERSION_MINOR: usize = {version_minor};"
     ));
     generated_lines.push("pub static MODULES: ::phf::Map<&'static str, (&'static str, &'static [u8], bool, usize, usize, bool)> = ::phf::phf_map! {".to_string());
     let mut source_offset = 0;
@@ -153,7 +160,7 @@ impl ModuleInfo {
 fn escape_bytes(bytes: &[u8]) -> String {
     bytes
         .iter()
-        .map(|b| format!(r"\x{:02x}", b))
+        .map(|b| format!(r"\x{b:02x}"))
         .collect::<Vec<String>>()
         .concat()
 }

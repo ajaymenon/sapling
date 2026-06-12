@@ -19,19 +19,20 @@ use futures::future;
 use futures::future::FutureExt;
 use futures::pin_mut;
 use futures::select;
+use gotham::helpers::http::Body;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham_derive::StateData;
 use gotham_derive::StaticResponseExtender;
-use gotham_ext::body_ext::BodyExt;
+use gotham_ext::body_ext::BodyExt as _;
 use gotham_ext::error::HttpError;
 use gotham_ext::middleware::RequestStartTime;
 use gotham_ext::middleware::ScubaMiddlewareState;
 use gotham_ext::response::BytesBody;
 use gotham_ext::response::TryIntoResponse;
+use http::StatusCode;
 use http::header::HeaderMap;
-use hyper::Body;
-use hyper::StatusCode;
+use http_body_util::BodyExt as _;
 use lfs_protocol::ObjectAction;
 use lfs_protocol::ObjectError;
 use lfs_protocol::ObjectStatus;
@@ -46,9 +47,9 @@ use maplit::hashmap;
 use mononoke_types::BlobstoreKey;
 use mononoke_types::hash::Sha256;
 use mononoke_types::typed_hash::ContentId;
-use rand::Rng;
 use redactedblobstore::has_redaction_root_cause;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_identity::RepoIdentityRef;
 use serde::Deserialize;
 use stats::prelude::*;
 use time_ext::DurationExt;
@@ -72,6 +73,13 @@ define_stats! {
     upload_no_redirect: timeseries(Rate, Sum),
     upload_rejected: timeseries(Rate, Sum),
 }
+
+/// JustKnob that, when enabled for a repo, makes batch download responses
+/// ignore the upstream LFS server entirely. Internal-only objects are returned
+/// as usual; objects that exist only upstream become 404s. Upload paths are
+/// unaffected. Per `eden/.llms/rules/rust_unwrap_safety.md`, a bare `?` is the
+/// correct pattern here; defaults belong in `just_knobs.json`.
+const SKIP_UPSTREAM_FOR_DOWNLOADS_JK: &str = "scm/mononoke:lfs_server_skip_upstream_for_downloads";
 
 enum Source {
     Internal,
@@ -258,7 +266,7 @@ async fn resolve_internal_object(
 
     let meta = filestore::get_metadata(&blobstore, &ctx.ctx, &(content_id.into()))
         .await
-        .with_context(|| format!("Failed fetching content metadata for {:?}", content_id));
+        .with_context(|| format!("Failed fetching content metadata for {content_id:?}"));
 
     match meta {
         Ok(Some(meta)) => {
@@ -285,7 +293,7 @@ async fn resolve_internal_object(
     let exists = blobstore
         .is_present(&ctx.ctx, &content_id.blobstore_key())
         .await
-        .with_context(|| format!("Failed to check for existence of: {:?}", content_id))?
+        .with_context(|| format!("Failed to check for existence of: {content_id:?}"))?
         .assume_not_found_if_unsure();
 
     if exists {
@@ -297,12 +305,12 @@ async fn resolve_internal_object(
 
 fn generate_routing_key(tasks_per_content: NonZeroU16, oid: Sha256) -> String {
     // Randomly generate task number to send to.
-    let task_n = rand::rng().random_range(0..tasks_per_content.get());
+    let task_n = rand::random_range(0..tasks_per_content.get());
     // For the base task, no extension is added to routing key.
-    let mut routing_key = format!("{}", oid);
+    let mut routing_key = format!("{oid}");
     if task_n > 0 {
         // All other tasks have tailing number in routing key.
-        routing_key = format!("{}-{}", routing_key, task_n);
+        routing_key = format!("{routing_key}-{task_n}");
     }
     routing_key
 }
@@ -566,6 +574,23 @@ async fn batch_download(
     batch: RequestBatch,
     scuba: &mut Option<&mut ScubaMiddlewareState>,
 ) -> Result<ResponseBatch, ErrorKind> {
+    if justknobs::eval(
+        SKIP_UPSTREAM_FOR_DOWNLOADS_JK,
+        None,
+        Some(ctx.repo.repo_identity().name()),
+    ) {
+        let internal_objects = internal_objects(ctx, &batch.objects).await?;
+        ScubaMiddlewareState::maybe_add(scuba, LfsScubaKey::BatchOrder, "skip_upstream");
+        let upstream = Ok(UpstreamObjects::NoUpstream);
+        let objects =
+            batch_download_response_objects(&batch.objects, &upstream, &internal_objects, scuba)
+                .map_err(ErrorKind::Error)?;
+        return Ok(ResponseBatch {
+            transfer: Transfer::Basic,
+            objects,
+        });
+    }
+
     let upstream = upstream_objects(ctx, &batch.objects).fuse();
     let internal = internal_objects(ctx, &batch.objects).fuse();
     pin_mut!(upstream, internal);
@@ -637,6 +662,7 @@ pub async fn batch(state: &mut State) -> Result<impl TryIntoResponse + use<>, Ht
     let headers = HeaderMap::try_borrow_from(state);
 
     let body = body
+        .into_data_stream()
         .try_concat_body_opt(headers)
         .map_err(HttpError::e400)?
         .await
@@ -706,7 +732,7 @@ mod test {
     use filestore::FilestoreConfigRef;
     use filestore::StoreRequest;
     use futures::stream;
-    use hyper::Uri;
+    use http::Uri;
     use memblob::Memblob;
     use mononoke_macros::mononoke;
     use mononoke_types::ContentMetadataV2Id;
@@ -832,8 +858,8 @@ mod test {
     #[mononoke::test]
     fn test_routing_keys() -> Result<(), Error> {
         // allowed keys
-        let allowed_routing_key_base: String = format!("{}", ONES_SHA256);
-        let allowed_routing_key_one: String = format!("{}-1", allowed_routing_key_base);
+        let allowed_routing_key_base: String = format!("{ONES_SHA256}");
+        let allowed_routing_key_one: String = format!("{allowed_routing_key_base}-1");
         // base case
         let routing_key_base = generate_routing_key(NonZeroU16::new(1).unwrap(), ONES_SHA256);
         assert_eq!(&routing_key_base, &allowed_routing_key_base);
@@ -929,12 +955,15 @@ mod test {
         let server = ServerUris::new(
             vec!["http://foo.com".to_string()],
             Some("http://bar.com".to_string()),
+            vec![],
+            vec![],
         )?;
         let uri_builder = UriBuilder {
             repository: "repo123".to_string(),
             server: Arc::new(server),
             host: "foo.com".to_string(),
             server_hostname: Arc::new(SERVER_HOSTNAME.to_string()),
+            force_http: false,
         };
 
         let res = batch_upload_response_objects(
@@ -1200,6 +1229,51 @@ mod test {
         assert_eq!(obj1, obj);
         assert_eq!(obj2, obj);
         assert_eq!(action1, action2);
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_batch_download_skips_upstream_when_jk_enabled(
+        fb: FacebookInit,
+    ) -> Result<(), Error> {
+        use justknobs::test_helpers::JustKnobsInMemory;
+        use justknobs::test_helpers::KnobVal;
+        use justknobs::test_helpers::with_just_knobs_async;
+
+        // Build a repo whose LFS config enables upstream and point the context
+        // at an upstream URI. The test HTTP client is Disabled — so any actual
+        // dispatch to upstream would panic. The test passes only if the JK gate
+        // prevents that call.
+        let repo: Repo = TestRepoFactory::new(fb)?
+            .with_config_override(|c| c.lfs.use_upstream_lfs_server = true)
+            .build()
+            .await?;
+
+        let ctx = RepositoryRequestContext::test_builder_with_repo(fb, repo)?
+            .upstream_uri(Some("http://upstream.example/".to_string()))
+            .build()?;
+
+        let request = RequestBatch {
+            operation: Operation::Download,
+            r#ref: None,
+            transfers: vec![Transfer::Basic],
+            objects: vec![obj(ONES_SHA256, 111)],
+        };
+
+        let res = with_just_knobs_async(
+            JustKnobsInMemory::new(hashmap! {
+                SKIP_UPSTREAM_FOR_DOWNLOADS_JK.to_string() => KnobVal::Bool(true),
+            }),
+            Box::pin(batch_download(&ctx, request, &mut None)),
+        )
+        .await?;
+
+        assert_eq!(res.objects.len(), 1);
+        match &res.objects[0].status {
+            ObjectStatus::Err { error } => assert_eq!(error.code, 404),
+            ObjectStatus::Ok { .. } => panic!("expected 404, got Ok"),
+        }
 
         Ok(())
     }

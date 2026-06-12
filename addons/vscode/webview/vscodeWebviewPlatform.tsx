@@ -73,17 +73,23 @@ const vscodeWebviewPlatform: Platform = {
   canCustomizeFileOpener: false,
   openDiff: (path: RepoRelativePath, comparison: Comparison) =>
     window.clientToServerAPI?.postMessage({type: 'platform/openDiff', path, comparison}),
+  revealInFileExplorer: (path: RepoRelativePath) =>
+    window.clientToServerAPI?.postMessage({type: 'platform/revealInFileExplorer', path}),
+  revealInExplorerView: (path: RepoRelativePath) =>
+    window.clientToServerAPI?.postMessage({type: 'platform/revealInExplorerView', path}),
   openExternalLink: url => {
     window.clientToServerAPI?.postMessage({type: 'platform/openExternal', url});
   },
   upsellExternalMergeTool: false,
 
   openDedicatedComparison: async (comparison: Comparison): Promise<boolean> => {
-    const {getComparisonPanelMode} = await import('./state');
+    const {getComparisonPanelMode, ComparisonPanelMode} = await import('./state');
     const mode = getComparisonPanelMode();
-    if (mode === 'Auto') {
+    if (mode === ComparisonPanelMode.Auto) {
+      // Auto mode: show inline in ISL when active
       return false;
     }
+    // Always Separate Panel mode: open multi-diff editor
     window.clientToServerAPI?.postMessage({
       type: 'platform/executeVSCodeCommand',
       command: 'sapling.open-comparison-view',

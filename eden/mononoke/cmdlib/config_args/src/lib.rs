@@ -44,18 +44,26 @@ pub struct ConfigArgs {
 const PRODUCTION_PREFIX: &str = "configerator://scm/mononoke/repos/tiers/";
 
 fn configerator_config_path(tier: &str) -> String {
-    format!("{}{}", PRODUCTION_PREFIX, tier)
+    format!("{PRODUCTION_PREFIX}{tier}")
 }
 
 impl ConfigArgs {
+    /// Returns the tier name for configerator-backed configs, or `None` for
+    /// local-path configs.
+    fn tier_name(&self) -> Option<&str> {
+        if self.prod {
+            Some("prod")
+        } else if self.git_config {
+            Some("gitimport_content")
+        } else {
+            self.config_tier.as_deref()
+        }
+    }
+
     pub fn config_path(&self) -> String {
         if let Some(config_path) = &self.config_path {
             config_path.clone()
-        } else if self.prod {
-            configerator_config_path("prod")
-        } else if self.git_config {
-            configerator_config_path("gitimport_content")
-        } else if let Some(tier) = &self.config_tier {
+        } else if let Some(tier) = self.tier_name() {
             configerator_config_path(tier)
         } else {
             String::new()
@@ -70,7 +78,7 @@ impl ConfigArgs {
             }
         } else {
             // Otherwise, we are prod if a prod tier is requested.
-            if self.prod || self.config_tier.is_some() {
+            if self.prod || self.git_config || self.config_tier.is_some() {
                 return ConfigMode::Production;
             }
         }
@@ -99,11 +107,31 @@ impl ConfigArgs {
         config_store: &ConfigStore,
     ) -> Result<Arc<MononokeConfigs>> {
         let config_path = self.config_path();
+        let manifest_path = self.manifest_path()?;
         Ok(Arc::new(MononokeConfigs::new(
             config_path,
             config_store,
+            manifest_path.as_deref(),
             handle,
         )?))
+    }
+
+    /// Derives the per-repo manifest path when split-loading is enabled.
+    /// Returns `None` when the JustKnob is off or when using non-configerator config.
+    fn manifest_path(&self) -> Result<Option<String>> {
+        if !justknobs::eval("scm/mononoke:use_split_config_loading", None, None) {
+            return Ok(None);
+        }
+        // Try --config_tier / --prod / --git_config first, then fall back to
+        // extracting the tier name from --mononoke-config-path if it matches
+        // the configerator prefix (e.g. "configerator://scm/mononoke/repos/tiers/scs" -> "scs").
+        let tier = self.tier_name().or_else(|| {
+            self.config_path
+                .as_deref()
+                .and_then(|p| p.strip_prefix(PRODUCTION_PREFIX))
+                .filter(|t| !t.is_empty())
+        });
+        Ok(tier.map(|t| format!("scm/mononoke/repos/tiers/{t}_manifest")))
     }
 }
 

@@ -87,10 +87,11 @@ python_library(
         "//cli/py/usage:lib",
         "//eden/fs/cli/facebook:hostcaps",
         "//eden/fs/cli/facebook:util",
-        "//eden/fs/py/eden/thrift:legacy",
-        "//eden/fs/service:thrift-py-deprecated",
-        "//fb303/thrift:fb303_core-py-deprecated",
-        "//thrift/lib/py:server_base",
+        "//eden/fs/py/eden/thrift:client",
+        "//eden/fs/service:thrift-python-clients",
+        "//fb303/thrift:fb303_core-python-types",
+        "//thrift/lib/python:types",
+        "//thrift/lib/python:types/exceptions",
     ],
 )
 
@@ -109,6 +110,11 @@ python_library(
     deps = [
         "//eden/fs/cli/facebook:hostcaps",
     ],
+)
+
+python_library(
+    name = "mp",
+    srcs = ["mp.py"],
 )
 
 python_library(
@@ -171,25 +177,26 @@ python_library(
         "fbsource//third-party/pypi/toml:toml",
         "fbsource//third-party/pypi/tqdm:tqdm",
         ":hostname",
+        ":mp",
         ":proc_utils",
         ":telemetry",
         ":version",
         "//eden/fs/cli/facebook:hostcaps",
         "//eden/fs/cli/facebook:rage",
-        "//eden/fs/inodes/overlay:serialization-py-deprecated",
+        "//eden/fs/inodes/overlay:serialization-python-types",
         "//eden/fs/py/eden:dirstate",
+        "//eden/fs/py/eden/thrift:client",
         "//eden/fs/py/eden/thrift:legacy",
-        "//eden/fs/service:thrift-py-deprecated",
         "//eden/scm:redact",
-        "//fb303/thrift:fb303_core-py-deprecated",
-        "//thrift/lib/py:base",
-        "//thrift/lib/py:server_base",
-        "//thrift/lib/py/util:inspect",
-        "//thrift/lib/py/util:py_util",
+        "//fb303/thrift:fb303_core-python-types",
+        "//thrift/lib/python:types",
     ] + select({
-        "DEFAULT": [],
+        "DEFAULT": [
+            "//eden/fs/cli/facebook:xplat_logger",
+        ],
         "ovr_config//os:linux": [
             "//eden/fs/cli/facebook:telemetry",
+            "//eden/fs/cli/facebook:xplat_logger",
         ],
     }),
 )
@@ -201,7 +208,7 @@ python_library(
         "proc_utils_win.py",
     ],
     deps = [
-        "//eden/fs/py/eden/thrift:legacy",
+        "//eden/fs/py/eden/thrift:client",
     ] + select({
         "DEFAULT": [],
         "ovr_config//os:linux": [
@@ -218,6 +225,7 @@ python_library(
     deps = [
         ":hostname",
         ":version",
+        "//eden/fs/cli/facebook:hostcaps",
     ],
 )
 

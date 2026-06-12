@@ -12,7 +12,6 @@ import type {CommitRev, CommitStackState, FileMetadata, FileStackIndex} from '..
 import type {FileRev, FileStackState} from '../fileStackState';
 import type {UseStackEditState} from './stackEditState';
 
-import * as stylex from '@stylexjs/stylex';
 import {Set as ImSet, type List, Range} from 'immutable';
 import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
@@ -20,6 +19,7 @@ import {Subtle} from 'isl-components/Subtle';
 import {TextField} from 'isl-components/TextField';
 import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue} from 'jotai';
+import type {JSX} from 'react';
 import {useEffect, useMemo, useRef, useState} from 'react';
 import {useContextMenu} from 'shared/ContextMenu';
 import {readableDiffBlocks as diffBlocks, type LineIdx, splitLines} from 'shared/diff';
@@ -45,6 +45,7 @@ import {isAbsent, reorderedRevs} from '../commitStackState';
 import {max, next, prev} from '../revMath';
 import {AISplitButton} from './AISplit';
 import {computeLinesForFileStackEditor} from './FileStackEditorLines';
+import css from './SplitStackEditPanel.module.css';
 import {
   bumpStackEditMetric,
   findStartEndRevs,
@@ -54,12 +55,6 @@ import {
 } from './stackEditState';
 
 import './SplitStackEditPanel.css';
-
-const styles = stylex.create({
-  full: {
-    width: '100%',
-  },
-});
 
 export function SplitStackEditPanel() {
   const stackEdit = useStackEditState();
@@ -78,7 +73,6 @@ export function SplitStackEditPanel() {
       <div>
         <EmptyState small>
           <T>Select a commit to split its changes.</T>
-          <br />
           <Subtle>
             <T>Or, select a range of commits to move contents among them.</T>
           </Subtle>
@@ -114,6 +108,29 @@ export function SplitStackEditPanel() {
     stackEdit.push(newStack, {name: 'insertBlankCommit'}, splitRange);
   };
 
+  const removeEmptyCommit = (rev: CommitRev) => {
+    const mainRev = (startRev + rev) as CommitRev;
+    const newStack = stackEdit.commitStack.drop(mainRev);
+
+    bumpStackEditMetric('splitRemoveEmpty');
+
+    let {splitRange} = stackEdit;
+    const removedKey = stackEdit.commitStack.get(mainRev)?.key;
+    if (removedKey === splitRange.startKey) {
+      const newStart = newStack.get(mainRev);
+      if (newStart != null) {
+        splitRange = splitRange.set('startKey', newStart.key);
+      }
+    } else if (removedKey === splitRange.endKey) {
+      const newEnd = newStack.get(prev(mainRev));
+      if (newEnd != null) {
+        splitRange = splitRange.set('endKey', newEnd.key);
+      }
+    }
+
+    stackEdit.push(newStack, {name: 'removeEmptyCommit'}, splitRange);
+  };
+
   // One commit per column.
   const columns: JSX.Element[] = subStack
     .revs()
@@ -125,6 +142,7 @@ export function SplitStackEditPanel() {
         rev={rev}
         subStack={subStack}
         insertBlankCommit={insertBlankCommit}
+        removeEmptyCommit={removeEmptyCommit}
       />
     ));
 
@@ -143,6 +161,7 @@ type SplitColumnProps = {
   subStack: CommitStackState;
   rev: CommitRev;
   insertBlankCommit: (rev: CommitRev) => unknown;
+  removeEmptyCommit: (rev: CommitRev) => unknown;
 };
 
 function InsertBlankCommitButton({
@@ -209,7 +228,7 @@ function SwapCommitsButton({
 }
 
 function SplitColumn(props: SplitColumnProps) {
-  const {stackEdit, commitStack, subStack, rev, insertBlankCommit} = props;
+  const {stackEdit, commitStack, subStack, rev, insertBlankCommit, removeEmptyCommit} = props;
 
   const [collapsedFiles, setCollapsedFiles] = useState(new Set());
 
@@ -292,14 +311,20 @@ function SplitColumn(props: SplitColumnProps) {
 
   const editors = editables.concat(nonEditables);
 
+  const canRemove = editors.isEmpty() && rev < subStack.size - 1 && subStack.size > 2;
+
   const body = editors.isEmpty() ? (
     <EmptyState small>
-      <Column>
-        <T>This commit is empty</T>
-        <Subtle>
-          <T>Use the left/right arrows to move files and lines of code and create new commits.</T>
-        </Subtle>
-      </Column>
+      <T>This commit is empty</T>
+      <Subtle>
+        <T>Use the left/right arrows to move files and lines of code and create new commits.</T>
+      </Subtle>
+      {canRemove ? (
+        <Button onClick={() => removeEmptyCommit(rev)}>
+          <Icon icon="trash" slot="start" />
+          <T>Remove empty commit</T>
+        </Button>
+      ) : null}
     </EmptyState>
   ) : (
     <ScrollY maxSize="calc((100vh / var(--zoom)) - var(--split-vertical-overhead))" hideBar={true}>
@@ -347,12 +372,10 @@ function SplitColumn(props: SplitColumnProps) {
 
   return (
     <>
-      {editors.isEmpty() ? null : (
-        <Column>
-          <InsertBlankCommitButton beforeRev={rev} onClick={() => insertBlankCommit(rev)} />
-          <SwapCommitsButton stackEdit={stackEdit} beforeRev={rev} />
-        </Column>
-      )}
+      <Column>
+        <InsertBlankCommitButton beforeRev={rev} onClick={() => insertBlankCommit(rev)} />
+        <SwapCommitsButton stackEdit={stackEdit} beforeRev={rev} />
+      </Column>
       <div className="split-commit-column">
         <div className="split-commit-header">
           <span className="split-commit-header-stack-number">
@@ -790,7 +813,7 @@ function EditableCommitTitle(props: MaybeEditableCommitTitleProps) {
   };
   return (
     <TextField
-      containerXstyle={styles.full}
+      containerClassName={css.full}
       value={existingTitle}
       title={t('Edit commit title')}
       style={{width: 'calc(100% - var(--pad))'}}
@@ -955,11 +978,16 @@ export function SplitFile(props: SplitFileProps) {
     <div className="split-file">
       <table ref={mainContentRef}>
         <colgroup>
-          <col width={50}>{/* left arrows */}</col>
-          <col width={50}>{/* before line numbers */}</col>
-          <col width={'100%'}>{/* diff content */}</col>
-          <col width={50}>{/* after line numbers */}</col>
-          <col width={50}>{/* rightarrow  */}</col>
+          <col width={50} />
+          {/* left arrows */}
+          <col width={50} />
+          {/* before line numbers */}
+          <col width={'100%'} />
+          {/* diff content */}
+          <col width={50} />
+          {/* after line numbers */}
+          <col width={50} />
+          {/* rightarrow  */}
         </colgroup>
         <tbody>{rows}</tbody>
       </table>

@@ -177,7 +177,7 @@ impl GitSegmentedCommits {
 
     /// Rewrite metalog bookmarks, remotenames to match git references.
     /// Import related commits to segments.
-    /// This is the reverse of `metalog_to_git_references`.
+    /// This is the reverse of `export_to_git`.
     /// Intended to be used at "open" time and at the start of a transaction.
     ///
     /// If `self.is_dotgit` is true, then the sync rules are a bit different:
@@ -281,7 +281,7 @@ impl GitSegmentedCommits {
                 ["refs", "remotetags", name] => {
                     // origin/v1 (name) => origin/tags/v1 (remotename in metalog)
                     let remotename = match name.split_once('/') {
-                        Some((remote, name)) => format!("{}/tags/{}", remote, name),
+                        Some((remote, name)) => format!("{remote}/tags/{name}"),
                         None => continue,
                     };
                     let should_import_to_dag = match existing_remotenames.get(&remotename) {
@@ -393,10 +393,18 @@ impl GitSegmentedCommits {
                     fn [<update_ $field>](&mut self, metalog: &MetaLog, name: RefName, value: Option<HgId>) -> Result<()> {
                         let map = load!(self, $field, metalog);
                         match value {
-                            None => { map.remove(&name); }
+                            None => {
+                                let removed = map.remove(&name);
+                                if removed.is_some() {
+                                    tracing::trace!(target: "commits_git::git::import", kind=stringify!($field), ?name, "delete because git ref is gone");
+                                }
+                            }
                             Some(id) => {
-                                let orig_id = map.insert(name, id);
-                                if orig_id != Some(id) { self.mark_add_head(id); }
+                                let orig_id = map.insert(name.clone(), id);
+                                if orig_id != Some(id) {
+                                    tracing::trace!(target: "commits_git::git::import", kind=stringify!($field), ?name, ?value, "updated because git ref is changed");
+                                    self.mark_add_head(id);
+                                }
                             }
                         }
                         Ok(())
@@ -433,8 +441,8 @@ impl GitSegmentedCommits {
                 state.update_remotenames(metalog, RefName::try_from(name)?, ref_value)?;
             } else if let Some(rest) = ref_name.strip_prefix("refs/remotetags/") {
                 let name = match rest.split_once('/') {
-                    Some((remote, name)) => format!("{}/tags/{}", remote, name),
-                    None => bail!("illformed ref_name: {}", ref_name),
+                    Some((remote, name)) => format!("{remote}/tags/{name}"),
+                    None => bail!("illformed ref_name: {ref_name}"),
                 };
                 state.update_remotenames(metalog, RefName::try_from(name)?, ref_value)?;
             } else if ref_name.starts_with("refs/visibleheads/") {
@@ -477,18 +485,24 @@ impl GitSegmentedCommits {
         }
 
         let mut opts = metalog::CommitOptions::default();
-        let message = format!("sync from git refs: {:?}", ref_names);
+        let message = format!("sync from git refs: {ref_names:?}");
         opts.message = &message;
         metalog.commit(opts)?;
 
         Ok(())
     }
 
-    /// Update git references to match metalog changes.
+    /// Update git references to match metalog *changes*.
     /// - remotenames, bookmarks: changes will be applied to Git references.
     /// - visibleheads: current state will replace refs/visibleheads/ namespace.
     ///
-    /// The reverse of `git_references_to_metalog`, used at the end of a transaction.
+    /// The changes are decided:
+    /// - If the metalog is dirty, then the dirty part is considered changed.
+    /// - If the metalog is clean, then the difference between the metalog and
+    ///   its parent is considered changed.
+    ///
+    /// The reverse of `git_references_to_metalog`, typically used at the end of
+    /// a transaction, when the metalog is committed.
     fn export_to_git(&self, metalog: &MetaLog) -> Result<()> {
         tracing::info!("updating git refs from metalog");
         if tracing::enabled!(tracing::Level::TRACE) {
@@ -565,15 +579,15 @@ impl GitSegmentedCommits {
             for (name, optional_id) in find_changes(&old_remotenames, &new_remotenames) {
                 let ref_name = match name.split_once("/tags/") {
                     Some((remote, tag)) if !remote.contains('/') => {
-                        format!("refs/remotetags/{}/{}", remote, tag)
+                        format!("refs/remotetags/{remote}/{tag}")
                     }
-                    _ => format!("refs/remotes/{}", name),
+                    _ => format!("refs/remotes/{name}"),
                 };
                 tracing::trace!(ref_name=&ref_name, id=?optional_id, "updating remotename ref");
                 ref_to_change.insert(ref_name, optional_id);
             }
             for (name, optional_id) in find_changes(&old_bookmarks, &new_bookmarks) {
-                let ref_name = format!("refs/heads/{}", name);
+                let ref_name = format!("refs/heads/{name}");
                 tracing::trace!(ref_name=&ref_name, id=?optional_id, "updating bookmark ref");
                 ref_to_change.insert(ref_name, optional_id);
             }
@@ -598,7 +612,7 @@ impl GitSegmentedCommits {
                         ));
                     }
                     None => {
-                        update_ref_stdin.push_str(&format!("delete {}\0\0", name));
+                        update_ref_stdin.push_str(&format!("delete {name}\0\0"));
                     }
                 }
             }
@@ -690,10 +704,10 @@ impl AppendCommits for GitSegmentedCommits {
         let null_rev = self.dag.vertex_id(null).await?;
         let wdir_rev = self.dag.vertex_id(wdir).await?;
         if Group::VIRTUAL.min_id() != null_rev {
-            bail!("unexpected null rev: {:?}", null_rev);
+            bail!("unexpected null rev: {null_rev:?}");
         }
         if Group::VIRTUAL.min_id() + 1 != wdir_rev {
-            bail!("unexpected wdir rev: {:?}", wdir_rev);
+            bail!("unexpected wdir rev: {wdir_rev:?}");
         }
         Ok(())
     }

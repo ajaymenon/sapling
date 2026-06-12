@@ -16,6 +16,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
+use commit_derived_data_mapping::CommitDerivedDataMapping;
 use commit_graph::CommitGraph;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
@@ -33,7 +34,7 @@ use metaconfig_types::RepoConfig;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
 use repo_blobstore::RepoBlobstore;
-use restricted_paths::ArcRestrictedPaths;
+use restricted_paths_common::ArcRestrictedPathsConfigBased;
 use scuba_ext::MononokeScubaSampleBuilder;
 
 /// Repository derived data management.
@@ -64,7 +65,8 @@ impl RepoDerivedData {
         scuba: MononokeScubaSampleBuilder,
         config: DerivedDataConfig,
         derivation_service_client: Option<Arc<dyn DerivationClient>>,
-        restricted_paths: ArcRestrictedPaths,
+        restricted_paths: ArcRestrictedPathsConfigBased,
+        commit_derived_data_mapping: Arc<CommitDerivedDataMapping>,
     ) -> Result<RepoDerivedData> {
         let managers = config
             .available_configs
@@ -87,6 +89,7 @@ impl RepoDerivedData {
                         config.clone(),
                         derivation_service_client.clone(),
                         restricted_paths.clone(),
+                        commit_derived_data_mapping.clone(),
                     ),
                 )
             })
@@ -286,7 +289,7 @@ impl RepoDerivedData {
     pub fn manager_for_config(&self, config_name: &str) -> Result<&DerivedDataManager> {
         self.managers
             .get(config_name)
-            .ok_or_else(|| anyhow!("No manager found for config {}", config_name))
+            .ok_or_else(|| anyhow!("No manager found for config {config_name}"))
     }
 
     /// Count the number of ancestors of a commit that are underived.

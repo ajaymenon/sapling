@@ -8,6 +8,30 @@
 
 _repocount=0
 
+# Detect the dot directory (.sl or .hg) for the repo at the given path (or cwd).
+_dotdir() {
+  local dir
+  if [ -n "$1" ]; then dir="$1"; else dir="."; fi
+  if [ -d "$dir/.sl" ]; then
+    echo ".sl"
+  else
+    echo ".hg"
+  fi
+}
+
+# Return the config file name for the dot dir (.sl/config or .hg/hgrc).
+# Note: inlines _dotdir logic because debugruntest shell doesn't pass
+# function args through $() command substitution.
+_dotdir_configfile() {
+  local dir
+  if [ -n "$1" ]; then dir="$1"; else dir="."; fi
+  if [ -d "$dir/.sl" ]; then
+    echo ".sl/config"
+  else
+    echo ".hg/hgrc"
+  fi
+}
+
 if [ -n "$USE_MONONOKE" ] && [ -z "$DEBUGRUNTEST_ENABLED" ] ; then
   . "$TESTDIR/../../mononoke/tests/integration/library.sh"
 fi
@@ -35,7 +59,7 @@ newrepo() {
   fi
   mkdir "$TESTTMP/$reponame"
   cd "$TESTTMP/$reponame"
-  hg init "$@"
+  sl init "$@"
 }
 
 newclientrepo() {
@@ -61,7 +85,7 @@ newclientrepo() {
     newserver "${server}"
     remflog=""
   fi
-  hg clone --config "clone.use-rust=True" $remflog -q "test:${server}" "$TESTTMP/$reponame"
+  sl clone --config "clone.use-rust=True" $remflog -q "test:${server}" "$TESTTMP/$reponame"
 
   local drawdaginput=""
   while IFS= read line
@@ -75,16 +99,16 @@ newclientrepo() {
 
   cd "$TESTTMP/$reponame"
   for book in $bookmarks ; do
-      hg pull -q -B $book
+      sl pull -q -B $book
   done
-  hg up -q tip
+  sl up -q tip
 }
 
 # create repo connected to remote repo ssh://user@dummy/server.
 # `newserver server` needs to be called at least once before this call to setup ssh repo
 newremoterepo() {
   newrepo "$@"
-  echo remotefilelog >> .hg/requires
+  echo remotefilelog >> "$(_dotdir)/requires"
   enable pushrebase
   if [ -n "$USE_MONONOKE" ] ; then
     setconfig paths.default=mononoke://$(mononoke_address)/server
@@ -107,12 +131,12 @@ newserver() {
     REPOID=${REPOID:-0}
     export REPOID=$((REPOID+1))
   elif [ -f "$TESTTMP/.eagerepo" ] ; then
-    hg init "$TESTTMP/$reponame" --config format.use-eager-repo=true
+    sl init "$TESTTMP/$reponame" --config format.use-eager-repo=true
     cd "$TESTTMP/$reponame"
   else
     mkdir "$TESTTMP/$reponame"
     cd "$TESTTMP/$reponame"
-    hg --config experimental.narrow-heads=false \
+    sl --config experimental.narrow-heads=false \
       --config visibility.enabled=false \
       init
     setconfig \
@@ -128,7 +152,7 @@ clone() {
   clientname="$2"
   shift 2
   cd "$TESTTMP"
-  remotecmd="hg"
+  remotecmd="sl"
   if [ -f "$TESTTMP/.eagerepo" ] ; then
       serverurl="test:$servername"
   elif [ -n "$USE_MONONOKE" ] ; then
@@ -137,12 +161,12 @@ clone() {
       serverurl="ssh://user@dummy/$servername"
   fi
 
-  hg clone -q "$serverurl" "$clientname" "$@" \
+  sl clone -q "$serverurl" "$clientname" "$@" \
     --config "remotefilelog.reponame=$servername" \
     --config "ui.ssh=$(dummysshcmd)" \
     --config "ui.remotecmd=$remotecmd"
 
-  cat >> $clientname/.hg/hgrc <<EOF
+  cat >> "$clientname/$(_dotdir_configfile "$clientname")" <<EOF
 [phases]
 publish=False
 
@@ -157,7 +181,7 @@ rebasekeepdate=True
 EOF
 
   if [ -n "$COMMITCLOUD" ]; then
-    hg --cwd $clientname cloud join -q
+    sl --cwd $clientname cloud join -q
   fi
 }
 
@@ -247,7 +271,7 @@ disable() {
   done
 }
 
-# Like "hg debugdrawdag", but do not leave local tags in the repo and define
+# Like "sl debugdrawdag", but do not leave local tags in the repo and define
 # nodes as environment variables.
 _drawdagcount=0
 drawdag() {
@@ -268,10 +292,10 @@ shorttraceback() {
 
 # Set config items like --config way, instead of using cat >> $HGRCPATH
 setconfig() {
-  hg debugpython -- "$RUNTESTDIR/setconfig.py" "$@"
+  sl debugpython -- "$RUNTESTDIR/setconfig.py" "$@"
 }
 
-# Set config item, but always in the main hgrc
+# Set config item, but always in the main config
 setglobalconfig() {
   ( cd "$TESTTMP" ; setconfig "$@" )
 }
@@ -285,9 +309,9 @@ setmodernconfig() {
 # Read config from stdin (usually a heredoc).
 readconfig() {
   local hgrcpath
-  if [ -e ".hg" ]
+  if [ -e ".hg" ] || [ -e ".sl" ]
   then
-    hgrcpath=".hg/hgrc"
+    hgrcpath="$(_dotdir_configfile)"
   else
     hgrcpath="$HGRCPATH"
   fi
@@ -311,17 +335,17 @@ newext() {
 }
 
 showgraph() {
-  hg log --graph -T "{node|short} {desc|firstline}" | sed \$d
+  sl log --graph -T "{node|short} {desc|firstline}" | sed \$d
 }
 
 tglog() {
-  hg log -G -T "{node|short} '{desc}' {bookmarks}" "$@"
+  sl log -G -T "{node|short} '{desc}' {bookmarks}" "$@"
 }
 
 tglogp() {
-  hg log -G -T "{node|short} {phase} '{desc}' {bookmarks}" "$@"
+  sl log -G -T "{node|short} {phase} '{desc}' {bookmarks}" "$@"
 }
 
 tglogm() {
-  hg log -G -T "{node|short} '{desc|firstline}' {bookmarks} {join(mutations % '(Rewritten using {operation} into {join(successors % \'{node|short}\', \', \')})', ' ')}" "$@"
+  sl log -G -T "{node|short} '{desc|firstline}' {bookmarks} {join(mutations % '(Rewritten using {operation} into {join(successors % \'{node|short}\', \', \')})', ' ')}" "$@"
 }

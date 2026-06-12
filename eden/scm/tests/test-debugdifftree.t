@@ -18,7 +18,7 @@
 
 # Print paths:
 
-  $ hg debugdifftree -r "$A" -r "$B"
+  $ sl debugdifftree -r "$A" -r "$B"
   M A
   A B
   A dir/B
@@ -27,7 +27,7 @@
 
 # JSON output:
 
-  $ hg debugdifftree -r $A -r $B -Tjson
+  $ sl debugdifftree -r $A -r $B -Tjson
   [
    {
     "newflags": "",
@@ -73,7 +73,7 @@
 
 # With path matcher:
 
-  $ hg debugdifftree -r null -r "$B" -Tjson dir
+  $ sl debugdifftree -r null -r "$B" -Tjson dir
   [
    {
     "newflags": "",

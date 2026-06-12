@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::Weak;
 
+use clidispatch::command::CommandDefinition;
 use clidispatch::command::CommandTable;
 use clidispatch::io::IO;
 use commandserver::ipc::ClientIpc;
@@ -359,9 +360,9 @@ fn read_to_py_object(py: Python, reader: &dyn clidispatch::io::Read) -> PyObject
 
 fn write_to_py_object(py: Python, writer: &dyn clidispatch::io::Write) -> PyObject {
     let any = writer.as_any();
-    if any.downcast_ref::<std::io::Stdout>().is_some() {
-        py.None()
-    } else if any.downcast_ref::<std::io::Stderr>().is_some() {
+    if any.downcast_ref::<std::io::Stdout>().is_some()
+        || any.downcast_ref::<std::io::Stderr>().is_some()
+    {
         py.None()
     } else if let Some(obj) = any.downcast_ref::<WrappedIO>() {
         obj.obj.clone_ref(py)
@@ -371,6 +372,14 @@ fn write_to_py_object(py: Python, writer: &dyn clidispatch::io::Write) -> PyObje
             writer.type_name()
         )
     }
+}
+
+fn python_command_aliases(def: &CommandDefinition) -> String {
+    def.aliases()
+        .split('|')
+        .map(|alias| alias.strip_prefix("legacy:").unwrap_or(alias))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn init_bindings_commands(py: Python, package: &str) -> PyResult<PyModule> {
@@ -408,15 +417,12 @@ fn init_bindings_commands(py: Python, package: &str) -> PyResult<PyModule> {
         for def in table.values() {
             let doc = def.doc().to_string();
 
-            // Key entry by primary command name which Python knows to
-            // look for. This avoids having to make the alias list
-            // match exactly between Python and Rust.
-            let primary_name = def.main_alias();
+            let aliases = python_command_aliases(def);
 
             if let Some(synopsis) = def.synopsis().map(|s| s.to_string()) {
-                py_table.set_item(py, primary_name, (doc, def.flags(), synopsis))?;
+                py_table.set_item(py, aliases, (doc, def.flags(), synopsis))?;
             } else {
-                py_table.set_item(py, primary_name, (doc, def.flags()))?;
+                py_table.set_item(py, aliases, (doc, def.flags()))?;
             }
         }
         Ok(py_table)

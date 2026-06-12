@@ -8,8 +8,20 @@
 // [cats]
 // entry_name.priority=20
 // entry_name.path=/var/boo/cat
+// entry_name.type=forwarded  # If not present, "forwarded" is the default.
 // different_entry_name.priority=5
-// different_entry_name.more_custom_data=/some/other
+// different_entry_name.path=/some/other
+// different_entry_name.type=auth
+// different_entry_name.wanted-key=scm_service_identity
+//
+// Forwarded and auth types are completely orthogonal. Each type is
+// resolved independently to the highest-priority group of that type.
+// The same token file can appear in groups of both types, causing it
+// to be sent in both x-forwarded-cats and x-auth-cats headers.
+//
+// When wanted-key is set, the JSON file is read as a map
+// and only the value at that key is sent. Without it, the default
+// "crypto_auth_tokens" key is used.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,16 +42,45 @@ pub struct MissingCATs {
     missing: Vec<PathBuf>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Cats {
+#[derive(Deserialize)]
+struct PremintedCats {
     crypto_auth_tokens: String,
+    #[serde(flatten)]
+    extra: HashMap<String, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CatTokenType {
+    Forwarded,
+    Auth,
+}
+
+impl CatTokenType {
+    pub fn from_type_str(s: &str) -> Result<Self> {
+        match s {
+            "forwarded" => Ok(Self::Forwarded),
+            "auth" => Ok(Self::Auth),
+            other => anyhow::bail!("unknown CAT token type: {other}"),
+        }
+    }
+
+    pub fn header_name(&self) -> &'static str {
+        match self {
+            Self::Forwarded => cats_constants::X_FORWARDED_CATS_HEADER,
+            Self::Auth => cats_constants::X_AUTH_CATS_HEADER,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatGroup {
     pub name: String,
     pub priority: i32,
     pub path: Option<PathBuf>,
+    pub token_type: CatTokenType,
+    #[serde(default)]
+    pub wanted_key: Option<String>,
 }
 
 impl CatGroup {
@@ -57,23 +98,31 @@ impl CatGroup {
             .transpose()?
             .unwrap_or_default();
 
+        let token_type = settings
+            .remove("type")
+            .map(|s| CatTokenType::from_type_str(&s))
+            .transpose()?
+            .unwrap_or(CatTokenType::Forwarded);
+
+        let wanted_key = settings.remove("wanted-key").map(|s| s.trim().to_string());
+
         Ok(Self {
             name,
             priority,
             path,
+            token_type,
+            wanted_key,
         })
     }
 }
 
 #[derive(Clone)]
-pub struct CatsSection<'a> {
+pub struct CatsSection {
     groups: Vec<CatGroup>,
-    #[allow(dead_code)]
-    config: &'a dyn Config,
 }
 
-impl<'a> CatsSection<'a> {
-    pub fn from_config(config: &'a dyn Config, section_name: &str) -> Self {
+impl CatsSection {
+    pub fn from_config(config: &dyn Config, section_name: &str) -> Self {
         // Use an IndexMap to preserve ordering; needed to correctly handle precedence.
         let mut groups = IndexMap::new();
 
@@ -98,15 +147,18 @@ impl<'a> CatsSection<'a> {
             .filter_map(|(group, settings)| CatGroup::new(group, settings).ok())
             .collect();
 
-        Self { groups, config }
+        Self { groups }
     }
 
-    /// Find existing cats with highest priority.
-    pub fn find_cats(&self) -> Result<Option<CatGroup>, MissingCATs> {
+    /// Find existing cats with highest priority, filtered by token type.
+    pub fn find_cats_by_type(
+        &self,
+        token_type: CatTokenType,
+    ) -> Result<Option<CatGroup>, MissingCATs> {
         let mut best: Option<&CatGroup> = None;
         let mut missing = Vec::new();
 
-        for group in &self.groups {
+        for group in self.groups.iter().filter(|g| g.token_type == token_type) {
             // If there is an existing candidate, check whether the current
             // cats entry is a more specific match.
             if let Some(best) = best {
@@ -142,18 +194,31 @@ impl<'a> CatsSection<'a> {
         }
     }
 
-    pub fn get_cats(&self) -> Result<Option<String>> {
-        if let Some(cats_group) = self.find_cats()? {
+    pub fn get_cats_by_type(&self, token_type: CatTokenType) -> Result<Option<String>> {
+        if let Some(cats_group) = self.find_cats_by_type(token_type)? {
             if let Some(path) = cats_group.path {
-                let f = std::fs::File::open(path)?;
+                let f = std::fs::File::open(&path)?;
                 let reader = std::io::BufReader::new(f);
-
-                let cats: Cats = serde_json::from_reader(reader)?;
-                let cats_data = cats.crypto_auth_tokens;
-
-                return Ok(Some(cats_data));
+                let preminted: PremintedCats = serde_json::from_reader(reader)?;
+                let token = match cats_group.wanted_key.as_deref() {
+                    Some(key) => match preminted.extra.get(key) {
+                        Some(value) => value.clone(),
+                        None => {
+                            tracing::warn!(
+                                "[cats] group {:?}: wanted-key {:?} not found in {:?}, falling back to crypto_auth_tokens",
+                                &cats_group.name,
+                                key,
+                                &path,
+                            );
+                            preminted.crypto_auth_tokens
+                        }
+                    },
+                    None => preminted.crypto_auth_tokens,
+                };
+                return Ok(Some(token));
             }
         }
+
         Ok(None)
     }
 }

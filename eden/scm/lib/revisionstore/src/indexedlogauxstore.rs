@@ -72,7 +72,7 @@ fn deserialize(bytes: Bytes) -> Result<Option<(HgId, FileAuxData)>> {
 
     let version = cur.read_u8()?;
     if version > 2 {
-        bail!("unsupported auxstore entry version {}", version);
+        bail!("unsupported auxstore entry version {version}");
     }
 
     if version == 0 {
@@ -225,6 +225,10 @@ impl AuxStore {
             // read_before_write=true to avoid the insert if the data is already present.
             true,
         )
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.0.is_dirty()
     }
 
     pub fn flush(&self) -> Result<()> {

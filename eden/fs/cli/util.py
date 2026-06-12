@@ -6,7 +6,6 @@
 
 # pyre-strict
 
-
 import abc
 import asyncio
 import binascii
@@ -41,19 +40,16 @@ from typing import (
     TypeVar,
 )
 
-import thrift.transport
-from eden.thrift.legacy import EdenClient, EdenNotRunningError
-from facebook.eden.ttypes import TreeInodeDebugInfo
-from fb303_core.ttypes import fb303_status
-from thrift import Thrift
+from eden.fs.service.eden.thrift_types import TreeInodeDebugInfo
+from eden.thrift.client import EdenNotRunningError
+from fb303_core.thrift_types import fb303_status
+from thrift.python.exceptions import Error, TransportError
 
 if TYPE_CHECKING:
     from .config import EdenCheckout, EdenInstance
 
 if sys.platform != "win32":
     import pwd
-else:
-    import winreg
 
 
 class EdensparseMigrationStep(enum.Enum):
@@ -132,7 +128,9 @@ class HealthStatus:
 
     def __str__(self) -> str:
         return "(%s, pid=%s, uptime=%s, detail=%r)" % (
-            fb303_status._VALUES_TO_NAMES.get(self.status, str(self.status)),
+            self.status.name
+            if isinstance(self.status, fb303_status)
+            else str(self.status),
             self.pid,
             self.uptime,
             self.detail,
@@ -263,7 +261,7 @@ def _create_dead_health_status() -> HealthStatus:
 
 
 def check_health(
-    get_client: Callable[..., EdenClient],
+    get_client: Callable[..., Any],
     config_dir: Path,
     timeout: Optional[float] = None,
 ) -> HealthStatus:
@@ -291,27 +289,29 @@ def check_health(
             assert status_value is not None
             status = status_value
             uptime = info.uptime
-    except (EdenNotRunningError, thrift.transport.TTransport.TTransportException):
+    except (
+        EdenNotRunningError,
+        TransportError,
+    ):
         # It is possible that the edenfs process is running, but the Thrift
         # server is not running. This could be during the startup, shutdown,
         # or takeover of the edenfs process. As a backup to requesting the
         # PID from the Thrift server, we read it from the lockfile and try
         # to deduce the current status of EdenFS.
         return check_health_using_lockfile(config_dir)
-    except Thrift.TException as ex:
+    except Error as ex:
         detail = "error talking to edenfs: " + str(ex)
         return HealthStatus(status, pid, uptime, detail)
 
-    status_name = fb303_status._VALUES_TO_NAMES.get(status)
+    status_name = status.name
     detail = "edenfs running (pid {}); status is {}".format(pid, status_name)
     return HealthStatus(status, pid, uptime, detail)
 
 
 def wait_for_daemon_healthy(
-    # pyre-fixme[24]: Generic type `subprocess.Popen` expects 1 type parameter.
-    proc: subprocess.Popen,
+    proc: subprocess.Popen[bytes],
     config_dir: Path,
-    get_client: Callable[..., EdenClient],
+    get_client: Callable[..., Any],
     timeout: float,
     exclude_pid: Optional[int] = None,
 ) -> HealthStatus:
@@ -384,8 +384,8 @@ def get_chef_log_path(platform: str) -> Optional[str]:
 
 def get_home_dir() -> Path:
     # NOTE: Path.home() should work on all platforms, but we would want
-    # to be careful about making that change in case users have muddled with
-    # their HOME env var or if the resolution is weird in a containairzed
+    # careful about making that change in case users have muddled with
+    # their HOME env var or if the resolution is weird in a containerized
     # environment. It would be worth having some external logging to count
     # mismatches between the two approaches
     home_dir = None
@@ -700,7 +700,7 @@ def get_eden_mount_name(path_arg: str) -> str:
         except OSError as e:
             # WinError 369 is "The provider that supports file system
             # virtualization is temporarily unavailable". This usually
-            # indicates the path is leftover of a previous EdednFS mount.
+            # indicates the path is leftover of a previous EdenFS mount.
             if e.winerror == 369:
                 raise NotAnEdenMountError(path_arg)
             raise
@@ -815,7 +815,7 @@ def get_eden_cli_cmd(argv: List[str] = sys.argv) -> List[str]:
 
 
 # some processes like hg and arc are sensitive about their environments, we
-# clear variables that might make problems for their dynamic linking.
+# clear variables that might cause problems for their dynamic linking.
 # note buck is even more sensitive see buck.run_buck_command
 def get_environment_suitable_for_subprocess() -> Dict[str, str]:
     env = os.environ.copy()
@@ -1039,40 +1039,6 @@ def get_enable_sqlite_overlay(overlay_type: Optional[str]) -> bool:
         return sys.platform == "win32"
 
     return overlay_type == "sqlite"
-
-
-if sys.platform == "win32":
-
-    def get_windows_build():
-        try:
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
-            ) as key:
-                ubr, _ = winreg.QueryValueEx(key, "UBR")
-                build, _ = winreg.QueryValueEx(key, "CurrentBuild")
-                return (int(build), int(ubr))
-        except FileNotFoundError:
-            return None
-
-
-def can_enable_windows_symlinks() -> bool:
-    if sys.platform != "win32":
-        return False
-    elif (
-        "INTEGRATION_TEST" in os.environ
-        or "EDENFS_UNITTEST" in os.environ
-        or "TESTTMP" in os.environ
-    ):
-        return True
-    else:
-        build = get_windows_build()
-        # There is an issue with symlinks on Windows 10 on builds older than
-        # 19045.4957 (a.k.a., KB5043131). Here 19045 corresponds to the Build
-        # number and 4957 corresponds to the Update Build Revision. Windows 10
-        # 22H2 is 19045 and Windows 11 starts at 22000. Also, see:
-        # https://en.wikipedia.org/wiki/List_of_Microsoft_Windows_versions
-        return build and build >= (19045, 4957)
 
 
 def maybe_edensparse_migration(
@@ -1490,7 +1456,7 @@ def maybe_edensparse_migration(
             migration_exceptions.append(
                 f"Migration exception: {checkout.path}\n{traceback.format_exc()}"
             )
-            print("rollbacking changes...", file=sys.stderr)
+            print("rolling back changes...", file=sys.stderr)
 
             if step == EdensparseMigrationStep.POST_EDEN_START:
                 # Restore Step 1 backups if they exist (for cross-step rollback)
@@ -1561,7 +1527,7 @@ class NaiveFaultInjector:
     """
     A naive fault injector that injects faults by raising exceptions when needed.
 
-    Injector knows when to faise an exception by checking if a file with
+    Injector knows when to raise an exception by checking if a file with
     the specified key exists in the eden client state directory.
 
     Ideally this should only be used in tests:

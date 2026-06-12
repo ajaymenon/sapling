@@ -13,7 +13,7 @@ license = "MIT"
 name = "configset"
 
 [dependencies]
-indexmap = { version = "2.13.0", features = ["arbitrary", "rayon", "serde"] }
+indexmap = { version = "2.14.0", features = ["arbitrary", "rayon", "serde"] }
 sapling-configmodel = { version = "0.1.0", path = "../model" }
 sapling-hgrc-parser = { version = "0.1.0", path = "../hgrc-parser" }
 sapling-minibytes = { version = "0.1.0", path = "../../minibytes" }
@@ -21,4 +21,4 @@ sapling-util = { version = "0.1.0", path = "../../util" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-tempfile = "3.22"
+tempfile = "3.27.0"

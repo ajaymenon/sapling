@@ -8,11 +8,14 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Duration;
 
+use acl_manifest::RootAclManifestId;
 use anyhow::Error;
 use async_trait::async_trait;
 use basename_suffix_skeleton_manifest_v3::RootBssmV3DirectoryId;
 use blame::RootBlameV2;
+use blame::RootBlameV3;
 use case_conflict_skeleton_manifest::RootCaseConflictSkeletonManifestId;
 use changeset_info::ChangesetInfo;
 use cloned::cloned;
@@ -22,12 +25,15 @@ use deleted_manifest::RootDeletedManifestV2Id;
 use derivation_queue_thrift::DerivationPriority;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
+use derived_data_manager::DerivableUntopologically;
 use derived_data_manager::DerivationError;
 use derived_data_manager::DerivedDataManager;
 use derived_data_manager::Rederivation;
 use derived_data_manager::SharedDerivationError;
 use derived_data_manager::VisitedDerivableTypesMap;
 use derived_data_manager::VisitedDerivableTypesMapStatic;
+use derived_data_manager::derivable::DerivationDependencies;
+use directory_branch_cluster_manifest::RootDirectoryBranchClusterManifestId;
 use fastlog::RootFastlog;
 use filenodes_derivation::FilenodesOnlyPublic;
 use fsnodes::RootFsnodeId;
@@ -37,12 +43,16 @@ use futures::stream;
 use git_types::MappedGitCommitId;
 use git_types::RootGitDeltaManifestV2Id;
 use git_types::RootGitDeltaManifestV3Id;
+use history_manifest::RootHistoryManifestDirectoryId;
 use inferred_copy_from::RootInferredCopyFromId;
 use itertools::Itertools;
 use mercurial_derivation::MappedHgChangesetId;
 use mercurial_derivation::RootHgAugmentedManifestId;
 use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableUntopologicallyVariant;
+use mononoke_types::MPath;
+use mononoke_types::PipelineDerivableVariant;
 use skeleton_manifest::RootSkeletonManifestId;
 use skeleton_manifest_v2::RootSkeletonManifestV2Id;
 use test_manifest::RootTestManifestDirectory;
@@ -117,6 +127,25 @@ pub trait BulkDerivation {
         derived_data_type: DerivableType,
     ) -> Result<bool, DerivationError>;
 
+    /// Check if the given derived data type's specific stage is derived for the given changeset id.
+    async fn is_stage_derived(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        derived_data_type: DerivableType,
+        stage_path: &MPath,
+    ) -> Result<bool, DerivationError>;
+
+    /// Verify that a stage output is consistent with the canonical derived
+    /// value.
+    async fn verify_stage_output(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        derived_data_type: DerivableType,
+        stage_path: &MPath,
+    ) -> Result<bool, DerivationError>;
+
     /// Returns a `Vec` that contains all changeset ids that don't have the given
     /// derived data type derived from the given changeset ids.
     async fn pending(
@@ -150,15 +179,21 @@ pub trait BulkDerivation {
         derived_data_type: DerivableType,
     ) -> Result<u64, DerivationError>;
 
-    /// Derive the given derived data type for the given changeset id, using its
-    /// predecessor derived data types.
-    async fn derive_from_predecessor(
+    /// Derive the given derived data type for the given changeset id, without
+    /// depending on derived data for its parents.
+    async fn unsafe_derive_untopologically(
         &self,
         ctx: &CoreContext,
         csid: ChangesetId,
         rederivation: Option<Arc<dyn Rederivation>>,
         derived_data_type: DerivableType,
     ) -> Result<(), DerivationError>;
+
+    /// Returns the derivable types that the given type statically depends on,
+    /// as declared via the `dependencies!` macro on its `BonsaiDerivable` impl.
+    ///
+    /// Only direct dependencies are returned (no transitive closure).
+    fn dependency_types(&self, derived_data_type: DerivableType) -> Vec<DerivableType>;
 }
 
 struct SingleTypeManager<T: BonsaiDerivable> {
@@ -228,19 +263,14 @@ trait SingleTypeDerivation: Send + Sync {
         rederivation: Option<Arc<dyn Rederivation>>,
     ) -> Result<u64, DerivationError>;
 
-    async fn derive_from_predecessor(
-        &self,
-        ctx: &CoreContext,
-        csid: ChangesetId,
-        rederivation: Option<Arc<dyn Rederivation>>,
-    ) -> Result<(), DerivationError>;
-
     async fn derive(
         &self,
         ctx: &CoreContext,
         csid: ChangesetId,
         rederivation: Option<Arc<dyn Rederivation>>,
     ) -> Result<(), SharedDerivationError>;
+
+    fn dependency_types(&self) -> Vec<DerivableType>;
 }
 
 #[async_trait]
@@ -326,7 +356,7 @@ impl<T: BonsaiDerivable> SingleTypeDerivation for SingleTypeManager<T> {
             .await?;
         Ok(derived
             .into_iter()
-            .map(|(csid, derived)| (csid, format!("{:?}", derived)))
+            .map(|(csid, derived)| (csid, format!("{derived:?}")))
             .collect())
     }
 
@@ -341,18 +371,6 @@ impl<T: BonsaiDerivable> SingleTypeDerivation for SingleTypeManager<T> {
             .await
     }
 
-    async fn derive_from_predecessor(
-        &self,
-        ctx: &CoreContext,
-        csid: ChangesetId,
-        rederivation: Option<Arc<dyn Rederivation>>,
-    ) -> Result<(), DerivationError> {
-        self.manager
-            .derive_from_predecessor::<T>(ctx, csid, rederivation)
-            .await?;
-        Ok(())
-    }
-
     async fn derive(
         &self,
         ctx: &CoreContext,
@@ -361,6 +379,35 @@ impl<T: BonsaiDerivable> SingleTypeDerivation for SingleTypeManager<T> {
     ) -> Result<(), SharedDerivationError> {
         self.manager
             .derive::<T>(ctx, csid, rederivation, DerivationPriority::LOW)
+            .await?;
+        Ok(())
+    }
+
+    fn dependency_types(&self) -> Vec<DerivableType> {
+        <T::Dependencies as DerivationDependencies>::iter().collect()
+    }
+}
+
+#[async_trait]
+trait SingleTypeUntopologicalDerivation: Send + Sync {
+    async fn unsafe_derive_untopologically(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        rederivation: Option<Arc<dyn Rederivation>>,
+    ) -> Result<(), DerivationError>;
+}
+
+#[async_trait]
+impl<T: DerivableUntopologically> SingleTypeUntopologicalDerivation for SingleTypeManager<T> {
+    async fn unsafe_derive_untopologically(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        rederivation: Option<Arc<dyn Rederivation>>,
+    ) -> Result<(), DerivationError> {
+        self.manager
+            .unsafe_derive_untopologically::<T>(ctx, csid, rederivation)
             .await?;
         Ok(())
     }
@@ -374,6 +421,7 @@ fn manager_for_type(
     match derived_data_type {
         DerivableType::Unodes => Arc::new(SingleTypeManager::<RootUnodeManifestId>::new(manager)),
         DerivableType::BlameV2 => Arc::new(SingleTypeManager::<RootBlameV2>::new(manager)),
+        DerivableType::BlameV3 => Arc::new(SingleTypeManager::<RootBlameV3>::new(manager)),
         DerivableType::FileNodes => {
             Arc::new(SingleTypeManager::<FilenodesOnlyPublic>::new(manager))
         }
@@ -412,12 +460,174 @@ fn manager_for_type(
             Arc::new(SingleTypeManager::<RootInferredCopyFromId>::new(manager))
         }
         DerivableType::BssmV3 => Arc::new(SingleTypeManager::<RootBssmV3DirectoryId>::new(manager)),
+        DerivableType::DirectoryBranchClusterManifest => {
+            Arc::new(SingleTypeManager::<RootDirectoryBranchClusterManifestId>::new(manager))
+        }
         DerivableType::TestManifests => {
             Arc::new(SingleTypeManager::<RootTestManifestDirectory>::new(manager))
         }
         DerivableType::TestShardedManifests => Arc::new(SingleTypeManager::<
             RootTestShardedManifestDirectory,
         >::new(manager)),
+        DerivableType::AclManifests => {
+            Arc::new(SingleTypeManager::<RootAclManifestId>::new(manager))
+        }
+        DerivableType::HistoryManifests => Arc::new(SingleTypeManager::<
+            RootHistoryManifestDirectoryId,
+        >::new(manager)),
+    }
+}
+
+fn manager_for_derivable_untopologically_variant(
+    manager: &DerivedDataManager,
+    variant: DerivableUntopologicallyVariant,
+) -> Arc<dyn SingleTypeUntopologicalDerivation + Send + Sync + 'static> {
+    let manager = manager.clone();
+    match variant {
+        DerivableUntopologicallyVariant::BssmV3 => {
+            Arc::new(SingleTypeManager::<RootBssmV3DirectoryId>::new(manager))
+        }
+        DerivableUntopologicallyVariant::ContentManifests => {
+            Arc::new(SingleTypeManager::<RootContentManifestId>::new(manager))
+        }
+        DerivableUntopologicallyVariant::HgAugmentedManifests => {
+            Arc::new(SingleTypeManager::<RootHgAugmentedManifestId>::new(manager))
+        }
+        DerivableUntopologicallyVariant::SkeletonManifestsV2 => {
+            Arc::new(SingleTypeManager::<RootSkeletonManifestV2Id>::new(manager))
+        }
+        DerivableUntopologicallyVariant::Ccsm => {
+            Arc::new(SingleTypeManager::<RootCaseConflictSkeletonManifestId>::new(manager))
+        }
+        DerivableUntopologicallyVariant::GitDeltaManifestsV3 => {
+            Arc::new(SingleTypeManager::<RootGitDeltaManifestV3Id>::new(manager))
+        }
+        DerivableUntopologicallyVariant::InferredCopyFrom => {
+            Arc::new(SingleTypeManager::<RootInferredCopyFromId>::new(manager))
+        }
+        DerivableUntopologicallyVariant::TestShardedManifests => Arc::new(SingleTypeManager::<
+            RootTestShardedManifestDirectory,
+        >::new(manager)),
+        DerivableUntopologicallyVariant::AclManifests => {
+            Arc::new(SingleTypeManager::<RootAclManifestId>::new(manager))
+        }
+    }
+}
+
+pub async fn derive_stage_batch(
+    ddm: &DerivedDataManager,
+    ctx: &CoreContext,
+    csids: Vec<ChangesetId>,
+    payload: &derived_data_manager::DerivationStagePayload,
+    variant: PipelineDerivableVariant,
+) -> Result<Duration, DerivationError> {
+    match variant {
+        PipelineDerivableVariant::Fsnodes => {
+            ddm.derive_stage_batch::<RootFsnodeId>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::Unodes => {
+            ddm.derive_stage_batch::<RootUnodeManifestId>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifestsV2 => {
+            ddm.derive_stage_batch::<RootSkeletonManifestV2Id>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifests => {
+            ddm.derive_stage_batch::<RootSkeletonManifestId>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::BlameV2 => {
+            ddm.derive_stage_batch::<RootBlameV2>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::Fastlog => {
+            ddm.derive_stage_batch::<RootFastlog>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::AclManifests => {
+            ddm.derive_stage_batch::<RootAclManifestId>(ctx, csids, payload)
+                .await
+        }
+    }
+}
+
+pub async fn is_stage_derived(
+    ddm: &DerivedDataManager,
+    ctx: &CoreContext,
+    csid: ChangesetId,
+    stage_path: &MPath,
+    variant: PipelineDerivableVariant,
+) -> Result<bool, DerivationError> {
+    match variant {
+        PipelineDerivableVariant::Fsnodes => {
+            ddm.is_stage_derived::<RootFsnodeId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::Unodes => {
+            ddm.is_stage_derived::<RootUnodeManifestId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifestsV2 => {
+            ddm.is_stage_derived::<RootSkeletonManifestV2Id>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifests => {
+            ddm.is_stage_derived::<RootSkeletonManifestId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::BlameV2 => {
+            ddm.is_stage_derived::<RootBlameV2>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::Fastlog => {
+            ddm.is_stage_derived::<RootFastlog>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::AclManifests => {
+            ddm.is_stage_derived::<RootAclManifestId>(ctx, csid, stage_path)
+                .await
+        }
+    }
+}
+
+pub async fn verify_stage_output(
+    ddm: &DerivedDataManager,
+    ctx: &CoreContext,
+    csid: ChangesetId,
+    stage_path: &MPath,
+    variant: PipelineDerivableVariant,
+) -> Result<bool, DerivationError> {
+    match variant {
+        PipelineDerivableVariant::Fsnodes => {
+            ddm.verify_stage_output::<RootFsnodeId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::Unodes => {
+            ddm.verify_stage_output::<RootUnodeManifestId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifestsV2 => {
+            ddm.verify_stage_output::<RootSkeletonManifestV2Id>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifests => {
+            ddm.verify_stage_output::<RootSkeletonManifestId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::BlameV2 => {
+            ddm.verify_stage_output::<RootBlameV2>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::Fastlog => {
+            ddm.verify_stage_output::<RootFastlog>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::AclManifests => {
+            ddm.verify_stage_output::<RootAclManifestId>(ctx, csid, stage_path)
+                .await
+        }
     }
 }
 
@@ -521,6 +731,28 @@ impl BulkDerivation for DerivedDataManager {
         manager.is_derived(ctx, csid, rederivation).await
     }
 
+    async fn is_stage_derived(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        derived_data_type: DerivableType,
+        stage_path: &MPath,
+    ) -> Result<bool, DerivationError> {
+        let variant = derived_data_type.into_pipeline_derivable_variant()?;
+        is_stage_derived(self, ctx, csid, stage_path, variant).await
+    }
+
+    async fn verify_stage_output(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        derived_data_type: DerivableType,
+        stage_path: &MPath,
+    ) -> Result<bool, DerivationError> {
+        let variant = derived_data_type.into_pipeline_derivable_variant()?;
+        verify_stage_output(self, ctx, csid, stage_path, variant).await
+    }
+
     async fn pending(
         &self,
         ctx: &CoreContext,
@@ -554,16 +786,21 @@ impl BulkDerivation for DerivedDataManager {
         manager.count_underived(ctx, csid, rederivation).await
     }
 
-    async fn derive_from_predecessor(
+    async fn unsafe_derive_untopologically(
         &self,
         ctx: &CoreContext,
         csid: ChangesetId,
         rederivation: Option<Arc<dyn Rederivation>>,
         derived_data_type: DerivableType,
     ) -> Result<(), DerivationError> {
-        let manager = manager_for_type(self, derived_data_type);
+        let variant = derived_data_type.into_derivable_untopologically_variant()?;
+        let manager = manager_for_derivable_untopologically_variant(self, variant);
         manager
-            .derive_from_predecessor(ctx, csid, rederivation)
+            .unsafe_derive_untopologically(ctx, csid, rederivation)
             .await
+    }
+
+    fn dependency_types(&self, derived_data_type: DerivableType) -> Vec<DerivableType> {
+        manager_for_type(self, derived_data_type).dependency_types()
     }
 }

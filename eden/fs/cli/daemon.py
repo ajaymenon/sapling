@@ -6,12 +6,15 @@
 
 # pyre-strict
 
+import datetime
 import os
+import re
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from eden.fs.cli.util import (
     EdensparseMigrationStep,
@@ -34,6 +37,93 @@ from .util import is_apple_silicon, poll_until, print_stderr, ShutdownError
 # killing the old process but without starting the new process, which is
 # generally undesirable if we can avoid it.
 DEFAULT_SIGKILL_TIMEOUT = 30.0
+
+EDENFS_UNIT_NAME_TEMPLATE = "edenfs@{escaped_state_dir}.service"
+EDENFS_SYSTEMD_SERVICE_UNIT = Path("/usr/lib/systemd/user/edenfs@.service")
+EDENFS_SYSTEMD_SLICE_UNIT = Path("/usr/lib/systemd/user/edenfs.slice")
+
+
+def _sanitize_unit_name(eden_dir: str) -> str:
+    """Build a systemd unit name from the eden state directory path.
+
+    Systemd treats '-' and ':' as special characters in unit names, so replace
+    them with '_'.
+    Append the current UNIX timestamp to avoid collisions during graceful restart
+    where old and new scopes coexist briefly.
+    """
+    sanitized = re.sub(r"[^a-zA-Z0-9_./]", "_", eden_dir).strip("/").replace("/", "_")
+    return f"edenfs_{sanitized}_{os.getpid()}_{int(time.time())}"
+
+
+def _build_systemd_run_cmd(edenfs_cmd: List[str], eden_dir: str) -> List[str]:
+    """Wrap an edenfs command in systemd-run for cgroup isolation.
+
+    Places edenfs in a transient scope under a dedicated eden.slice
+    """
+    unit_name = _sanitize_unit_name(eden_dir)
+    return [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--property=Delegate=yes",
+        "--slice=edenfs",
+        f"--unit={unit_name}",
+    ] + edenfs_cmd
+
+
+def _ensure_dbus_env(env: Dict[str, str]) -> bool:
+    """Ensure D-Bus session vars are present in *env*.
+
+    If ``XDG_RUNTIME_DIR`` or ``DBUS_SESSION_BUS_ADDRESS`` are missing,
+    falls back to the standard systemd paths derived from the UID.
+
+    Returns True if the vars are now set, False if the D-Bus socket does
+    not exist.
+    """
+    if "XDG_RUNTIME_DIR" in env and "DBUS_SESSION_BUS_ADDRESS" in env:
+        return True
+    uid = os.getuid()
+    xdg_runtime_dir = env.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    dbus_socket = f"{xdg_runtime_dir}/bus"
+    if not os.path.exists(dbus_socket):
+        return False
+    env.setdefault("XDG_RUNTIME_DIR", xdg_runtime_dir)
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={dbus_socket}")
+    return True
+
+
+def get_systemd_user_env() -> Optional[Dict[str, str]]:
+    """Return os.environ with D-Bus vars ensured, or None if unavailable."""
+    env = os.environ.copy()
+    if not _ensure_dbus_env(env):
+        return None
+    return env
+
+
+def _try_setup_systemd_env(
+    eden_env: Dict[str, str],
+    instance: "EdenInstance",
+) -> bool:
+    """Ensure the D-Bus session env vars are available for systemd --user commands.
+
+    get_edenfs_environment() preserves them from os.environ when present.
+    When invoked from a system service (e.g. edenfs_restarter timer), they may
+    be missing.  Fall back to the standard systemd paths derived from the UID.
+    If the D-Bus socket does not exist, skip systemd entirely.
+
+    Returns True if the env is ready, False to fall back to direct daemon
+    management.
+    """
+    if not _ensure_dbus_env(eden_env):
+        instance.log_sample(
+            "systemd_setup",
+            success=False,
+            reason=f"dbus_socket_not_found at {eden_env.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/bus",
+        )
+        return False
+    return True
 
 
 def wait_for_process_exit(pid: int, timeout: float) -> bool:
@@ -61,6 +151,7 @@ def wait_for_shutdown(
     config_dir: Path,
     timeout: float,
     kill_timeout: float = DEFAULT_SIGKILL_TIMEOUT,
+    instance: Optional["EdenInstance"] = None,
 ) -> bool:
     """Wait for a process to exit.
 
@@ -83,12 +174,49 @@ def wait_for_shutdown(
         "within {} seconds. Attempting SIGKILL.",
         timeout,
     )
-    sigkill_process(pid, config_dir, timeout=kill_timeout)
+    sigkill_process(pid, config_dir, timeout=kill_timeout, instance=instance)
     return False
 
 
+def _send_sigkill(
+    pid: int,
+    instance: Optional["EdenInstance"] = None,
+) -> None:
+    """Send SIGKILL to edenfs via systemctl or direct signal."""
+    if instance is not None and sys.platform == "linux":
+        try:
+            unit = _get_systemd_unit(instance)
+            if _is_systemd_unit_active(unit):
+                systemd_env = get_systemd_user_env()
+                subprocess.run(
+                    ["systemctl", "--user", "kill", "--signal=KILL", unit],
+                    env=systemd_env,
+                )
+                subprocess.run(
+                    ["systemctl", "--user", "stop", unit],
+                    env=systemd_env,
+                )
+                return
+        except (RuntimeError, OSError) as ex:
+            print_stderr(
+                f"Failed to kill edenfs via systemctl, falling back to "
+                f"direct signal: {ex}"
+            )
+
+    proc_utils: proc_utils_mod.ProcUtils = proc_utils_mod.new()
+    try:
+        proc_utils.kill_process(pid)
+    except PermissionError as ex:
+        raise ShutdownError(
+            f"Received a permission error when attempting to kill edenfs: {ex}"
+        )
+
+
 def sigkill_process(
-    pid: int, config_dir: Path, timeout: float = DEFAULT_SIGKILL_TIMEOUT
+    pid: int,
+    config_dir: Path,
+    timeout: float = DEFAULT_SIGKILL_TIMEOUT,
+    instance: Optional["EdenInstance"] = None,
 ) -> None:
     """Send SIGKILL to a process, and wait for it to exit.
 
@@ -116,13 +244,7 @@ def sigkill_process(
         except Exception as e:
             print_stderr(f"Failed to delete heartbeat file {heartbeat_file}: {e}")
 
-    proc_utils: proc_utils_mod.ProcUtils = proc_utils_mod.new()
-    try:
-        proc_utils.kill_process(pid)
-    except PermissionError as ex:
-        raise ShutdownError(
-            f"Received a permission error when attempting to kill edenfs: {ex}"
-        )
+    _send_sigkill(pid, instance)
 
     if timeout <= 0:
         return
@@ -201,6 +323,23 @@ def _start_edenfs_service(
     # prepare_edenfs_privileges for more info.
     cmd, eden_env = prepare_edenfs_privileges(daemon_binary, cmd, eden_env, privhelper)
 
+    if should_use_systemd_lifecycle_management(instance) and _try_setup_systemd_env(
+        eden_env, instance
+    ):
+        return _systemctl_start_or_reload(instance, cmd, eden_env, takeover)
+
+    if (
+        sys.platform == "linux"
+        and instance.get_config_bool(
+            "experimental.systemd-cgroup-isolation", default=False
+        )
+        and _try_setup_systemd_env(eden_env, instance)
+    ):
+        cmd = _build_systemd_run_cmd(cmd, str(instance.state_dir))
+        use_systemd_cgroup = True
+    else:
+        use_systemd_cgroup = False
+
     creation_flags = 0
 
     maybe_edensparse_migration(instance, EdensparseMigrationStep.PRE_EDEN_START)
@@ -208,7 +347,214 @@ def _start_edenfs_service(
         cmd, stdin=subprocess.DEVNULL, env=eden_env, creationflags=creation_flags
     )
     maybe_edensparse_migration(instance, EdensparseMigrationStep.POST_EDEN_START)
+
+    if use_systemd_cgroup:
+        instance.log_sample(
+            "systemd_cgroup_start",
+            success=exit_code == 0,
+            is_takeover=takeover,
+            exit_signal=exit_code,
+        )
+
     return exit_code
+
+
+def _get_systemd_unit(instance: EdenInstance) -> str:
+    """Compute the systemd unit name for this instance.
+
+    Uses systemd-escape to produce the canonical path encoding for the state
+    directory.  Raises if systemd-escape is not available or fails.
+    """
+    config_dir = str(instance.state_dir)
+    try:
+        escaped = subprocess.check_output(
+            ["systemd-escape", "--path", config_dir],
+            text=True,
+        ).strip()
+    except FileNotFoundError:
+        raise RuntimeError(
+            "systemd-escape is not installed; cannot construct systemd unit name"
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"systemd-escape failed for {config_dir}: {e}") from e
+    return EDENFS_UNIT_NAME_TEMPLATE.format(escaped_state_dir=escaped)
+
+
+def should_use_systemd_lifecycle_management(instance: EdenInstance) -> bool:
+    """Check whether this EdenFS instance should use systemd for lifecycle management.
+
+    Returns True only when all of the following are satisfied:
+    1. Running on Linux
+    2. The config key experimental.systemd-managed-lifecycle is true
+    3. The systemd unit files are installed on disk
+    """
+    if sys.platform != "linux":
+        return False
+    if not instance.get_config_bool(
+        "experimental.systemd-managed-lifecycle", default=False
+    ):
+        return False
+    return _systemd_unit_files_installed()
+
+
+def _systemd_unit_files_installed() -> bool:
+    """Check whether the required systemd unit files are installed on disk."""
+    missing = [
+        str(p)
+        for p in (EDENFS_SYSTEMD_SERVICE_UNIT, EDENFS_SYSTEMD_SLICE_UNIT)
+        if not p.exists()
+    ]
+    if missing:
+        print_stderr(
+            f"warning: systemd-managed-lifecycle is enabled in config but "
+            f"the following unit files were not found: {', '.join(missing)}. "
+            f"Falling back to direct daemon management."
+        )
+        return False
+    return True
+
+
+def _is_systemd_unit_active(unit: str) -> bool:
+    """Check whether the systemd unit for this instance is currently active."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", unit],
+            env=get_systemd_user_env(),
+        )
+        return result.returncode == 0
+    except OSError:
+        return False
+
+
+def print_systemd_status_full(instance: "EdenInstance") -> None:
+    """Print full systemctl status output for this instance's systemd unit."""
+    try:
+        unit = _get_systemd_unit(instance)
+        subprocess.run(
+            ["systemctl", "--user", "status", "--no-pager", unit],
+            env=get_systemd_user_env(),
+        )
+    except (RuntimeError, OSError) as e:
+        print_stderr(f"warning: failed to get status of edenfs service unit: {e}")
+        return
+
+
+def _rotate_startup_log(log_path: Path, keep: int = 5) -> None:
+    """Rotate the startup log, keeping the last `keep` copies.
+
+    Renames the current log to include its last-modified timestamp, then
+    removes the oldest copies beyond `keep`.
+    """
+    try:
+        if not log_path.exists():
+            return
+        mtime = log_path.stat().st_mtime
+        ts = datetime.datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
+        rotated = log_path.with_name(f"{log_path.name}.{ts}")
+        log_path.rename(rotated)
+    except OSError as e:
+        print_stderr(f"warning: failed to rotate startup log: {e}")
+        # If we can't rotate, just truncate.
+        try:
+            log_path.write_text("")
+        except OSError as e2:
+            print_stderr(f"warning: failed to truncate startup log: {e2}")
+        return
+
+    # Prune old rotated logs beyond the retention limit.
+    try:
+        prefix = f"{log_path.name}."
+        rotated_logs = sorted(
+            (p for p in log_path.parent.iterdir() if p.name.startswith(prefix)),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        for old in rotated_logs[keep:]:
+            old.unlink(missing_ok=True)
+    except OSError as e:
+        print_stderr(f"warning: failed to prune old startup logs: {e}")
+
+
+def _extract_daemon_error(startup_log_content: str) -> Optional[str]:
+    """Return the error portion of the daemon's startup log.
+
+    Lines before the "Starting edenfs" marker are XLOG noise emitted before
+    redirectOutput() and are not useful for diagnostics.  Returns None if the
+    marker is absent or there is no content after it.
+    """
+    lines = startup_log_content.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("Starting edenfs"):
+            filtered = "\n".join(lines[i + 1 :]).strip()
+            return filtered if filtered else None
+    return None
+
+
+def _systemctl_start_or_reload(
+    instance: EdenInstance,
+    cmd: List[str],
+    eden_env: Dict[str, str],
+    takeover: bool,
+) -> int:
+    """Start or reload the edenfs systemd service.
+
+    Writes the daemon command and environment to an args file, then calls
+    systemctl start (fresh start) or systemctl reload (takeover).
+    """
+    instance.state_dir.mkdir(parents=True, exist_ok=True)
+    daemon_util.write_systemd_args_file(instance.state_dir, cmd, eden_env)
+    unit = _get_systemd_unit(instance)
+    if takeover and _is_systemd_unit_active(unit):
+        action = "reload"
+    else:
+        action = "start"
+
+    # Rotate old startup logs before launching so we only capture output
+    # from this invocation.  systemd uses StandardOutput=file: which appends,
+    # so stale content would otherwise leak into the CLI output.
+    # TODO: make the retention count configurable
+    startup_log = instance.state_dir / daemon_util.SYSTEMD_STARTUP_LOG_FILENAME
+    _rotate_startup_log(startup_log, keep=5)
+
+    start_time = time.time()
+    result = subprocess.run(
+        ["systemctl", "--user", action, unit],
+        capture_output=True,
+        text=True,
+        env=eden_env,
+    )
+    rc = result.returncode
+
+    # Display the daemon's startup output captured by systemd (StandardOutput=file:).
+    # Only read if created after we invoked systemctl, to avoid showing stale content
+    # from a previous run if log rotation failed.
+    startup_log_content: Optional[str] = None
+    try:
+        if startup_log.exists() and startup_log.stat().st_mtime >= start_time:
+            startup_log_content = startup_log.read_text()
+            sys.stderr.write(startup_log_content)
+    except OSError as e:
+        print_stderr(f"warning: failed to read startup log: {e}")
+
+    sample_kwargs: Dict[str, Union[bool, int, str]] = {
+        "action": action,
+        "success": rc == 0,
+        "exit_code": rc,
+    }
+    if result.stderr:
+        sample_kwargs["error"] = result.stderr
+    if rc != 0:
+        if result.stderr:
+            print_stderr(result.stderr)
+        # Always check the startup log for daemon errors independently of
+        # systemctl stderr — systemctl's generic "Job failed" message doesn't
+        # contain the actual daemon error (e.g. "error starting EdenFS: ...").
+        if startup_log_content:
+            daemon_error = _extract_daemon_error(startup_log_content)
+            if daemon_error:
+                sample_kwargs["daemon_startup_log"] = daemon_error
+    instance.log_sample("systemctl_action", **sample_kwargs)
+    return rc
 
 
 def get_edenfsctl_cmd() -> str:
@@ -330,7 +676,7 @@ def get_edenfs_environment(
 
     # Errors from Rust will be logged to the edenfs log.
     eden_env["SL_LOG"] = (
-        "clienttelemetry=info,error,walkdetector=info,backingstore::prefetch=info"
+        "clienttelemetry=info,error,walkdetector=info,backingstore::prefetch=info,indexedlog::rotate=info"
     )
 
     if sys.platform != "win32":
@@ -374,6 +720,8 @@ def get_edenfs_environment(
         "SSH_AGENT_PID",
         "KRB5CCNAME",
         "ATLAS",
+        # Identifier of dev docker containers
+        "ATLAS_ENV_ID",
         "SANDCASTLE",
         "SANDCASTLE_ALIAS",
         "SANDCASTLE_INSTANCE_ID",
@@ -409,6 +757,12 @@ def get_edenfs_environment(
         "INSIDE_RE_WORKER",
         # Used by tests to trigger error conditions in instrumented Rust code.
         "FAILPOINTS",
+        # systemd-run --user needs these to connect to the user session bus
+        # when starting edenfs with cgroup isolation.
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        # Used to identify if edenfs was started by a coding agent
+        "CODING_AGENT_METADATA",
     ]
 
     # Add user-specified environment variables to preserve

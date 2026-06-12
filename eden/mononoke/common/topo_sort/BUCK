@@ -1,6 +1,6 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "topo_sort",
@@ -9,6 +9,5 @@ rust_library(
         "fbsource//third-party/rust:maplit",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
     ],
-    deps = [
-    ],
+    deps = [],
 )

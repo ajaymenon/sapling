@@ -17,6 +17,7 @@ mod repo_handlers;
 mod request_handler;
 mod wireproto_sink;
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -41,8 +42,6 @@ use scuba_ext::MononokeScubaSampleBuilder;
 use crate::connection_acceptor::connection_acceptor;
 pub use crate::connection_acceptor::wait_for_connections_closed;
 
-const CONFIGERATOR_RATE_LIMITING_CONFIG: &str = "scm/mononoke/ratelimiting/ratelimits";
-
 pub async fn create_repo_listeners<'a>(
     fb: FacebookInit,
     configs: Arc<MononokeConfigs>,
@@ -61,10 +60,15 @@ pub async fn create_repo_listeners<'a>(
     acl_provider: &dyn AclProvider,
     readonly: bool,
     mtls_disabled: bool,
+    is_shadow_tier: bool,
+    tls_ca_path: Option<&Path>,
+    rate_limit_config_path: Option<String>,
 ) -> Result<()> {
     let rate_limiter = {
         let handle = config_store
-            .get_config_handle_DEPRECATED(CONFIGERATOR_RATE_LIMITING_CONFIG.to_string())
+            .get_config_handle_DEPRECATED(
+                rate_limit_config_path.ok_or(anyhow::anyhow!("rate_limit_config_path is None"))?,
+            )
             .ok();
 
         let ods_counter_manager = OdsCounterManager::new(fb);
@@ -92,6 +96,9 @@ pub async fn create_repo_listeners<'a>(
             &common_config,
             readonly,
             mtls_disabled,
+            config_store,
+            is_shadow_tier,
+            tls_ca_path,
         )
         .context("Error instantiating SaplingRemoteAPI")?
     };

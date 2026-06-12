@@ -7,9 +7,9 @@ Do not strip innocent children. See https://bitbucket.org/facebook/hg-experiment
 
   $ enable absorb
 
-  $ hg init repo
+  $ sl init repo
   $ cd repo
-  $ hg debugdrawdag << EOF
+  $ sl debugdrawdag << EOF
   > E
   > |
   > D F
@@ -21,10 +21,10 @@ Do not strip innocent children. See https://bitbucket.org/facebook/hg-experiment
   > A
   > EOF
 
-  $ hg up E -q
+  $ sl up E -q
   $ echo 1 >> B
   $ echo 2 >> D
-  $ hg absorb -a
+  $ sl absorb -a
   showing changes for B
           @@ -0,1 +0,1 @@
   1124789 -B
@@ -39,7 +39,7 @@ Do not strip innocent children. See https://bitbucket.org/facebook/hg-experiment
   1124789 B
   2 of 2 chunks applied
 
-  $ hg log -G -T '{desc}'
+  $ sl log -G -T '{desc}'
   @  E
   │
   o  D

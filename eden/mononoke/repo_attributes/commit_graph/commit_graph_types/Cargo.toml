@@ -8,17 +8,17 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
 bincode = { version = "2", features = ["serde"] }
-clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 commit_graph_thrift = { version = "0.1.0", path = "if" }
 context = { version = "0.1.0", path = "../../../servers/slapi/slapi_server/context" }
-either = "1.5"
+either = "1.16.0"
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 maplit = "1.0"
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
 repo_identity = { version = "0.1.0", path = "../../repo_identity" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
-smallvec = { version = "1.15", features = ["impl_bincode", "serde", "specialization", "union"] }
-vec1 = { version = "1", features = ["serde"] }
+smallvec = { version = "1.15", features = ["impl_bincode", "serde", "specialization", "union", "write"] }
+vec1 = { version = "1.12.1", features = ["serde"] }

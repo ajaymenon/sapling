@@ -22,6 +22,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -62,6 +63,7 @@ define_stats! {
     gets_deduped: timeseries(Sum),
     gets_not_storable: timeseries(Sum),
     gets_not_storable_deduped: timeseries(Sum),
+    gets_unsharded: timeseries(Sum),
     puts: timeseries(Sum),
     puts_deduped: timeseries(Sum),
 }
@@ -79,7 +81,7 @@ struct CacheKey(String);
 
 impl CacheKey {
     fn from_key(key: &str) -> Self {
-        Self(format!("vsb.{}", key))
+        Self(format!("vsb.{key}"))
     }
 }
 
@@ -113,7 +115,7 @@ impl CacheData {
             return Ok(Self::Stored(val));
         }
 
-        Err(anyhow!("Invalid prefix: {:?}", prefix))
+        Err(anyhow!("Invalid prefix: {prefix:?}"))
     }
 }
 
@@ -151,7 +153,7 @@ impl PresenceData {
             return Ok(Self::Put(u64::from_ne_bytes(bytes)));
         }
 
-        Err(anyhow!("Invalid prefix: {:?}", prefix))
+        Err(anyhow!("Invalid prefix: {prefix:?}"))
     }
 
     fn serialize(&self) -> Bytes {
@@ -417,25 +419,36 @@ async fn shared_read<T: Blobstore + 'static>(
     Ok(inflight_read.await?)
 }
 
-fn report_deduplicated_put(ctx: &CoreContext, key: &str) {
+fn report_deduplicated_put(ctx: &CoreContext, key: &str) -> Result<()> {
     STATS::puts_deduped.add_value(1);
     let mut scuba = ctx.scuba().clone();
 
-    const DEFAULT_SAMPLING_RATE: u64 = 100000;
-
-    if let Some(sampling_rate) = NonZeroU64::new(
-        justknobs::get_as::<u64>(
-            "scm/mononoke:blobstore_deduplicated_put_sampling_rate",
-            None,
-        )
-        .unwrap_or(DEFAULT_SAMPLING_RATE),
-    ) {
+    if let Some(sampling_rate) = NonZeroU64::new(justknobs::get_as::<u64>(
+        "scm/mononoke:blobstore_deduplicated_put_sampling_rate",
+        None,
+    )) {
         scuba.sampled(sampling_rate);
     }
     scuba.add("key", key).log_with_msg("Put deduplicated", None);
 
     ctx.perf_counters()
         .increment_counter(PerfCounterType::BlobPutsDeduplicated);
+    Ok(())
+}
+
+/// JustKnob controlling how long a `get` waits to acquire its per-shard dedup
+/// semaphore before giving up and reading from the blobstore without a lease.
+/// Expressed in milliseconds; `0` disables the timeout (unbounded wait, i.e.
+/// strict per-shard serialization). Bounding the wait stops one slow read from
+/// stalling unrelated keys that happen to hash to the same shard.
+const READ_SHARD_TIMEOUT_MS_KNOB: &str =
+    "scm/mononoke:virtually_sharded_blobstore_read_shard_timeout_ms";
+
+fn read_shard_timeout() -> Option<Duration> {
+    match justknobs::get_as::<u64>(READ_SHARD_TIMEOUT_MS_KNOB, None) {
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
+    }
 }
 
 #[async_trait]
@@ -466,6 +479,11 @@ impl<T: Blobstore + 'static> Blobstore for VirtuallyShardedBlobstore<T> {
             None => true,
         };
 
+        // Read the timeout knob here, on the caller's thread, so that the value
+        // (and any unit-test override) is captured before the work is moved onto
+        // a task by spawn_task below.
+        let shard_timeout = read_shard_timeout();
+
         let key = key.to_owned();
         let fut = async move {
             ctx.perf_counters()
@@ -476,7 +494,7 @@ impl<T: Blobstore + 'static> Blobstore for VirtuallyShardedBlobstore<T> {
             let permit = if take_lease {
                 let acq = inner
                     .read_shards
-                    .acquire(&ctx, &key, ticket, || {
+                    .acquire(&ctx, &key, ticket, shard_timeout, || {
                         inner.cache.get_from_cache(&cache_key)
                     })
                     .await?;
@@ -498,6 +516,14 @@ impl<T: Blobstore + 'static> Blobstore for VirtuallyShardedBlobstore<T> {
                         return shared_read(&inner, &ctx, key, ticket).await;
                     }
                     SemaphoreAcquisition::Acquired(permit) => Some(permit),
+                    SemaphoreAcquisition::Unsharded(ticket) => {
+                        // Timed out waiting for the shard. Read without a dedup lease
+                        // rather than block on an unrelated slow read that hashed to
+                        // the same shard.
+                        STATS::gets_unsharded.add_value(1);
+                        ticket.finish().await?;
+                        None
+                    }
                 }
             } else {
                 // We already know the data can't be cached, so we'll have to go to the
@@ -544,7 +570,7 @@ impl<T: Blobstore + 'static> Blobstore for VirtuallyShardedBlobstore<T> {
         // Only deduplicate if we're not forcing an overwrite
         if !put_behaviour.should_overwrite() {
             if let Ok(Some(KnownToExist)) = inner.cache.check_presence(&cache_key, presence) {
-                report_deduplicated_put(&ctx, &key);
+                report_deduplicated_put(&ctx, &key)?;
                 return Ok(OverwriteStatus::Prevented);
             }
         }
@@ -554,7 +580,7 @@ impl<T: Blobstore + 'static> Blobstore for VirtuallyShardedBlobstore<T> {
 
             let acq = inner
                 .write_shards
-                .acquire(&ctx, &key, ticket, || {
+                .acquire(&ctx, &key, ticket, None, || {
                     if put_behaviour.should_overwrite() {
                         Ok(None)
                     } else {
@@ -565,11 +591,17 @@ impl<T: Blobstore + 'static> Blobstore for VirtuallyShardedBlobstore<T> {
 
             let permit = match acq {
                 SemaphoreAcquisition::Cancelled(KnownToExist, ticket) => {
-                    report_deduplicated_put(&ctx, &key);
+                    report_deduplicated_put(&ctx, &key)?;
                     ticket.cancel();
                     return Ok(OverwriteStatus::Prevented);
                 }
-                SemaphoreAcquisition::Acquired(permit) => permit,
+                SemaphoreAcquisition::Acquired(permit) => Some(permit),
+                SemaphoreAcquisition::Unsharded(ticket) => {
+                    // Writes never set a shard timeout, so this is effectively
+                    // unreachable; handle it defensively by writing without a lease.
+                    ticket.finish().await?;
+                    None
+                }
             };
 
             scopeguard::defer! { drop(permit) };
@@ -601,7 +633,7 @@ impl<T: Blobstore + 'static> Blobstore for VirtuallyShardedBlobstore<T> {
         let presence = PresenceData::from_put(&value);
 
         if let Ok(Some(KnownToExist)) = inner.cache.check_presence(&cache_key, presence) {
-            report_deduplicated_put(&ctx, &key);
+            report_deduplicated_put(&ctx, &key)?;
             return Ok(OverwriteStatus::Prevented);
         }
 
@@ -610,18 +642,24 @@ impl<T: Blobstore + 'static> Blobstore for VirtuallyShardedBlobstore<T> {
 
             let acq = inner
                 .write_shards
-                .acquire(&ctx, &key, ticket, || {
+                .acquire(&ctx, &key, ticket, None, || {
                     inner.cache.check_presence(&cache_key, presence)
                 })
                 .await?;
 
             let permit = match acq {
                 SemaphoreAcquisition::Cancelled(KnownToExist, ticket) => {
-                    report_deduplicated_put(&ctx, &key);
+                    report_deduplicated_put(&ctx, &key)?;
                     ticket.cancel();
                     return Ok(OverwriteStatus::Prevented);
                 }
-                SemaphoreAcquisition::Acquired(permit) => permit,
+                SemaphoreAcquisition::Acquired(permit) => Some(permit),
+                SemaphoreAcquisition::Unsharded(ticket) => {
+                    // Writes never set a shard timeout, so this is effectively
+                    // unreachable; handle it defensively by writing without a lease.
+                    ticket.finish().await?;
+                    None
+                }
             };
 
             scopeguard::defer! { drop(permit) };
@@ -1046,7 +1084,7 @@ mod test {
                     let count = sender.receiver_count();
 
                     if count > 1 {
-                        return Err(anyhow!("Too many first receivers: {}", count));
+                        return Err(anyhow!("Too many first receivers: {count}"));
                     }
 
                     if count > 0 {
@@ -1065,7 +1103,7 @@ mod test {
                     let count = sender.receiver_count();
 
                     if count > 1 {
-                        return Err(anyhow!("Too many second receivers: {}", count));
+                        return Err(anyhow!("Too many second receivers: {count}"));
                     }
 
                     if count > 0 {
@@ -1095,7 +1133,7 @@ mod test {
                     let count = sender.receiver_count();
 
                     if count > 1 {
-                        return Err(anyhow!("Too many third receivers: {}", count));
+                        return Err(anyhow!("Too many third receivers: {count}"));
                     }
 
                     if count > 0 {
@@ -1257,6 +1295,98 @@ mod test {
 
             Ok(())
         }
+
+        #[mononoke::fbinit_test]
+        async fn test_read_shard_timeout(fb: FacebookInit) -> Result<()> {
+            use futures::FutureExt;
+            use justknobs::test_helpers::JustKnobsInMemory;
+            use justknobs::test_helpers::KnobVal;
+            use justknobs::test_helpers::with_just_knobs_async;
+
+            let ctx = CoreContext::test_mock(fb);
+            // A single shard guarantees the two unrelated keys collide on it.
+            let blobstore = make_blobstore(
+                fb,
+                TestBlobstore::new(),
+                "shard_timeout_blobs",
+                nonzero!(1usize),
+                allow_all_filter,
+            )?;
+            borrowed!(ctx, blobstore);
+
+            let slow_key = "shard_timeout_slow";
+            let fast_key = "shard_timeout_fast";
+            let fast_val = BlobstoreBytes::from_bytes("fast");
+
+            // The slow key blocks in the blobstore until we send on its channel,
+            // holding the shard. The fast key returns as soon as it is reached.
+            let (slow_sender, _) = broadcast::channel(1);
+            {
+                let mut data = blobstore.inner.blobstore.data.lock().unwrap();
+                data.entry(slow_key.to_owned()).or_default().data =
+                    Some(BlobData::Channel(slow_sender.clone()));
+                data.entry(fast_key.to_owned()).or_default().data =
+                    Some(BlobData::Bytes(fast_val.clone()));
+            }
+
+            // 20ms timeout: long enough that the fast read first contends on the
+            // shard, short enough to keep the test quick.
+            let knobs = JustKnobsInMemory::new(
+                [(READ_SHARD_TIMEOUT_MS_KNOB.to_string(), KnobVal::Int(20))]
+                    .into_iter()
+                    .collect(),
+            );
+
+            with_just_knobs_async(
+                knobs,
+                async move {
+                    let slow_get = blobstore.get(ctx, slow_key);
+
+                    let controller = async {
+                        // Wait until the slow read is in the blobstore holding the shard.
+                        loop {
+                            tokio::task::yield_now().await;
+                            if slow_sender.receiver_count() > 0 {
+                                break;
+                            }
+                        }
+
+                        // The fast read hashes to the same (only) shard. Without the
+                        // timeout it would block behind the slow read indefinitely;
+                        // with it, it must time out (~20ms) and read on its own.
+                        let fast = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            blobstore.get(ctx, fast_key),
+                        )
+                        .await
+                        .map_err(|_| {
+                            anyhow!(
+                                "fast read blocked behind slow read; timeout fallthrough broken"
+                            )
+                        })??;
+
+                        assert_eq!(fast.unwrap().as_bytes(), &fast_val);
+
+                        // Release the slow read so the whole future can complete.
+                        slow_sender
+                            .send(BlobstoreBytes::from_bytes("slow"))
+                            .map_err(|_| anyhow!("failed to release slow read"))?;
+
+                        Result::<_>::Ok(())
+                    };
+
+                    let (slow_res, controller_res) =
+                        futures::future::join(slow_get, controller).await;
+                    slow_res?;
+                    controller_res?;
+                    Result::<_>::Ok(())
+                }
+                .boxed(),
+            )
+            .await?;
+
+            Ok(())
+        }
     }
 
     mod ratelimiting {
@@ -1357,7 +1487,7 @@ mod test {
 
             // get
             let (stats, _) = futures::future::try_join_all((0..10u64).map(|i| {
-                let key = format!("get{}", i);
+                let key = format!("get{i}");
                 async move { blobstore.get(ctx, &key).await }
             }))
             .try_timed()
@@ -1367,7 +1497,7 @@ mod test {
 
             // is_present
             let (stats, _) = futures::future::try_join_all((0..10u64).map(|i| {
-                let key = format!("present{}", i);
+                let key = format!("present{i}");
                 async move { blobstore.is_present(ctx, &key).await }
             }))
             .try_timed()
@@ -1378,7 +1508,7 @@ mod test {
             // put
             let bytes = BlobstoreBytes::from_bytes("test foobar");
             let (stats, _) = futures::future::try_join_all(
-                (0..10u64).map(|i| blobstore.put(ctx, format!("put{}", i), bytes.clone())),
+                (0..10u64).map(|i| blobstore.put(ctx, format!("put{i}"), bytes.clone())),
             )
             .try_timed()
             .await?;
@@ -1417,7 +1547,7 @@ mod test {
             // get
             let (stats, _) = futures::future::try_join_all((0..10u64).flat_map(|i| {
                 (0..10u64).map(move |_| {
-                    let key = format!("get{}", i);
+                    let key = format!("get{i}");
                     async move { blobstore.get(ctx, &key).await }
                 })
             }))
@@ -1432,7 +1562,7 @@ mod test {
             // put
             let bytes = &BlobstoreBytes::from_bytes("test foobar");
             let (stats, _) = futures::future::try_join_all((0..10u64).flat_map(|i| {
-                (0..10u64).map(move |_| blobstore.put(ctx, format!("put{}", i), bytes.clone()))
+                (0..10u64).map(move |_| blobstore.put(ctx, format!("put{i}"), bytes.clone()))
             }))
             .try_timed()
             .await?;

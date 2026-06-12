@@ -10,12 +10,16 @@
 // Implementation of the NFSv3 protocol as described in:
 // https://tools.ietf.org/html/rfc1813
 
+#include <optional>
+
+#include <folly/ExceptionWrapper.h>
 #include "eden/common/telemetry/TraceBus.h"
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/fs/inodes/FsChannel.h"
 #include "eden/fs/nfs/NfsDispatcher.h"
 #include "eden/fs/nfs/rpc/RpcServer.h"
 #include "eden/fs/utils/ProcessAccessLog.h"
+#include "folly/Function.h"
 
 namespace folly {
 class Executor;
@@ -23,13 +27,31 @@ class Executor;
 
 namespace facebook::eden {
 
+class ErrorLogger;
 class Notifier;
 class PrivHelper;
 class ProcessInfoCache;
+class EdenFsEventsLogger;
 class FsEventLogger;
-class StructuredLogger;
+
+namespace detail {
+/**
+ * Log SERVERFAULT errors to structured error telemetry.
+ * Normal filesystem errors (ENOENT, EACCES, etc.) are not logged.
+ */
+void logNfsError(
+    nfsstat3 error,
+    const folly::exception_wrapper& ex,
+    ErrorLogger& errorLogger,
+    uint64_t inode,
+    const AbsolutePath& mountPath);
+} // namespace detail
 
 using TraceDetailedArgumentsHandle = std::shared_ptr<void>;
+
+enum class NfsInvalidationSource : uint8_t {
+  Gc,
+};
 
 struct NfsArgsDetails {
   /* implicit */ NfsArgsDetails(
@@ -135,7 +157,8 @@ class Nfsd3 final : public FsChannel {
       const folly::Logger* straceLogger,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       std::shared_ptr<FsEventLogger> fsEventLogger,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
+      ErrorLogger& errorLogger,
       folly::Duration requestTimeout,
       std::shared_ptr<Notifier> notifications,
       CaseSensitivity caseSensitive,
@@ -143,7 +166,8 @@ class Nfsd3 final : public FsChannel {
       size_t maximumInFlightRequests,
       std::chrono::nanoseconds highNfsRequestsLogInterval,
       std::chrono::nanoseconds longRunningFSRequestThreshold,
-      size_t traceBusCapacity);
+      size_t traceBusCapacity,
+      bool fastPathRPCs);
 
   void destroy() override;
 
@@ -184,14 +208,14 @@ class Nfsd3 final : public FsChannel {
    *   1. chmod goes all the way through the kernel to EdenFS. All "writes"
    *   seem to function this way.
    *   2. When the kernel sees the mtime in the post op attr in the response
-   *   from EdenFS has updated in the response to chmod, it will drop it's
+   *   from EdenFS has updated in the response to chmod, it will drop its
    *   caches for the children of the directory.
    *
    * 1. is implied by the NFS mode 2. isn't really guaranteed anywhere, but
    * this works well enough on Linux and macOS and we don't have many other
    * options.
    *
-   * We use to just do an open call here. This was insufficient because the
+   * We used to just do an open call here. This was insufficient because the
    * open and subsequent reads can be served purely from cache on macOS.
    * This was sufficient on Linux as all open calls go to EdenFS and CTO
    * (close-to-open) guarantees from NFS guarantees the caches must be flushed.
@@ -209,12 +233,17 @@ class Nfsd3 final : public FsChannel {
   void invalidate(
       AbsolutePath path,
       mode_t mode,
-      std::function<void()> onSuccess = nullptr);
+      folly::Function<void()> onSuccess = nullptr,
+      std::optional<NfsInvalidationSource> source = std::nullopt);
 
   bool takeoverStop() override;
 
   ImmediateFuture<folly::Unit> waitForPendingWrites() override {
     return folly::unit;
+  }
+
+  folly::coro::now_task<folly::Unit> co_waitForPendingWrites() override {
+    co_return folly::unit;
   }
 
   /*
@@ -304,6 +333,7 @@ class Nfsd3 final : public FsChannel {
   std::vector<TraceSubscriptionHandle<NfsTraceEvent>> traceSubscriptionHandles_;
 
   folly::Promise<FsStopDataPtr> stopPromise_;
+  EdenStatsPtr stats_;
   std::shared_ptr<RpcServer> server_;
   ProcessAccessLog processAccessLog_;
   // It is critical that this is a SerialExecutor. invalidation for parent

@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use anyhow::Context;
 use anyhow::Error;
 use anyhow::anyhow;
 use anyhow::format_err;
@@ -301,9 +300,7 @@ pub async fn list_file_history<'a>(
         "scm/mononoke:fastlog_disable_mutable_renames",
         None,
         Some(repo.repo_identity().name()),
-    )
-    .context("Failed to contact justknob server")?
-    {
+    ) {
         follow_mutable_renames = FollowMutableRenames::No;
     }
     let path = Arc::new(path);
@@ -499,7 +496,7 @@ async fn process_deletion_nodes(
     let mut deleted_to_last_mapping: Vec<_> = deleted_linknodes
         .iter()
         .map(|(cs_id, _)| cs_id)
-        .zip(last_linknodes.into_iter())
+        .zip(last_linknodes)
         .collect();
     deleted_to_last_mapping.sort_by_key(|(deleted_linknode, _)| *deleted_linknode);
     deleted_to_last_mapping
@@ -666,8 +663,7 @@ where
                 // we want to proceed to next iteration to fetch the parents
                 if Some(&cs_and_path) == prefetch.as_ref() {
                     return Err(format_err!(
-                        "internal error: infinite loop while traversing history for {:?}",
-                        cs_and_path
+                        "internal error: infinite loop while traversing history for {cs_and_path:?}"
                     ));
                 }
                 next_to_fetch = Some(cs_and_path.clone());
@@ -753,7 +749,7 @@ pub(crate) async fn _find_possible_mutable_ancestors(
         .get_cs_ids_with_rename(ctx, path.clone())
         .await?;
     let mut possible_mutable_ancestors: Vec<(Generation, ChangesetId)> =
-        stream::iter(mutable_csids.into_iter())
+        stream::iter(mutable_csids)
             .then({
                 move |mutated_at| async move {
                     // We also want to grab generation here, because we're going to sort
@@ -1198,7 +1194,7 @@ async fn prefetch_fastlog_by_changeset(
 ) -> Result<Vec<(ChangesetId, Vec<FastlogParent>)>, Error> {
     let unode_entry_opt = derive_unode_entry(ctx, repo, changeset_id.clone(), path).await?;
     let entry = unode_entry_opt
-        .ok_or_else(|| format_err!("Unode entry is not found {:?} {:?}", changeset_id, path))?;
+        .ok_or_else(|| format_err!("Unode entry is not found {changeset_id:?} {path:?}"))?;
 
     // optimistically try to fetch history for a unode
     let fastlog_batch_opt = prefetch_history(ctx, repo, &entry).await?;
@@ -1213,7 +1209,7 @@ async fn prefetch_fastlog_by_changeset(
         .await?;
     let fastlog_batch_opt = prefetch_history(ctx, repo, &entry).await?;
     fastlog_batch_opt
-        .ok_or_else(|| format_err!("Fastlog data is not found {:?} {:?}", changeset_id, path))
+        .ok_or_else(|| format_err!("Fastlog data is not found {changeset_id:?} {path:?}"))
 }
 
 #[cfg(test)]
@@ -1290,7 +1286,7 @@ mod test {
         let mut expected = vec![];
         for i in 1..300 {
             let file = if i % 2 == 1 { "2" } else { filename };
-            let content = format!("{}", i);
+            let content = format!("{i}");
 
             let bcs_id = CreateCommitContext::new(ctx, &repo, parents)
                 .add_file(file, content)
@@ -2391,9 +2387,9 @@ mod test {
         let mut commits = vec![];
         for i in 0..number {
             let mut bcs = CreateCommitContext::new(ctx, repo, parents.clone())
-                .add_file(filename, format!("{} - {}", branch, i));
+                .add_file(filename, format!("{branch} - {i}"));
             if branch_file {
-                bcs = bcs.add_file(branch, format!("{}", i));
+                bcs = bcs.add_file(branch, format!("{i}"));
             }
             let bcs_id = bcs.commit().await?;
 
@@ -2413,28 +2409,28 @@ mod test {
         let filename = "1";
         // bottom
         let bottom_id = CreateCommitContext::new(ctx, repo, parents.clone())
-            .add_file(filename, format!("B - {:?}", parents))
+            .add_file(filename, format!("B - {parents:?}"))
             .commit()
             .await?;
         expected.push(bottom_id.clone());
 
         // right
         let right_id = CreateCommitContext::new(ctx, repo, vec![bottom_id])
-            .add_file(filename, format!("R - {:?}", parents))
+            .add_file(filename, format!("R - {parents:?}"))
             .commit()
             .await?;
         expected.push(right_id.clone());
 
         // left
         let left_id = CreateCommitContext::new(ctx, repo, vec![bottom_id])
-            .add_file(filename, format!("L - {:?}", parents))
+            .add_file(filename, format!("L - {parents:?}"))
             .commit()
             .await?;
         expected.push(left_id.clone());
 
         // up
         let up_id = CreateCommitContext::new(ctx, repo, vec![left_id, right_id])
-            .add_file(filename, format!("U - {:?}", parents))
+            .add_file(filename, format!("U - {parents:?}"))
             .commit()
             .await?;
         expected.push(up_id.clone());

@@ -15,12 +15,13 @@ use anyhow::Result;
 use anyhow::anyhow;
 use clientinfo::ClientInfo;
 use clientinfo::ClientRequestInfo;
+use hickory_resolver::TokioResolver;
+use hickory_resolver::proto::rr::RData;
 use permission_checker::MononokeIdentitySet;
 use permission_checker::MononokeIdentitySetExt;
 use session_id::SessionId;
 use session_id::generate_session_id;
 use tokio::time::timeout;
-use trust_dns_resolver::TokioAsyncResolver;
 
 #[derive(Clone, Debug, Default)]
 pub struct Metadata {
@@ -42,6 +43,7 @@ pub struct Metadata {
     client_info: Option<ClientInfo>,
     fetch_cause: Option<String>,
     fetch_from_cas_attempted: bool,
+    upstream_client_id: Option<String>,
 }
 
 impl Metadata {
@@ -88,6 +90,7 @@ impl Metadata {
             client_info: None,
             fetch_cause: None,
             fetch_from_cas_attempted: false,
+            upstream_client_id: None,
         }
     }
 
@@ -100,13 +103,18 @@ impl Metadata {
         // impact performance much. In case this does lead to performance issues we
         // could start caching this, which for now would be preferred to avoid as this
         // might lead to unexpected behavior if the system configuration changes.
-        let resolver = TokioAsyncResolver::tokio_from_system_conf()?;
-        resolver
-            .reverse_lookup(client_ip)
-            .await?
+        let resolver = TokioResolver::builder_tokio()?.build()?;
+        let lookup = resolver.reverse_lookup(client_ip).await?;
+        lookup
+            .answers()
             .iter()
-            .next()
-            .map(|name| name.to_string().trim_end_matches('.').to_string())
+            .find_map(|record| {
+                if let RData::PTR(ptr) = &record.data {
+                    Some(ptr.0.to_string().trim_end_matches('.').to_string())
+                } else {
+                    None
+                }
+            })
             .ok_or_else(|| anyhow!("failed to do reverse lookup"))
     }
 
@@ -135,7 +143,7 @@ impl Metadata {
                 if !client_request_info.has_main_id() {
                     client_request_info.set_main_id(
                         self.identities
-                            .main_client_identity(x.fb.sandcastle_alias(), x.fb.atlas_env_id()),
+                            .main_client_identity(x.fb.sandcastle_alias()),
                     )
                 }
             })
@@ -279,6 +287,10 @@ impl Metadata {
         self.client_info.as_ref().and_then(|ci| ci.fb.is_atlas())
     }
 
+    pub fn clientinfo_atlas_rl(&self) -> Option<bool> {
+        self.client_info.as_ref().and_then(|ci| ci.fb.is_atlas_rl())
+    }
+
     pub fn clientinfo_atlas_env_id(&self) -> Option<&str> {
         self.client_info
             .as_ref()
@@ -291,5 +303,21 @@ impl Metadata {
 
     pub fn fetch_from_cas_attempted(&self) -> bool {
         self.fetch_from_cas_attempted
+    }
+
+    pub fn add_upstream_client_id(&mut self, client_id: String) -> &mut Self {
+        self.upstream_client_id = Some(client_id);
+        self
+    }
+
+    pub fn upstream_client_id(&self) -> Option<&str> {
+        self.upstream_client_id.as_deref()
+    }
+
+    pub fn machine_tier(&self) -> Option<&str> {
+        self.identities()
+            .iter()
+            .find(|identity| identity.id_type() == "MACHINE_TIER")
+            .map(|identity| identity.id_data())
     }
 }

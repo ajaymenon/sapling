@@ -18,15 +18,15 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
-from typing import Any, cast, Dict, List, Optional, TextIO, Tuple, Union
+from typing import Any, cast, Dict, Generator, List, Optional, TextIO, Tuple, Union
 
 from eden.fs.cli import util
 from eden.fs.service.eden.thrift_clients import EdenService
 from eden.fs.service.eden.thrift_types import MountState
-from eden.thrift import client, legacy
-from eden.thrift.legacy import EdenClient
+from eden.thrift import client
 from fb303_core.thrift_types import fb303_status
 
 from .find_executables import FindExe
@@ -176,7 +176,7 @@ class EdenFS:
         # Before shutting down, get the current pid. This may differ from process.pid when
         # edenfs is started with sudo.
         daemon_pid = util.check_health(
-            self.get_thrift_client_legacy, self.eden_dir, timeout=30
+            self.get_thrift_client, self.eden_dir, timeout=30
         ).pid
 
         self._process = None
@@ -187,7 +187,7 @@ class EdenFS:
             timeout = 30
             while (
                 util.check_health(
-                    self.get_thrift_client_legacy, self.eden_dir, timeout=30
+                    self.get_thrift_client, self.eden_dir, timeout=30
                 ).status
                 != fb303_status.DEAD
             ):
@@ -199,10 +199,16 @@ class EdenFS:
             process.kill()
         process.wait(timeout=10)
 
-    def get_thrift_client_legacy(
+    @contextmanager
+    def get_thrift_client(
         self, timeout: Optional[float] = None
-    ) -> legacy.EdenClient:
-        return legacy.create_thrift_client(str(self._eden_dir), timeout=timeout)
+    ) -> Generator[EdenService.Sync, None, None]:
+        """Get a modern thrift-python sync client for communicating with EdenFS."""
+        with client.create_thrift_client(
+            eden_dir=str(self._eden_dir),
+            timeout=timeout if timeout is not None else 0,
+        ) as thrift_client:
+            yield thrift_client
 
     def get_async_thrift_client(self, timeout: float = 0) -> EdenService.Async:
         return client.create_async_thrift_client(str(self._eden_dir), timeout=timeout)
@@ -307,7 +313,8 @@ class EdenFS:
         health = util.wait_for_daemon_healthy(
             proc=process,
             config_dir=self._eden_dir,
-            get_client=self.get_thrift_client_legacy,
+            # pyre-ignore[6]: get_thrift_client is a context manager, compatible with check_health
+            get_client=self.get_thrift_client,
             timeout=timeout,
         )
         return health.is_healthy()
@@ -356,7 +363,8 @@ class EdenFS:
             util.wait_for_daemon_healthy(
                 proc=process,
                 config_dir=self._eden_dir,
-                get_client=self.get_thrift_client_legacy,
+                # pyre-ignore[6]: get_thrift_client is a context manager, compatible with check_health
+                get_client=self.get_thrift_client,
                 timeout=timeout,
                 exclude_pid=takeover_from,
             )
@@ -494,7 +502,7 @@ class EdenFS:
         # Before shutting down, get the current pid. This may differ from process.pid when
         # edenfs is started with sudo.
         daemon_pid = util.check_health(
-            self.get_thrift_client_legacy, self.eden_dir, timeout=30
+            self.get_thrift_client, self.eden_dir, timeout=30
         ).pid
 
         self.report_time(
@@ -570,11 +578,11 @@ class EdenFS:
         self.start()
 
     def get_pid_via_thrift(self) -> int:
-        with self.get_thrift_client_legacy() as client:
+        with self.get_thrift_client() as client:
             return client.getDaemonInfo().pid
 
     def get_privhelper_pid(self) -> int:
-        with self.get_thrift_client_legacy(timeout=5) as client:
+        with self.get_thrift_client(timeout=5) as client:
             privHelperInfo = client.checkPrivHelper()
             return privHelperInfo.pid
 
@@ -716,7 +724,7 @@ class EdenFS:
         return results
 
     def get_mount_state(
-        self, mount: pathlib.Path, client: Optional[EdenClient] = None
+        self, mount: pathlib.Path, client: Optional[EdenService.Sync] = None
     ) -> Optional[MountState]:
         """
         Query edenfs over thrift for the state of the specified mount.
@@ -725,7 +733,7 @@ class EdenFS:
         this mount path.
         """
         if client is None:
-            with self.get_thrift_client_legacy() as client:
+            with self.get_thrift_client() as client:
                 return self.get_mount_state(mount, client)
         else:
             for entry in client.listMounts():
@@ -760,7 +768,6 @@ class EdenFS:
         path: Union[str, os.PathLike],
         allow_empty: bool = False,
         case_sensitive: Optional[bool] = None,
-        enable_windows_symlinks: bool = False,
         backing_store: Optional[str] = None,
         filter_paths: Optional[List[str]] = None,
     ) -> None:
@@ -774,8 +781,6 @@ class EdenFS:
             params.append("--case-sensitive")
         elif case_sensitive is False:  # Can also be None
             params.append("--case-insensitive")
-        if enable_windows_symlinks:
-            params.append("--enable-windows-symlinks")
         if backing_store is not None:
             params.append("--backing-store")
             params.append(backing_store)
@@ -831,7 +836,7 @@ class EdenFS:
         return cmd_result.returncode == 0
 
     def set_log_level(self, category: str, level: str) -> None:
-        with self.get_thrift_client_legacy() as client:
+        with self.get_thrift_client() as client:
             client.setOption("logging", f"{category}={level}")
 
     def client_dir_for_mount(self, mount_path: pathlib.Path) -> pathlib.Path:

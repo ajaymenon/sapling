@@ -50,7 +50,7 @@ fn deserialize(bytes: Bytes) -> Result<(HgId, TreeAuxData)> {
     let hgid = cur.read_hgid()?;
     let version = cur.read_u8()?;
     if version > 0 {
-        bail!("unsupported treeauxstore entry version {}", version);
+        bail!("unsupported treeauxstore entry version {version}");
     }
     let mut bytes = [0u8; Blake3::len()];
     cur.read_exact(&mut bytes)?;
@@ -134,6 +134,10 @@ impl TreeAuxStore {
             // read_before_write=true to avoid the insert if the data is already present.
             true,
         )
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.store.is_dirty()
     }
 
     pub fn flush(&self) -> Result<()> {

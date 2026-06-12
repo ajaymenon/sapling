@@ -38,23 +38,13 @@ from typing import (
 import eden.config
 from eden.fs.cli import util
 from eden.fs.service.eden.thrift_clients import EdenService
-from eden.test_support.testcase import EdenTestCaseBase
-from eden.thrift import legacy
-
-if sys.platform == "win32":
-    from eden.thrift.windows_thrift import WindowsSocketException
-else:
-
-    class WindowsSocketException(Exception):
-        pass
-
-
 from eden.fs.service.eden.thrift_types import (
     FaultDefinition,
     GetBlockedFaultsRequest,
     RemoveFaultArg,
     UnblockFaultArg,
 )
+from eden.test_support.testcase import EdenTestCaseBase
 
 from . import edenclient, gitrepo, hgrepo, repobase, skip
 from .find_executables import FindExe
@@ -138,7 +128,6 @@ class EdenTestCase(EdenTestCaseBase):
                 )
                 break
             except (
-                WindowsSocketException,
                 edenclient.EdenCommandError,
                 util.EdenStartError,
             ) as e:
@@ -261,11 +250,15 @@ class EdenTestCase(EdenTestCaseBase):
     def make_temporary_directory(self, prefix: Optional[str] = None) -> str:
         return str(self.temp_mgr.make_temp_dir(prefix=prefix))
 
-    def get_thrift_client_legacy(self) -> legacy.EdenClient:
+    @contextmanager
+    def get_thrift_client(
+        self,
+    ) -> Generator[EdenService.Sync, None, None]:
         """
-        Get a thrift client to the edenfs daemon.
+        Get a modern thrift-python sync client to the edenfs daemon.
         """
-        return self.eden.get_thrift_client_legacy()
+        with self.eden.get_thrift_client() as client:
+            yield client
 
     def get_async_thrift_client(self) -> EdenService.Async:
         """
@@ -274,7 +267,7 @@ class EdenTestCase(EdenTestCaseBase):
         return self.eden.get_async_thrift_client()
 
     def get_counters(self) -> typing.Mapping[str, float]:
-        with self.get_thrift_client_legacy() as thrift_client:
+        with self.get_thrift_client() as thrift_client:
             thrift_client.flushStatsNow()
             return thrift_client.getCounters()
 
@@ -317,7 +310,6 @@ class EdenTestCase(EdenTestCaseBase):
         configs = {
             "experimental": [
                 "enable-nfs-server = true",
-                "windows-symlinks = false",
                 "propagate-checkout-errors = true",
                 "filteredfs-optimize-unfiltered = true",
                 "lazy-inode-persistence = true",
@@ -326,12 +318,20 @@ class EdenTestCase(EdenTestCaseBase):
             # Defaulting to 8 retry threads is excessive when the test
             # framework runs tests on each CPU core.
             "hg": ['num-retry-threads = "2"'],
+            "overlay": [
+                "direct-file-writes = true",
+            ],
         }
 
         # Collect experimental configs from mixins
         experimental_configs = self.get_experimental_configs()
         if experimental_configs:
             configs["experimental"].extend(experimental_configs)
+
+        # Collect coroutines configs from mixins
+        coroutines_configs = self.get_coroutines_configs()
+        if coroutines_configs:
+            configs["coroutines"] = coroutines_configs
 
         if self.use_nfs():
             configs["clone"] = ['default-mount-protocol = "NFS"']
@@ -516,17 +516,21 @@ class EdenTestCase(EdenTestCaseBase):
         """Default implementation returns no additional configs."""
         return []
 
+    def get_coroutines_configs(self) -> List[str]:
+        """Default implementation returns no additional coroutines configs."""
+        return []
+
     def remove_fault(
         self,
         keyClass: str,
         keyValueRegex: str = ".*",
     ) -> None:
-        with self.eden.get_thrift_client_legacy() as client:
+        with self.eden.get_thrift_client() as client:
             client.removeFault(
                 RemoveFaultArg(
                     keyClass=keyClass,
                     keyValueRegex=keyValueRegex,
-                )._to_py_deprecated()
+                )
             )
 
     def unblock_fault(
@@ -534,12 +538,12 @@ class EdenTestCase(EdenTestCaseBase):
         keyClass: str,
         keyValueRegex: str = ".*",
     ) -> None:
-        with self.eden.get_thrift_client_legacy() as client:
+        with self.eden.get_thrift_client() as client:
             client.unblockFault(
                 UnblockFaultArg(
                     keyClass=keyClass,
                     keyValueRegex=keyValueRegex,
-                )._to_py_deprecated()
+                )
             )
 
     def wait_on_fault_unblock(
@@ -549,12 +553,12 @@ class EdenTestCase(EdenTestCaseBase):
         numToUnblock: int = 1,
     ) -> None:
         def unblock() -> Optional[bool]:
-            with self.eden.get_thrift_client_legacy() as client:
+            with self.eden.get_thrift_client() as client:
                 unblocked = client.unblockFault(
                     UnblockFaultArg(
                         keyClass=keyClass,
                         keyValueRegex=keyValueRegex,
-                    )._to_py_deprecated()
+                    )
                 )
             if unblocked == 1:
                 return True
@@ -569,18 +573,18 @@ class EdenTestCase(EdenTestCaseBase):
         """
 
         def faults_hit() -> Optional[bool]:
-            with self.eden.get_thrift_client_legacy() as client:
+            with self.eden.get_thrift_client() as client:
                 blocked_faults = client.getBlockedFaults(
-                    GetBlockedFaultsRequest(keyclass=key_class)._to_py_deprecated()
+                    GetBlockedFaultsRequest(keyclass=key_class)
                 ).keyValues
             return True if len(blocked_faults) == num_to_hit else None
 
         try:
             util.poll_until(faults_hit, timeout=30)
         except TimeoutError as e:
-            with self.eden.get_thrift_client_legacy() as client:
+            with self.eden.get_thrift_client() as client:
                 # this unblock all faults to avoid tests hang
-                client.unblockFault(UnblockFaultArg()._to_py_deprecated())
+                client.unblockFault(UnblockFaultArg())
             raise e
 
     @contextmanager
@@ -589,13 +593,13 @@ class EdenTestCase(EdenTestCaseBase):
         keyClass: str,
         keyValueRegex: str = ".*",
     ) -> Generator[None, None, None]:
-        with self.eden.get_thrift_client_legacy() as client:
+        with self.eden.get_thrift_client() as client:
             client.injectFault(
                 FaultDefinition(
                     keyClass=keyClass,
                     keyValueRegex=keyValueRegex,
                     block=True,
-                )._to_py_deprecated()
+                )
             )
 
             try:
@@ -605,13 +609,13 @@ class EdenTestCase(EdenTestCaseBase):
                     RemoveFaultArg(
                         keyClass=keyClass,
                         keyValueRegex=keyValueRegex,
-                    )._to_py_deprecated()
+                    )
                 )
                 client.unblockFault(
                     UnblockFaultArg(
                         keyClass=keyClass,
                         keyValueRegex=keyValueRegex,
-                    )._to_py_deprecated()
+                    )
                 )
 
 
@@ -656,8 +660,6 @@ class EdenRepoTest(EdenTestCase):
     # case sensitivities on a single platform.
     is_case_sensitive: Optional[bool] = None
 
-    enable_windows_symlinks: bool = False
-
     backing_store_type: Optional[str] = None
 
     def setup_eden_test(self) -> None:
@@ -673,7 +675,6 @@ class EdenRepoTest(EdenTestCase):
             self.repo.path,
             self.mount,
             case_sensitive=self.is_case_sensitive,
-            enable_windows_symlinks=self.enable_windows_symlinks,
             backing_store=self.backing_store_type,
         )
         self.eden_repo = self.create_eden_repo()
@@ -854,6 +855,61 @@ def _replicate_eden_nfs_repo_test(
 # decorator.
 eden_nfs_repo_test = test_replicator(_replicate_eden_nfs_repo_test)
 
+
+class WalEnabledMixin:
+    """Enables the overlay write-ahead log via `edenfs_extra_config`.
+
+    Used by `eden_nfs_repo_test_with_wal_variant` to generate sibling
+    WAL flavors of overlay-sensitive tests so we cover the WAL fast path
+    alongside the default (non-WAL) overlay rewrite path.
+    """
+
+    # pyre-ignore[15]: Inconsistent override is expected — the mixin
+    # composes with EdenRepoTest at runtime via MRO.
+    def edenfs_extra_config(self) -> Optional[Dict[str, List[str]]]:
+        # pyre-ignore[16]: `super()` resolves to EdenRepoTest at runtime.
+        configs = super().edenfs_extra_config() or {}
+        configs.setdefault("overlay", []).append("use-wal = true")
+        return configs
+
+
+def _replicate_eden_nfs_repo_test_with_wal_variant(
+    test_class: Type[EdenRepoTest],
+) -> Iterable[Tuple[str, Type[EdenRepoTest]]]:
+    """Variant generator: every `eden_nfs_repo_test` variant, plus a
+    WAL flavor of each.
+
+    Yields the base Default/NFS variants unchanged, then re-emits each
+    with `WalEnabledMixin` mixed in (suffixed `Wal`). Picks up new
+    base variants automatically if `_replicate_eden_nfs_repo_test`
+    grows them.
+    """
+    base_variants = list(_replicate_eden_nfs_repo_test(test_class))
+    # WAL is only implemented for the Legacy/LegacyDev FsInodeCatalog
+    # (Linux/macOS). Windows uses the Sqlite catalog, so the WAL variants
+    # would exercise the same code path as the base variants.
+    if sys.platform == "win32":
+        return base_variants
+    wal_variants: List[Tuple[str, Type[EdenRepoTest]]] = []
+    for label, cls in base_variants:
+
+        class WalRepoTest(WalEnabledMixin, cls):
+            pass
+
+        wal_variants.append(
+            (f"{label}Wal", typing.cast(Type[EdenRepoTest], WalRepoTest))
+        )
+    return base_variants + wal_variants
+
+
+# Like `eden_nfs_repo_test` but also generates a WAL-on variant for
+# every base variant. Apply to overlay-format-sensitive tests where WAL
+# changes the on-disk layout (corrupt-overlay recovery, fsck, etc.).
+eden_nfs_repo_test_with_wal_variant = test_replicator(
+    _replicate_eden_nfs_repo_test_with_wal_variant
+)
+
+
 MixinList = List[Tuple[str, List[Type[Any]]]]
 
 
@@ -861,6 +917,7 @@ def _replicate_eden_repo_test(
     test_class: Type[EdenRepoTest],
     run_on_nfs: bool = True,
     case_sensitivity_dependent: bool = False,
+    run_coroutines: bool = True,
 ) -> Iterable[Tuple[str, Type[EdenRepoTest]]]:
     nfs_variants: MixinList = [("", [])]
     if run_on_nfs and eden.config.HAVE_NFS:
@@ -887,7 +944,13 @@ def _replicate_eden_repo_test(
             for case_label, case_mixins in case_variants:
 
                 class VariantRepoTest(
-                    *nfs_mixins, *scm_mixins, *case_mixins, test_class
+                    # pyrefly: ignore [invalid-inheritance]
+                    *nfs_mixins,
+                    # pyrefly: ignore [invalid-inheritance]
+                    *scm_mixins,
+                    # pyrefly: ignore [invalid-inheritance]
+                    *case_mixins,
+                    test_class,
                 ):
                     pass
 
@@ -897,6 +960,19 @@ def _replicate_eden_repo_test(
                         typing.cast(Type[EdenRepoTest], VariantRepoTest),
                     )
                 )
+
+    # Add a single Coroutines variant after all other combinations
+    if run_coroutines:
+
+        class CoroutinesVariantRepoTest(
+            CoroutinesTestMixin, HgRepoTestMixin, test_class
+        ):
+            pass
+
+        variants.append(
+            ("Coroutines", typing.cast(Type[EdenRepoTest], CoroutinesVariantRepoTest))
+        )
+
     return variants
 
 
@@ -921,7 +997,6 @@ class HgRepoTestMixin:
         # pyre-fixme[16]: `HgRepoTestMixin` has no attribute `create_hg_repo`.
         return self.create_hg_repo(
             name,
-            init_configs=["experimental.windows-symlinks=True"],
             filtered=filtered,
         )
 
@@ -971,7 +1046,22 @@ class CaseInsensitiveTestMixin:
 
 class CoroutinesTestMixin:
     def get_experimental_configs(self) -> List[str]:
-        return ["enable-coroutines-debug-get-blob = true"]
+        return [
+            "enable-coroutines-debug-get-blob = true",
+        ]
+
+    def get_coroutines_configs(self) -> List[str]:
+        return [
+            "enable-phase2 = true",
+            "enable-phase5 = true",
+            "enable-phase3 = true",
+            "enable-phase4 = true",
+            "enable-phase6 = true",
+            "enable-phase7 = true",
+            "enable-phase8 = true",
+            "enable-phase9 = true",
+            "enable-phase11 = true",
+        ]
 
 
 def _replicate_eden_test(

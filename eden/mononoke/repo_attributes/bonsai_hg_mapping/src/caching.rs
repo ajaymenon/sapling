@@ -156,7 +156,7 @@ impl CachingBonsaiHgMapping {
         let key_prefix = "scm.mononoke.bonsai_hg_mapping";
 
         let sitever =
-            justknobs::get_as::<u32>("scm/mononoke_memcache_sitevers:bonsai_hg_mapping", None)?;
+            justknobs::get_as::<u32>("scm/mononoke_memcache_sitevers:bonsai_hg_mapping", None);
 
         Ok(KeyGen::new(key_prefix, thrift::MC_CODEVER as u32, sitever))
     }
@@ -185,6 +185,14 @@ impl BonsaiHgMapping for CachingBonsaiHgMapping {
 
     async fn add(&self, ctx: &CoreContext, entry: BonsaiHgMappingEntry) -> Result<bool, Error> {
         self.mapping.add(ctx, entry).await
+    }
+
+    async fn bulk_add(
+        &self,
+        ctx: &CoreContext,
+        entries: &[BonsaiHgMappingEntry],
+    ) -> Result<u64, Error> {
+        self.mapping.bulk_add(ctx, entries).await
     }
 
     async fn get(

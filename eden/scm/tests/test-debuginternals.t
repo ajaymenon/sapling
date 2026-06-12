@@ -8,7 +8,7 @@
   > A
   > EOS
 
-  $ hg debuginternals
+  $ sl debuginternals
   *	blackbox (glob)
   *	store/hgcommits (glob)
   *	store/indexedlogdatastore (glob) (?)
@@ -17,5 +17,5 @@
   *	store/mutation (glob)
   *	store/segments (glob)
 
-  $ hg debuginternals -o a.tar.gz 2>/dev/null
+  $ sl debuginternals -o a.tar.gz 2>/dev/null
   a.tar.gz

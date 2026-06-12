@@ -6,6 +6,7 @@
  */
 
 use anyhow::Result;
+use anyhow::bail;
 use scs_client_raw::thrift;
 
 use crate::ScscApp;
@@ -13,9 +14,6 @@ use crate::ScscApp;
 #[derive(clap::Parser)]
 /// Create a bookmark
 pub(super) struct CommandArgs {
-    /// Dry run
-    #[clap(long, short = 'n')]
-    dry_run: bool,
     /// Hipster group to use for newly created ACL (if not specified, will not create new ACL)
     #[clap(long)]
     hipster_group: Option<String>,
@@ -41,7 +39,6 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
         .collect();
     let params = thrift::CreateReposParams {
         repos,
-        dry_run: args.dry_run,
         ..Default::default()
     };
     let token = conn.create_repos(&params).await?;
@@ -49,8 +46,31 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
     // Repo creation is potentially asynchronous request. Let's poll it until it's done.
     loop {
         let res = conn.create_repos_poll(&token).await?;
-        if res.result.is_some() {
-            break;
+        if let Some(result) = res.result {
+            match result.status {
+                thrift::CreateReposStatus::SUCCESS => {
+                    eprintln!("Repo creation succeeded.");
+                    break;
+                }
+                thrift::CreateReposStatus::FAILED => {
+                    let msg = result
+                        .message
+                        .unwrap_or_else(|| "no details provided".to_string());
+                    bail!("Repo creation failed: {msg}");
+                }
+                thrift::CreateReposStatus::ABORTED => {
+                    let msg = result
+                        .message
+                        .unwrap_or_else(|| "no details provided".to_string());
+                    bail!("Repo creation aborted: {msg}");
+                }
+                thrift::CreateReposStatus::IN_PROGRESS => {
+                    // Still in progress, keep polling
+                }
+                status => {
+                    bail!("Repo creation returned unexpected status: {status:?}");
+                }
+            }
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     }

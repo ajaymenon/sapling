@@ -17,18 +17,18 @@ name = "blackbox"
 harness = false
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 byteorder = "1.5"
-libc = "0.2.139"
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
+libc = "0.2.186"
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-clientinfo = { version = "0.1.0", path = "../clientinfo" }
 sapling-indexedlog = { version = "0.1.0", path = "../indexedlog" }
 sapling-serde_alt = { version = "0.1.0", path = "serde_alt" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_cbor = "0.11"
+serde_cbor = "0.11.2"
 serde_derive = "1.0.185"
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 
 [dev-dependencies]
 sapling-minibench = { version = "0.1.0", path = "../minibench" }
-tempfile = "3.22"
+tempfile = "3.27.0"

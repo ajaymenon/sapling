@@ -19,9 +19,12 @@
 #include "eden/fs/inodes/InodeAccessLogger.h"
 #include "eden/fs/model/git/TopLevelIgnores.h"
 #include "eden/fs/nfs/NfsServer.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/telemetry/FileAccessStructuredLogger.h"
 #include "eden/fs/telemetry/FsEventLogger.h"
+#include "eden/fs/telemetry/facebook/XplatLogger.h"
 #include "eden/fs/utils/Clock.h"
 
 DEFINE_bool(
@@ -46,7 +49,7 @@ constexpr std::chrono::seconds kSystemIgnoreMinPollSeconds{5};
 ServerState::ServerState(
     UserInfo userInfo,
     EdenStatsPtr edenStats,
-    SessionInfo sessionInfo,
+    SessionInfo sessionInfo, // NOLINT(performance-unnecessary-value-param)
     std::shared_ptr<PrivHelper> privHelper,
     std::shared_ptr<UnboundedQueueExecutor> threadPool,
     std::shared_ptr<folly::Executor> fsChannelThreadPool,
@@ -54,13 +57,15 @@ ServerState::ServerState(
     std::shared_ptr<ProcessInfoCache> processInfoCache,
     std::shared_ptr<StructuredLogger> structuredLogger,
     std::shared_ptr<StructuredLogger> notificationsStructuredLogger,
+    std::shared_ptr<ErrorLogger> errorLogger,
     std::shared_ptr<IScribeLogger> scribeLogger,
     std::shared_ptr<ReloadableConfig> reloadableConfig,
     const EdenConfig& initialConfig,
     [[maybe_unused]] folly::EventBase* mainEventBase,
     std::shared_ptr<Notifier> notifier,
     bool enableFaultDetection,
-    std::shared_ptr<InodeAccessLogger> inodeAccessLogger)
+    std::shared_ptr<InodeAccessLogger> inodeAccessLogger,
+    XplatLogger* xplatLogger)
     : userInfo_{std::move(userInfo)},
       edenStats_{std::move(edenStats)},
       privHelper_{std::move(privHelper)},
@@ -69,7 +74,13 @@ ServerState::ServerState(
       clock_{std::move(clock)},
       processInfoCache_{std::move(processInfoCache)},
       structuredLogger_{std::move(structuredLogger)},
+      edenFsEventsLogger_{std::make_shared<EdenFsEventsLogger>(
+          structuredLogger_,
+          xplatLogger,
+          reloadableConfig,
+          edenStats_.copy())},
       notificationsStructuredLogger_{std::move(notificationsStructuredLogger)},
+      errorLogger_{std::move(errorLogger)},
       scribeLogger_{std::move(scribeLogger)},
       faultInjector_{std::make_unique<FaultInjector>(enableFaultDetection)},
       nfs_{
@@ -79,7 +90,7 @@ ServerState::ServerState(
                     mainEventBase,
                     fsChannelThreadPool_,
                     initialConfig.runInternalRpcbind.getValue(),
-                    structuredLogger_,
+                    edenFsEventsLogger_,
                     initialConfig.maxFsChannelInflightRequests.getValue(),
                     initialConfig.highFsRequestsLogInterval.getValue(),
                     initialConfig.longRunningFSRequestThreshold.getValue())
@@ -104,7 +115,9 @@ ServerState::ServerState(
                         config_->getEdenConfig()
                             ->fileAccessScribeCategory.getValue(),
                         std::move(sessionInfo),
-                        edenStats_.copy()))},
+                        edenStats_.copy()),
+                    edenStats_.copy(),
+                    xplatLogger)},
       fsEventLogger_{
           initialConfig.requestSamplesPerMinute.getValue()
               ? std::make_shared<FsEventLogger>(config_, scribeLogger_)

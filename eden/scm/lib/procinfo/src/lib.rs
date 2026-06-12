@@ -287,7 +287,7 @@ pub fn parent_pid(pid: u32) -> u32 {
 
     #[cfg(target_os = "linux")]
     {
-        if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+        if let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
             let prefix = "PPid:";
             for line in content.lines() {
                 if let Some(suffix) = line.strip_prefix(prefix) {
@@ -322,7 +322,7 @@ pub fn exe_name(pid: u32) -> String {
 
     #[cfg(target_os = "linux")]
     {
-        if let Ok(path) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
+        if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/exe")) {
             return path.into_os_string().to_string_lossy().into_owned();
         }
     }
@@ -336,6 +336,34 @@ pub fn exe_name(pid: u32) -> String {
 
     #[allow(unreachable_code)]
     String::new()
+}
+
+/// Structured process information.
+#[derive(Default, Debug, serde::Serialize)]
+pub struct ProcInfo {
+    pub name: String,
+    pub pid: u32,
+}
+
+/// Walk the parent process tree up to `max_depth` levels, collecting
+/// executable names and pids. Returns empty results on error or if
+/// the chain is shorter than `max_depth`.
+pub fn process_ancestors(max_depth: usize) -> Vec<ProcInfo> {
+    let mut ancestors = Vec::new();
+    let mut pids = Vec::new();
+    let mut ppid = parent_pid(0);
+    // In theory, the OS should not report a cyclic process graph (ex. pid 1
+    // has parent pid = 1). Practically `parent_pids` takes snapshots
+    // every time on Windows (unnecessarily) and is subject to races. Be
+    // extra careful here so the loop wouldn't be infinite.
+    while ppid != 0 && pids.len() < max_depth && !pids.contains(&ppid) {
+        let name = exe_name(ppid);
+        let proc_info = ProcInfo { name, pid: ppid };
+        ancestors.push(proc_info);
+        pids.push(ppid);
+        ppid = parent_pid(ppid);
+    }
+    ancestors
 }
 
 /// Get a description of pid's ancestors, including pid itself.

@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 
 #include <folly/Conv.h>
 #include <folly/FileUtil.h>
@@ -22,9 +24,9 @@
 #include <unistd.h>
 #endif
 
-#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/FileUtils.h"
 #include "eden/common/utils/SpawnedProcess.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 
 using std::optional;
@@ -48,15 +50,33 @@ time_t getBootTimeSysctl() {
   }
   return boottime.tv_sec;
 }
+#elif defined(__linux__)
+time_t getBootTimeProcStat() {
+  std::ifstream procStat("/proc/stat");
+  if (!procStat.is_open()) {
+    return -1;
+  }
+  std::string line;
+  while (std::getline(procStat, line)) {
+    if (line.starts_with("btime ")) {
+      try {
+        return folly::to<time_t>(line.substr(6));
+      } catch (const std::exception&) {
+        return -1;
+      }
+    }
+  }
+  return -1;
+}
 #endif
 
 } // namespace
 
 HeartbeatManager::HeartbeatManager(
     const EdenStateDir& edenDir,
-    std::shared_ptr<StructuredLogger> structuredLogger)
+    std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger)
     : edenDir_(edenDir),
-      structuredLogger_(std::move(structuredLogger)),
+      edenFsEventsLogger_(std::move(edenFsEventsLogger)),
       heartbeatFilePath_(
           edenDir_.getPath() + PathComponentPiece{getHeartbeatFileName()}),
       heartbeatFilePathString_(heartbeatFilePath_.c_str()),
@@ -142,6 +162,8 @@ bool HeartbeatManager::checkForPreviousHeartbeat(
 
 #ifdef __APPLE__
         time_t bootTime = getBootTimeSysctl();
+#elif defined(__linux__)
+        time_t bootTime = getBootTimeProcStat();
 #else
         time_t bootTime = 0;
 #endif
@@ -162,19 +184,19 @@ bool HeartbeatManager::checkForPreviousHeartbeat(
                                                           logMemoryPressure](
                                                              auto&&) {
           std::optional<bool> maybeMemoryPressure = std::nullopt;
-          std::string memoryPressureErrorStr;
+          std::string systemLogCheckErrorStr;
           if (logMemoryPressure) {
             auto isMemoryPressure =
                 self->isMemoryPressureInSystemLog(latestDaemonHeartbeat);
             if (!isMemoryPressure.hasException()) {
               maybeMemoryPressure = isMemoryPressure.value();
             } else {
-              memoryPressureErrorStr =
+              systemLogCheckErrorStr =
                   isMemoryPressure.exception().what().toStdString();
               XLOGF(
                   WARN,
                   "Failed to check memory pressure in system log: {}",
-                  memoryPressureErrorStr);
+                  systemLogCheckErrorStr);
             }
           }
           XLOGF(
@@ -185,13 +207,19 @@ bool HeartbeatManager::checkForPreviousHeartbeat(
               maybeMemoryPressure.has_value()
                   ? (maybeMemoryPressure.value() ? "true" : "false")
                   : "unknown");
-          self->structuredLogger_->logEvent(
+          std::optional<uint64_t> downtime = std::nullopt;
+          if (latestDaemonHeartbeat > 0) {
+            uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+            downtime = now - latestDaemonHeartbeat;
+          }
+          self->edenFsEventsLogger_->logEvent(
               SilentDaemonExit{
                   latestDaemonHeartbeat,
                   daemon_exit_signal,
                   static_cast<uint64_t>(bootTime),
                   maybeMemoryPressure,
-                  memoryPressureErrorStr});
+                  systemLogCheckErrorStr,
+                  downtime});
         });
         folly::futures::detachOn(threadPool, std::move(future));
         // Remove any existing daemon exit signal file to clean up
@@ -259,6 +287,7 @@ std::string HeartbeatManager::getHeartbeatFileName() const {
   return edenDir_.getHeartbeatFileNamePrefix().toString() + pidContents;
 }
 
+#ifndef _WIN32
 // Helper function to convert UNIX timestamp to "YYYY-MM-DD HH:MM:SS"
 std::string HeartbeatManager::timestampToDateTimeString(uint64_t timestamp) {
   std::time_t t = static_cast<std::time_t>(timestamp);
@@ -276,13 +305,14 @@ std::string HeartbeatManager::timestampToDateTimeString(uint64_t timestamp) {
 folly::Try<bool> HeartbeatManager::isMemoryPressureInSystemLog(
     uint64_t latestDaemonHeartbeat) {
   try {
-    // Use helper for both start and end time
     std::string startDateTime =
         timestampToDateTimeString(latestDaemonHeartbeat);
+
+#ifdef __APPLE__
     std::time_t now = std::time(nullptr);
     std::string endDateTime =
         timestampToDateTimeString(static_cast<uint64_t>(now));
-    // Construct the log show command
+    // Construct "log show" command
     std::vector<std::string> cmd = {
         "/usr/bin/log",
         "show",
@@ -294,6 +324,10 @@ folly::Try<bool> HeartbeatManager::isMemoryPressureInSystemLog(
         endDateTime,
         "--predicate",
         "eventMessage CONTAINS \"largest compressed process edenfs\""};
+#else
+    // Construct "dmesg" command
+    std::vector<std::string> cmd = {"/usr/bin/dmesg", "--since", startDateTime};
+#endif
     // Run the command using SpawnedProcess
     SpawnedProcess::Options opts;
     opts.pipeStdout();
@@ -301,14 +335,37 @@ folly::Try<bool> HeartbeatManager::isMemoryPressureInSystemLog(
     auto proc = SpawnedProcess(cmd, std::move(opts));
     std::string output = proc.communicate().first;
     proc.waitTimeout(std::chrono::seconds(10));
-    // Check if "killing largest compressed process edenfs" exists in the output
+
+#ifdef __APPLE__
     bool found = output.find("killing largest compressed process edenfs") !=
         std::string::npos;
+#else
+    // Check each line for OOM kills of edenfs processes.
+    // We check per-line to avoid false positives from unrelated processes.
+    bool found = false;
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+      std::string lower = line;
+      folly::toLowerAscii(lower);
+      if ((lower.find("oom") != std::string::npos ||
+           lower.find("out of memory") != std::string::npos) &&
+          lower.find("killed process") != std::string::npos &&
+          (lower.find("(edenfs)") != std::string::npos ||
+           lower.find("(edenfs_privhelp)") != std::string::npos)) {
+        found = true;
+        break;
+      }
+    }
+#endif
     return folly::Try<bool>(found);
+
   } catch (const std::exception& e) {
     return folly::Try<bool>(e);
   }
 }
+
+#endif
 
 // Convert integer to string in a signal-safe way (simple itoa)
 // return the length of the string

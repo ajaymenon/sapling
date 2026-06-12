@@ -33,6 +33,7 @@ use manifest::Manifest;
 use manifest_tree::TreeManifest;
 use manifest_tree::TreeStore;
 use manifest_tree::apply_diff_grafts;
+use manifest_tree::testutil::TestStore;
 use parking_lot::RwLock;
 use pathmatcher::AlwaysMatcher;
 use pathmatcher::ExactMatcher;
@@ -61,6 +62,7 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
             )
         ),
     )?;
+    m.add(py, "testtreemanifest", py_fn!(py, test_treemanifest()))?;
     m.add(
         py,
         "prefetch",
@@ -74,6 +76,16 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
         ),
     )?;
     Ok(m)
+}
+
+impl treemanifest {
+    pub fn from_rust(py: Python, underlying: TreeManifest) -> PyResult<Self> {
+        treemanifest::create_instance(
+            py,
+            Arc::new(RwLock::new(underlying)),
+            RefCell::new(HashSet::new()),
+        )
+    }
 }
 
 py_class!(pub class treemanifest |py| {
@@ -90,7 +102,7 @@ py_class!(pub class treemanifest |py| {
             None => TreeManifest::ephemeral(manifest_store),
             Some(value) => TreeManifest::durable(manifest_store, pybytes_to_node(py, value)?),
         };
-        treemanifest::create_instance(py, Arc::new(RwLock::new(underlying)), RefCell::new(HashSet::new()))
+        treemanifest::from_rust(py, underlying)
     }
 
     /// Returns a new instance of treemanifest that contains the same data as the base.
@@ -111,8 +123,7 @@ py_class!(pub class treemanifest |py| {
             Ok(value) => value,
             Err(_) => {
                 let msg = format!(
-                    "cannot find file '{}' in manifest",
-                    path,
+                    "cannot find file '{path}' in manifest",
                 );
                 return Err(PyErr::new::<exc::KeyError, _>(py, msg))
             }
@@ -120,7 +131,7 @@ py_class!(pub class treemanifest |py| {
         let tree = self.underlying(py).read();
         match tree.get_file(repo_path).map_pyerr(py)? {
             None => {
-                let msg = format!("cannot find file '{}' in manifest", repo_path);
+                let msg = format!("cannot find file '{repo_path}' in manifest");
                 Err(PyErr::new::<exc::KeyError, _>(py, msg))
             }
             Some(file_metadata) => file_metadata_to_py_tuple(py, &file_metadata),
@@ -155,6 +166,17 @@ py_class!(pub class treemanifest |py| {
             _ => false
         };
         Ok(result)
+    }
+
+    /// Return path is present (True), absent (False), or restricted (None).
+    def lookup(&self, path: PyPathBuf) -> PyResult<Option<bool>> {
+        let repo_path = path.to_repo_path().map_pyerr(py)?;
+        let tree = self.underlying(py).read();
+        match tree.get(repo_path) {
+            Ok(entry) => Ok(Some(entry.is_some())),
+            Err(err) if err.is::<types::errors::PermissionDenied>() => Ok(None),
+            Err(err) => Err(err).map_pyerr(py),
+        }
     }
 
     /// Count the number of files that match the predicate passed to the function.
@@ -542,7 +564,7 @@ py_class!(pub class treemanifest |py| {
         let tree = self.underlying(py).read();
         match tree.get_file(repo_path).map_pyerr(py)? {
             Some(file_metadata) => Ok(node_to_pybytes(py, file_metadata.hgid)),
-            None => Err(PyErr::new::<exc::KeyError, _>(py, format!("file {} not found", path))),
+            None => Err(PyErr::new::<exc::KeyError, _>(py, format!("file {path} not found"))),
         }
     }
 
@@ -626,19 +648,17 @@ py_class!(pub class treemanifest |py| {
         &self,
         p1tree: Option<&treemanifest> = None,
         p2tree: Option<&treemanifest> = None
-    ) -> PyResult<Vec<PyTuple>> {
+    ) -> PyResult<PyBytes> {
         let pending_delete = self.pending_delete(py).borrow();
         if !pending_delete.is_empty() {
             return Err(PyErr::new::<exc::RuntimeError, _>(
                 py,
                 format!(
                     "Error finalizing manifest. Invalid state: \
-                    expecting deletion commands for the following paths: {:?}",
-                    pending_delete
+                    expecting deletion commands for the following paths: {pending_delete:?}"
                 )
             ));
         }
-        let mut result = Vec::new();
         let mut tree = self.underlying(py).write();
         let mut parents = vec!();
         if let Some(m1) = p1tree {
@@ -647,34 +667,11 @@ py_class!(pub class treemanifest |py| {
         if let Some(m2) = p2tree {
             parents.push(m2.underlying(py).read());
         }
-        let entries = tree.finalize(
-            parents.iter().map(|x| x.deref()).collect()
+        let parent_refs: Vec<&TreeManifest> = parents.iter().map(|x| x.deref()).collect();
+        let hgid = tree.persist(
+            &parent_refs,
         ).map_pyerr(py)?;
-        for entry in entries {
-            let (repo_path, node, raw, p1node, p2node) = entry;
-            let tuple = PyTuple::new(
-                py,
-                &[
-                    PyPathBuf::from(repo_path).to_py_object(py).into_object(),
-                    node_to_pybytes(py, node).into_object(),
-                    PyBytes::new(py, &raw).into_object(),
-                    PyBytes::new(py, &[]).into_object(),
-                    node_to_pybytes(py, p1node).into_object(),
-                    node_to_pybytes(py, p2node).into_object(),
-                ],
-            );
-            result.push(tuple);
-        }
-        Ok(result)
-    }
-
-    /// flush() -> node.
-    /// Write pending trees to store. Return root node.
-    /// Only works for git store. Use finalize() for hg store instead.
-    def flush(&self) -> PyResult<PyBytes> {
-        let mut tree = self.underlying(py).write();
-        let hgid = tree.flush().map_pyerr(py)?;
-        Ok(PyBytes::new(py, hgid.as_ref()))
+        Ok(node_to_pybytes(py, hgid))
     }
 
     @classmethod def applydiffgrafts(_cls, m1: &treemanifest, m2: &treemanifest) -> PyResult<(Self, Self)> {
@@ -765,6 +762,16 @@ pub fn prefetch(
     Ok(PyNone)
 }
 
+fn test_treemanifest(py: Python) -> PyResult<treemanifest> {
+    let store = Arc::new(TestStore::new());
+    let manifest = TreeManifest::ephemeral(store);
+    treemanifest::create_instance(
+        py,
+        Arc::new(RwLock::new(manifest)),
+        RefCell::new(HashSet::new()),
+    )
+}
+
 fn insert(
     tree: &mut TreeManifest,
     path: RepoPathBuf,
@@ -787,7 +794,7 @@ fn insert(
         manifest_tree::InsertErrorCause::DirectoryExistsForPath => {
             let files: Vec<File> = tree
                 .files(TreeMatcher::from_rules(
-                    [format!("{}/**", path)].iter(),
+                    [format!("{path}/**")].iter(),
                     true, // case_sensitive=true
                 )?)
                 .collect::<Result<_>>()?;

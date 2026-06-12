@@ -69,7 +69,7 @@ fn unbundle(py: Python, data: PyBytes) -> PyResult<Vec<mutationentry>> {
     if version != BUNDLE_FORMAT_VERSION {
         return Err(PyErr::new::<exc::IOError, _>(
             py,
-            format!("Unsupported mutation format: {}", version),
+            format!("Unsupported mutation format: {version}"),
         ));
     }
     let count = cursor.read_vlq().map_pyerr(py)?;
@@ -268,6 +268,8 @@ py_class!(class mutationstore |py| {
         Ok(entries)
     }
 
+    /// get_dag(nodes, successors=True, predecessors=True)
+    ///
     /// Figure out connected components related to specified nodes.
     /// The returned graph supports DAG related calculations like
     /// ancestors, heads, roots, etc.

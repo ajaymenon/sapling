@@ -12,6 +12,7 @@ use anyhow::Result;
 use flume::Sender;
 use progress_model::ProgressBar;
 use storemodel::FileAuxData;
+use storemodel::SerializationFormat;
 use storemodel::TreeAuxData;
 use tracing::field;
 use types::FetchContext;
@@ -35,6 +36,7 @@ use crate::indexedlogtreeauxstore::TreeAuxStore;
 use crate::scmstore::KeyFetchError;
 use crate::scmstore::fetch::CommonFetchState;
 use crate::scmstore::fetch::FetchErrors;
+use crate::scmstore::fetch::MaxFetchCount;
 use crate::scmstore::tree::types::AuxData;
 use crate::scmstore::tree::types::LazyTree;
 
@@ -82,10 +84,11 @@ impl FetchState {
         tree_cache: Option<Arc<IndexedLogHgIdDataStore>>,
         file_aux_cache: Option<Arc<AuxStore>>,
         tree_aux_cache: Option<Arc<TreeAuxStore>>,
+        max_fetch_count: MaxFetchCount,
     ) -> Self {
         let cause = fctx.cause();
         FetchState {
-            common: CommonFetchState::new(keys, attrs, found_tx, fctx, bar),
+            common: CommonFetchState::new(keys, attrs, found_tx, fctx, bar, max_fetch_count),
             errors: FetchErrors::new(),
             metrics: if cause.is_prefetch() {
                 &TREE_STORE_PREFETCH_METRICS
@@ -108,6 +111,7 @@ impl FetchState {
         indexedlog_cache: Option<&IndexedLogHgIdDataStore>,
         historystore_cache: Option<&IndexedLogHgIdHistoryStore>,
         verify_hash: bool,
+        format: SerializationFormat,
     ) -> Result<()> {
         let pending: Vec<_> = self
             .common
@@ -147,12 +151,13 @@ impl FetchState {
         let response = edenapi
             .trees_blocking(self.common.fctx.clone(), pending, Some(attributes))
             .map_err(|e| e.tag_network())?;
+
         for entry in response.entries {
             bar.increase_position(1);
 
             let entry = entry?;
             let key = entry.key.clone();
-            let entry = LazyTree::SaplingRemoteApi(entry, verify_hash);
+            let entry = LazyTree::SaplingRemoteApi(entry, verify_hash, format);
 
             self.cache_child_aux_data(&entry);
 
@@ -170,8 +175,8 @@ impl FetchState {
             }
 
             if indexedlog_cache.is_some() {
-                if let Some(entry) = entry.indexedlog_cache_entry(key.hgid)? {
-                    self.trees_to_cache.push((entry.node(), entry));
+                if let Some(cache_entry) = entry.indexedlog_cache_entry(key.hgid)? {
+                    self.trees_to_cache.push((cache_entry.node(), cache_entry));
                     if self.trees_to_cache.len() >= TREE_BATCH_THRESHOLD {
                         self.flush_trees();
                     }

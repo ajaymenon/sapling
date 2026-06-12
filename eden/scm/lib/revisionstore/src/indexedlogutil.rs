@@ -19,6 +19,7 @@ use configmodel::convert::ByteCount;
 use indexedlog::OpenWithRepair;
 use indexedlog::Result as IndexedlogResult;
 use indexedlog::log;
+use indexedlog::log::Appendable;
 use indexedlog::log::ExtendWrite;
 use indexedlog::log::IndexDef;
 use indexedlog::log::IndexOutput;
@@ -70,14 +71,9 @@ impl Store {
         self.read().is_permanent()
     }
 
-    /// Add the buffer to the store.
-    pub fn append(&self, buf: impl AsRef<[u8]>) -> Result<()> {
-        self.write().append(buf)
-    }
-
-    /// Write to the store directly.
-    pub fn append_direct(&self, cb: impl Fn(&mut dyn ExtendWrite) -> Result<()>) -> Result<()> {
-        self.write().append_direct(cb)
+    /// Add data to the store.
+    pub fn append(&self, data: impl Appendable) -> Result<()> {
+        self.write().append(data)
     }
 
     /// Attempt to make slice backed by the mmap buffer to avoid heap allocation.
@@ -121,10 +117,14 @@ impl Store {
         let mut log = self.write();
 
         for (k, v) in items {
-            log.append_direct(|buf| serialize(k, v, buf))?;
+            log.append(|buf: &mut dyn ExtendWrite| serialize(k, v, buf))?;
         }
 
         Ok(())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.inner.read().is_dirty()
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -184,18 +184,11 @@ impl Inner {
         Ok(!self.lookup(index_id, key)?.is_empty()?)
     }
 
-    /// Add the buffer to the store.
-    pub fn append(&mut self, buf: impl AsRef<[u8]>) -> Result<()> {
+    /// Add data to the store.
+    pub fn append(&mut self, data: impl Appendable) -> Result<()> {
         match self {
-            Self::Permanent(log) => Ok(log.append(buf)?),
-            Self::Rotated(log) => Ok(log.append(buf)?),
-        }
-    }
-
-    pub fn append_direct(&mut self, cb: impl Fn(&mut dyn ExtendWrite) -> Result<()>) -> Result<()> {
-        match self {
-            Self::Permanent(log) => Ok(log.append_direct(cb)?),
-            Self::Rotated(log) => Ok(log.append_direct(cb)?),
+            Self::Permanent(log) => Ok(log.append(data)?),
+            Self::Rotated(log) => Ok(log.append(data)?),
         }
     }
 
@@ -234,6 +227,13 @@ impl Inner {
             }
         };
         Ok(())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        match self {
+            Self::Permanent(log) => log.is_dirty(),
+            Self::Rotated(log) => log.is_dirty(),
+        }
     }
 
     fn is_changed_on_disk(&self) -> bool {
@@ -285,6 +285,7 @@ pub struct StoreOpenOptions {
     indexes: Vec<IndexDef>,
     create: bool,
     btrfs_compression: bool,
+    cleanup_old_logs_chance: f64,
 }
 
 impl StoreOpenOptions {
@@ -299,6 +300,9 @@ impl StoreOpenOptions {
                 .must_get("scmstore", "sync-logs-if-changed-on-disk")
                 .unwrap_or_default(),
             btrfs_compression: false,
+            cleanup_old_logs_chance: config
+                .must_get("scmstore", "cleanup-old-logs-chance")
+                .unwrap_or(0.01),
         }
     }
 
@@ -373,8 +377,7 @@ impl StoreOpenOptions {
 
     /// Create a permanent `Store`.
     ///
-    /// Data added to the store will never be rotated out, and `fsync(2)` is used to guarantee
-    /// data consistency.
+    /// Data added to the store will never be rotated out.
     pub fn permanent(self, path: impl AsRef<Path>) -> Result<Store> {
         let sync_if_changed_on_disk = self.sync_if_changed_on_disk;
         let should_compress = self.should_compress(path.as_ref())?;
@@ -417,16 +420,21 @@ impl StoreOpenOptions {
     pub fn rotated(self, path: impl AsRef<Path>) -> Result<Store> {
         let sync_if_changed_on_disk = self.sync_if_changed_on_disk;
         let should_compress = self.should_compress(path.as_ref())?;
+        let cleanup_chance = self.cleanup_old_logs_chance;
         let opts = self
             .into_rotated_open_options()
             .btrfs_compression(!should_compress);
         let mut rotate_log = opts.open_with_repair(path.as_ref())?;
-        // Attempt to clean up old logs that might be left around. On Windows, other
-        // Mercurial processes that have the store opened might prevent their removal.
-        let res = rotate_log.remove_old_logs();
-        if let Err(err) = res {
-            debug!("Unable to remove old indexedlogutil logs: {:?}", err);
+
+        if rand::random_bool(cleanup_chance) {
+            // Attempt to clean up old logs that might be left around. On Windows, other
+            // Mercurial processes that have the store opened might prevent their removal.
+            let res = rotate_log.remove_old_logs();
+            if let Err(err) = res {
+                debug!("Unable to remove old indexedlogutil logs: {:?}", err);
+            }
         }
+
         Ok(Store {
             inner: RwLock::new(Inner::Rotated(rotate_log)),
             auto_sync_count: AtomicU64::new(0),

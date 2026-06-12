@@ -23,6 +23,7 @@
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/store/ScmStatusDiffCallback.h"
 #include "eden/fs/store/TreeCache.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
@@ -77,9 +78,12 @@ class DiffTest : public ::testing::Test {
         treeCache,
         makeRefPtr<EdenStats>(),
         std::make_shared<ProcessInfoCache>(),
-        std::make_shared<NullStructuredLogger>(),
+        std::make_shared<EdenFsEventsLogger>(
+            std::make_shared<NullStructuredLogger>(),
+            nullptr,
+            nullptr,
+            makeRefPtr<EdenStats>()),
         edenConfig,
-        true,
         kPathMapDefaultCaseSensitive);
   }
 
@@ -94,7 +98,6 @@ class DiffTest : public ::testing::Test {
         ObjectFetchContext::getNullContext(),
         listIgnored,
         caseSensitive,
-        true,
         store_,
         std::move(topLevelIgnores));
   }
@@ -1375,4 +1378,97 @@ TEST_F(DiffTest, directoryDiff) {
           std::make_pair(RelativePath{"h"}, ScmFileStatus::ADDED)));
   // TODO(xavierd): Are we missing a change to the root whenever a file to the
   // root is created/removed?
+}
+
+TEST_F(DiffTest, restrictedEntrySkipped) {
+  // Set up tree1 with a restricted directory alongside normal files.
+  FakeTreeBuilder builder1;
+  builder1.setFile("src/main.c", "hello world");
+  builder1.setFile("restricted_dir/secret.txt", "secret");
+  builder1.setDirIsRestricted("restricted_dir");
+  builder1.finalize(backingStore_, /* setReady */ true);
+  backingStore_->putCommit("1", builder1)->setReady();
+
+  // tree2: remove the restricted directory, modify normal file.
+  auto builder2 = builder1.clone();
+  builder2.replaceFile("src/main.c", "hello world v2");
+  builder2.removeFile("restricted_dir/secret.txt");
+  builder2.finalize(backingStore_, /* setReady */ true);
+  backingStore_->putCommit("2", builder2)->setReady();
+
+  // Diff should report src/main.c as modified but NOT report
+  // restricted_dir or its contents as removed.
+  auto result = diffCommits("1", "2").get(100ms);
+  EXPECT_THAT(*result.errors(), UnorderedElementsAre());
+  EXPECT_THAT(
+      *result.entries(),
+      UnorderedElementsAre(Pair("src/main.c", ScmFileStatus::MODIFIED)));
+}
+
+TEST_F(DiffTest, restrictedEntryAddedSkipped) {
+  FakeTreeBuilder builder1;
+  builder1.setFile("src/main.c", "hello world");
+  builder1.finalize(backingStore_, /* setReady */ true);
+  backingStore_->putCommit("1", builder1)->setReady();
+
+  auto builder2 = builder1.clone();
+  builder2.replaceFile("src/main.c", "hello world v2");
+  builder2.setFile("restricted_dir/secret.txt", "secret");
+  builder2.setDirIsRestricted("restricted_dir");
+  builder2.finalize(backingStore_, /* setReady */ true);
+  backingStore_->putCommit("2", builder2)->setReady();
+
+  // Diff should report the normal file change but not synthesize an added
+  // subtree from the restricted directory placeholder.
+  auto result = diffCommits("1", "2").get(100ms);
+  EXPECT_THAT(*result.errors(), UnorderedElementsAre());
+  EXPECT_THAT(
+      *result.entries(),
+      UnorderedElementsAre(Pair("src/main.c", ScmFileStatus::MODIFIED)));
+}
+
+TEST_F(DiffTest, restrictedEntryBothPresent) {
+  // Both trees have the same restricted directory—diff should skip it.
+  FakeTreeBuilder builder1;
+  builder1.setFile("src/main.c", "hello world");
+  builder1.setFile("restricted_dir/secret.txt", "secret");
+  builder1.setDirIsRestricted("restricted_dir");
+  builder1.finalize(backingStore_, /* setReady */ true);
+  backingStore_->putCommit("1", builder1)->setReady();
+
+  auto builder2 = builder1.clone();
+  builder2.replaceFile("restricted_dir/secret.txt", "new secret");
+  builder2.setDirIsRestricted("restricted_dir");
+  builder2.finalize(backingStore_, /* setReady */ true);
+  backingStore_->putCommit("2", builder2)->setReady();
+
+  auto result = diffCommits("1", "2").get(100ms);
+  EXPECT_THAT(*result.errors(), UnorderedElementsAre());
+  // restricted_dir content change should not be reported
+  EXPECT_THAT(*result.entries(), UnorderedElementsAre());
+}
+
+TEST_F(DiffTest, restrictedOnOneSideSkipsDiff) {
+  // tree1: restricted_dir is NOT restricted.
+  FakeTreeBuilder builder1;
+  builder1.setFile("src/main.c", "hello world");
+  builder1.setFile("restricted_dir/secret.txt", "secret");
+  builder1.finalize(backingStore_, /* setReady */ true);
+  backingStore_->putCommit("1", builder1)->setReady();
+
+  // tree2: restricted_dir IS restricted, with different content.
+  auto builder2 = builder1.clone();
+  builder2.replaceFile("src/main.c", "hello world v2");
+  builder2.replaceFile("restricted_dir/secret.txt", "new secret");
+  builder2.setDirIsRestricted("restricted_dir");
+  builder2.finalize(backingStore_, /* setReady */ true);
+  backingStore_->putCommit("2", builder2)->setReady();
+
+  // The OR-guard in processBothPresent should skip restricted_dir
+  // because one side is restricted, even though the other is not.
+  auto result = diffCommits("1", "2").get(100ms);
+  EXPECT_THAT(*result.errors(), UnorderedElementsAre());
+  EXPECT_THAT(
+      *result.entries(),
+      UnorderedElementsAre(Pair("src/main.c", ScmFileStatus::MODIFIED)));
 }

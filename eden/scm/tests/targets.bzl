@@ -21,10 +21,8 @@ def excluded_t_tests():
             "infinitepush_scratchbookmark_commands_t",
             "network_doctor_t",
             "remotenames_fastheaddiscovery_hidden_commits_t",
-
             # see comment in core.tests.blacklist
             "help_t",
-
             # non-debugruntest tests do not work under buck for the most part,
             # as sandcastle has an even older version of /bin/bash and other commands
             # and .bat file shenanigans
@@ -45,11 +43,11 @@ def excluded_t_tests():
             "rust_clone_t",
             "share_t",
             "sparse_hgrc_profile_t",
-
             # times out
             "commitcloud_sync_t",
             "fb_ext_copytrace_t",
             "merge_changedelete_t",
+            "sign_commit_x509_t",
         ]
     return excluded
 
@@ -65,7 +63,6 @@ def excluded_watchman_t_tests():
             # debugruntest issues (see comment in excluded_t_tests)
             "pushrebase_withmerges_t",
             "treestate_fresh_instance_t",
-
             # these tests also fail with run-tests.py
             "casefolding_t",
             "check_code_t",
@@ -74,14 +71,14 @@ def excluded_watchman_t_tests():
         ]
     return excluded
 
-def get_hg_run_tests_excluded():
+def get_sl_run_tests_excluded():
     return "test_(%s)" % "|".join(excluded_t_tests())
 
-def get_hg_watchman_run_tests_excluded():
+def get_sl_watchman_run_tests_excluded():
     excluded = excluded_t_tests() + excluded_watchman_t_tests()
     return "test_(%s)" % "|".join(excluded)
 
-def get_hg_edenfs_watchman_run_tests_included():
+def get_sl_edenfs_watchman_run_tests_included():
     included = [
         "eden_watchman_edenapi_glob_t",
         "eden_watchman_noedenapi_glob_t",
@@ -97,6 +94,9 @@ def get_blocklist():
     return blocklist_prefix + "centos7"
 
 _RT_ENV = {
+    # Keep using hg_test binary for now. Tests still use "$ hg" commands and
+    # expect HG-identity output. Will switch to sl_test after all tests are
+    # converted to use "$ sl".
     "HGEXECUTABLEPATH": "$(location //eden/scm:hg_test)",
     "HGRUNTEST_SKIP_ENV": "1",
     "HGTEST_BLOCKLIST": get_blocklist(),
@@ -104,7 +104,7 @@ _RT_ENV = {
     # used by unittestify.py
     "HGTEST_DIR": "eden/scm/tests",
     "HGTEST_DUMMYSSH": "$(location :dummyssh3)",
-    "HGTEST_EXCLUDED": get_hg_run_tests_excluded(),
+    "HGTEST_EXCLUDED": get_sl_run_tests_excluded(),
     "HGTEST_HG": "$(location //eden/scm:hg_test)",
     "HGTEST_NORMAL_LAYOUT": "0",
     "HGTEST_PYTHON": "fbpython",
@@ -132,15 +132,7 @@ SRCS = dict(
 
 # Generartes a test target
 # Do not use excluded and included at the same time
-def run_tests_target(
-        name = None,
-        watchman = False,
-        eden = False,
-        mononoke = False,
-        env_overrides = dict(),
-        excluded = None,
-        included = None,
-        **kwargs):
+def run_tests_target(name = None, watchman = False, eden = False, mononoke = False, env_overrides = dict(), excluded = None, included = None, **kwargs):
     if not name:
         extras = ""
         if eden:
@@ -149,7 +141,7 @@ def run_tests_target(
             extras += "watchman_"
         if mononoke:
             extras += "mononoke_"
-        name = "hg_%srun_tests" % extras
+        name = "sl_%srun_tests" % extras
     resources = dict(_RT_RESOURCES)
     if not eden:
         ENV = dict(_RT_ENV)
@@ -167,7 +159,7 @@ def run_tests_target(
         ENV["HGTEST_MONONOKE_SERVER"] = "$(location //eden/mononoke:mononoke)"
         ENV["HGTEST_GET_FREE_SOCKET"] = "$(location //eden/mononoke/tests/integration:get_free_socket)"
         ENV["TEST_FIXTURES"] = "$(location //eden/mononoke/tests/integration:test_fixtures)"
-        ENV["JUST_KNOBS_DEFAULTS"] = "$(location //eden/mononoke/common/mononoke_macros:just_knobs_defaults)"
+        ENV["JUST_KNOBS_DEFAULTS"] = "$(location //eden/mononoke/common/mononoke_macros:test_just_knobs)"
         ENV["FB_TEST_FIXTURES"] = "$(location //eden/mononoke/tests/integration/facebook:facebook_test_fixtures)"
         resources["//eden/mononoke/tests/integration/certs/facebook:test_certs"] = "certs"
         resources["//eden/mononoke/tests/integration:get_free_socket"] = "get_free_socket.par"
@@ -192,7 +184,7 @@ def run_tests_target(
         env = ENV,
         resources = resources,
         supports_static_listing = False,
-        **kwargs
+        **kwargs,
     )
     buck_command_alias(
         name = name + "_cli",
@@ -202,7 +194,7 @@ def run_tests_target(
     )
 
 def generate_trinity_smoketests(included, **kwargs):
-    hg_d = [
+    sl_d = [
         {},
         {
             # Make sure to keep these in sync with unittestify
@@ -212,7 +204,7 @@ def generate_trinity_smoketests(included, **kwargs):
             "HG_REAL_BIN": None,
         },
     ]
-    hg_s = ["", "prod_hg_"]
+    sl_s = ["", "prod_sl_"]
     eden_d = [
         {},
         {
@@ -231,19 +223,19 @@ def generate_trinity_smoketests(included, **kwargs):
         },
     ]
     mononoke_s = ["", "prod_mononoke_"]
-    for hg in range(2):
+    for sl in range(2):
         for eden in range(2):
             for mononoke in range(2):
-                if hg + eden + mononoke == 0:
+                if sl + eden + mononoke == 0:
                     # This is the default smoke test, so we don't generate one
                     continue
-                name = "trinity_smoke_%stest" % (hg_s[hg] + eden_s[eden] + mononoke_s[mononoke])
+                name = "trinity_smoke_%stest" % (sl_s[sl] + eden_s[eden] + mononoke_s[mononoke])
                 run_tests_target(
                     name = name,
                     eden = True,
                     mononoke = True,
                     watchman = True,
-                    env_overrides = hg_d[hg] | eden_d[eden] | mononoke_d[mononoke],
+                    env_overrides = sl_d[sl] | eden_d[eden] | mononoke_d[mononoke],
                     included = included,
-                    **kwargs
+                    **kwargs,
                 )

@@ -247,6 +247,7 @@ from sapling import (
     exchange,
     extensions,
     hg,
+    identity,
     lock,
     match as matchmod,
     merge as mergemod,
@@ -1544,7 +1545,10 @@ def warnverifyactions(ui, repo, actions, state, ctxs):
         verifyactions(actions, state, ctxs)
     except error.ParseError:
         if repo.localvfs.exists("histedit-last-edit.txt"):
-            ui.warn(_("warning: histedit rules saved to: .hg/histedit-last-edit.txt\n"))
+            ui.warn(
+                _("warning: histedit rules saved to: %s/histedit-last-edit.txt\n")
+                % identity.default().dotdir()
+            )
         raise
 
 
@@ -1736,6 +1740,4 @@ def summaryhook(ui, repo):
 
 def extsetup(ui):
     cmdutil.summaryhooks.add("histedit", summaryhook)
-    cmdutil.afterresolvedstates.append(
-        ("histedit-state", _("@prog@ histedit --continue"))
-    )
+    cmdutil.afterresolvedstates.append(("histedit-state", "@prog@ histedit --continue"))

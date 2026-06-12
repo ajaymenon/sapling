@@ -34,8 +34,11 @@ use crate::lfs::LfsStore;
 use crate::scmstore::FileStore;
 use crate::scmstore::TreeStore;
 use crate::scmstore::activitylogger::ActivityLogger;
+use crate::scmstore::fetch::MaxFetchCount;
 use crate::scmstore::file::FileStoreMetrics;
+use crate::scmstore::tree::RestrictedTreeMode;
 use crate::scmstore::tree::TreeMetadataMode;
+use crate::scmstore::tree::new_acl_check_cache;
 use crate::util::RUN_ONCE_FILENAME;
 use crate::util::check_run_once;
 use crate::util::get_cache_path;
@@ -56,6 +59,8 @@ pub struct FileStoreBuilder<'a> {
 
     edenapi: Option<Arc<SaplingRemoteApiFileStore>>,
     format: Option<SerializationFormat>,
+
+    max_fetch_count: MaxFetchCount,
 }
 
 impl<'a> FileStoreBuilder<'a> {
@@ -69,7 +74,13 @@ impl<'a> FileStoreBuilder<'a> {
             indexedlog_cache: None,
             edenapi: None,
             format: None,
+            max_fetch_count: MaxFetchCount::default(),
         }
+    }
+
+    pub fn max_fetch_count(mut self, max_fetch_count: MaxFetchCount) -> Self {
+        self.max_fetch_count = max_fetch_count;
+        self
     }
 
     pub fn local_path(mut self, path: impl AsRef<Path>) -> Self {
@@ -339,6 +350,7 @@ impl<'a> FileStoreBuilder<'a> {
 
             activity_logger,
             metrics: FileStoreMetrics::new(),
+            max_fetch_count: self.max_fetch_count,
 
             aux_cache,
 
@@ -370,6 +382,9 @@ pub struct TreeStoreBuilder<'a> {
     tree_aux_store: Option<Arc<TreeAuxStore>>,
     filestore: Option<Arc<FileStore>>,
     format: Option<SerializationFormat>,
+    permission_denied_paths:
+        Option<Arc<Mutex<std::collections::VecDeque<types::errors::PermissionDenied>>>>,
+    max_fetch_count: MaxFetchCount,
 }
 
 impl<'a> TreeStoreBuilder<'a> {
@@ -385,7 +400,22 @@ impl<'a> TreeStoreBuilder<'a> {
             tree_aux_store: None,
             filestore: None,
             format: None,
+            permission_denied_paths: None,
+            max_fetch_count: MaxFetchCount::default(),
         }
+    }
+
+    pub fn max_fetch_count(mut self, max_fetch_count: MaxFetchCount) -> Self {
+        self.max_fetch_count = max_fetch_count;
+        self
+    }
+
+    pub fn permission_denied_paths(
+        mut self,
+        paths: Arc<Mutex<std::collections::VecDeque<types::errors::PermissionDenied>>>,
+    ) -> Self {
+        self.permission_denied_paths = Some(paths);
+        self
     }
 
     pub fn local_path(mut self, path: impl AsRef<Path>) -> Self {
@@ -645,6 +675,16 @@ impl<'a> TreeStoreBuilder<'a> {
             _ => TreeMetadataMode::Never,
         };
 
+        let restricted_tree_mode = match self
+            .config
+            .get("experimental", "restricted-tree-mode")
+            .as_deref()
+        {
+            Some("logged") => RestrictedTreeMode::Logged,
+            Some("enforced") => RestrictedTreeMode::Enforced,
+            _ => RestrictedTreeMode::Disabled,
+        };
+
         let fetch_tree_aux_data = self
             .config
             .get_or_default::<bool>("scmstore", "fetch-tree-aux-data")?;
@@ -677,6 +717,10 @@ impl<'a> TreeStoreBuilder<'a> {
                 .config
                 .get_or_default("experimental", "unbounded-scmstore-queue")?,
             verify_hash,
+            restricted_tree_mode,
+            acl_check_cache: new_acl_check_cache(),
+            permission_denied_paths: self.permission_denied_paths,
+            max_fetch_count: self.max_fetch_count,
         })
     }
 }

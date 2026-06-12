@@ -52,7 +52,7 @@ impl SourceControlServiceImpl {
         for repo_id_in_cfg in repo_ids_in_cfg {
             if !known_repo_ids.contains(&RepositoryId::new(repo_id_in_cfg as i32)) {
                 return Err(scs_errors::ServiceError::from(scs_errors::repo_not_found(
-                    format!("{}", repo_id_in_cfg),
+                    format!("{repo_id_in_cfg}"),
                 )));
             }
         }
@@ -70,9 +70,7 @@ impl SourceControlServiceImpl {
             .repo_by_id(ctx.clone(), target_repo_id)
             .await
             .map_err(scs_errors::invalid_request)?
-            .ok_or_else(|| {
-                scs_errors::invalid_request(anyhow!("repo not found {}", target_repo_id))
-            })?
+            .ok_or_else(|| scs_errors::invalid_request(anyhow!("repo not found {target_repo_id}")))?
             .build()
             .await?;
         // Check that source control service writes are enabled
@@ -98,10 +96,12 @@ impl SourceControlServiceImpl {
             .into_config_format(&self.mononoke)?;
         let target_repo_id = RepositoryId::new(target.repo_id.try_into().unwrap());
         self.check_write_allowed(&ctx, target_repo_id).await?;
-        let repo_configs = self.configs.repo_configs();
-        let (_, target_repo_config) = repo_configs
-            .get_repo_config(target_repo_id)
-            .ok_or_else(|| MononokeError::InvalidRequest("repo not found".to_string()))?;
+        // Route through `get_or_load_repo_config_by_id` so split-loaded repos
+        // (only present in the per-tier RepoSpec manifest) resolve correctly.
+        let (_, target_repo_config) = self
+            .configs
+            .get_or_load_repo_config_by_id(target_repo_id.id())
+            .map_err(|_| MononokeError::InvalidRequest("repo not found".to_string()))?;
 
         let new_config = params.new_config.into_config_format(&self.mononoke)?;
         self.verify_repos_by_config(&new_config)?;

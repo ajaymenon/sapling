@@ -67,7 +67,7 @@ Main protocol servers (Mononoke/SLAPI, SCS, Git, LFS) and internal microservices
 Background maintenance tasks: Walker (graph validation), Blobstore Healer (storage durability), Derivation Worker, Cross-Repo Sync, and Statistics Collector.
 
 **[3.3 - Tools and Utilities](3.3-tools-and-utilities.md)**
-Command-line tools: admin CLI (primary tool), import/export tools (blobimport, gitimport), verification tools (aliasverify), and maintenance utilities (packer, sqlblob_gc).
+Command-line tools: admin CLI (primary tool), import/export tools (gitimport), verification tools (aliasverify), and maintenance utilities (packer, sqlblob_gc).
 
 **[3.4 - Libraries and Frameworks](3.4-libraries-and-frameworks.md)**
 Shared libraries: cmdlib/mononoke_app framework for new binaries, common utilities (async, SQL, logging), core types, and testing utilities.
@@ -113,6 +113,9 @@ Graph traversal and validation tool. Covers scrubbing (validation and repair), c
 
 **[6.3 - Monitoring and Observability](6.3-monitoring-and-observability.md)**
 Metrics (ODS/stats), logging (Scuba), tracing, dashboards, health checks, and performance indicators.
+
+**[6.4 - SCS Reduced Availability Workarounds](6.4-scs-reduced-availability.md)**
+How to work around SCS reduced availability when downstream consequences would be SEV1 or above. Covers immediate mitigation actions, alternative access paths, and guidance for downstream service owners.
 
 ### Appendix A. Future Improvements
 

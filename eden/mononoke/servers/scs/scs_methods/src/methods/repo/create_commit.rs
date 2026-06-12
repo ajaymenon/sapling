@@ -136,8 +136,7 @@ impl SourceControlServiceImpl {
             }
             thrift::RepoCreateCommitParamsFileContent::UnknownField(t) => {
                 return Err(scs_errors::invalid_request(format!(
-                    "file content type not supported: {}",
-                    t
+                    "file content type not supported: {t}"
                 ))
                 .into());
             }
@@ -199,8 +198,7 @@ impl SourceControlServiceImpl {
                         },
                         thrift::RepoCreateCommitParamsGitLfs::UnknownField(t) => {
                             return Err(scs_errors::invalid_request(format!(
-                                "git lfs variant not supported: {}",
-                                t
+                                "git lfs variant not supported: {t}"
                             ))
                             .into());
                         }
@@ -225,8 +223,7 @@ impl SourceControlServiceImpl {
             thrift::RepoCreateCommitParamsChange::deleted(_d) => CreateChange::Deletion,
             thrift::RepoCreateCommitParamsChange::UnknownField(t) => {
                 return Err(scs_errors::invalid_request(format!(
-                    "file change type not supported: {}",
-                    t
+                    "file change type not supported: {t}"
                 ))
                 .into());
             }
@@ -242,7 +239,7 @@ impl SourceControlServiceImpl {
             .into_iter()
             .map(|(path, change)| async move {
                 let path = MPath::try_from(&path).map_err(|e| {
-                    scs_errors::invalid_request(format!("invalid path '{}': {}", path, e))
+                    scs_errors::invalid_request(format!("invalid path '{path}': {e}"))
                 })?;
                 let change = Self::convert_create_commit_change(repo, change).await?;
                 Ok::<_, scs_errors::ServiceError>((path, change))
@@ -265,6 +262,9 @@ impl SourceControlServiceImpl {
             .repo_for_service(ctx, &repo, params.service_identity.clone())
             .await?;
 
+        let checks = CreateChangesetChecks::from_request(&params.checks)?;
+        repo.enforce_create_commit_check_bypass(&checks).await?;
+
         let parent_ctxs = Self::convert_create_commit_parents(&repo, &params.parents).await?;
         let parent_ids: Vec<ChangesetId> = parent_ctxs.iter().map(|ctx| ctx.id()).collect();
         let mut info = CreateInfo::from_request(&params.info)?;
@@ -283,13 +283,7 @@ impl SourceControlServiceImpl {
         }
 
         let created_changeset = repo
-            .create_changeset(
-                parent_ids,
-                info,
-                changes,
-                bubble,
-                CreateChangesetChecks::from_request(&params.checks)?,
-            )
+            .create_changeset(parent_ids, info, changes, bubble, checks)
             .await?;
 
         // If you ask for a git identity back, then we'll assume that you supplied one to us
@@ -327,6 +321,9 @@ impl SourceControlServiceImpl {
             .await?;
         let repo = &repo;
 
+        let checks = CreateChangesetChecks::from_request(&params.checks)?;
+        repo.enforce_create_commit_check_bypass(&checks).await?;
+
         let parent_ctxs = Self::convert_create_commit_parents(repo, &params.parents).await?;
         let stack_parent_ids: Vec<ChangesetId> = parent_ctxs.iter().map(|ctx| ctx.id()).collect();
         let mut info_stack = params
@@ -362,13 +359,7 @@ impl SourceControlServiceImpl {
 
         let bubble = None;
         let stack = repo
-            .create_changeset_stack(
-                stack_parent_ids,
-                info_stack,
-                changes_stack,
-                bubble,
-                CreateChangesetChecks::from_request(&params.checks)?,
-            )
+            .create_changeset_stack(stack_parent_ids, info_stack, changes_stack, bubble, checks)
             .await?;
         // If you ask for a git identity back, then we'll assume that you supplied one to us
         // and set it. Later, when we can derive a git commit hash, this'll become more
@@ -378,13 +369,13 @@ impl SourceControlServiceImpl {
             .identity_schemes
             .contains(&thrift::CommitIdentityScheme::GIT)
         {
-            for created_changeset in stack.iter() {
+            futures::future::try_join_all(stack.iter().map(|created_changeset| {
                 repo.set_git_mapping_from_changeset(
                     &created_changeset.changeset_ctx,
                     &created_changeset.hg_extras,
                 )
-                .await?;
-            }
+            }))
+            .await?;
         }
 
         if let Some(prepare_types) = &params.prepare_derived_data_types {
@@ -424,6 +415,9 @@ impl SourceControlServiceImpl {
             .repo_for_service(ctx.clone(), &repo, params.service_identity.clone())
             .await?;
 
+        let checks = CreateChangesetChecks::from_request(&params.checks)?;
+        repo.enforce_create_commit_check_bypass(&checks).await?;
+
         let bottom_id = self
             .changeset_id(&repo, &params.bottom)
             .await
@@ -452,7 +446,7 @@ impl SourceControlServiceImpl {
                 top_id,
                 Some(additional_changes),
                 create_info,
-                CreateChangesetChecks::from_request(&params.checks)?,
+                checks,
             )
             .await?;
 

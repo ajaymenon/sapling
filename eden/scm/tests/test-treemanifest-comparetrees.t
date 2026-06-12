@@ -1,18 +1,17 @@
 #chg-compatible
-#debugruntest-incompatible
 
   $ . "$TESTDIR/library.sh"
 
   $ hginit master
   $ cd master
-  $ cat >> .hg/hgrc <<EOF
+  $ cat >> .sl/config <<EOF
   > [extensions]
   > pushrebase=
   > [remotefilelog]
   > server=True
   > EOF
   $ mkcommit root
-  $ hg debugmakepublic -r 'all()'
+  $ sl debugmakepublic -r 'all()'
 
 Clone it
   $ cd ..
@@ -20,7 +19,7 @@ Clone it
   1 files fetched over * (glob) (?)
   $ cd client1
 
-  $ hg debugdrawdag <<EOS
+  $ sl debugdrawdag <<EOS
   >   F      # A/dir1/file = A
   >  /       # A/dir2/file = A
   > C E      # A/dir3/file = A
@@ -37,12 +36,12 @@ Clone it
   >          # E/dir2/file = E
   >          # F/dir3/file = F
   > EOS
-  $ hg bundle -f --base 'A+B+C' leaves.hg -r 'D+E+F'
+  $ sl bundle -f --base 'A+B+C' leaves.hg -r 'D+E+F'
   3 changesets found
 
 The bundle should have 6 tree items in it - the root tree, and the directory tree that is modified in each of the 3 commits.
 
-  $ hg debugbundle leaves.hg
+  $ sl debugbundle leaves.hg
   Stream params: {Compression: BZ}
   changegroup -- {nbchanges: 3, version: 02}
       e77dab89c4644acd044afb734c17e20046be6ae7

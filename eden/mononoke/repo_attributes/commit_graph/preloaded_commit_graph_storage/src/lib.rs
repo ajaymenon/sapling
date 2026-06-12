@@ -42,8 +42,6 @@ use vec1::Vec1;
 #[cfg(test)]
 mod tests;
 
-const DEFAULT_RELOADING_INTERVAL_SECS: u64 = 60 * 60;
-
 /// A commit graph storage that wraps another storage and periodically preloads
 /// the changeset edges of the commit graph from the blobstore. Writes are passed
 /// to the underlying storage, while reads first search the preloaded changeset
@@ -79,7 +77,7 @@ impl PreloadedEdges {
                     Ok(self
                         .cs_id_to_edges
                         .get(cs_id)
-                        .ok_or_else(|| anyhow!("Missing changeset edges for {}", cs_id))?
+                        .ok_or_else(|| anyhow!("Missing changeset edges for {cs_id}"))?
                         .to_thrift(**cs_id, *unique_id))
                 })
                 .collect::<Result<_>>()?,
@@ -112,11 +110,11 @@ impl PreloadedEdges {
         let cs_id = **self
             .unique_id_to_cs_id
             .get(&unique_id)
-            .ok_or_else(|| anyhow!("Missing changeset id for unique id: {}", unique_id))?;
+            .ok_or_else(|| anyhow!("Missing changeset id for unique id: {unique_id}"))?;
         let edges = self
             .cs_id_to_edges
             .get(&cs_id)
-            .ok_or_else(|| anyhow!("Missing changeset edges for {}", cs_id))?;
+            .ok_or_else(|| anyhow!("Missing changeset edges for {cs_id}"))?;
 
         Ok(ChangesetNode::new(
             cs_id,
@@ -157,9 +155,9 @@ impl PreloadedEdges {
                 .iter()
                 .map(|subtree_source_id| self.get_node(*subtree_source_id))
                 .collect::<Result<_>>()?,
-            merge_ancestor: compact_edges
-                .merge_ancestor
-                .map(|merge_ancestor| self.get_node(merge_ancestor))
+            merge_ancestor_or_root: compact_edges
+                .merge_ancestor_or_root
+                .map(|merge_ancestor_or_root| self.get_node(merge_ancestor_or_root))
                 .transpose()?,
             skip_tree_parent: compact_edges
                 .skip_tree_parent
@@ -243,9 +241,9 @@ impl ExtendablePreloadedEdges {
             .subtree_sources()
             .map(|subtree_source| self.unique_id(subtree_source.cs_id))
             .collect();
-        let merge_ancestor = edges
-            .merge_ancestor::<Parents>()
-            .map(|merge_ancestor| self.unique_id(merge_ancestor.cs_id));
+        let merge_ancestor_or_root = edges
+            .merge_ancestor_or_root::<Parents>()
+            .map(|merge_ancestor_or_root| self.unique_id(merge_ancestor_or_root.cs_id));
         let skip_tree_parent = edges
             .skip_tree_parent::<Parents>()
             .map(|skip_tree_parent| self.unique_id(skip_tree_parent.cs_id));
@@ -256,7 +254,7 @@ impl ExtendablePreloadedEdges {
             .skip_tree_skew_ancestor::<FirstParentLinear>()
             .map(|p1_linear_skew_ancestor| self.unique_id(p1_linear_skew_ancestor.cs_id));
         let subtree_or_merge_ancestor = edges
-            .merge_ancestor::<ParentsAndSubtreeSources>()
+            .merge_ancestor_or_root::<ParentsAndSubtreeSources>()
             .map(|subtree_or_merge_ancestor| self.unique_id(subtree_or_merge_ancestor.cs_id));
         let subtree_source_parent = edges
             .skip_tree_parent::<ParentsAndSubtreeSources>()
@@ -279,7 +277,7 @@ impl ExtendablePreloadedEdges {
                     as u32,
                 parents,
                 subtree_sources,
-                merge_ancestor,
+                merge_ancestor_or_root,
                 skip_tree_parent,
                 skip_tree_skew_ancestor,
                 p1_linear_skew_ancestor,
@@ -288,7 +286,7 @@ impl ExtendablePreloadedEdges {
                 subtree_source_skew_ancestor,
             }),
         ) {
-            Some(old_edges) => Err(anyhow!("Duplicate changeset edges found: {:?}", old_edges)),
+            Some(old_edges) => Err(anyhow!("Duplicate changeset edges found: {old_edges:?}")),
             None => Ok(()),
         }
     }
@@ -348,13 +346,10 @@ impl PreloadedCommitGraphStorage {
         let reloader = Reloader::reload_periodically(
             ctx.clone(),
             move || {
-                std::time::Duration::from_secs(
-                    justknobs::get_as::<u64>(
-                        "scm/mononoke:preloaded_commit_graph_reloading_interval_secs",
-                        None,
-                    )
-                    .unwrap_or(DEFAULT_RELOADING_INTERVAL_SECS),
-                )
+                std::time::Duration::from_secs(justknobs::get_as::<u64>(
+                    "scm/mononoke:preloaded_commit_graph_reloading_interval_secs",
+                    None,
+                ))
             },
             loader,
         )
@@ -366,12 +361,12 @@ impl PreloadedCommitGraphStorage {
     }
 
     /// Check if fallback should be applied for this repository
-    fn should_apply_fallback(&self) -> Result<bool> {
-        Ok(!justknobs::eval(
+    fn should_apply_fallback(&self) -> bool {
+        !justknobs::eval(
             "scm/mononoke:commit_graph_disable_subtree_source_fallback",
             None,
             Some(self.repo_name()),
-        )?)
+        )
     }
 }
 
@@ -393,7 +388,7 @@ impl CommitGraphStorage for PreloadedCommitGraphStorage {
         match self
             .preloaded_edges
             .load()
-            .get(&cs_id, self.should_apply_fallback()?)?
+            .get(&cs_id, self.should_apply_fallback())?
         {
             Some(edges) => Ok(edges),
             None => self.persistent_storage.fetch_edges(ctx, cs_id).await,
@@ -408,7 +403,7 @@ impl CommitGraphStorage for PreloadedCommitGraphStorage {
         match self
             .preloaded_edges
             .load()
-            .get(&cs_id, self.should_apply_fallback()?)?
+            .get(&cs_id, self.should_apply_fallback())?
         {
             Some(edges) => Ok(Some(edges)),
             None => self.persistent_storage.maybe_fetch_edges(ctx, cs_id).await,
@@ -424,8 +419,7 @@ impl CommitGraphStorage for PreloadedCommitGraphStorage {
         let edges = self.maybe_fetch_many_edges(ctx, cs_ids, prefetch).await?;
         if let Some(missing_changeset) = cs_ids.iter().find(|cs_id| !edges.contains_key(cs_id)) {
             Err(anyhow!(
-                "Missing changeset from preloaded commit graph storage: {}",
-                missing_changeset,
+                "Missing changeset from preloaded commit graph storage: {missing_changeset}",
             ))
         } else {
             Ok(edges)
@@ -439,7 +433,7 @@ impl CommitGraphStorage for PreloadedCommitGraphStorage {
         prefetch: Prefetch,
     ) -> Result<HashMap<ChangesetId, FetchedChangesetEdges>> {
         let preloaded_edges = self.preloaded_edges.load();
-        let should_apply_fallback = self.should_apply_fallback()?;
+        let should_apply_fallback = self.should_apply_fallback();
         let mut fetched_edges: HashMap<_, _> = cs_ids
             .iter()
             .filter_map(|cs_id| {

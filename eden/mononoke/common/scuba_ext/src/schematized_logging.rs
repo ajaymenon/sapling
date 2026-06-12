@@ -86,14 +86,12 @@ impl CommonServerData {
             var("TW_JOB_USER"),
             var("TW_JOB_NAME"),
         ) {
-            data.tw_handle = Some(format!("{}/{}/{}", tw_cluster, tw_user, tw_name));
+            data.tw_handle = Some(format!("{tw_cluster}/{tw_user}/{tw_name}"));
 
             // Tupperware task handle (format: cluster/user/name/taskid)
             if let Ok(tw_task_id) = var("TW_TASK_ID") {
-                data.tw_task_handle = Some(format!(
-                    "{}/{}/{}/{}",
-                    tw_cluster, tw_user, tw_name, tw_task_id
-                ));
+                data.tw_task_handle =
+                    Some(format!("{tw_cluster}/{tw_user}/{tw_name}/{tw_task_id}"));
             }
         }
 
@@ -125,7 +123,7 @@ impl CommonServerData {
 pub struct CommonMetadata {
     pub session_uuid: String,
     pub client_identities: Vec<String>,
-    pub client_identity_variant: Option<String>,
+    pub client_identities_typed: Vec<String>,
     pub source_hostname: Option<String>,
     pub client_ip: Option<String>,
     pub unix_username: Option<String>,
@@ -156,14 +154,14 @@ impl CommonMetadata {
                 .iter()
                 .map(|i| i.to_string())
                 .collect(),
+            client_identities_typed: metadata
+                .identities()
+                .iter()
+                .map(|i| i.to_typed_string())
+                .collect(),
             fetch_from_cas_attempted: metadata.fetch_from_cas_attempted(),
             ..Default::default()
         };
-
-        // Client identity variant
-        if let Some(first_identity) = metadata.identities().first() {
-            data.client_identity_variant = Some(first_identity.variant().to_string());
-        }
 
         // Source hostname or client IP (mutually exclusive)
         if let Some(client_hostname) = metadata.client_hostname() {

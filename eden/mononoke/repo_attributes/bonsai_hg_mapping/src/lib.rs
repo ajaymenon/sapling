@@ -127,6 +127,12 @@ pub trait BonsaiHgMapping: Send + Sync {
 
     async fn add(&self, ctx: &CoreContext, entry: BonsaiHgMappingEntry) -> Result<bool, Error>;
 
+    async fn bulk_add(
+        &self,
+        ctx: &CoreContext,
+        entries: &[BonsaiHgMappingEntry],
+    ) -> Result<u64, Error>;
+
     async fn get(
         &self,
         ctx: &CoreContext,
@@ -210,8 +216,7 @@ pub trait BonsaiHgMapping: Send + Sync {
             }
             ensure!(
                 missing.is_empty(),
-                "Missing bonsai mapping for hg changesets: {:?}",
-                missing,
+                "Missing bonsai mapping for hg changesets: {missing:?}",
             );
             Ok(result)
         } else {
@@ -245,8 +250,7 @@ pub trait BonsaiHgMapping: Send + Sync {
             }
             ensure!(
                 missing.is_empty(),
-                "Missing hg mapping for bonsai changesets: {:?}",
-                missing,
+                "Missing hg mapping for bonsai changesets: {missing:?}",
             );
             Ok(result)
         } else {
@@ -282,16 +286,14 @@ impl RendezVousConnection {
             bonsai: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
-                    "bonsai_hg_mapping.bonsai.{}",
-                    name,
+                    "bonsai_hg_mapping.bonsai.{name}",
                 ))),
             ),
             hg: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
-                Arc::new(RendezVousStats::new(format!(
-                    "bonsai_hg_mapping.hg.{}",
-                    name,
-                ))),
+                Arc::new(RendezVousStats::new(
+                    format!("bonsai_hg_mapping.hg.{name}",),
+                )),
             ),
         }
     }
@@ -444,7 +446,7 @@ impl SqlBonsaiHgMapping {
 
         let (by_hg_rows, by_bcs_rows) = future::try_join(by_hg, by_bcs).await?;
 
-        match by_hg_rows.into_iter().chain(by_bcs_rows.into_iter()).next() {
+        match by_hg_rows.into_iter().chain(by_bcs_rows).next() {
             Some(entry) if entry == (hg_cs_id, bcs_id) => Ok(()),
             Some((hg_cs_id, bcs_id)) => Err(ErrorKind::ConflictingEntries(
                 BonsaiHgMappingEntry { hg_cs_id, bcs_id },
@@ -463,32 +465,44 @@ impl BonsaiHgMapping for SqlBonsaiHgMapping {
     }
 
     async fn add(&self, ctx: &CoreContext, entry: BonsaiHgMappingEntry) -> Result<bool, Error> {
-        STATS::adds.add_value(1);
+        self.bulk_add(ctx, &[entry]).await.map(|rows| rows >= 1)
+    }
+
+    async fn bulk_add(
+        &self,
+        ctx: &CoreContext,
+        entries: &[BonsaiHgMappingEntry],
+    ) -> Result<u64, Error> {
+        STATS::adds.add_value(entries.len() as i64);
         ctx.perf_counters()
             .increment_counter(PerfCounterType::SqlWrites);
 
-        let BonsaiHgMappingEntry { hg_cs_id, bcs_id } = entry.clone();
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|e| (&self.repo_id, &e.hg_cs_id, &e.bcs_id))
+            .collect();
+
         if self.overwrite {
             let result = ReplaceMapping::query(
                 &self.write_connection,
                 ctx.sql_query_telemetry(),
-                &[(&self.repo_id, &hg_cs_id, &bcs_id)],
+                rows.as_slice(),
             )
             .await?;
-            Ok(result.affected_rows() >= 1)
+            Ok(result.affected_rows())
         } else {
             let result = InsertMapping::query(
                 &self.write_connection,
                 ctx.sql_query_telemetry(),
-                &[(&self.repo_id, &hg_cs_id, &bcs_id)],
+                rows.as_slice(),
             )
             .await?;
-            if result.affected_rows() == 1 {
-                Ok(true)
-            } else {
-                self.verify_consistency(ctx, entry).await?;
-                Ok(false)
+            if result.affected_rows() != entries.len() as u64 {
+                for entry in entries {
+                    self.verify_consistency(ctx, entry.clone()).await?;
+                }
             }
+            Ok(result.affected_rows())
         }
     }
 
@@ -498,7 +512,7 @@ impl BonsaiHgMapping for SqlBonsaiHgMapping {
         ids: BonsaiOrHgChangesetIds,
     ) -> Result<Vec<BonsaiHgMappingEntry>> {
         let cons_read_opts =
-            consistent_read_options(ctx.client_correlator(), Some("bonsai_hg_mapping"));
+            consistent_read_options(ctx.client_correlator(), Some("bonsai_hg_mapping"))?;
 
         let used_consistent_reads = cons_read_opts.is_some();
         let timed_res = async move {

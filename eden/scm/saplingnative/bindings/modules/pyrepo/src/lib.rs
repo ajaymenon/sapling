@@ -31,6 +31,7 @@ use pyconfigloader::config;
 use pydag::commits::commits as PyCommits;
 use pyeagerepo::EagerRepoStore as PyEagerRepoStore;
 use pyedenapi::PyClient as PySaplingRemoteApi;
+use pymanifest::treemanifest as PyTreeManifest;
 use pymetalog::metalog as PyMetaLog;
 use pyrevisionstore::filescmstore as PyFileScmStore;
 use pyrevisionstore::treescmstore as PyTreeScmStore;
@@ -73,10 +74,12 @@ py_class!(pub class repo |py| {
         Ok(PyNone)
     }
 
-    def __new__(_cls, path: PyPathBuf, config: &config) -> PyResult<Self> {
-        let config = config.get_cfg(py);
+    def __new__(_cls, path: PyPathBuf, ctx: ImplInto<CoreContext>) -> PyResult<Self> {
+        let ctx: CoreContext = ctx.into();
+        let config = configset::ConfigSet::wrap(ctx.config.clone());
         let abs_path = util::path::absolute(path.as_path()).map_pyerr(py)?;
-        let repo = Repo::load_with_config(abs_path, config).map_pyerr(py)?;
+        let mut repo = Repo::load_with_config(abs_path, config).map_pyerr(py)?;
+        repo.set_permission_denied_paths(ctx.permission_denied_paths.clone());
         Self::create_instance(py, RwLock::new(repo), RefCell::new(None), PyDict::new(py))
     }
 
@@ -145,7 +148,7 @@ py_class!(pub class repo |py| {
     def storage_format(&self) -> PyResult<String> {
         let repo_ref = self.inner(py).read();
         let format = repo_ref.storage_format();
-        let lower_case = format!("{:?}", format).to_lowercase();
+        let lower_case = format!("{format:?}").to_lowercase();
         Ok(lower_case)
     }
 
@@ -208,9 +211,9 @@ py_class!(pub class repo |py| {
         Ok(PyNone)
     }
 
-    def invalidatestores(&self) -> PyResult<PyNone> {
+    def flushstores(&self) -> PyResult<PyNone> {
         let repo_ref = self.inner(py).write();
-        repo_ref.invalidate_stores().map_pyerr(py)?;
+        repo_ref.flush_stores().map_pyerr(py)?;
         Ok(PyNone)
     }
 
@@ -293,6 +296,22 @@ py_class!(pub class repo |py| {
     @property
     def volatile_state(&self) -> PyResult<PyDict> {
         Ok(self.volatile_state_obj(py).clone_ref(py))
+    }
+
+    def add_commit(
+        &self,
+        commit: Serde<rsrepo::NewCommit>,
+    ) -> PyResult<Serde<HgId>> {
+        let repo_ref = self.inner(py).write();
+        let node = repo_ref.add_commit(commit.0).map_pyerr(py)?;
+        Ok(Serde(node))
+    }
+
+    def manifest_by_root_id(&self, root_id: Serde<HgId>) -> PyResult<PyTreeManifest> {
+        let repo = self.inner(py).read();
+        let resolver = repo.tree_resolver().map_pyerr(py)?;
+        let manifest = resolver.get_by_root_id(&root_id.0).map_pyerr(py)?;
+        PyTreeManifest::from_rust(py, manifest)
     }
 });
 

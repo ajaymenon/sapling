@@ -40,6 +40,10 @@ use tokio::task;
 use crate::snapshot_cache::SharedSnapshotFileCache;
 use crate::util::calc_contentid;
 
+/// ENXIO errno value (6 on Linux/macOS). Returned when attempting to read
+/// non-regular files such as Unix domain sockets or FIFOs.
+const ENXIO: i32 = 6;
+
 /// Statistics for blob downloads tracking different sources using atomic counters
 /// This provides thread-safe, lock-free counting for concurrent async operations
 ///
@@ -317,7 +321,7 @@ pub async fn upload_snapshot_with_cache(
     } = files;
     let (need_upload, mut upload_data): (Vec<_>, Vec<_>) = modified
         .into_iter()
-        .chain(added.into_iter())
+        .chain(added)
         .map(|(p, t)| (p, t, Tracked))
         .chain(
             // TODO(yancouto): Don't upload untracked files if they're too big.
@@ -326,13 +330,24 @@ pub async fn upload_snapshot_with_cache(
         // rel_path is relative to the repo root
         .map(|(rel_path, file_type, tracked)| -> anyhow::Result<_> {
             load_files(&root, rel_path.clone(), file_type, tracked)
-                .with_context(|| anyhow::anyhow!("Failed to load file {}", rel_path))
+                .with_context(|| anyhow::anyhow!("Failed to load file {rel_path}"))
         })
-        // Let's ignore file not found errors, they might come from transient files that disappeared.
+        // Ignore IO errors for files that can't be read as regular files:
+        // - NotFound: transient files that disappeared between status and snapshot
+        // - IsADirectory: symlinks resolving to directories, or directory entries
+        //   that reached the upload pipeline despite upstream filtering
+        // - ENXIO (os error 6): non-regular files like Unix domain sockets (e.g.
+        //   .chataccd/socket) or FIFOs that can't be read with std::fs::read
         .filter_map(|res| match res {
             Ok(ok) => Some(Ok(ok)),
             Err(err) => match err.downcast_ref::<std::io::Error>() {
-                Some(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => None,
+                Some(io_error)
+                    if io_error.kind() == std::io::ErrorKind::NotFound
+                        || io_error.kind() == std::io::ErrorKind::IsADirectory
+                        || io_error.raw_os_error() == Some(ENXIO) =>
+                {
+                    None
+                }
                 _ => Some(Err(err)),
             },
         })
@@ -398,10 +413,7 @@ pub async fn upload_snapshot_with_cache(
             let upload_token = file_content_tokens
                 .get(&cid)
                 .with_context(|| {
-                    format_err!(
-                        "unexpected error: upload token is missing for ContentId({})",
-                        cid
-                    )
+                    format_err!("unexpected error: upload token is missing for ContentId({cid})")
                 })?
                 .clone();
             let change = if tracked == Tracked {

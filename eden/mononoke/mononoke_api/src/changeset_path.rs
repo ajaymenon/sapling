@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use acl_regions::AclRegionsRef;
 use anyhow::Error;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -24,7 +25,6 @@ use deleted_manifest::RootDeletedManifestIdCommon;
 use derivation_queue_thrift::DerivationPriority;
 use filestore::FetchKey;
 use futures::future::TryFutureExt;
-use futures::future::try_join_all;
 use futures::stream;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
@@ -48,14 +48,18 @@ pub use mononoke_types::ContentMetadataV2 as FileMetadata;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
 use mononoke_types::FileUnodeId;
-use mononoke_types::FsnodeId;
 use mononoke_types::ManifestUnodeId;
 use mononoke_types::NonRootMPath;
 use mononoke_types::blame_v2::BlameV2;
+use mononoke_types::content_manifest::compat;
 use mononoke_types::deleted_manifest_common::DeletedManifestCommon;
-use mononoke_types::fsnode::FsnodeFile;
 use mononoke_types::path::MPath;
+use repo_blobstore::RepoBlobstoreArc;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataArc;
+use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentityRef;
+use repo_permission_checker::RepoPermissionCheckerRef;
 use restricted_paths::RestrictedPathsArc;
 
 use crate::MononokeRepo;
@@ -63,6 +67,7 @@ use crate::changeset::ChangesetContext;
 use crate::errors::MononokeError;
 use crate::file::FileContext;
 use crate::repo::RepoContext;
+use crate::restricted_paths::PathAccessInfo;
 use crate::tree::TreeContext;
 
 pub struct HistoryEntry {
@@ -87,7 +92,8 @@ pub enum PathEntry<R> {
 }
 
 type UnodeResult = Result<Option<Entry<ManifestUnodeId, FileUnodeId>>, MononokeError>;
-type FsnodeResult = Result<Option<Entry<FsnodeId, FsnodeFile>>, MononokeError>;
+type ContentManifestResult =
+    Result<Option<Entry<compat::ContentManifestId, compat::ContentManifestFile>>, MononokeError>;
 type LinknodeResult = Result<Option<ChangesetId>, MononokeError>;
 
 /// Context that makes it cheap to fetch content info about a path within a changeset.
@@ -98,10 +104,10 @@ type LinknodeResult = Result<Option<ChangesetId>, MononokeError>;
 pub struct ChangesetPathContentContext<R> {
     changeset: ChangesetContext<R>,
     path: MPath,
-    fsnode_id: LazyShared<FsnodeResult>,
+    manifest_entry: LazyShared<ContentManifestResult>,
 }
 
-impl<R: MononokeRepo> fmt::Debug for ChangesetPathContentContext<R> {
+impl<R: RepoIdentityRef> fmt::Debug for ChangesetPathContentContext<R> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -121,7 +127,7 @@ pub struct ChangesetPathHistoryContext<R> {
     linknode: LazyShared<LinknodeResult>,
 }
 
-impl<R: MononokeRepo> fmt::Debug for ChangesetPathHistoryContext<R> {
+impl<R: RepoIdentityRef> fmt::Debug for ChangesetPathHistoryContext<R> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -140,7 +146,7 @@ pub struct ChangesetPathContext<R> {
     entry_kind: LazyShared<Result<Option<Entry<(), ()>>, MononokeError>>,
 }
 
-impl<R: MononokeRepo> fmt::Debug for ChangesetPathContext<R> {
+impl<R: RepoIdentityRef> fmt::Debug for ChangesetPathContext<R> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -152,70 +158,7 @@ impl<R: MononokeRepo> fmt::Debug for ChangesetPathContext<R> {
     }
 }
 
-impl<R: MononokeRepo> ChangesetPathContentContext<R> {
-    pub(crate) async fn new(
-        changeset: ChangesetContext<R>,
-        path: impl Into<MPath>,
-    ) -> Result<Self, MononokeError> {
-        let path = path.into();
-        changeset
-            .repo_ctx()
-            .authorization_context()
-            .require_path_read(
-                changeset.ctx(),
-                changeset.repo_ctx().repo(),
-                changeset.id(),
-                &path,
-            )
-            .await?;
-
-        restricted_paths::spawn_enforce_restricted_path_access(
-            changeset.ctx(),
-            changeset.repo_ctx().repo().restricted_paths_arc().clone(),
-            &path,
-            "changeset_path_content_context_new",
-        )
-        .await?;
-
-        Ok(Self {
-            changeset,
-            path,
-            fsnode_id: LazyShared::new_empty(),
-        })
-    }
-
-    pub(crate) async fn new_with_fsnode_entry(
-        changeset: ChangesetContext<R>,
-        path: impl Into<MPath>,
-        fsnode_entry: Entry<FsnodeId, FsnodeFile>,
-    ) -> Result<Self, MononokeError> {
-        let path = path.into();
-        changeset
-            .repo_ctx()
-            .authorization_context()
-            .require_path_read(
-                changeset.ctx(),
-                changeset.repo_ctx().repo(),
-                changeset.id(),
-                &path,
-            )
-            .await?;
-
-        restricted_paths::spawn_enforce_restricted_path_access(
-            changeset.ctx(),
-            changeset.repo_ctx().repo().restricted_paths_arc().clone(),
-            &path,
-            "changeset_path_context_fsnode_new",
-        )
-        .await?;
-
-        Ok(Self {
-            changeset,
-            path,
-            fsnode_id: LazyShared::new_ready(Ok(Some(fsnode_entry))),
-        })
-    }
-
+impl<R> ChangesetPathContentContext<R> {
     /// The `RepoContext` for this query.
     pub fn repo_ctx(&self) -> &RepoContext<R> {
         self.changeset.repo_ctx()
@@ -230,23 +173,118 @@ impl<R: MononokeRepo> ChangesetPathContentContext<R> {
     pub fn path(&self) -> &MPath {
         &self.path
     }
+}
 
-    async fn fsnode_id(&self) -> Result<Option<Entry<FsnodeId, FsnodeFile>>, MononokeError> {
-        self.fsnode_id
+impl<R> ChangesetPathContentContext<R>
+where
+    R: RepoPermissionCheckerRef
+        + AclRegionsRef
+        + RepoIdentityRef
+        + RestrictedPathsArc
+        + RepoBlobstoreArc
+        + RepoBlobstoreRef
+        + RepoDerivedDataArc
+        + RepoDerivedDataRef
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    pub(crate) async fn new(
+        changeset: ChangesetContext<R>,
+        path: impl Into<MPath>,
+    ) -> Result<Self, MononokeError> {
+        let path = path.into();
+        let id_type = changeset
+            .repo_ctx()
+            .authorization_context()
+            .require_path_read_with_result(
+                changeset.ctx(),
+                changeset.repo_ctx().repo(),
+                changeset.id(),
+                &path,
+            )
+            .await?;
+        if let Some(id_type) = id_type {
+            changeset
+                .repo_ctx()
+                .record_path_acl_deciding_identity_type(id_type);
+        }
+
+        restricted_paths::spawn_enforce_restricted_path_access(
+            changeset.ctx(),
+            changeset.repo_ctx().repo().restricted_paths_arc().clone(),
+            &path,
+            "changeset_path_content_context_new",
+            Some(changeset.id()),
+        )
+        .await?;
+
+        Ok(Self {
+            changeset,
+            path,
+            manifest_entry: LazyShared::new_empty(),
+        })
+    }
+
+    pub(crate) async fn new_with_manifest_entry(
+        changeset: ChangesetContext<R>,
+        path: impl Into<MPath>,
+        manifest_entry: Entry<compat::ContentManifestId, compat::ContentManifestFile>,
+    ) -> Result<Self, MononokeError> {
+        let path = path.into();
+        let id_type = changeset
+            .repo_ctx()
+            .authorization_context()
+            .require_path_read_with_result(
+                changeset.ctx(),
+                changeset.repo_ctx().repo(),
+                changeset.id(),
+                &path,
+            )
+            .await?;
+        if let Some(id_type) = id_type {
+            changeset
+                .repo_ctx()
+                .record_path_acl_deciding_identity_type(id_type);
+        }
+
+        restricted_paths::spawn_enforce_restricted_path_access(
+            changeset.ctx(),
+            changeset.repo_ctx().repo().restricted_paths_arc().clone(),
+            &path,
+            "changeset_path_context_fsnode_new",
+            Some(changeset.id()),
+        )
+        .await?;
+
+        Ok(Self {
+            changeset,
+            path,
+            manifest_entry: LazyShared::new_ready(Ok(Some(manifest_entry))),
+        })
+    }
+
+    async fn manifest_entry(
+        &self,
+    ) -> Result<Option<Entry<compat::ContentManifestId, compat::ContentManifestFile>>, MononokeError>
+    {
+        self.manifest_entry
             .get_or_init(|| {
                 cloned!(self.changeset, self.path);
                 async move {
                     let ctx = changeset.ctx().clone();
                     let blobstore = changeset.repo_ctx().repo().repo_blobstore().clone();
-                    let root_fsnode_id = changeset.root_fsnode_id().await?;
+                    let root_id = changeset.root_content_manifest_id().await?;
+
                     if let Some(mpath) = path.into_optional_non_root_path() {
-                        root_fsnode_id
-                            .fsnode_id()
+                        root_id
                             .find_entry(ctx, blobstore, MPath::from(mpath))
                             .await
                             .map_err(MononokeError::from)
+                            .map(|opt| opt.map(|e| e.map_leaf(Into::into)))
                     } else {
-                        Ok(Some(Entry::Tree(root_fsnode_id.fsnode_id().clone())))
+                        Ok(Some(Entry::Tree(root_id)))
                     }
                 }
             })
@@ -255,12 +293,11 @@ impl<R: MononokeRepo> ChangesetPathContentContext<R> {
 
     /// Returns `true` if the path exists (as a file or directory) in this commit.
     pub async fn exists(&self) -> Result<bool, MononokeError> {
-        // The path exists if there is any kind of fsnode.
-        Ok(self.fsnode_id().await?.is_some())
+        Ok(self.manifest_entry().await?.is_some())
     }
 
     pub async fn is_file(&self) -> Result<bool, MononokeError> {
-        let is_file = match self.fsnode_id().await? {
+        let is_file = match self.manifest_entry().await? {
             Some(Entry::Leaf(_)) => true,
             _ => false,
         };
@@ -268,7 +305,7 @@ impl<R: MononokeRepo> ChangesetPathContentContext<R> {
     }
 
     pub async fn is_tree(&self) -> Result<bool, MononokeError> {
-        let is_tree = match self.fsnode_id().await? {
+        let is_tree = match self.manifest_entry().await? {
             Some(Entry::Tree(_)) => true,
             _ => false,
         };
@@ -276,8 +313,8 @@ impl<R: MononokeRepo> ChangesetPathContentContext<R> {
     }
 
     pub async fn file_type(&self) -> Result<Option<FileType>, MononokeError> {
-        let file_type = match self.fsnode_id().await? {
-            Some(Entry::Leaf(file)) => Some(*file.file_type()),
+        let file_type = match self.manifest_entry().await? {
+            Some(Entry::Leaf(file)) => Some(file.file_type()),
             _ => None,
         };
         Ok(file_type)
@@ -286,10 +323,10 @@ impl<R: MononokeRepo> ChangesetPathContentContext<R> {
     /// Returns a `TreeContext` for the tree at this path.  Returns `None` if the path
     /// is not a directory in this commit.
     pub async fn tree(&self) -> Result<Option<TreeContext<R>>, MononokeError> {
-        let tree = match self.fsnode_id().await? {
-            Some(Entry::Tree(fsnode_id)) => Some(TreeContext::new_authorized(
+        let tree = match self.manifest_entry().await? {
+            Some(Entry::Tree(manifest_id)) => Some(TreeContext::new_authorized(
                 self.repo_ctx().clone(),
-                fsnode_id,
+                manifest_id,
             )),
             _ => None,
         };
@@ -299,10 +336,10 @@ impl<R: MononokeRepo> ChangesetPathContentContext<R> {
     /// Returns a `FileContext` for the file at this path.  Returns `None` if the path
     /// is not a file in this commit.
     pub async fn file(&self) -> Result<Option<FileContext<R>>, MononokeError> {
-        let file = match self.fsnode_id().await? {
+        let file = match self.manifest_entry().await? {
             Some(Entry::Leaf(file)) => Some(FileContext::new_authorized(
                 self.repo_ctx().clone(),
-                FetchKey::Canonical(*file.content_id()),
+                FetchKey::Canonical(file.content_id()),
             )),
             _ => None,
         };
@@ -338,21 +375,38 @@ impl<R: MononokeRepo> ChangesetPathContentContext<R> {
     /// or file at this path. Returns `NotPresent` if the path is not a file
     /// or directory in this commit.
     pub async fn entry(&self) -> Result<PathEntry<R>, MononokeError> {
-        let entry = match self.fsnode_id().await? {
-            Some(Entry::Tree(fsnode_id)) => PathEntry::Tree(TreeContext::new_authorized(
+        let entry = match self.manifest_entry().await? {
+            Some(Entry::Tree(manifest_id)) => PathEntry::Tree(TreeContext::new_authorized(
                 self.repo_ctx().clone(),
-                fsnode_id,
+                manifest_id,
             )),
             Some(Entry::Leaf(file)) => PathEntry::File(
                 FileContext::new_authorized(
                     self.repo_ctx().clone(),
-                    FetchKey::Canonical(*file.content_id()),
+                    FetchKey::Canonical(file.content_id()),
                 ),
-                *file.file_type(),
+                file.file_type(),
             ),
             _ => PathEntry::NotPresent,
         };
         Ok(entry)
+    }
+}
+
+impl<R> ChangesetPathHistoryContext<R> {
+    /// The `RepoContext` for this query.
+    pub fn repo_ctx(&self) -> &RepoContext<R> {
+        self.changeset.repo_ctx()
+    }
+
+    /// The `ChangesetContext` for this query.
+    pub fn changeset(&self) -> &ChangesetContext<R> {
+        &self.changeset
+    }
+
+    /// The path for this query.
+    pub fn path(&self) -> &MPath {
+        &self.path
     }
 }
 
@@ -362,22 +416,28 @@ impl<R: MononokeRepo> ChangesetPathHistoryContext<R> {
         path: impl Into<MPath>,
     ) -> Result<Self, MononokeError> {
         let path = path.into();
-        changeset
+        let id_type = changeset
             .repo_ctx()
             .authorization_context()
-            .require_path_read(
+            .require_path_read_with_result(
                 changeset.ctx(),
                 changeset.repo_ctx().repo(),
                 changeset.id(),
                 &path,
             )
             .await?;
+        if let Some(id_type) = id_type {
+            changeset
+                .repo_ctx()
+                .record_path_acl_deciding_identity_type(id_type);
+        }
 
         restricted_paths::spawn_enforce_restricted_path_access(
             changeset.ctx(),
             changeset.repo_ctx().repo().restricted_paths_arc().clone(),
             &path,
             "changeset_path_history_context_new",
+            Some(changeset.id()),
         )
         .await?;
 
@@ -395,22 +455,28 @@ impl<R: MononokeRepo> ChangesetPathHistoryContext<R> {
         unode_entry: Entry<ManifestUnodeId, FileUnodeId>,
     ) -> Result<Self, MononokeError> {
         let path = path.into();
-        changeset
+        let id_type = changeset
             .repo_ctx()
             .authorization_context()
-            .require_path_read(
+            .require_path_read_with_result(
                 changeset.ctx(),
                 changeset.repo_ctx().repo(),
                 changeset.id(),
                 &path,
             )
             .await?;
+        if let Some(id_type) = id_type {
+            changeset
+                .repo_ctx()
+                .record_path_acl_deciding_identity_type(id_type);
+        }
 
         restricted_paths::spawn_enforce_restricted_path_access(
             changeset.ctx(),
             changeset.repo_ctx().repo().restricted_paths_arc().clone(),
             &path,
             "changeset_path_history_context_new",
+            Some(changeset.id()),
         )
         .await?;
 
@@ -427,16 +493,21 @@ impl<R: MononokeRepo> ChangesetPathHistoryContext<R> {
         path: MPath,
         deleted_manifest_id: Manifest::Id,
     ) -> Result<Self, MononokeError> {
-        changeset
+        let id_type = changeset
             .repo_ctx()
             .authorization_context()
-            .require_path_read(
+            .require_path_read_with_result(
                 changeset.ctx(),
                 changeset.repo_ctx().repo(),
                 changeset.id(),
                 &path,
             )
             .await?;
+        if let Some(id_type) = id_type {
+            changeset
+                .repo_ctx()
+                .record_path_acl_deciding_identity_type(id_type);
+        }
         let ctx = changeset.ctx().clone();
         let blobstore = changeset.repo_ctx().repo().repo_blobstore().clone();
 
@@ -445,6 +516,7 @@ impl<R: MononokeRepo> ChangesetPathHistoryContext<R> {
             changeset.repo_ctx().repo().restricted_paths_arc().clone(),
             &path,
             "changeset_path_history_context_new",
+            Some(changeset.id()),
         )
         .await?;
 
@@ -457,21 +529,6 @@ impl<R: MononokeRepo> ChangesetPathHistoryContext<R> {
                 Ok(deleted_manifest.linknode().cloned())
             }),
         })
-    }
-
-    /// The `RepoContext` for this query.
-    pub fn repo_ctx(&self) -> &RepoContext<R> {
-        self.changeset.repo_ctx()
-    }
-
-    /// The `ChangesetContext` for this query.
-    pub fn changeset(&self) -> &ChangesetContext<R> {
-        &self.changeset
-    }
-
-    /// The path for this query.
-    pub fn path(&self) -> &MPath {
-        &self.path
     }
 
     // pub(crate) for testing
@@ -577,7 +634,7 @@ impl<R: MononokeRepo> ChangesetPathHistoryContext<R> {
         let ctx = self.changeset.ctx();
         let repo = self.changeset.repo_ctx().repo();
         let csid = self.changeset.id();
-        let (blame, _) =
+        let blame =
             history_traversal::blame(ctx, repo, csid, &self.path, follow_mutable_file_history)
                 .await?;
         Ok(blame)
@@ -644,81 +701,91 @@ impl<R: MononokeRepo> ChangesetPathHistoryContext<R> {
                 if self.until_timestamp.is_some() || self.until_committer_timestamp.is_some() {
                     let until_timestamp = self.until_timestamp;
                     let until_committer_timestamp = self.until_committer_timestamp;
-                    cs_ids = try_join_all(cs_ids.into_iter().map(|(cs_id, path)| async move {
-                        let info = if cs_info_enabled {
-                            repo.repo_derived_data()
-                                .derive::<ChangesetInfo>(ctx, cs_id, DerivationPriority::LOW)
-                                .watched()
-                                .await
-                        } else {
-                            let bonsai = cs_id.load(ctx, repo.repo_blobstore()).watched().await?;
-                            Ok(ChangesetInfo::new(cs_id, bonsai))
-                        }?;
+                    cs_ids = stream::iter(cs_ids)
+                        .map(|(cs_id, path)| async move {
+                            let info = if cs_info_enabled {
+                                repo.repo_derived_data()
+                                    .derive::<ChangesetInfo>(ctx, cs_id, DerivationPriority::LOW)
+                                    .watched()
+                                    .await
+                            } else {
+                                let bonsai =
+                                    cs_id.load(ctx, repo.repo_blobstore()).watched().await?;
+                                Ok(ChangesetInfo::new(cs_id, bonsai))
+                            }?;
 
-                        if let Some(until_ts) = until_timestamp {
-                            let timestamp = info.author_date().as_chrono().timestamp();
-                            if timestamp < until_ts {
-                                return anyhow::Ok(None);
+                            if let Some(until_ts) = until_timestamp {
+                                let timestamp = info.author_date().as_chrono().timestamp();
+                                if timestamp < until_ts {
+                                    return anyhow::Ok(None);
+                                }
                             }
-                        }
-                        if let Some(until_committer_ts) = until_committer_timestamp {
-                            // Get committer_date if available, otherwise fall back to author_date
-                            let timestamp = match info.committer_date() {
-                                Some(committer_date) => committer_date.as_chrono().timestamp(),
-                                None => info.author_date().as_chrono().timestamp(),
-                            };
-                            if timestamp < until_committer_ts {
-                                return anyhow::Ok(None);
+                            if let Some(until_committer_ts) = until_committer_timestamp {
+                                // Get committer_date if available, otherwise fall back to author_date
+                                let timestamp = match info.committer_date() {
+                                    Some(committer_date) => committer_date.as_chrono().timestamp(),
+                                    None => info.author_date().as_chrono().timestamp(),
+                                };
+                                if timestamp < until_committer_ts {
+                                    return anyhow::Ok(None);
+                                }
                             }
-                        }
-                        Ok(Some((cs_id, path)))
-                    }))
-                    .watched()
-                    .await?
-                    .into_iter()
-                    .filter_map(std::convert::identity)
-                    .collect();
+                            anyhow::Ok(Some((cs_id, path)))
+                        })
+                        .buffer_unordered(100)
+                        .try_collect::<Vec<_>>()
+                        .watched()
+                        .await?
+                        .into_iter()
+                        .filter_map(std::convert::identity)
+                        .collect();
                 }
 
                 if let Some(descendants_of) = self.descendants_of {
-                    cs_ids = try_join_all(cs_ids.into_iter().map(|(cs_id, path)| async move {
-                        if repo
-                            .commit_graph()
-                            .is_ancestor(ctx, descendants_of, cs_id)
-                            .watched()
-                            .await?
-                        {
-                            anyhow::Ok(Some((cs_id, path)))
-                        } else {
-                            anyhow::Ok(None)
-                        }
-                    }))
-                    .watched()
-                    .await?
-                    .into_iter()
-                    .filter_map(std::convert::identity)
-                    .collect();
+                    cs_ids = stream::iter(cs_ids)
+                        .map(|(cs_id, path)| async move {
+                            if repo
+                                .commit_graph()
+                                .is_ancestor(ctx, descendants_of, cs_id)
+                                .watched()
+                                .await?
+                            {
+                                anyhow::Ok(Some((cs_id, path)))
+                            } else {
+                                anyhow::Ok(None)
+                            }
+                        })
+                        .buffer_unordered(100)
+                        .try_collect::<Vec<_>>()
+                        .watched()
+                        .await?
+                        .into_iter()
+                        .filter_map(std::convert::identity)
+                        .collect();
                 }
 
                 if let Some(exclude_changeset_and_ancestors) = self.exclude_changeset_and_ancestors
                 {
-                    cs_ids = try_join_all(cs_ids.into_iter().map(|(cs_id, path)| async move {
-                        if repo
-                            .commit_graph()
-                            .is_ancestor(ctx, cs_id, exclude_changeset_and_ancestors)
-                            .watched()
-                            .await?
-                        {
-                            Ok::<_, MononokeError>(None)
-                        } else {
-                            Ok::<_, MononokeError>(Some((cs_id, path)))
-                        }
-                    }))
-                    .watched()
-                    .await?
-                    .into_iter()
-                    .filter_map(std::convert::identity)
-                    .collect();
+                    cs_ids = stream::iter(cs_ids)
+                        .map(|(cs_id, path)| async move {
+                            if repo
+                                .commit_graph()
+                                .is_ancestor(ctx, cs_id, exclude_changeset_and_ancestors)
+                                .watched()
+                                .await?
+                            {
+                                Ok::<_, MononokeError>(None)
+                            } else {
+                                Ok::<_, MononokeError>(Some((cs_id, path)))
+                            }
+                        })
+                        .buffer_unordered(100)
+                        .try_collect::<Vec<_>>()
+                        .watched()
+                        .await?
+                        .into_iter()
+                        .filter_map(std::convert::identity)
+                        .collect();
                 }
                 Ok(cs_ids)
             }
@@ -751,7 +818,7 @@ impl<R: MononokeRepo> ChangesetPathHistoryContext<R> {
                 repo: &impl history_traversal::Repo,
                 descendant_id_cs_ids: Vec<(Option<CsAndPath>, Vec<CsAndPath>)>,
             ) -> Result<(), Error> {
-                let items = stream::iter(descendant_id_cs_ids.into_iter())
+                let items = stream::iter(descendant_id_cs_ids)
                     .map(|(descendant_cs_id, cs_ids)| {
                         self._visit(ctx, repo, descendant_cs_id.clone(), cs_ids.clone())
                             .map_ok(move |res| ((descendant_cs_id, cs_ids), res))
@@ -817,28 +884,51 @@ impl<R: MononokeRepo> ChangesetPathHistoryContext<R> {
     }
 }
 
+impl<R> ChangesetPathContext<R> {
+    /// The `RepoContext` for this query.
+    pub fn repo_ctx(&self) -> &RepoContext<R> {
+        self.changeset.repo_ctx()
+    }
+
+    /// The `ChangesetContext` for this query.
+    pub fn changeset(&self) -> &ChangesetContext<R> {
+        &self.changeset
+    }
+
+    /// The path for this query.
+    pub fn path(&self) -> &MPath {
+        &self.path
+    }
+}
+
 impl<R: MononokeRepo> ChangesetPathContext<R> {
     pub(crate) async fn new(
         changeset: ChangesetContext<R>,
         path: impl Into<MPath>,
     ) -> Result<Self, MononokeError> {
         let path = path.into();
-        changeset
+        let id_type = changeset
             .repo_ctx()
             .authorization_context()
-            .require_path_read(
+            .require_path_read_with_result(
                 changeset.ctx(),
                 changeset.repo_ctx().repo(),
                 changeset.id(),
                 &path,
             )
             .await?;
+        if let Some(id_type) = id_type {
+            changeset
+                .repo_ctx()
+                .record_path_acl_deciding_identity_type(id_type);
+        }
 
         restricted_paths::spawn_enforce_restricted_path_access(
             changeset.ctx(),
             changeset.repo_ctx().repo().restricted_paths_arc().clone(),
             &path,
             "changeset_path_context_new",
+            Some(changeset.id()),
         )
         .await?;
 
@@ -855,36 +945,26 @@ impl<R: MononokeRepo> ChangesetPathContext<R> {
         entry: Entry<(), ()>,
     ) -> Result<Self, MononokeError> {
         let path = path.into();
-        changeset
+        let id_type = changeset
             .repo_ctx()
             .authorization_context()
-            .require_path_read(
+            .require_path_read_with_result(
                 changeset.ctx(),
                 changeset.repo_ctx().repo(),
                 changeset.id(),
                 &path,
             )
             .await?;
+        if let Some(id_type) = id_type {
+            changeset
+                .repo_ctx()
+                .record_path_acl_deciding_identity_type(id_type);
+        }
         Ok(Self {
             changeset,
             path,
             entry_kind: LazyShared::new_ready(Ok(Some(entry))),
         })
-    }
-
-    /// The `RepoContext` for this query.
-    pub fn repo_ctx(&self) -> &RepoContext<R> {
-        self.changeset.repo_ctx()
-    }
-
-    /// The `ChangesetContext` for this query.
-    pub fn changeset(&self) -> &ChangesetContext<R> {
-        &self.changeset
-    }
-
-    /// The path for this query.
-    pub fn path(&self) -> &MPath {
-        &self.path
     }
 
     async fn entry_kind(&self) -> Result<Option<Entry<(), ()>>, MononokeError> {
@@ -901,7 +981,7 @@ impl<R: MononokeRepo> ChangesetPathContext<R> {
                             "scm/mononoke:changeset_path_context_use_skeleton_manifest_v2",
                             None,
                             Some(&repo_name),
-                        )? {
+                        ) {
                             let root_skeleton_manifest_v2_id =
                                 changeset.root_skeleton_manifest_v2_id().await?;
                             root_skeleton_manifest_v2_id
@@ -950,5 +1030,127 @@ impl<R: MononokeRepo> ChangesetPathContext<R> {
             _ => false,
         };
         Ok(is_tree)
+    }
+}
+
+/// Context for querying restriction metadata about a path in a changeset.
+///
+/// Unlike `ChangesetPathContext`, `ChangesetPathContentContext`, and
+/// `ChangesetPathHistoryContext`, this type does NOT enforce access checks
+/// in its constructor. This is intentional: restriction queries are
+/// meta-queries about access policy, and callers need to examine paths
+/// they may not have read access to (e.g. to determine which paths are
+/// restricted and whether the user should request access).
+///
+/// This type never returns file content, directory listings, or history —
+/// only restriction metadata (ACLs, access checks).
+pub struct ChangesetPathRestrictionContext<R> {
+    changeset: ChangesetContext<R>,
+    path: MPath,
+}
+
+impl<R: MononokeRepo> ChangesetPathRestrictionContext<R> {
+    // Enforces repo read access, but no Path ACLs access checks, since this will
+    // be used to query restriction metadata.
+    pub(crate) async fn new(
+        changeset: ChangesetContext<R>,
+        path: MPath,
+    ) -> Result<Self, MononokeError> {
+        let id_type = changeset
+            .repo_ctx()
+            .authorization_context()
+            .require_path_read_with_result(
+                changeset.ctx(),
+                changeset.repo_ctx().repo(),
+                changeset.id(),
+                &path,
+            )
+            .await?;
+        if let Some(id_type) = id_type {
+            changeset
+                .repo_ctx()
+                .record_path_acl_deciding_identity_type(id_type);
+        }
+
+        Ok(Self { changeset, path })
+    }
+
+    pub fn changeset(&self) -> &ChangesetContext<R> {
+        &self.changeset
+    }
+
+    pub fn path(&self) -> &MPath {
+        &self.path
+    }
+
+    /// Check if this path falls under any restricted paths and return restriction info
+    /// for all matching roots.
+    ///
+    /// Returns an empty Vec if the path is not restricted.
+    /// When a path is under multiple nested roots (e.g. `foo/` and `foo/bar/`),
+    /// returns info for each matching root.
+    ///
+    /// When `check_permissions` is true, the `has_access` field in each
+    /// `PathAccessInfo` will be populated with the result of an ACL check.
+    /// When false, `has_access` will be `None`.
+    pub async fn restriction_info(
+        &self,
+        check_permissions: bool,
+    ) -> Result<Vec<PathAccessInfo>, MononokeError> {
+        let path = match NonRootMPath::try_from(self.path().clone()) {
+            Ok(p) => p,
+            // Root path cannot be restricted
+            Err(_) => return Ok(vec![]),
+        };
+
+        let restricted_paths = self.changeset().repo_ctx().repo().restricted_paths_arc();
+        let cs_id = self.changeset().id();
+
+        if check_permissions {
+            let restriction_checks = restricted_paths
+                .get_path_restriction_check(
+                    self.changeset().ctx(),
+                    Some(cs_id),
+                    std::slice::from_ref(&path),
+                )
+                .await?;
+            return Ok(restriction_checks
+                .into_iter()
+                .map(|restriction_check| PathAccessInfo {
+                    has_access: Some(restriction_check.has_authorization()),
+                    restriction: restriction_check.into_restriction_info(),
+                })
+                .collect());
+        }
+
+        let restriction_infos = restricted_paths
+            .get_path_restriction_info(
+                self.changeset().ctx(),
+                Some(cs_id),
+                std::slice::from_ref(&path),
+            )
+            .await?;
+
+        Ok(restriction_infos
+            .into_iter()
+            .map(|restriction| PathAccessInfo {
+                restriction,
+                has_access: None,
+            })
+            .collect())
+    }
+
+    /// Find all restricted paths that are descendants of this path.
+    ///
+    /// Returns restriction info for each restriction root under this path.
+    /// Since the number of roots can grow, this method will not perform
+    /// access checks unless `check_permissions` is true.
+    pub async fn find_restricted_descendants(
+        &self,
+        check_permissions: bool,
+    ) -> Result<Vec<PathAccessInfo>, MononokeError> {
+        self.changeset()
+            .find_restricted_descendants(vec![self.path().clone()], check_permissions)
+            .await
     }
 }

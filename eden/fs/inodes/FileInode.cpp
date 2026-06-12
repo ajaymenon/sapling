@@ -10,6 +10,8 @@
 #include <fmt/format.h>
 #include <optional>
 
+#include <folly/coro/Collect.h>
+#include <folly/coro/Invoke.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/io/async/EventBase.h>
@@ -517,9 +519,7 @@ Hash20 FileInodeState::MaterializedState::getSha1(FileInode& inode) {
   }
 
 #ifdef _WIN32
-  auto sha1 = getFileSha1(
-      inode.getMaterializedFilePath(),
-      inode.getMount()->getCheckoutConfig()->getEnableWindowsSymlinks());
+  auto sha1 = getFileSha1(inode.getMaterializedFilePath());
 #else
   auto sha1 = inode.getMount()->getOverlayFileAccess()->getSha1(inode);
 #endif // _WIN32
@@ -534,10 +534,8 @@ Hash32 FileInodeState::MaterializedState::getBlake3(
   // always delegate to overlayFileAccess to save on the materialized state
   // memory footprint
 #ifdef _WIN32
-  const auto blake3 = getFileBlake3(
-      inode.getMaterializedFilePath(),
-      maybeBlake3Key,
-      inode.getMount()->getCheckoutConfig()->getEnableWindowsSymlinks());
+  const auto blake3 =
+      getFileBlake3(inode.getMaterializedFilePath(), maybeBlake3Key);
 #else
   const auto blake3 = inode.getMount()->getOverlayFileAccess()->getBlake3(
       inode, maybeBlake3Key);
@@ -876,6 +874,10 @@ AbsolutePath FileInode::getMaterializedFilePath() {
 
 #endif
 
+// DEPRECATED: use co_getSha1 directly. Kept only because
+// VirtualInode::getSHA1, FileInode::isSameAsSlow, FileInode::isSameAs,
+// and FileInode::getxattr still consume ImmediateFuture chains;
+// delete once those paths are migrated to coroutines.
 ImmediateFuture<Hash20> FileInode::getSha1(
     const ObjectFetchContextPtr& fetchContext) {
   auto state = LockedState{this};
@@ -897,6 +899,9 @@ ImmediateFuture<Hash20> FileInode::getSha1(
 
 ImmediateFuture<Hash32> FileInode::getBlake3(
     const ObjectFetchContextPtr& fetchContext) {
+  // DEPRECATED: use co_getBlake3 directly. Kept only because
+  // VirtualInode::getBlake3 and getxattr still consume ImmediateFuture chains;
+  // delete once those paths are migrated to coroutines.
   auto state = LockedState{this};
 
   logAccess(*fetchContext);
@@ -911,6 +916,42 @@ ImmediateFuture<Hash32> FileInode::getBlake3(
         return state->materializedState.getBlake3(
             *this, getMount()->getEdenConfig()->blake3Key.getValue());
       });
+  }
+
+  XLOGF(FATAL, "FileInode in illegal state: {}", state->tag);
+}
+
+folly::coro::now_task<Hash20> FileInode::co_getSha1(
+    const ObjectFetchContextPtr& fetchContext) {
+  auto state = LockedState{this};
+
+  logAccess(*fetchContext);
+  if (state->tag == State::BLOB_NOT_LOADING ||
+      state->tag == State::BLOB_LOADING) {
+    auto id = state->nonMaterializedState.id;
+    state.unlock();
+    co_return co_await getObjectStore().co_getBlobSha1(id, fetchContext);
+  } else if (state->tag == State::MATERIALIZED_IN_OVERLAY) {
+    co_return state->materializedState.getSha1(*this);
+  }
+
+  XLOGF(FATAL, "FileInode in illegal state: {}", state->tag);
+}
+
+folly::coro::now_task<Hash32> FileInode::co_getBlake3(
+    const ObjectFetchContextPtr& fetchContext) {
+  auto state = LockedState{this};
+
+  logAccess(*fetchContext);
+  if (state->tag == State::BLOB_NOT_LOADING ||
+      state->tag == State::BLOB_LOADING) {
+    auto id = state->nonMaterializedState.id;
+    state.unlock();
+    // If a file is not materialized, it should have a id value.
+    co_return co_await getObjectStore().co_getBlobBlake3(id, fetchContext);
+  } else if (state->tag == State::MATERIALIZED_IN_OVERLAY) {
+    co_return state->materializedState.getBlake3(
+        *this, getMount()->getEdenConfig()->blake3Key.getValue());
   }
 
   XLOGF(FATAL, "FileInode in illegal state: {}", state->tag);
@@ -990,6 +1031,51 @@ ImmediateFuture<struct stat> FileInode::stat(
   }
 }
 
+folly::coro::now_task<struct stat> FileInode::co_stat(
+    const ObjectFetchContextPtr& context) {
+  // Keep this FileInode alive across the co_await.
+  [[maybe_unused]] auto self = inodePtrFromThis();
+  notifyParentOfStat(/*isFile=*/true, *context);
+  logAccess(*context);
+
+  auto st = getMount()->initStatData();
+  st.st_nlink = 1;
+  st.st_ino = getNodeId().get();
+
+  auto state = LockedState{this};
+
+#ifndef _WIN32
+  getMetadataLocked(*state).applyToStat(st);
+#endif
+
+  if (state->isMaterialized()) {
+    st.st_size = state->materializedState.getSize(*this);
+    updateBlockCount(st);
+    co_return st;
+  }
+
+  if (state->nonMaterializedState.size != FileInodeState::kUnknownSize) {
+    st.st_size = state->nonMaterializedState.size;
+    updateBlockCount(st);
+    co_return st;
+  }
+
+  // Async fetch needed — extract id and unlock before co_await.
+  auto objectId = state->nonMaterializedState.id;
+  state.unlock();
+
+  // Mirror FileInode::stat()'s use of getBlobSize() (the lighter fast path
+  // that avoids fetching SHA1/Blake3 when only size is needed).
+  auto size = co_await getObjectStore().co_getBlobSize(objectId, context);
+
+  if (auto lockedState = LockedState{this}; !lockedState->isMaterialized()) {
+    lockedState->nonMaterializedState.size = size;
+  }
+  st.st_size = size;
+  updateBlockCount(st);
+  co_return st;
+}
+
 void FileInode::updateBlockCount([[maybe_unused]] struct stat& st) {
   // win32 does not have stat::st_blocks
 #ifndef _WIN32
@@ -1027,10 +1113,28 @@ ImmediateFuture<folly::Unit> FileInode::fallocate(
 ImmediateFuture<string> FileInode::readAll(
     const ObjectFetchContextPtr& fetchContext,
     CacheHint cacheHint) {
-  // TODO: calling this on Windows with a non ProjFS filesystem is likely to
-  // deadlock Eden. diff calls into this. So `hg status` on non ProjFS mounts
-  // is likely to hang things.
-  auto interest = BlobCache::Interest::LikelyNeededAgain;
+  // DEPRECATED: use co_readAll directly. Kept only because
+  // TreeInode::loadGitIgnoreThenDiff (diff path) still calls it;
+  // delete once diff is migrated to coroutines.
+  return ImmediateFuture{
+      // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+      folly::coro::co_invoke(
+          [](auto&& self, auto&&... args) -> folly::coro::Task<std::string> {
+            co_return co_await self->co_readAll(
+                std::forward<decltype(args)>(args)...);
+          },
+          inodePtrFromThis(),
+          fetchContext.copy(),
+          cacheHint)
+          .semi()};
+}
+
+folly::coro::now_task<std::string> FileInode::co_readAll(
+    const ObjectFetchContextPtr& fetchContext,
+    CacheHint cacheHint) {
+  auto self = inodePtrFromThis();
+
+  BlobCache::Interest interest;
   switch (cacheHint) {
     case CacheHint::NotNeededAgain:
       interest = BlobCache::Interest::UnlikelyNeededAgain;
@@ -1042,45 +1146,103 @@ ImmediateFuture<string> FileInode::readAll(
       // loaded.
       interest = BlobCache::Interest::WantHandle;
       break;
+    default:
+      EDEN_BUG() << "unexpected CacheHint value: "
+                 << static_cast<int>(cacheHint);
   }
 
-  return runWhileDataLoaded(
-      LockedState{this},
-      interest,
-      fetchContext,
-      nullptr,
-      [self = inodePtrFromThis()](
-          LockedState&& state, std::shared_ptr<const Blob> blob) -> string {
-        std::string result;
-        switch (state->tag) {
-          case State::MATERIALIZED_IN_OVERLAY: {
-#ifdef _WIN32
-            result = readFile(self->getMaterializedFilePath()).value();
-#else
-            XDCHECK(!blob);
-            result = self->getOverlayFileAccess(state)->readAllContents(*self);
-#endif
-            break;
-          }
-          case State::BLOB_NOT_LOADING: {
-            const auto& contentsBuf = blob->getContents();
-            folly::io::Cursor cursor(&contentsBuf);
-            result =
-                cursor.readFixedString(contentsBuf.computeChainDataLength());
-            break;
-          }
-          default:
-            EDEN_BUG() << "neither materialized nor loaded during "
-                          "runWhileDataLoaded() call";
+  // Acquire lock, check state, load if needed.
+  std::shared_ptr<const Blob> blob;
+  {
+    auto state = LockedState{self};
+    switch (state->tag) {
+      case State::BLOB_NOT_LOADING:
+        blob = state.getCachedBlob(getMount(), interest);
+        if (blob) {
+          // Blob was in cache, read immediately.
+          logAccess(*fetchContext);
+          const auto& contentsBuf = blob->getContents();
+          folly::io::Cursor cursor(&contentsBuf);
+          auto result =
+              cursor.readFixedString(contentsBuf.computeChainDataLength());
+          updateAtimeLocked(*state);
+          co_return result;
         }
+        blob = co_await co_startLoadingData(
+            std::move(state), interest, fetchContext);
+        break;
+      case State::BLOB_LOADING: {
+        // Already loading, latch on to the in-progress load.
+        // Unlock before co_await: completeDataLoad() needs this lock to
+        // fulfill the promise.
+        auto future = state->blobLoadingPromise->getImmediateFuture();
+        state.unlock();
+        blob = co_await std::move(future).semi();
+        break;
+      }
+      case State::MATERIALIZED_IN_OVERLAY: {
+        // File is materialized, read from overlay.
+        logAccess(*fetchContext);
+#ifdef _WIN32
+        auto result = readFile(self->getMaterializedFilePath()).value();
+#else
+        auto result = self->getOverlayFileAccess(state)->readAllContents(*self);
+#endif
+        updateAtimeLocked(*state);
+        co_return result;
+      }
+      default:
+        EDEN_BUG() << "unexpected FileInode state in co_readAll(): "
+                   << state->tag;
+    }
+  }
 
-        // We want to update atime after the read operation.
-        self->updateAtimeLocked(*state);
+  // Re-acquire lock after loading completes.
+  auto state = LockedState{self};
+  XDCHECK(
+      state->tag == State::BLOB_NOT_LOADING ||
+      state->tag == State::MATERIALIZED_IN_OVERLAY)
+      << "unexpected FileInode state after loading: " << state->tag;
+  logAccess(*fetchContext);
 
-        return result;
-      });
+  std::string result;
+  switch (state->tag) {
+    case State::MATERIALIZED_IN_OVERLAY: {
+      // Concurrent materialization during load — read from overlay.
+#ifdef _WIN32
+      result = readFile(self->getMaterializedFilePath()).value();
+#else
+      result = self->getOverlayFileAccess(state)->readAllContents(*self);
+#endif
+      break;
+    }
+    case State::BLOB_NOT_LOADING: {
+      // A BrokenPromise from truncation would have transitioned to
+      // MATERIALIZED_IN_OVERLAY. If we have a null blob and are still in
+      // BLOB_NOT_LOADING, it means the background task was dropped
+      if (!blob) {
+        throw InodeError(
+            EIO,
+            self,
+            fmt::format(
+                "Blob loading for {} was cancelled",
+                state->nonMaterializedState.id));
+      }
+      const auto& contentsBuf = blob->getContents();
+      folly::io::Cursor cursor(&contentsBuf);
+      result = cursor.readFixedString(contentsBuf.computeChainDataLength());
+      break;
+    }
+    case State::BLOB_LOADING:
+      EDEN_BUG() << "unexpected BLOB_LOADING state after loading completed in "
+                    "co_readAll() call";
+    default:
+      EDEN_BUG() << "unexpected FileInode state after loading in co_readAll(): "
+                 << state->tag;
+  }
+  updateAtimeLocked(*state);
+  co_return result;
 }
-
 ImmediateFuture<std::tuple<BufVec, bool>> FileInode::read(
     size_t size,
     FileOffset off,
@@ -1400,6 +1562,56 @@ ImmediateFuture<BlobPtr> FileInode::startLoadingData(
           })
           .deferError<folly::BrokenPromise>(
               [](auto&&) -> BlobPtr { return nullptr; })};
+}
+
+folly::coro::now_task<BlobPtr> FileInode::co_startLoadingData(
+    LockedState state,
+    BlobCache::Interest interest,
+    const ObjectFetchContextPtr& fetchContext) {
+  XDCHECK_EQ(state->tag, State::BLOB_NOT_LOADING);
+
+  auto blobLoadingPromise =
+      std::make_unique<FileInodeState::BlobLoadingPromise>();
+  // Everything from here through state.unlock() should be noexcept.
+  // Once we transition to BLOB_LOADING, other callers will latch onto
+  // blobLoadingPromise, so we must guarantee completeDataLoad is called.
+  state->blobLoadingPromise = std::move(blobLoadingPromise);
+  auto resultFuture = state->blobLoadingPromise->getRawSemiFuture();
+  state->tag = State::BLOB_LOADING;
+  auto objectId = state->nonMaterializedState.id;
+
+  // Unlock state_ while we wait on the blob data to load
+  state.unlock();
+
+  // Load the blob and fulfill the promise. LoadingOngoing RAII ensures that
+  // if the coroutine is cancelled, completeDataLoad(BrokenPromise) is called
+  // to reset the inode from BLOB_LOADING back to BLOB_NOT_LOADING, preventing
+  // other callers latched onto blobLoadingPromise from hanging.
+  {
+    LoadingOngoing load{inodePtrFromThis()};
+    try {
+      auto tryResult = co_await folly::coro::co_awaitTry(
+          getMount()->getBlobAccess()->co_getBlob(
+              objectId, fetchContext, interest));
+      auto self = std::move(load).extractInodePtr();
+      self->completeDataLoad(std::move(tryResult));
+    } catch (const std::exception&) {
+      XLOG(
+          FATAL,
+          "Failed to propagate failure in getBlob(), no choice but to die");
+      throw;
+    }
+  }
+
+  // resultFuture is now fulfilled by completeDataLoad above.
+  // On truncation, the promise is destroyed before completeDataLoad runs,
+  // so resultFuture throws BrokenPromise — return nullptr so the caller
+  // retries the load.
+  try {
+    co_return co_await std::move(resultFuture);
+  } catch (const folly::BrokenPromise&) {
+    co_return nullptr;
+  }
 }
 
 void FileInode::completeDataLoad(folly::Try<BlobCache::GetResult> tryResult) {

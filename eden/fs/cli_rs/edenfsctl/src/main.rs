@@ -11,7 +11,6 @@ use std::process::Command;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use clap::Parser;
 use edenfs_commands::is_command_enabled_in_rust;
 #[cfg(fbcode_build)]
 use edenfs_telemetry::EDENFSCTL_CLI_USAGE;
@@ -42,7 +41,7 @@ fn python_fallback() -> Result<Command> {
         let mut parts = args.split_ascii_whitespace();
         let binary = parts
             .next()
-            .ok_or_else(|| anyhow!("invalid fallback environment variable: {:?}", args))?;
+            .ok_or_else(|| anyhow!("invalid fallback environment variable: {args:?}"))?;
         let mut cmd = Command::new(binary);
         #[cfg(windows)]
         if binary.ends_with(".par") {
@@ -113,7 +112,7 @@ fn fallback(reason: Option<&clap::Error>) -> Result<i32> {
     // Create a subprocess to run Python edenfsctl
     let status = cmd
         .status()
-        .with_context(|| format!("failed to execute: {:?}", cmd))?;
+        .with_context(|| format!("failed to execute: {cmd:?}"))?;
 
     Ok(status.code().unwrap_or(1))
 }
@@ -128,10 +127,7 @@ fn setup_logging() {
     let subscriber = subscriber.with_env_filter(EnvFilter::from_env("EDENFS_LOG"));
 
     if let Err(e) = subscriber.try_init() {
-        eprintln!(
-            "Unable to initialize logger. Logging will be disabled. Cause: {:?}",
-            e
-        );
+        eprintln!("Unable to initialize logger. Logging will be disabled. Cause: {e:?}");
     }
 }
 
@@ -160,7 +156,7 @@ fn wrapper_main(telemetry_sample: &mut CliUsageSample) -> Result<i32> {
             // We failed to parse the command due to unknown argument/flag.
             // Print the clap-generated error message (which includes helpful usage info)
             // and exit with the same exit code that Python exits with for parse failures.
-            Err(e) if e.kind() == clap::ErrorKind::UnknownArgument => {
+            Err(e) if e.kind() == clap::error::ErrorKind::UnknownArgument => {
                 e.print().ok();
                 std::process::exit(PYTHON_EDENFSCTL_EX_USAGE)
             }
@@ -227,16 +223,16 @@ fn wrapper_main(telemetry_sample: &mut CliUsageSample) -> Result<i32> {
             // display the rust error. We still return the python error code 64 to differentiate from
             // edenfsctl errors(2)
             Err(e) => {
-                if e.kind() == clap::ErrorKind::DisplayHelp
-                    || e.kind() == clap::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                if e.kind() == clap::error::ErrorKind::DisplayHelp
+                    || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
                 {
                     if should_use_rust_help(std::env::args(), &None, &None).unwrap_or(false) {
                         e.exit()
                     } else {
                         fallback(Some(&e))
                     }
-                } else if e.kind() == clap::ErrorKind::UnknownArgument
-                    || e.kind() == clap::ErrorKind::InvalidSubcommand
+                } else if e.kind() == clap::error::ErrorKind::UnknownArgument
+                    || e.kind() == clap::error::ErrorKind::InvalidSubcommand
                 {
                     // Failed to parse the command. We should try to fallback to Python.
                     fallback(Some(&e))

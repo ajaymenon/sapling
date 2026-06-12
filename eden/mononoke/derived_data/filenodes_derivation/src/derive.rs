@@ -633,7 +633,7 @@ mod tests {
             // compare PreparedFilenode::Info::Linknode
             if let Some(cs_id) = *self.cs_id.lock().unwrap() {
                 if info.iter().any(|filenode| filenode.info.linknode == cs_id) {
-                    return Err(anyhow!("filenodes for {} are prohibited", cs_id));
+                    return Err(anyhow!("filenodes for {cs_id} are prohibited"));
                 }
             }
             self.inner.add_filenodes(ctx, info).await
@@ -683,7 +683,7 @@ mod tests {
             .await?
             .load(ctx, &repo.repo_blobstore)
             .await
-            .with_context(|| format!("while fetching manifest from prod for cs {:?}", cs))?
+            .with_context(|| format!("while fetching manifest from prod for cs {cs:?}"))?
             .manifestid();
         manifest
             .list_all_entries(ctx.clone(), repo.repo_blobstore.clone())
@@ -703,24 +703,83 @@ mod tests {
                     let prod = repo.filenodes
                         .get_filenode(ctx, &path, node)
                         .await
-                        .with_context(|| format!("while get prod filenode for cs {:?}", cs))?;
+                        .with_context(|| format!("while get prod filenode for cs {cs:?}"))?;
                     let backup = backup_repo.filenodes
                         .get_filenode(ctx, &path, node)
                         .await
-                        .with_context(|| format!("while get backup filenode for cs {:?}", cs))?;
+                        .with_context(|| format!("while get backup filenode for cs {cs:?}"))?;
                     match (prod, backup) {
                         (FilenodeResult::Present(prod), FilenodeResult::Present(backup)) => {
-                            assert!(prod == backup, "Different filenode for cs {} with path {:?}\nfilenode in prod repo {:?}\nfilenode in backup repo {:?}", cs, path, prod, backup);
+                            assert!(prod == backup, "Different filenode for cs {cs} with path {path:?}\nfilenode in prod repo {prod:?}\nfilenode in backup repo {backup:?}");
                             Ok(())
                         }
                         (FilenodeResult::Disabled, FilenodeResult::Disabled) => Ok(()),
-                        (_, _) => Err(anyhow!("filenodes results different for cs: {:?}", cs)),
+                        (_, _) => Err(anyhow!("filenodes results different for cs: {cs:?}")),
                     }
                 }
             })
             .try_buffer_unordered(100)
             .try_for_each(|_| async { Ok(()) })
             .await?;
+        Ok(())
+    }
+
+    /// Filenodes use a content-addressed root filenode as derivation marker.
+    /// For merges with no file changes, create_hg_manifest reuses P1's manifest,
+    /// so merge and P1 share the same marker. Deriving filenodes for P1 makes
+    /// the merge falsely appear "derived," breaking the monotonicity assumption
+    /// in ancestors_frontier_with and causing derivation failures for descendants.
+    #[mononoke::fbinit_test]
+    async fn derive_filenodes_shared_root_manifest(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: TestRepo = test_repo_factory::build_empty(ctx.fb).await?;
+
+        //    target (parents: merge, c, adds target_file)
+        //   /      \
+        //  merge    |
+        //  |    \   |
+        //  a     c -+
+        //        |
+        //        b
+        //
+        // merge(a, c) has no file changes → HG manifest reuses a's.
+        // Deriving filenodes for a makes merge appear "derived."
+        // Deriving target fails: boundary parent c is in ancestors(merge)
+        // (assumed derived) but is NOT actually derived.
+        let b = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("dir/f", "v")
+            .commit()
+            .await?;
+        let c = CreateCommitContext::new(&ctx, &repo, vec![b])
+            .delete_file("dir/f")
+            .commit()
+            .await?;
+        let a = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("dir/f", "v")
+            .commit()
+            .await?;
+        let merge = CreateCommitContext::new(&ctx, &repo, vec![a, c])
+            .commit()
+            .await?;
+        let target = CreateCommitContext::new(&ctx, &repo, vec![merge, c])
+            .add_file("target_file", "v")
+            .commit()
+            .await?;
+
+        let manager = repo.repo_derived_data().manager();
+
+        // Only derive filenodes for a. This makes merge falsely appear
+        // "derived" via the shared root manifest, while b and c remain
+        // underived.
+        manager
+            .derive::<FilenodesOnlyPublic>(&ctx, a, None, DerivationPriority::LOW)
+            .await?;
+
+        // Gap-filling detects the underived boundary parent and fills it.
+        manager
+            .derive::<FilenodesOnlyPublic>(&ctx, target, None, DerivationPriority::LOW)
+            .await?;
+
         Ok(())
     }
 }

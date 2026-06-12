@@ -11,9 +11,9 @@
 # First create a base repository with sparse enabled.
 
   $ eagerepo
-  $ hg init base
+  $ sl init base
   $ cd base
-  $ cat > .hg/hgrc << 'EOF'
+  $ cat > .sl/config << 'EOF'
   > [extensions]
   > sparse=
   > journal=
@@ -21,26 +21,26 @@
 
   $ echo a > file1
   $ echo x > file2
-  $ hg ci -Aqm initial
+  $ sl ci -Aqm initial
   $ cd ..
 
 # Now create a shared working copy that is not sparse.
 
-  $ hg --config 'extensions.share=' share base shared
+  $ sl --config 'extensions.share=' share base shared
   updating working directory
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cd shared
-  $ cat > .hg/hgrc << 'EOF'
+  $ cat > .sl/config << 'EOF'
   > [extensions]
   > share=
   > sparse=!
   > journal=
   > EOF
 
-# Make sure "hg diff" works in the non-sparse working directory.
+# Make sure "sl diff" works in the non-sparse working directory.
 
   $ echo z >> file1
-  $ hg diff
+  $ sl diff
   diff -r 1f02e070b36e file1
   --- a/file1	Thu Jan 01 00:00:00 1970 +0000
   +++ b/file1	Thu Jan 01 00:00:00 1970 +0000

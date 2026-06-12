@@ -2,7 +2,7 @@
 
 Mononoke is the server built for the [Sapling Source Control
 System](https://sapling-scm.com/), meant to scale up to accepting thousands of
-commits every hour across millions of files. It is primarily written in the
+commits every hour across millions of files. It is primarily written in
 [Rust programming language](https://www.rust-lang.org/en-US/).
 
 The open source build includes mysql, sqlite, file and S3 backends.
@@ -23,11 +23,11 @@ omitted are:
 * CacheLib support. There is caching, but not yet using the [OSS CacheLib release](https://github.com/facebook/cachelib).
 * Documentation on how to configure.  You can probably work out some hints from the tests.
 
-Check GitHub Actions for the latest build/test status. Linux is Mononoke's primary target platform with OSS CI also running on MacOS. Other Unix-like OSes may be supported in the future.
+Check GitHub Actions for the latest build/test status. Linux is Mononoke's primary target platform with OSS CI also running on MacOS. Other Unix-like platforms may be supported in the future.
 
 ## Subsystem Docs
 
-Most of our documentation is in internal systems, however a few subsystems have in-repo markdown docs available:
+Most of our  documentation is in internal systems, however a few subsystems have in-repo markdown docs available:
 
 * [Integration Tests](tests/integration/README.md)
 * [Packblob Storage](blobstore/packblob/README.md) how Mononoke compressed store works

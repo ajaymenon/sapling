@@ -13,7 +13,7 @@ license = "MIT"
 name = "filters"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 blake3 = { version = "=1.8.2", features = ["mmap", "rayon", "traits-preview"] }
 derivative = "2.2"
 sapling-configmodel = { version = "0.1.0", path = "../config/model" }
@@ -26,7 +26,7 @@ serde = { version = "1.0.219", features = ["derive", "rc"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-tempfile = "3.22"
+tempfile = "3.27.0"
 
 [features]
 default = []

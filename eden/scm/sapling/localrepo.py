@@ -45,7 +45,7 @@ from . import (
     extensions,
     filelog,
     git,
-    gpg,
+    grepo,
     hook,
     identity,
     lock as lockmod,
@@ -63,6 +63,7 @@ from . import (
     revset,
     revsetlang,
     scmutil,
+    signing,
     smallcommitmetadata,
     store,
     transaction,
@@ -242,9 +243,6 @@ class localpeer(repository.peer):
             return bundle2.getunbundler(self.ui, cb)
         else:
             return changegroup.getunbundler("01", cb, None)
-
-    def heads(self, *args, **kwargs):
-        return list(self._repo.heads(*args, **kwargs))
 
     def known(self, nodes):
         return self._repo.known(nodes)
@@ -428,7 +426,7 @@ class localrepository:
         self.ui = baseui.copy()
         self.ui.loadrepoconfig(self.root)
 
-        self._rsrepo = bindings.repo.repo(self.root, self.ui._rcfg)
+        self._rsrepo = bindings.repo.repo(self.root, self.ui.rustcontext())
 
         # sharedvfs: the local vfs of the primary shared repo for shared repos.
         # for non-shared repos this is the same as localvfs.
@@ -471,13 +469,6 @@ class localrepository:
         except IOError as inst:
             if inst.errno != errno.ENOENT:
                 raise
-        forcewindowssymlinks = self.ui.configbool(
-            "experimental", "windows-symlinks.force", None
-        )
-        if forcewindowssymlinks:
-            self.requirements.add("windowssymlinks")
-        elif forcewindowssymlinks is False:
-            self.requirements.remove("windowssymlinks")
 
         # wvfs: rooted at the repository root, used to access the working copy
         disablesymlinks = util.iswindows and "windowssymlinks" not in self.requirements
@@ -504,7 +495,8 @@ class localrepository:
             s = sharedvfs.base
             if not sharedvfs.exists():
                 raise errormod.RepoError(
-                    _(".hg/sharedpath points to nonexistent directory %s") % s
+                    _("%s/sharedpath points to nonexistent directory %s")
+                    % (identity.default().dotdir(), s)
                 )
             self.sharedpath = s
             self.sharedroot = sharedvfs.dirname(s)
@@ -830,7 +822,7 @@ class localrepository:
         if flush_rust:
             # We have have done a pure-Rust operation that wrote to caches.
             # Flush via the Rust repo.
-            self._rsrepo.invalidatestores()
+            self._rsrepo.flushstores()
 
         if "changelog" in self.__dict__ and self.changelog.isvertexlazy():
             # Errors are not fatal. We lost some caches downloaded from the
@@ -1055,8 +1047,8 @@ class localrepository:
 
         with (
             self.conn(source) as conn,
-            lockfree and util.nullcontextmanager() or self.wlock(),
-            lockfree and util.nullcontextmanager() or self.lock(),
+            self.wlock(lockfree=lockfree),
+            self.lock(lockfree=lockfree),
             self.transaction("pull", lockfree=lockfree),
             self.ui.configoverride(configoverride),
         ):
@@ -1076,10 +1068,7 @@ class localrepository:
                     b for b in bookmarknames if b not in remotebookmarks
                 ]
                 if missing_bookmarknames:
-                    if (
-                        self.ui.configbool("pull", "httpbookmarks")
-                        and self.nullableedenapi is not None
-                    ):
+                    if self.nullableedenapi is not None:
                         fetchedbookmarks = self.edenapi.bookmarks(missing_bookmarknames)
                         tracing.debug(
                             "edenapi fetched bookmarks: %s" % str(fetchedbookmarks),
@@ -1097,7 +1086,7 @@ class localrepository:
                             remote.listkeyspatterns(
                                 "bookmarks", patterns=missing_bookmarknames
                             )
-                        )  # {name: hexnode}
+                        )
 
                 for name in bookmarknames:
                     if name in remotebookmarks:
@@ -1307,11 +1296,11 @@ class localrepository:
     # _phasesets depend on changelog. what we need is to call
     # _phasecache.invalidate() if '00changelog.i' was changed, but it
     # can't be easily expressed in filecache mechanism.
-    @storecache("phaseroots", "00changelog.i", "remotenames", "visibleheads")
+    @storecache()
     def _phasecache(self):
         return phases.phasecache(self, self._phasedefaults)
 
-    @storecache("00changelog.i", "visibleheads", "remotenames")
+    @storecache()
     def changelog(self):
         # Trigger loading of the metalog, before loading changelog.
         # This avoids potential races such as metalog refers to
@@ -1354,7 +1343,7 @@ class localrepository:
         # manifestlog. It allows bundlerepo to intercept the manifest creation.
         return manifest.manifestrevlog(self.svfs)
 
-    @storecache("00manifest.i", "00manifesttree.i")
+    @storecache()
     def manifestlog(self):
         return manifest.manifestlog(self.svfs, self)
 
@@ -1367,12 +1356,14 @@ class localrepository:
         if (
             edenfs.requirement in self.requirements
             or git.DOTGIT_REQUIREMENT in self.requirements
+            or grepo.GREPO_REQUIREMENT in self.requirements
         ):
             return self._eden_dirstate
 
         if (
             not "treestate" in self.requirements
             and git.DOTGIT_REQUIREMENT not in self.requirements
+            and grepo.GREPO_REQUIREMENT not in self.requirements
         ):
             raise errormod.RequirementError(
                 f"legacy dirstate implementations are no longer supported (path={self.path}, requirements={self.requirements})"
@@ -1515,6 +1506,8 @@ class localrepository:
         The revset is specified as a string ``expr`` that may contain
         %-formatting to escape certain types. See ``revsetlang.formatspec``.
 
+        Note that `repo.revs(expr)` is equivalent to `repo.revs("%r", expr).
+
         Revset aliases from the configuration are not expanded. To expand
         user aliases, consider calling ``scmutil.revrange()`` or
         ``repo.anyrevs([expr], user=True)``.
@@ -1522,7 +1515,8 @@ class localrepository:
         Returns a revset.abstractsmartset, which is a list-like interface
         that contains integer revisions.
         """
-        expr = revsetlang.formatspec(expr, *args)
+        if args:
+            expr = revsetlang.formatspec(expr, *args)
         m = revset.match(None, expr)
         subset = kwargs.get("subset", None)
         return m(self, subset=subset)
@@ -2215,6 +2209,7 @@ class localrepository:
         if (
             edenfs.requirement in self.requirements
             or git.DOTGIT_REQUIREMENT in self.requirements
+            or grepo.GREPO_REQUIREMENT in self.requirements
         ):
             self.dirstate.invalidate()
             return
@@ -2368,7 +2363,7 @@ class localrepository:
         else:  # no lock have been found.
             callback()
 
-    def lock(self, wait=True):
+    def lock(self, wait=True, lockfree=False):
         """Lock the repository store (.hg/store) and return a weak reference
         to the lock. Use this before modifying the store (e.g. committing or
         stripping). If you are opening a transaction, get a lock as well.)
@@ -2378,7 +2373,12 @@ class localrepository:
 
         Returns 'nullcontextmanager' without reading or writing on-disk locks,
         if the current active transaction is marked as lockfree.
+
+        If lockfree is True, returns util.nullcontextmanager() without waiting.
         """
+        if lockfree:
+            return util.nullcontextmanager()
+
         if self._is_within_lockfree_transaction():
             return util.nullcontextmanager()
 
@@ -2424,7 +2424,7 @@ class localrepository:
         self._lockref = weakref.ref(l)
         return l
 
-    def wlock(self, wait=True):
+    def wlock(self, wait=True, lockfree=False):
         """Lock the non-store parts of the repository (everything under
         .hg except .hg/store) and return a weak reference to the lock.
 
@@ -2432,11 +2432,15 @@ class localrepository:
 
         If both 'lock' and 'wlock' must be acquired, ensure you always acquires
         'wlock' first to avoid a dead-lock hazard.
+
+        If lockfree is True, returns util.nullcontextmanager() without waiting.
         """
+        if lockfree:
+            return util.nullcontextmanager()
+
         if self._is_within_lockfree_transaction():
             raise errormod.ProgrammingError(
                 "wlock inside lockfree transaction is not currently allowed",
-                stacklevel=1,
             )
         l = self._wlockref and self._wlockref()
         if l is not None and l.held:
@@ -2844,7 +2848,7 @@ class localrepository:
                 user,
                 ctx.date(),
                 extra,
-                gpg.get_gpg_keyid(self.ui),
+                signing.get_signing_backend(self.ui),
             )
             xp1, xp2 = p1.hex(), p2 and p2.hex() or ""
             self.hook("pretxncommit", throw=True, node=hex(n), parent1=xp1, parent2=xp2)

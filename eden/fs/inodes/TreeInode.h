@@ -8,23 +8,33 @@
 #pragma once
 
 #include <folly/CancellationToken.h>
+#include <folly/CppAttributes.h>
 #include <folly/File.h>
+#include <folly/Function.h>
 #include <folly/Portability.h>
 #include <folly/Synchronized.h>
+#include <folly/coro/safe/NowTask.h>
+#include <chrono>
+#include <memory>
 #include <optional>
+#include <vector>
 #include "eden/common/utils/FileOffset.h"
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/fuse/Invalidation.h"
 #include "eden/fs/inodes/DirEntry.h"
 #include "eden/fs/inodes/InodeBase.h"
+#include "eden/fs/inodes/Traverse.h"
+#include "eden/fs/model/EntryAttributeFlags.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/model/TreeAuxDataFwd.h"
+#include "eden/fs/utils/MiniTracer.h"
 
 namespace facebook::eden {
 
 class CheckoutAction;
 class CheckoutContext;
 class MiniTracer;
+class DeferredDiffEntry;
 class DiffContext;
 class FuseDirList;
 class NfsDirList;
@@ -40,6 +50,9 @@ class TreeEntry;
 class TreeInodeDebugInfo;
 class PrjfsDirEntry;
 class VirtualInode;
+#ifndef _WIN32
+struct GcBarrierTrie;
+#endif
 
 constexpr folly::StringPiece kDotEdenName{".eden"};
 
@@ -92,6 +105,7 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
 
   /**
    * Construct an inode that only has backing in the Overlay area.
+   * Set isRestricted=true for directories denied by server-side path ACLs.
    */
   TreeInode(
       InodeNumber ino,
@@ -100,7 +114,8 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       mode_t initialMode,
       const std::optional<InodeTimestamps>& initialTimestamps,
       DirContents&& dir,
-      std::optional<ObjectId> treeId);
+      std::optional<ObjectId> treeId,
+      bool isRestricted = false);
 
   /**
    * Construct the root TreeInode from a source control commit's root.
@@ -118,6 +133,9 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   ~TreeInode() override;
 
   ImmediateFuture<struct stat> stat(
+      const ObjectFetchContextPtr& context) override;
+
+  folly::coro::now_task<struct stat> co_stat(
       const ObjectFetchContextPtr& context) override;
 
   ImmediateFuture<struct stat> setattr(
@@ -145,6 +163,14 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       bool loadInodes);
 
   /**
+   * Coroutine version of getOrFindChild.
+   */
+  folly::coro::now_task<VirtualInode> co_getOrFindChild(
+      PathComponentPiece name,
+      const ObjectFetchContextPtr& context,
+      bool loadInodes);
+
+  /**
    * Retrieves VirtualInode for each of entry in this Tree, like
    * getOrFindChild, but for all the children of a directory.
    *
@@ -165,6 +191,34 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   getChildren(const ObjectFetchContextPtr& context, bool loadInodes);
 
   /**
+   * Coroutine variant of getChildren() returning eagerly-resolved
+   * Try<VirtualInode> values instead of per-entry ImmediateFutures.
+   */
+  folly::coro::now_task<
+      std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>>
+  co_getChildren(const ObjectFetchContextPtr& context, bool loadInodes = false);
+
+  /**
+   * Pipelined coroutine version of getChildren + getEntryAttributes.
+   *
+   * Each child task does (resolve VirtualInode → fetch attributes) in
+   * sequence, and all child tasks run in parallel under a single
+   * collectAllTryRange. This avoids the barrier between phases that a
+   * separate co_getChildren followed by per-attr tasks would impose,
+   * preserving the latency profile of the original futures-based
+   * implementation while still avoiding the ImmediateFuture wrapper
+   * overhead.
+   */
+  folly::coro::now_task<
+      std::vector<std::pair<PathComponent, folly::Try<EntryAttributes>>>>
+  co_getChildrenAttributes(
+      EntryAttributeFlags requestedAttributes,
+      RelativePath path,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      timespec lastCheckoutTime,
+      const ObjectFetchContextPtr& context);
+
+  /**
    * Get the inode object for a child of this directory.
    *
    * The Inode object will be loaded if it is not already loaded.
@@ -172,7 +226,13 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   ImmediateFuture<InodePtr> getOrLoadChild(
       PathComponentPiece name,
       const ObjectFetchContextPtr& context);
+  folly::coro::now_task<InodePtr> co_getOrLoadChild(
+      PathComponentPiece name,
+      const ObjectFetchContextPtr& context);
   ImmediateFuture<TreeInodePtr> getOrLoadChildTree(
+      PathComponentPiece name,
+      const ObjectFetchContextPtr& context);
+  folly::coro::now_task<TreeInodePtr> co_getOrLoadChildTree(
       PathComponentPiece name,
       const ObjectFetchContextPtr& context);
 
@@ -183,6 +243,10 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * will be loaded if they are not already loaded.
    */
   ImmediateFuture<InodePtr> getChildRecursive(
+      RelativePathPiece name,
+      const ObjectFetchContextPtr& context);
+
+  folly::coro::now_task<InodePtr> co_getChildRecursive(
       RelativePathPiece name,
       const ObjectFetchContextPtr& context);
 
@@ -214,23 +278,71 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       off_t off,
       const ObjectFetchContextPtr& context);
 
-  const folly::Synchronized<TreeInodeState>& getContents() const {
+  /**
+   * Acquire a read lock on the contents.
+   * Calls checkAccess() to enforce path ACL restrictions.
+   */
+  folly::Synchronized<TreeInodeState>::ConstLockedPtr lockContentsRead() const {
+    checkAccess();
+    return contents_.rlock();
+  }
+
+  /**
+   * Acquire a write lock on the contents.
+   * Calls checkAccess() to enforce path ACL restrictions.
+   */
+  folly::Synchronized<TreeInodeState>::LockedPtr lockContentsWrite() {
+    checkAccess();
+    return contents_.wlock();
+  }
+
+  /**
+   * Direct access to contents without ACL checks. Only for internal
+   * operations that must bypass restrictions (inode unload, checkout).
+   * Prefer lockContentsRead() / lockContentsWrite() for normal access.
+   */
+  const folly::Synchronized<TreeInodeState>& getContentsUnchecked() const {
     return contents_;
   }
-  folly::Synchronized<TreeInodeState>& getContents() {
+  folly::Synchronized<TreeInodeState>& getContentsUnchecked() {
     return contents_;
   }
+
+  /**
+   * Return a copy of all child entry names. This acquires and releases the
+   * contents lock internally.
+   */
+  std::vector<PathComponent> getChildNames() const;
+
+  /**
+   * Snapshot of directory entries and tree ID for traversal purposes.
+   * Copies entry metadata so the caller can use it without holding
+   * the contents lock.
+   */
+  struct TraversalSnapshot {
+    std::vector<ChildEntry> children;
+    std::optional<ObjectId> treeId;
+  };
+  TraversalSnapshot getTraversalSnapshot() const;
 
   std::optional<ObjectId> getObjectId() const override;
 
+  // Bypasses checkAccess(): all user-facing callers are guarded upstream
+  // (path traversal, lock accessors). Internal callers (InodeMap, GC)
+  // need this to work on restricted inodes.
   bool isMaterialized() const override {
     return contents_.rlock()->isMaterialized();
   }
 
   /**
    * Get the digest id for this inode.
+   *
+   * DEPRECATED: Use co_getDigestHash() instead.
    */
   ImmediateFuture<std::optional<Hash32>> getDigestHash(
+      const ObjectFetchContextPtr& fetchContext);
+
+  folly::coro::now_task<std::optional<Hash32>> co_getDigestHash(
       const ObjectFetchContextPtr& fetchContext);
 
   /**
@@ -243,6 +355,9 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * Get the tree aux data for this inode.
    */
   ImmediateFuture<std::optional<TreeAuxData>> getTreeAuxData(
+      const ObjectFetchContextPtr& fetchContext);
+
+  folly::coro::now_task<std::optional<TreeAuxData>> co_getTreeAuxData(
       const ObjectFetchContextPtr& fetchContext);
 
   FileInodePtr symlink(
@@ -278,10 +393,10 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       const ObjectFetchContextPtr& context);
 
   /**
-   * Internal method intended for removeRecursively to use. This method does not
-   * flush invalidation so the caller won't see the up-to-date content after
-   * return. Call EdenMount::flushInvalidations to ensure any changes to the
-   * inode will be visible after it returns.
+   * Internal method intended for removeRecursively to use. This method does
+   * not flush invalidation so the caller won't see the up-to-date content
+   * after return. Call EdenMount::flushInvalidations to ensure any changes to
+   * the inode will be visible after it returns.
    */
   ImmediateFuture<folly::Unit> removeRecursivelyNoFlushInvalidation(
       PathComponentPiece name,
@@ -355,6 +470,13 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       const GitIgnoreStack* parentIgnore,
       bool isIgnored);
 
+  folly::coro::now_task<folly::Unit> co_diff(
+      DiffContext* context,
+      RelativePathPiece currentPath,
+      std::vector<std::shared_ptr<const Tree>> trees,
+      const GitIgnoreStack* parentIgnore,
+      bool isIgnored);
+
   /**
    * Update this directory so that it matches the specified source control Tree
    * object.
@@ -399,7 +521,8 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    */
   void childMaterialized(
       const RenameLock& renameLock,
-      PathComponentPiece childName);
+      PathComponentPiece childName,
+      bool writeOverlay = true);
 
   /**
    * Update this directory when a child entry is dematerialized.
@@ -418,7 +541,9 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   void childDematerialized(
       const RenameLock& renameLock,
       PathComponentPiece childName,
-      ObjectId childScmId);
+      ObjectId childScmId,
+      bool writeOverlay = true,
+      bool isRestricted = false);
 
   /**
    * Internal API only for use by InodeMap.
@@ -457,11 +582,11 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   size_t unloadChildrenNow();
 
   /**
-   * Unload all children, recursively, neither referenced internally by Eden nor
-   * by FUSE or ProjectedFS.
+   * Unload all children, recursively, neither referenced internally by Eden
+   * nor by FUSE or ProjectedFS.
    *
-   * If mustPersistInodeNumbers is false, we will skip lazy inode persistence to
-   * overlay. This makes sense for "checkout" where all bets are off and we
+   * If mustPersistInodeNumbers is false, we will skip lazy inode persistence
+   * to overlay. This makes sense for "checkout" where all bets are off and we
    * don't want user to wait for overlay writes.
    *
    * Returns the number of inodes unloaded.
@@ -564,6 +689,8 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   InodeMetadata getMetadataLocked(const DirContents&) const;
 #endif
 
+  struct stat statWithCurrentRestrictionState() const;
+
   /**
    * The InodeMap is guaranteed to remain valid for at least the lifetime of
    * the TreeInode object.
@@ -620,6 +747,36 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       const ObjectFetchContextPtr& context,
       folly::CancellationToken cancellationToken = {});
 
+#ifndef _WIN32
+  /**
+   * Active FUSE invalidation for pressure-based GC.
+   *
+   * Walks the inode tree bottom-up, sending FUSE_NOTIFY_INVAL_ENTRY for stale
+   * entries. Fully stale directory subtrees are collapsed into a single
+   * invalidation from the first ancestor that cannot also be collapsed. This
+   * causes the kernel to send FORGET for those inodes, decrementing fsRefcount
+   * so they can be unloaded.
+   *
+   * Both materialized and non-materialized inodes are invalidated —
+   * invalidateEntry only drops the dcache entry, overlay data is preserved.
+   */
+  ImmediateFuture<uint64_t /* numInvalidated */>
+  invalidateChildrenNotAccessedRecentlyFuse(
+      std::chrono::system_clock::time_point cutoff,
+      const ObjectFetchContextPtr& context,
+      const folly::CancellationToken& cancellationToken = {});
+
+  ImmediateFuture<std::pair<uint64_t /* numInvalidated */, bool /* allStale */>>
+  invalidateChildrenNotAccessedRecentlyFuseImpl(
+      std::chrono::system_clock::time_point cutoff,
+      std::chrono::system_clock::time_point collapseCutoff,
+      const ObjectFetchContextPtr& context,
+      const folly::CancellationToken& cancellationToken,
+      const std::shared_ptr<const GcBarrierTrie>& gcBarrier,
+      const GcBarrierTrie* FOLLY_NULLABLE currentGcBarrier,
+      bool isRoot);
+#endif
+
   /**
    * Materialize this directory in the overlay.
    *
@@ -646,13 +803,16 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   /**
    * Saves the entries of this inode to the overlay.
    */
-  void saveOverlayDir(const DirContents& contents) const;
+  void saveOverlayDir(const DirContents& contents, bool isMaterialized = true)
+      const;
 
   /**
    * Saves the entries for a specified inode number.
    */
-  void saveOverlayDir(InodeNumber inodeNumber, const DirContents& contents)
-      const;
+  void saveOverlayDir(
+      InodeNumber inodeNumber,
+      const DirContents& contents,
+      bool isMaterialized = true) const;
 
   /**
    * Converts a Tree to a Dir and saves it to the Overlay under the given inode
@@ -666,8 +826,7 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   static DirContents buildDirFromTree(
       const Tree* tree,
       Overlay* overlay,
-      CaseSensitivity caseSensitive,
-      bool windowsSymlinksEnabled);
+      CaseSensitivity caseSensitive);
 
   void updateAtime();
 
@@ -705,6 +864,62 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    */
   template <typename Fn>
   bool readdirImpl(off_t offset, const ObjectFetchContextPtr& context, Fn add);
+
+ public:
+  /**
+   * Returns true if this directory is restricted by a path ACL.
+   * Restricted directories deny access to their contents.
+   */
+  bool isRestricted() const {
+    return isRestricted_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  /**
+   * Throws EACCES if this directory is restricted by a path ACL.
+   * Called by guarded lock accessors before contents_ acquisition.
+   *
+   * "has_acl" in the Sapling layer means a tree entry has an ACL file
+   * present — it does not imply restriction. isRestricted is only set
+   * after a permission check determines the user lacks access.
+   */
+  void checkAccess() const {
+    if (FOLLY_UNLIKELY(isRestricted_.load(std::memory_order_relaxed))) {
+      throwRestrictedAccess();
+    }
+  }
+
+  /**
+   * Throws EACCES with inode context for restricted directory access.
+   */
+  [[noreturn]] void throwRestrictedAccess() const;
+
+  /**
+   * If this inode is restricted and the TTL has expired, re-validate
+   * permissions via check_permission. If the user now has access,
+   * calls transitionToUnrestricted() to populate this inode.
+   */
+  ImmediateFuture<folly::Unit> recheckPermissionIfExpired(
+      const ObjectFetchContextPtr& fetchContext);
+
+  /**
+   * Transition this inode from restricted to unrestricted. Fetch the real
+   * tree, rebuild DirContents, and install it under the usual rename/content
+   * locks.
+   */
+  ImmediateFuture<folly::Unit> transitionToUnrestricted(
+      const ObjectFetchContextPtr& fetchContext);
+
+  /**
+   * Build DirContents for an unrestricted tree by checking the overlay
+   * first (preserving existing inode numbers), falling back to
+   * saveDirFromTree() for fresh allocation. Reused by startLoadingInode()
+   * and transitionToUnrestricted().
+   */
+  DirContents buildUnrestrictedDirContents(
+      InodeNumber inodeNumber,
+      const Tree& tree,
+      std::optional<MiniTracer::Span> loadOverlayDirSpan = std::nullopt);
 
   /**
    * createImpl() is a helper function for creating new children inodes.
@@ -786,12 +1001,9 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
 
   /**
    * This helper function starts loading a currently unloaded child inode.
-   * It must be held with the contents_ lock held.  (The Dir argument is only
-   * required as a parameter to ensure that the caller is actually holding the
-   * lock.)
+   * Must be called with the contents_ lock held.
    */
   ImmediateFuture<InodePtr> loadChildLocked(
-      DirContents& dir,
       PathComponentPiece name,
       DirEntry& entry,
       std::vector<IncompleteInodeLoad>& pendingLoads,
@@ -802,6 +1014,14 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * it is loaded.
    */
   [[nodiscard]] ImmediateFuture<folly::Unit> loadGitIgnoreThenDiff(
+      InodePtr gitignoreInode,
+      DiffContext* context,
+      RelativePathPiece currentPath,
+      std::vector<std::shared_ptr<const Tree>> trees,
+      const GitIgnoreStack* parentIgnore,
+      bool isIgnored);
+
+  folly::coro::now_task<folly::Unit> co_loadGitIgnoreThenDiff(
       InodePtr gitignoreInode,
       DiffContext* context,
       RelativePathPiece currentPath,
@@ -821,8 +1041,33 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       folly::Synchronized<TreeInodeState>::LockedPtr contentsLock,
       DiffContext* context,
       RelativePathPiece currentPath,
+      const std::vector<std::shared_ptr<const Tree>>& trees,
+      std::unique_ptr<GitIgnoreStack> ignore,
+      bool isIgnored);
+
+  folly::coro::now_task<folly::Unit> co_computeDiff(
+      folly::Synchronized<TreeInodeState>::LockedPtr contentsLock,
+      DiffContext* context,
+      RelativePathPiece currentPath,
       std::vector<std::shared_ptr<const Tree>> trees,
       std::unique_ptr<GitIgnoreStack> ignore,
+      bool isIgnored);
+
+  /**
+   * Shared synchronous first pass of computeDiff / co_computeDiff.
+   *
+   * Walks the merge of `trees` and this directory's inode entries under
+   * `contentsLock`, builds the DeferredDiffEntry list, releases the lock, and
+   * finishes any pending inode loads started during the walk. The caller is
+   * responsible for keeping `ignore` alive until the returned deferred entries
+   * have completed.
+   */
+  std::vector<std::unique_ptr<DeferredDiffEntry>> prepareDeferredDiffEntries(
+      folly::Synchronized<TreeInodeState>::LockedPtr contentsLock,
+      DiffContext* context,
+      RelativePathPiece currentPath,
+      const std::vector<std::shared_ptr<const Tree>>& trees,
+      GitIgnoreStack* ignore,
       bool isIgnored);
 
   /**
@@ -843,6 +1088,7 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   static bool canShortCircuitCheckout(
       CheckoutContext* ctx,
       const ObjectId& treeId,
+      bool isRestricted,
       const Tree* fromTree,
       const Tree* toTree);
   void computeCheckoutActions(
@@ -855,30 +1101,47 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
 
   /**
    * Sets wasDirectoryListModified true if this checkout entry operation has
-   * modified the directory contents, which implies the return value is nullptr.
+   * modified the directory contents, which implies the return value is
+   * nullptr.
    *
    * This function could return a std::variant of InvalidationRequired and
    * std::shared_ptr<CheckoutAction> instead of setting a boolean.
    */
+  template <typename Contents>
   std::shared_ptr<CheckoutAction> processCheckoutEntry(
       CheckoutContext* ctx,
       TreeInodeState& state,
+      Contents& contents,
       const Tree::value_type* oldScmEntry,
       const Tree::value_type* newScmEntry,
       std::vector<IncompleteInodeLoad>& pendingLoads,
       bool& wasDirectoryListModified);
 
+  template <typename Contents>
   std::shared_ptr<CheckoutAction> processCheckoutEntryImpl(
       CheckoutContext* ctx,
-      TreeInodeState& contents,
+      TreeInodeState& state,
+      Contents& contents,
       const Tree::value_type* oldScmEntry,
       const Tree::value_type* newScmEntry,
       std::vector<IncompleteInodeLoad>& pendingLoads,
       bool& wasDirectoryListModified);
 
+  template <typename Contents>
+  folly::Try<folly::Unit> removeOrReplaceCheckoutEntryLocked(
+      CheckoutContext* ctx,
+      TreeInodeState& state,
+      Contents& contents,
+      typename Contents::iterator it,
+      const InodePtr& loadedChild,
+      const Tree::value_type* newScmEntry,
+      bool& wasDirectoryListModified);
+
+  template <typename Contents>
   std::shared_ptr<CheckoutAction> processAbsentCheckoutEntry(
       CheckoutContext* ctx,
       TreeInodeState& state,
+      Contents& contents,
       const Tree::value_type* oldScmEntry,
       const Tree::value_type* newScmEntry,
       bool& wasDirectoryListModified);
@@ -938,14 +1201,14 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * the inode with out performing any write operations. `loadInodes` indicates
    * that you would like to load the inodes if they are not yet loaded. If the
    * inode is not loaded and `loadInodes` is set, a nullopt value will be
-   * returned and you can call wlockGetOrFindChild to load and return the inode.
+   * returned and you can call wlockGetOrFindChild to load and return the
+   * inode.
    *
    * If the inode is already loaded this will return the inode.
-   * Otherwise, if loadInodes is set or the inode is materialized we will return
-   * nullopt because the inode must be loaded to inspect it and loading an inode
-   * is a write operation.
-   * If we fall into none of the above cases the TreeOrEntry representing the
-   * data for that inode will be returned.
+   * Otherwise, if loadInodes is set or the inode is materialized we will
+   * return nullopt because the inode must be loaded to inspect it and loading
+   * an inode is a write operation. If we fall into none of the above cases the
+   * TreeOrEntry representing the data for that inode will be returned.
    */
   std::optional<ImmediateFuture<VirtualInode>> rlockGetOrFindChild(
       const TreeInodeState& contents,
@@ -953,13 +1216,32 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       const ObjectFetchContextPtr& context,
       bool loadInodes);
 
+  /**
+   * Coroutine equivalent of rlockGetOrFindChild. Checks if a child entry can
+   * be resolved without loading an inode. Returns a VirtualInode for
+   * synchronous cases (loaded inode, unmaterialized file). Sets dirFetch for
+   * unmaterialized directories that need an async tree fetch after the lock
+   * is released. Returns nullopt if an inode load is needed (requires wlock).
+   */
+  struct PendingDirFetch {
+    ObjectId treeId;
+    mode_t mode{};
+  };
+
+  std::optional<VirtualInode> rlockCheckChild(
+      const TreeInodeState& contents,
+      PathComponentPiece name,
+      const ObjectFetchContextPtr& context,
+      bool loadInodes,
+      std::optional<PendingDirFetch>& dirFetch);
+
   // We need to do some cleanup outside of the lock. So we return some promises
   // and futures and things to fulfil after the lock is released.
   struct LoadChildCleanUp {
-    // If we are responsible for loading the inode, but the load is not complete
-    // yet, then we need to register the inode load, so that someone will take
-    // care of the cleanup after loading the inode. This future will be valid if
-    // we are the ones responsible for the inode load.
+    // If we are responsible for loading the inode, but the load is not
+    // complete yet, then we need to register the inode load, so that someone
+    // will take care of the cleanup after loading the inode. This future will
+    // be valid if we are the ones responsible for the inode load.
     folly::Future<std::unique_ptr<InodeBase>> inodeLoadFuture;
 
     // If we are the ones responsible for the inode load and the load is
@@ -976,9 +1258,9 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
 
   /**
    * Loads and returns the inode for this child. Note this does not perform
-   * inode load cleanup. loadChildCleanup must be called after the lock has been
-   * released, any code between calling this and loadChildCleanUp should be no
-   * throw or call loadChildCleanUp despite exceptions.
+   * inode load cleanup. loadChildCleanup must be called after the lock has
+   * been released, any code between calling this and loadChildCleanUp should
+   * be no throw or call loadChildCleanUp despite exceptions.
    */
   std::pair<folly::SemiFuture<InodePtr>, LoadChildCleanUp> loadChild(
       folly::Synchronized<TreeInodeState>::LockedPtr& contents,
@@ -992,6 +1274,23 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   void loadChildCleanUp(PathComponentPiece name, LoadChildCleanUp result);
 
   folly::Synchronized<TreeInodeState> contents_;
+
+  /**
+   * True if this directory is restricted by a path ACL. When set,
+   * checkAccess() throws EACCES and stat() clears permission bits.
+   * Contents are empty — no tree data was fetched from the server.
+   *
+   * Derived from "has_acl" in the Sapling layer after a permission
+   * check confirms the user lacks access.
+   */
+  std::atomic<bool> isRestricted_{false};
+
+  /**
+   * Timestamp of the last permission recheck attempt for restricted inodes.
+   * Initialized to now() so newly created restricted inodes do not
+   * immediately retry.
+   */
+  std::atomic<std::chrono::steady_clock::time_point> lastPermissionCheck_{};
 
   /**
    * Valid state transitions:

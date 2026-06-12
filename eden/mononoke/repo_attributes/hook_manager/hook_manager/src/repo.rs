@@ -26,6 +26,8 @@ use bookmarks::Bookmarks;
 use bytes::Bytes;
 use changeset_info::ChangesetInfo;
 use commit_graph::CommitGraph;
+use commit_rate_limit_config::CommitRateLimit;
+use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
 use fsnodes::RootFsnodeId;
@@ -39,10 +41,10 @@ use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::ContentMetadataV2;
-use mononoke_types::FsnodeId;
 use mononoke_types::MPath;
 use mononoke_types::ManifestUnodeId;
 use mononoke_types::NonRootMPath;
+use mononoke_types::content_manifest::compat;
 use mononoke_types::hash::GitSha1;
 use repo_blobstore::RepoBlobstore;
 use repo_cross_repo::RepoCrossRepo;
@@ -90,6 +92,9 @@ pub struct HookRepo {
 
     #[facet]
     pub restricted_paths: RestrictedPaths,
+
+    #[facet]
+    pub commit_rate_limit: CommitRateLimit,
 }
 
 impl HookRepo {
@@ -152,8 +157,8 @@ impl HookRepo {
             .bookmarks
             .get(ctx.clone(), &bookmark, bookmarks::Freshness::MostRecent)
             .await
-            .with_context(|| format!("Error fetching bookmark: {}", bookmark))?
-            .ok_or_else(|| anyhow!("Bookmark {} does not exist", bookmark))?;
+            .with_context(|| format!("Error fetching bookmark: {bookmark}"))?
+            .ok_or_else(|| anyhow!("Bookmark {bookmark} does not exist"))?;
 
         self.find_content_by_changeset_id(ctx, changeset_id, paths)
             .await
@@ -165,17 +170,24 @@ impl HookRepo {
         changeset_id: ChangesetId,
         paths: Vec<NonRootMPath>,
     ) -> Result<HashMap<NonRootMPath, PathContent>> {
-        let fsnode_id = derive_fsnode(ctx, &self.repo_derived_data, changeset_id).await?;
+        let manifest_id = derive_manifest(
+            ctx,
+            self.repo_identity.name(),
+            &self.repo_derived_data,
+            changeset_id,
+        )
+        .await?;
 
-        fsnode_id
+        manifest_id
             .find_entries(ctx.clone(), self.repo_blobstore.clone(), paths)
             .map_ok(|(mb_path, entry)| async move {
                 if let Some(path) = Option::<NonRootMPath>::from(mb_path) {
                     match entry {
                         Entry::Tree(_) => Ok(Some((path, PathContent::Directory))),
                         Entry::Leaf(file) => {
+                            let file: compat::ContentManifestFile = file.into();
                             let content_id = file.content_id();
-                            Ok(Some((path, PathContent::File(*content_id))))
+                            Ok(Some((path, PathContent::File(content_id))))
                         }
                     }
                 } else {
@@ -194,8 +206,18 @@ impl HookRepo {
         new_cs_id: ChangesetId,
         old_cs_id: ChangesetId,
     ) -> Result<Vec<(NonRootMPath, FileChangeType)>> {
-        let new_mf_fut = derive_fsnode(ctx, &self.repo_derived_data, new_cs_id);
-        let old_mf_fut = derive_fsnode(ctx, &self.repo_derived_data, old_cs_id);
+        let new_mf_fut = derive_manifest(
+            ctx,
+            self.repo_identity.name(),
+            &self.repo_derived_data,
+            new_cs_id,
+        );
+        let old_mf_fut = derive_manifest(
+            ctx,
+            self.repo_identity.name(),
+            &self.repo_derived_data,
+            old_cs_id,
+        );
 
         let (new_mf, old_mf) = future::try_join(new_mf_fut, old_mf_fut).await?;
 
@@ -207,7 +229,8 @@ impl HookRepo {
                         Some(path) => match entry {
                             Entry::Tree(_) => Ok(None),
                             Entry::Leaf(c) => {
-                                Ok(Some((path, FileChangeType::Added(*c.content_id()))))
+                                let file: compat::ContentManifestFile = c.into();
+                                Ok(Some((path, FileChangeType::Added(file.content_id()))))
                             }
                         },
                         None => Ok(None),
@@ -215,10 +238,17 @@ impl HookRepo {
                     Diff::Changed(path, old_entry, entry) if !path.is_root() => {
                         match Option::<NonRootMPath>::from(path) {
                             Some(path) => match (old_entry, entry) {
-                                (Entry::Leaf(old_c), Entry::Leaf(c)) => Ok(Some((
-                                    path,
-                                    FileChangeType::Changed(*old_c.content_id(), *c.content_id()),
-                                ))),
+                                (Entry::Leaf(old_c), Entry::Leaf(c)) => {
+                                    let old_file: compat::ContentManifestFile = old_c.into();
+                                    let new_file: compat::ContentManifestFile = c.into();
+                                    Ok(Some((
+                                        path,
+                                        FileChangeType::Changed(
+                                            old_file.content_id(),
+                                            new_file.content_id(),
+                                        ),
+                                    )))
+                                }
                                 _ => Ok(None),
                             },
                             None => Ok(None),
@@ -253,8 +283,8 @@ impl HookRepo {
             .bookmarks
             .get(ctx.clone(), &bookmark, bookmarks::Freshness::MostRecent)
             .await
-            .with_context(|| format!("Error fetching bookmark: {}", bookmark))?
-            .ok_or_else(|| anyhow!("Bookmark {} does not exist", bookmark))?;
+            .with_context(|| format!("Error fetching bookmark: {bookmark}"))?
+            .ok_or_else(|| anyhow!("Bookmark {bookmark} does not exist"))?;
 
         let master_mf = derive_unode_manifest(ctx, &self.repo_derived_data, changeset_id).await?;
         master_mf
@@ -277,7 +307,7 @@ impl HookRepo {
                         .derive::<ChangesetInfo>(ctx, linknode, DerivationPriority::LOW)
                         .await
                         .with_context(|| {
-                            format!("Error deriving changeset info for bonsai: {}", linknode)
+                            format!("Error deriving changeset info for bonsai: {linknode}")
                         })?;
 
                     Ok(Some((path, cs_info)))
@@ -301,7 +331,7 @@ impl HookRepo {
             .repo_derived_data
             .derive::<RootSkeletonManifestId>(ctx, changeset_id, DerivationPriority::LOW)
             .await
-            .with_context(|| format!("Error deriving skeleton manifest for {}", changeset_id))?
+            .with_context(|| format!("Error deriving skeleton manifest for {changeset_id}"))?
             .skeleton_manifest_id()
             .clone();
         sk_mf
@@ -332,7 +362,7 @@ impl HookRepo {
             .bookmarks
             .get(ctx.clone(), bookmark, bookmarks::Freshness::MostRecent)
             .await
-            .with_context(|| format!("Error fetching bookmark: {}", bookmark))?;
+            .with_context(|| format!("Error fetching bookmark: {bookmark}"))?;
         if let Some(cs_id) = maybe_bookmark_val {
             Ok(BookmarkState::Existing(cs_id))
         } else {
@@ -395,23 +425,35 @@ impl HookRepo {
     }
 }
 
-async fn derive_fsnode(
+async fn derive_manifest(
     ctx: &CoreContext,
+    repo_name: &str,
     repo_derived_data: &RepoDerivedData,
     changeset_id: ChangesetId,
-) -> Result<FsnodeId> {
-    let fsnode_id = repo_derived_data
-        .derive::<RootFsnodeId>(ctx, changeset_id.clone(), DerivationPriority::LOW)
-        .await
-        .with_context(|| {
-            format!(
-                "Error deriving fsnode manifest for bonsai: {}",
-                changeset_id
-            )
-        })?
-        .into_fsnode_id();
+) -> Result<compat::ContentManifestId> {
+    let use_content_manifests = justknobs::eval(
+        "scm/mononoke:derived_data_use_content_manifests",
+        None,
+        Some(repo_name),
+    );
 
-    Ok(fsnode_id)
+    if use_content_manifests {
+        let root_id = repo_derived_data
+            .derive::<RootContentManifestId>(ctx, changeset_id.clone(), DerivationPriority::LOW)
+            .await
+            .with_context(|| {
+                format!("Error deriving content manifest for bonsai: {changeset_id}")
+            })?;
+        Ok(root_id.into_content_manifest_id().into())
+    } else {
+        let root_id = repo_derived_data
+            .derive::<RootFsnodeId>(ctx, changeset_id.clone(), DerivationPriority::LOW)
+            .await
+            .with_context(|| {
+                format!("Error deriving fsnode manifest for bonsai: {changeset_id}")
+            })?;
+        Ok(root_id.into_fsnode_id().into())
+    }
 }
 
 async fn derive_unode_manifest(
@@ -422,7 +464,7 @@ async fn derive_unode_manifest(
     let unode_mf = repo_derived_data
         .derive::<RootUnodeManifestId>(ctx, changeset_id.clone(), DerivationPriority::LOW)
         .await
-        .with_context(|| format!("Error deriving unode manifest for bonsai: {}", changeset_id))?
+        .with_context(|| format!("Error deriving unode manifest for bonsai: {changeset_id}"))?
         .manifest_unode_id()
         .clone();
     Ok(unode_mf)

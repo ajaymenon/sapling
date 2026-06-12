@@ -35,6 +35,7 @@ use commit_graph_types::segments::BoundaryChangesets;
 pub use commit_graph_types::segments::ChangesetSegment;
 use commit_graph_types::segments::SegmentDescription;
 use commit_graph_types::segments::SegmentedSliceDescription;
+pub use commit_graph_types::segments::SegmentedSliceWithBoundaries;
 use commit_graph_types::storage::CommitGraphStorage;
 use commit_graph_types::storage::Prefetch;
 use commit_graph_types::storage::PrefetchTarget;
@@ -400,6 +401,43 @@ impl CommitGraph {
 
         Ok(descendants)
     }
+
+    /// Returns true if the changesets that are ancestors of `descendant`
+    /// excluding strict ancestors of `ancestor` form a linear stack i.e.
+    /// none of them have more than one parent and `ancestor` is an ancestor
+    /// of `descendant`.
+    pub async fn is_linear_stack(
+        &self,
+        ctx: &CoreContext,
+        ancestor: ChangesetId,
+        descendant: ChangesetId,
+    ) -> Result<bool> {
+        let (ancestor_edges, descendant_edges) = futures::try_join!(
+            self.parent_ops.storage.fetch_edges(ctx, ancestor),
+            self.parent_ops.storage.fetch_edges(ctx, descendant),
+        )?;
+
+        let target_gen = ancestor_edges.node().generation::<Parents>();
+
+        if descendant_edges.node().generation::<Parents>() < target_gen {
+            return Ok(false);
+        }
+
+        if let Some(merge_ancestor) = descendant_edges.merge_ancestor_or_root::<Parents>()
+            && merge_ancestor.generation::<Parents>() > FIRST_GENERATION
+            && merge_ancestor.generation::<Parents>() >= target_gen
+        {
+            return Ok(false);
+        }
+
+        let mut frontier = ChangesetFrontier::new_single(
+            descendant,
+            descendant_edges.node().generation::<Parents>(),
+        );
+
+        self.lower_frontier(ctx, &mut frontier, target_gen).await?;
+        Ok(frontier.highest_generation_contains(ancestor, target_gen))
+    }
 }
 
 impl<E: EdgeType> CommitGraphOps<E> {
@@ -485,42 +523,6 @@ impl<E: EdgeType> CommitGraphOps<E> {
         Ok(frontier.highest_generation_contains(ancestor, target_gen))
     }
 
-    /// Returns true if the changesets that are ancestors of `ancestor` excluding
-    /// strict ancestors of `descendant` form a linear stack i.e. none of them have
-    /// more than one parent and `ancestor` is an ancestor of `descendant`.
-    pub async fn is_linear_stack(
-        &self,
-        ctx: &CoreContext,
-        ancestor: ChangesetId,
-        descendant: ChangesetId,
-    ) -> Result<bool> {
-        let (ancestor_edges, descendant_edges) = futures::try_join!(
-            self.storage.fetch_edges(ctx, ancestor),
-            self.storage.fetch_edges(ctx, descendant),
-        )?;
-
-        let target_gen = ancestor_edges.node().generation::<Parents>();
-
-        if descendant_edges.node().generation::<Parents>() < target_gen {
-            return Ok(false);
-        }
-
-        if let Some(merge_ancestor) = descendant_edges.merge_ancestor::<Parents>()
-            && merge_ancestor.generation::<Parents>() > FIRST_GENERATION
-            && merge_ancestor.generation::<Parents>() >= target_gen
-        {
-            return Ok(false);
-        }
-
-        let mut frontier = ChangesetFrontier::new_single(
-            descendant,
-            descendant_edges.node().generation::<Parents>(),
-        );
-
-        self.lower_frontier(ctx, &mut frontier, target_gen).await?;
-        Ok(frontier.highest_generation_contains(ancestor, target_gen))
-    }
-
     /// Returns true if the ancestor changeset is an ancestor of any of
     /// the descendant changesets.
     ///
@@ -537,6 +539,63 @@ impl<E: EdgeType> CommitGraphOps<E> {
         )?;
         self.lower_frontier(ctx, &mut frontier, target_gen).await?;
         Ok(frontier.highest_generation_contains(ancestor, target_gen))
+    }
+
+    /// Given a descendant commit and a list of candidate ancestor commits,
+    /// returns only those candidates that are actual ancestors of the
+    /// descendant. Uses progressive frontier lowering to share traversal
+    /// work across all candidates — more efficient than N individual
+    /// `is_ancestor` calls.
+    ///
+    /// Ancestry is inclusive: a commit is its own ancestor.
+    pub async fn filter_ancestors(
+        &self,
+        ctx: &CoreContext,
+        descendant: ChangesetId,
+        candidates: Vec<ChangesetId>,
+    ) -> Result<Vec<ChangesetId>> {
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Fetch generations for descendant and all candidates in one batch.
+        // fetch_many_edges returns a map, so duplicate candidates are
+        // naturally deduplicated without an extra allocation.
+        let descendant_gen = self.changeset_generation(ctx, descendant).await?;
+        let all_edges = self
+            .storage
+            .fetch_many_edges(ctx, &candidates, Prefetch::None)
+            .await?;
+
+        // Sort candidates by generation descending (highest first)
+        // so we can progressively lower the frontier.
+        // Skip candidates with generation > descendant — they can't
+        // be ancestors.
+        let mut candidates_with_gen: Vec<(ChangesetId, Generation)> = candidates
+            .into_iter()
+            .filter_map(|cs_id| {
+                let generation = all_edges.get(&cs_id)?.node().generation::<E>();
+                if generation > descendant_gen {
+                    return None;
+                }
+                Some((cs_id, generation))
+            })
+            .collect();
+        candidates_with_gen.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Build frontier from descendant
+        let mut frontier = self.single_frontier(ctx, descendant).await?;
+        let mut results = Vec::new();
+
+        // Progressively lower frontier, checking each candidate
+        for (cs_id, generation) in candidates_with_gen {
+            self.lower_frontier(ctx, &mut frontier, generation).await?;
+            if frontier.highest_generation_contains(cs_id, generation) {
+                results.push(cs_id);
+            }
+        }
+
+        Ok(results)
     }
 
     /// Returns a stream of all ancestors of any changeset in heads,
@@ -661,10 +720,10 @@ impl<E: EdgeType> CommitGraphOps<E> {
                     for (cs_id, edges) in all_edges.into_iter() {
                         let distance = *cs_ids_and_remaining_distance
                             .get(&cs_id)
-                            .ok_or_else(|| anyhow!("missing distance for changeset {} (in CommitGraph::ancestors_within_distance)", cs_id))?;
-                        for parent in edges.parents::<Parents>() {
+                            .ok_or_else(|| anyhow!("missing distance for changeset {cs_id} (in CommitGraph::ancestors_within_distance)"))?;
+                        for parent in edges.parents::<E>() {
                             let parent_distance = frontier
-                                .entry(parent.generation::<Parents>())
+                                .entry(parent.generation::<E>())
                                 .or_default()
                                 .entry(parent.cs_id)
                                 .or_default();
@@ -744,25 +803,16 @@ impl<E: EdgeType> CommitGraphOps<E> {
             // highest generation changesets' skip tree skew ancestor.
             // This is optimized for the case where u_frontier has only
             // one changeset, but is correct in all cases.
-            if let Some(ancestor) = u_highest_generation_edges.skip_tree_skew_ancestor::<Parents>()
-            {
+            if let Some(ancestor) = u_highest_generation_edges.skip_tree_skew_ancestor::<E>() {
                 let mut lowered_u_frontier = u_frontier.clone();
                 let mut lowered_v_frontier = v_frontier.clone();
 
-                self.lower_frontier(
-                    ctx,
-                    &mut lowered_u_frontier,
-                    ancestor.generation::<Parents>(),
-                )
-                .watched()
-                .await?;
-                self.lower_frontier(
-                    ctx,
-                    &mut lowered_v_frontier,
-                    ancestor.generation::<Parents>(),
-                )
-                .watched()
-                .await?;
+                self.lower_frontier(ctx, &mut lowered_u_frontier, ancestor.generation::<E>())
+                    .watched()
+                    .await?;
+                self.lower_frontier(ctx, &mut lowered_v_frontier, ancestor.generation::<E>())
+                    .watched()
+                    .await?;
 
                 // If the two lowered frontier are disjoint then it's safe to lower,
                 // otherwise there might be a higher generation common ancestor.
@@ -859,7 +909,7 @@ impl<E: EdgeType> CommitGraphOps<E> {
     /// Slices ancestors of `heads` excluding ancestors of `common` into a sequence
     /// of topologically ordered segmented slices for processing.
     ///
-    /// Returns a tuple of the slices and the boundary changesets between the slices.
+    /// Returns a vector of slices, each containing its segments and boundary changesets.
     /// A boundary changeset is any changeset that is a parent of another changeset in
     /// another slice.
     ///
@@ -872,7 +922,23 @@ impl<E: EdgeType> CommitGraphOps<E> {
         heads: Vec<ChangesetId>,
         common: Vec<ChangesetId>,
         slice_size: u64,
-    ) -> Result<(Vec<SegmentedSliceDescription>, BoundaryChangesets)> {
+    ) -> Result<Vec<SegmentedSliceWithBoundaries>> {
+        let (slices, _) = self
+            .segmented_slice_ancestors_with_external_parents(ctx, heads, common, slice_size)
+            .await?;
+        Ok(slices)
+    }
+
+    /// Like `segmented_slice_ancestors`, but also returns the external parents:
+    /// segment parents outside all segments (with `location: None`). These are
+    /// parents in the `common` frontier that the caller assumed are derived.
+    pub async fn segmented_slice_ancestors_with_external_parents(
+        &self,
+        ctx: &CoreContext,
+        heads: Vec<ChangesetId>,
+        common: Vec<ChangesetId>,
+        slice_size: u64,
+    ) -> Result<(Vec<SegmentedSliceWithBoundaries>, Vec<ChangesetId>)> {
         let segments = self
             .ancestors_difference_segments(ctx, heads, common)
             .await?;
@@ -887,18 +953,22 @@ impl<E: EdgeType> CommitGraphOps<E> {
         // part to the current slice and continue from the second part.
 
         let mut slices = vec![];
-        let mut boundary_changesets: BoundaryChangesets = Default::default();
+        let mut external_parents = HashSet::new();
 
         let mut current_segments = vec![];
         let mut current_slice_heads: BTreeMap<ChangesetId, u64> = Default::default();
         let mut current_slice_size = 0;
+        let mut current_slice_boundaries: BoundaryChangesets = Default::default();
 
         for mut segment in segments {
             loop {
                 // Current slice is full. Add it to the list of slices and create a new one.
                 if current_slice_size == slice_size {
-                    slices.push(SegmentedSliceDescription {
-                        segments: std::mem::take(&mut current_segments),
+                    slices.push(SegmentedSliceWithBoundaries {
+                        slice: SegmentedSliceDescription {
+                            segments: std::mem::take(&mut current_segments),
+                        },
+                        boundaries: std::mem::take(&mut current_slice_boundaries),
                     });
                     current_slice_heads.clear();
                     current_slice_size = 0;
@@ -907,8 +977,9 @@ impl<E: EdgeType> CommitGraphOps<E> {
                 // Go through all parents of the current segment and check if they are
                 // contained in another slice. If so, add them to boundary changesets.
                 for parent in segment.parents {
-                    // Check that the parent has a location. Otherwise it's part of
-                    // ancestors of `common` and shouldn't be added to boundary changesets.
+                    if parent.location.is_none() {
+                        external_parents.insert(parent.cs_id);
+                    }
                     if let Some(location) = parent.location {
                         // Parent is part of another slice if its location is either relative
                         // to a head of a segment belonging to another slice or to a segment
@@ -918,7 +989,7 @@ impl<E: EdgeType> CommitGraphOps<E> {
                         match current_slice_heads.get(&location.head) {
                             Some(length) if location.distance < *length => {}
                             _ => {
-                                boundary_changesets.insert(parent.cs_id);
+                                current_slice_boundaries.insert(parent.cs_id);
                             }
                         }
                     }
@@ -963,7 +1034,7 @@ impl<E: EdgeType> CommitGraphOps<E> {
 
                     // The split head is a parent of the upcoming slice so
                     // it's a boundary changeset.
-                    boundary_changesets.insert(split_head);
+                    current_slice_boundaries.insert(split_head);
 
                     // Continue loop using the second part of the segment.
                     segment = ChangesetSegment {
@@ -974,8 +1045,11 @@ impl<E: EdgeType> CommitGraphOps<E> {
                     };
 
                     // Current slice is full. Add it to the list of slices and create a new one.
-                    slices.push(SegmentedSliceDescription {
-                        segments: std::mem::take(&mut current_segments),
+                    slices.push(SegmentedSliceWithBoundaries {
+                        slice: SegmentedSliceDescription {
+                            segments: std::mem::take(&mut current_segments),
+                        },
+                        boundaries: std::mem::take(&mut current_slice_boundaries),
                     });
                     current_slice_heads.clear();
                     current_slice_size = 0;
@@ -985,12 +1059,15 @@ impl<E: EdgeType> CommitGraphOps<E> {
 
         // Make sure to add the last slice to the list of slices.
         if current_slice_size > 0 {
-            slices.push(SegmentedSliceDescription {
-                segments: current_segments,
+            slices.push(SegmentedSliceWithBoundaries {
+                slice: SegmentedSliceDescription {
+                    segments: current_segments,
+                },
+                boundaries: current_slice_boundaries,
             });
         }
 
-        Ok((slices, boundary_changesets))
+        Ok((slices, external_parents.into_iter().collect()))
     }
 
     /// Runs the given `process` closure on all of the given changesets in local topological

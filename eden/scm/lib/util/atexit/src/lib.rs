@@ -9,18 +9,22 @@
 //! Intended to be used as an alternative to Python's
 //! `except KeyboardInterrupt`.
 
+mod once_take;
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use std::sync::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-use once_cell::sync::Lazy;
+use once_take::OnceTake;
 
 /// Call `drop` on drop if `ignored` is `false`.
-pub struct AtExit {
-    drop: Option<Box<dyn FnOnce() + Send + Sync>>,
+pub struct AtExit(Arc<AtExitInner>);
+
+struct AtExitInner {
+    drop: OnceTake<Box<dyn FnOnce() + Send + Sync>>,
     name: Cow<'static, str>,
     ignored: AtomicBool,
 }
@@ -29,18 +33,29 @@ pub struct AtExit {
 /// Dropping `AtExitRef` does not call `drop`.
 pub struct AtExitRef {
     // Private to prevent Arc::upgrade.
-    inner: Weak<AtExit>,
+    inner: Weak<AtExitInner>,
 }
 
 /// Central place for global `AtExit`s.
 /// Use `drop_queued` to drop them.
-static AT_EXIT_QUEUED: Lazy<Mutex<Vec<Arc<AtExit>>>> = Lazy::new(Default::default);
+static AT_EXIT_QUEUED: Lazy<Mutex<Vec<Arc<AtExitInner>>>> = Lazy::new(Default::default);
 
-impl Drop for AtExit {
+/// `AtExit`s that are created but not queued to `AT_EXIT_QUEUED`.
+///
+/// This is to ensure those `AtExit`s get handled during Ctrl+C calling
+/// `drop_queued`. The regular stack unwinding could be unreliable for
+/// Ctrl+C unwinding.
+static AT_EXIT_WEAK: Lazy<Mutex<Vec<Weak<AtExitInner>>>> = Lazy::new(Default::default);
+
+impl Drop for AtExitInner {
     fn drop(&mut self) {
-        let mut drop = None;
-        std::mem::swap(&mut drop, &mut self.drop);
-        if let Some(func) = drop {
+        self.maybe_drop_once();
+    }
+}
+
+impl AtExitInner {
+    fn maybe_drop_once(&self) {
+        if let Some(func) = self.drop.take() {
             if !self.ignored.load(Ordering::Acquire) {
                 tracing::debug!("running AtExit handler: {}", self.name);
                 func();
@@ -55,36 +70,36 @@ impl AtExit {
     /// Create `AtExit` that calls `drop` on drop.
     ///
     /// The `AtExit` is intended to be a (Rust) stack variable that gets dropped
-    /// when exiting the (Rust) function. `exit()` will unroll stacks so `drop`
-    /// will be called if another thread calls `exit()`.
+    /// when exiting the (Rust) function, or calling `drop_queued` (e.g. Ctrl+C).
     ///
     /// If you don't want the drop behavior on (Rust) function return, or have
     /// to store the `AtExit` in heap, consider using `queued()`. For example,
     /// in a CPython function, the Python objects that wraps the `AtExit` are
     /// not on (Rust) stack and won't be cleaned up on `exit()`. So for Python
     /// logic `queued()` should probably be always used.
-    pub fn new(drop: Box<dyn FnOnce() + Send + Sync>) -> Self {
-        Self {
-            drop: Some(drop),
+    pub fn new(name: impl Into<Cow<'static, str>>, drop: Box<dyn FnOnce() + Send + Sync>) -> Self {
+        let inner = AtExitInner {
+            drop: OnceTake::new(drop),
             ignored: AtomicBool::new(false),
-            name: "unnamed".into(),
+            name: name.into(),
+        };
+        let inner = Arc::new(inner);
+        {
+            let mut stack = AT_EXIT_WEAK.lock().unwrap();
+            clean_up_weak_refs(&mut stack);
+            stack.push(Arc::downgrade(&inner));
         }
+        Self(inner)
     }
 
-    /// Assign a name to the `AtExit` handler.
-    pub fn named(mut self, name: Cow<'static, str>) -> Self {
-        self.name = name;
-        self
-    }
-
-    /// Move the `AtExit` to a global queue.
+    /// Move the `AtExit` to a global queue. Extends its scope.
     ///
     /// Return `AtExitRef`, which can be used to cancel the `drop`.
-    /// Dropping `AtExitRef` wouldn't trigger `drop`.
-    ///
-    /// The global queue can be dropped by `drop_queued`.
+    /// Dropping `AtExitRef` wouldn't trigger `drop` immediately.
+    /// `drop` will be triggered by `drop_queued` (usually normal
+    /// exit and Ctrl+C exit).
     pub fn queued(self) -> AtExitRef {
-        let arc = Arc::new(self);
+        let arc = self.0;
         let weak = Arc::downgrade(&arc);
         let mut queue = AT_EXIT_QUEUED.lock().unwrap();
         queue.push(arc);
@@ -93,6 +108,18 @@ impl AtExit {
 
     /// Skip calling `drop` on drop.
     pub fn cancel(&self) {
+        self.0.cancel()
+    }
+}
+
+fn clean_up_weak_refs(weak_vec: &mut Vec<Weak<AtExitInner>>) {
+    // Scan the tail. Avoid whole vec scan (pushing N AtExits will be O(N^2)),
+    // and linear vec shifts. Practically this is hopefully good enough.
+    while weak_vec.pop_if(|v| v.upgrade().is_none()).is_some() {}
+}
+
+impl AtExitInner {
+    fn cancel(&self) {
         self.ignored.store(true, Ordering::Release);
     }
 }
@@ -109,15 +136,35 @@ impl AtExitRef {
 /// Drop `AtExit`s that are previously `queued`.
 /// This is usually called at the end of a program.
 pub fn drop_queued() {
+    if let Ok(mut lock) = AT_EXIT_WEAK.lock() {
+        if !lock.is_empty() {
+            tracing::debug!(
+                "running {} AtExit handlers (WEAK) by drop_queued()",
+                lock.len()
+            );
+            let mut to_drop: Vec<_> = lock.drain(..).collect();
+            drop(lock);
+            to_drop.drain(..).rev().for_each(|w| {
+                if let Some(v) = w.upgrade() {
+                    v.maybe_drop_once();
+                }
+            });
+        }
+    }
     if let Ok(mut lock) = AT_EXIT_QUEUED.lock() {
-        tracing::debug!("running {} AtExit handlers by drop_queued()", lock.len());
-        let mut to_drop: Vec<_> = lock.drain(..).collect();
-        // Unlock first so drop(to_drop) can call `drop_queued`
-        // without deadlock.
-        drop(lock);
-        // Drop in reverse push order (first push last drop)
-        // as if it is a stack.
-        to_drop.drain(..).rev().for_each(drop);
+        if !lock.is_empty() {
+            tracing::debug!(
+                "running {} AtExit handlers (QUEUED) by drop_queued()",
+                lock.len()
+            );
+            let mut to_drop: Vec<_> = lock.drain(..).collect();
+            // Unlock first so drop(to_drop) can call `drop_queued`
+            // without deadlock.
+            drop(lock);
+            // Drop in reverse push order (first push last drop)
+            // as if it is a stack.
+            to_drop.drain(..).rev().for_each(drop);
+        }
     }
 }
 
@@ -129,7 +176,7 @@ mod tests {
         let v = Arc::new(AtomicBool::new(false));
         let a = {
             let v = v.clone();
-            AtExit::new(Box::new(move || v.store(true, Ordering::Release)))
+            AtExit::new("1", Box::new(move || v.store(true, Ordering::Release)))
         };
         (v, a)
     }
@@ -165,7 +212,7 @@ mod tests {
 
         // Does not deadlock if drop_queued is called by AtExit
         // inside drop_queued.
-        let r3 = AtExit::new(Box::new(drop_queued));
+        let r3 = AtExit::new("queued", Box::new(drop_queued));
         let _r3 = r3.queued();
         drop_queued();
     }
@@ -175,14 +222,17 @@ mod tests {
         let drop_order = Arc::new(Mutex::new(Vec::new()));
         let push_atexit = |value: u8| -> AtExit {
             let drop_order = drop_order.clone();
-            AtExit::new(Box::new(move || {
-                drop_order.lock().unwrap().push(value);
-            }))
+            AtExit::new(
+                value.to_string(),
+                Box::new(move || {
+                    drop_order.lock().unwrap().push(value);
+                }),
+            )
         };
 
         let a1 = push_atexit(1);
-        let a2 = push_atexit(2);
         let a3 = push_atexit(3);
+        let a2 = push_atexit(2);
         a1.queued();
         a3.queued();
         a2.queued();

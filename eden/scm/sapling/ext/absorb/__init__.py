@@ -96,7 +96,7 @@ def uniq(lst):
     return result
 
 
-def getdraftstack(headctx, limit=None):
+def getdraftstack(headctx, limit=None, immutable=None):
     """(ctx, int?) -> [ctx]. get a linear stack of non-public changesets.
 
     changesets are sorted in topo order, oldest first.
@@ -104,10 +104,14 @@ def getdraftstack(headctx, limit=None):
 
     merges are considered as non-draft as well. i.e. every commit
     returned has and only has 1 parent.
+
+    immutable, if provided, are considered as non-draft as well.
     """
     ctx = headctx
+    repo = ctx.repo()
+    immutable_revs = scmutil.revrange(repo, immutable or [])
     result = []
-    while not ctx.ispublic() and not ctx.obsolete():
+    while not ctx.ispublic() and not ctx.obsolete() and ctx.rev() not in immutable_revs:
         if limit and len(result) >= limit:
             break
         if len(ctx.parents()) > 1:
@@ -392,7 +396,12 @@ class filefixupstate:
         a, alines = b"", []
         for i in range(len(self.contents)):
             b, blines = self.contents[i], self.contentlines[i]
+            # see filefixupstate docstring for linelog revs used here
+            prev_rev = llog.max_rev()
             llrev = i * 2 + 1
+            assert llrev > prev_rev
+            fixup_rev = llrev + 1
+            llog = llog.with_dag_edge(prev_rev, llrev).with_dag_edge(llrev, fixup_rev)
             chunks = self._alldiffchunks(a, b, alines, blines)
             for a1, a2, b1, b2 in reversed(list(chunks)):
                 llog = llog.edit_chunk(llrev, a1, a2, llrev, b1, b2)
@@ -413,7 +422,9 @@ class filefixupstate:
         """() -> [str]. prompt all lines for edit"""
         max_rev = self.linelog.max_rev()
         # discard the "end" line
-        alllines = self.linelog.checkout_lines(max_rev, 0)[:-1]
+        alllines = self.linelog.checkout_revs_lines(
+            self.linelog.nanodag().ancestors(max_rev)
+        )[:-1]
         # header
         editortext = _(
             '{0}: editing {1}\n{0}: "y" means the line to the right '
@@ -870,9 +881,11 @@ def absorb(ui, repo, stack=None, targetctx=None, pats=None, opts=None):
     if stack is None, the current draft stack will be used.
     return fixupstate.
     """
+    if opts is None:
+        opts = {}
     if stack is None:
         limit = ui.configint("absorb", "maxstacksize", 50)
-        stack = getdraftstack(repo["."], limit)
+        stack = getdraftstack(repo["."], limit, opts.get("immutable"))
         if limit and len(stack) >= limit:
             ui.warn(
                 _("absorb: only the recent %d changesets will be analysed\n") % limit
@@ -883,8 +896,6 @@ def absorb(ui, repo, stack=None, targetctx=None, pats=None, opts=None):
         targetctx = repo[None]
     if pats is None:
         pats = ()
-    if opts is None:
-        opts = {}
 
     date = opts.get("date")
     if date:
@@ -964,6 +975,7 @@ def absorb(ui, repo, stack=None, targetctx=None, pats=None, opts=None):
             _("edit what lines belong to which commits before commit (EXPERIMENTAL)"),
         ),
         ("d", "date", "", _("record the specified date as commit date"), _("DATE")),
+        ("P", "immutable", [], _("consider REV as immutable"), _("REV")),
     ]
     + commands.dryrunopts
     + commands.templateopts
@@ -981,8 +993,8 @@ def absorbcmd(ui, repo, *pats, **opts):
     change will be left in the working copy, untouched. The unabsorbed
     changes can be observed by :prog:`status` or :prog:`diff` afterwards.
 
-    Commits outside the revset `::. and not public() and not merge()` will
-    not be changed.
+    Commits outside the revset
+    ``. % (public() | merge() | immutable)`` will not be changed.
 
     Commits that become empty after applying the changes will be deleted.
 
@@ -1081,7 +1093,7 @@ def _amendcmd(flag, orig, ui, repo, *pats, **opts):
 def _calculate_gap_lines(linelog, rev=None):
     if rev is None:
         rev = linelog.max_rev()
-    all_lines = linelog.checkout_lines(rev, 0)
+    all_lines = linelog.checkout_revs_lines(linelog.nanodag().ancestors(rev))
     gap_lines = []
     lineno = -1
     last_gap_line = -1

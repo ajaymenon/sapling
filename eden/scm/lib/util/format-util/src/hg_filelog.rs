@@ -61,7 +61,7 @@ pub fn parse_copy_from_hg_file_metadata(data: &[u8]) -> Result<Option<Key>> {
         } else if line.starts_with(b"copyrev: ") {
             hgid = Some(HgId::from_str(str::from_utf8(&line[9..])?)?);
         } else {
-            bail!("Unknown metadata in data: {:?}", line);
+            bail!("Unknown metadata in data: {line:?}");
         }
     }
 
@@ -71,6 +71,27 @@ pub fn parse_copy_from_hg_file_metadata(data: &[u8]) -> Result<Option<Key>> {
 
         (None, None) => Ok(None),
         (Some(path), Some(hgid)) => Ok(Some(Key::new(path, hgid))),
+    }
+}
+
+/// Prepend hg metadata to content if necessary.
+pub fn prepend_hg_file_metadata(data: Bytes, copy_meta: Option<Key>) -> Bytes {
+    // Add the header if we have copy metadata, or to escape the data if it looks like it starts with the header.
+    if data.starts_with(b"\x01\n") || copy_meta.is_some() {
+        let meta = match copy_meta {
+            Some(meta) => format!(
+                "\x01\ncopy: {}\ncopyrev: {}\n\x01\n",
+                meta.path,
+                meta.hgid.to_hex(),
+            ),
+            None => "\x01\n\x01\n".to_string(),
+        };
+        let mut with_metadata = Vec::with_capacity(data.len() + meta.len());
+        with_metadata.extend_from_slice(meta.as_bytes());
+        with_metadata.extend_from_slice(data.as_ref());
+        with_metadata.into()
+    } else {
+        data
     }
 }
 
@@ -161,6 +182,48 @@ mod tests {
         let (blob, copy_from) = split_hg_file_metadata(&data);
         assert_eq!(blob, data);
         assert_eq!(copy_from, Bytes::new());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_hg_copy_data_roundtrip() -> Result<()> {
+        // Have copy info - prepend header.
+        {
+            let data = Bytes::from_static(b"content");
+            let key = key("foo/bar/baz", "1234");
+
+            let formatted = prepend_hg_file_metadata(data.clone(), Some(key.clone()));
+            assert_eq!(formatted, b"\x01\ncopy: foo/bar/baz\ncopyrev: 0000000000000000000000000000000000001234\n\x01\ncontent");
+
+            let (got_data, got_copy) = strip_file_metadata(&formatted, SerializationFormat::Hg)?;
+            assert_eq!(got_data, data);
+            assert_eq!(got_copy, Some(key));
+        }
+
+        // Data accidentally starts with header - prepend header.
+        {
+            let data = Bytes::from_static(b"\x01\ncontent");
+
+            let formatted = prepend_hg_file_metadata(data.clone(), None);
+            assert_eq!(formatted, b"\x01\n\x01\n\x01\ncontent");
+
+            let (got_data, got_copy) = strip_file_metadata(&formatted, SerializationFormat::Hg)?;
+            assert_eq!(got_data, data);
+            assert_eq!(got_copy, None);
+        }
+
+        // No copy data, no lookalike content.
+        {
+            let data = Bytes::from_static(b"content");
+
+            let formatted = prepend_hg_file_metadata(data.clone(), None);
+            assert_eq!(formatted, b"content");
+
+            let (got_data, got_copy) = strip_file_metadata(&formatted, SerializationFormat::Hg)?;
+            assert_eq!(got_data, data);
+            assert_eq!(got_copy, None);
+        }
 
         Ok(())
     }

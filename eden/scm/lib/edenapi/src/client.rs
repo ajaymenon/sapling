@@ -27,7 +27,12 @@ use edenapi_types::BlameRequest;
 use edenapi_types::BlameResult;
 use edenapi_types::BonsaiChangesetContent;
 use edenapi_types::BookmarkEntry;
+use edenapi_types::BookmarkKind;
 use edenapi_types::BookmarkResult;
+use edenapi_types::CheckManifestPermissionRequest;
+use edenapi_types::CheckManifestPermissionResponse;
+use edenapi_types::CheckPathPermissionRequest;
+use edenapi_types::CheckPathPermissionResponse;
 use edenapi_types::CloudShareWorkspaceRequest;
 use edenapi_types::CloudShareWorkspaceResponse;
 use edenapi_types::CloudWorkspaceRequest;
@@ -75,6 +80,8 @@ use edenapi_types::IdenticalChangesetContent;
 use edenapi_types::IndexableId;
 use edenapi_types::LandStackRequest;
 use edenapi_types::LandStackResponse;
+use edenapi_types::ListBookmarkPatternsRequest;
+use edenapi_types::ListBookmarkPatternsResponse;
 use edenapi_types::LookupRequest;
 use edenapi_types::LookupResponse;
 use edenapi_types::LookupResult;
@@ -173,6 +180,7 @@ pub mod paths {
     pub const ALTER_SNAPSHOT: &str = "snapshot/alter";
     pub const BLAME: &str = "blame";
     pub const BOOKMARKS2: &str = "bookmarks2";
+    pub const BOOKMARKS_LIST_PATTERNS: &str = "bookmarks/list_patterns";
     pub const CAPABILITIES: &str = "capabilities";
     pub const CLOUD_HISTORICAL_VERSIONS: &str = "cloud/historical_versions";
     pub const CLOUD_OTHER_REPO_WORKSPACES: &str = "cloud/other_repo_workspaces";
@@ -214,6 +222,8 @@ pub mod paths {
     pub const UPLOAD_TREES: &str = "upload/trees";
     pub const UPLOAD_IDENTICAL_CHANGESET: &str = "upload/changesets/identical";
     pub const UPLOAD_FILE: &str = "upload/file/";
+    pub const CHECK_PERMISSION: &str = "check_permission";
+    pub const CHECK_MANIFEST_PERMISSION: &str = "check_manifest_permission";
 }
 
 #[derive(Clone)]
@@ -684,16 +694,16 @@ impl Client {
         let mut url = self.build_url(paths::UPLOAD_FILE)?;
         match item {
             AnyFileContentId::ContentId(id) => {
-                url = url.join("content_id/")?.join(&format!("{}", id))?;
+                url = url.join("content_id/")?.join(&format!("{id}"))?;
             }
             AnyFileContentId::Sha1(id) => {
-                url = url.join("sha1/")?.join(&format!("{}", id))?;
+                url = url.join("sha1/")?.join(&format!("{id}"))?;
             }
             AnyFileContentId::Sha256(id) => {
-                url = url.join("sha256/")?.join(&format!("{}", id))?;
+                url = url.join("sha256/")?.join(&format!("{id}"))?;
             }
             AnyFileContentId::SeededBlake3(id) => {
-                url = url.join("seeded_blake3/")?.join(&format!("{}", id))?;
+                url = url.join("seeded_blake3/")?.join(&format!("{id}"))?;
             }
         }
 
@@ -1074,6 +1084,42 @@ impl Client {
             .map_err(SaplingRemoteApiError::RequestSerializationFailed)?;
 
         self.fetch::<StreamingChangelogResponse>(vec![request])
+    }
+
+    async fn check_permission_attempt(
+        &self,
+        request: CheckPathPermissionRequest,
+    ) -> Result<Response<CheckPathPermissionResponse>, SaplingRemoteApiError> {
+        tracing::info!("Checking permissions for {} path(s)", request.paths.len());
+
+        let url = self.build_url(paths::CHECK_PERMISSION)?;
+        let req = self
+            .configure_request(paths::CHECK_PERMISSION, self.inner.client.post(url))?
+            .cbor(&request.to_wire())
+            .map_err(SaplingRemoteApiError::RequestSerializationFailed)?;
+
+        self.fetch::<CheckPathPermissionResponse>(vec![req])
+    }
+
+    async fn check_manifest_permission_attempt(
+        &self,
+        request: CheckManifestPermissionRequest,
+    ) -> Result<Response<CheckManifestPermissionResponse>, SaplingRemoteApiError> {
+        tracing::info!(
+            "Checking manifest permissions for {} manifest(s)",
+            request.manifest_ids.len()
+        );
+
+        let url = self.build_url(paths::CHECK_MANIFEST_PERMISSION)?;
+        let req = self
+            .configure_request(
+                paths::CHECK_MANIFEST_PERMISSION,
+                self.inner.client.post(url),
+            )?
+            .cbor(&request.to_wire())
+            .map_err(SaplingRemoteApiError::RequestSerializationFailed)?;
+
+        self.fetch::<CheckManifestPermissionResponse>(vec![req])
     }
 
     async fn commit_translate_id_attempt(
@@ -1591,12 +1637,41 @@ impl SaplingRemoteApi for Client {
         let flattened_response = response
             .into_iter()
             .map(|res| {
-                res.data.map_err(|err| {
-                    SaplingRemoteApiError::ServerError(SaplingRemoteApiServerError::new(err))
-                })
+                res.data
+                    .map_err(|err| SaplingRemoteApiServerError::new(err).into())
             })
             .collect::<Result<Vec<BookmarkEntry>, _>>();
         return flattened_response;
+    }
+
+    async fn list_bookmark_patterns(
+        &self,
+        patterns: Vec<String>,
+        kinds: Vec<BookmarkKind>,
+    ) -> Result<Vec<BookmarkEntry>, SaplingRemoteApiError> {
+        tracing::info!("Requesting bookmarks for {} patterns", patterns.len());
+
+        let url = self.build_url(paths::BOOKMARKS_LIST_PATTERNS)?;
+        let request = ListBookmarkPatternsRequest { patterns, kinds };
+
+        self.log_request(&request, "list_bookmark_patterns");
+        let request_wire = request.to_wire();
+        let req = self
+            .configure_request(paths::BOOKMARKS_LIST_PATTERNS, self.inner.client.post(url))?
+            .cbor(&request_wire)
+            .map_err(SaplingRemoteApiError::RequestSerializationFailed)?;
+
+        let response = self
+            .fetch_vec_with_retry::<ListBookmarkPatternsResponse>(vec![req])
+            .await?;
+
+        response
+            .into_iter()
+            .map(|res| {
+                res.data
+                    .map_err(|err| SaplingRemoteApiServerError::new(err).into())
+            })
+            .collect::<Result<Vec<BookmarkEntry>, _>>()
     }
 
     async fn set_bookmark(
@@ -2175,6 +2250,25 @@ impl SaplingRemoteApi for Client {
         self.with_retry(|this| this.streaming_clone_attempt(tag.clone()).boxed())
             .await
     }
+
+    async fn check_permission(
+        &self,
+        request: CheckPathPermissionRequest,
+    ) -> Result<Response<CheckPathPermissionResponse>, SaplingRemoteApiError> {
+        self.with_retry(|this| this.check_permission_attempt(request.clone()).boxed())
+            .await
+    }
+
+    async fn check_manifest_permission(
+        &self,
+        request: CheckManifestPermissionRequest,
+    ) -> Result<Response<CheckManifestPermissionResponse>, SaplingRemoteApiError> {
+        self.with_retry(|this| {
+            this.check_manifest_permission_attempt(request.clone())
+                .boxed()
+        })
+        .await
+    }
 }
 
 /// Split up a collection of keys into batches of at most `batch_size`.
@@ -2232,7 +2326,7 @@ async fn raise_for_status(res: AsyncResponse) -> Result<AsyncResponse, SaplingRe
     Err(SaplingRemoteApiError::HttpError {
         status,
         message,
-        headers,
+        headers: Box::new(headers),
         url,
     })
 }

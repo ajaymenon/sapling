@@ -18,5 +18,5 @@
 
   $ setconfig "extensions.foo=python-base64:$(cat foo.txt)"
 
-  $ hg foo
+  $ sl foo
   This is the foo command

@@ -18,6 +18,7 @@ use crate::SqlCommitCloud;
 use crate::sql::heads_ops::DeleteArgs;
 use crate::sql::ops::Delete;
 use crate::sql::ops::Insert;
+use crate::sql::ops::InsertMany;
 
 #[allow(clippy::ptr_arg)]
 pub fn heads_from_list(s: &Vec<String>) -> anyhow::Result<Vec<WorkspaceHead>> {
@@ -38,7 +39,7 @@ pub fn heads_to_list(heads: &Vec<WorkspaceHead>) -> Vec<String> {
 pub async fn update_heads(
     sql_commit_cloud: &SqlCommitCloud,
     mut txn: Transaction,
-    ctx: &CoreContext,
+    _ctx: &CoreContext,
     cc_ctx: &CommitCloudContext,
     removed_heads: Vec<CloudChangesetId>,
     new_heads: Vec<CloudChangesetId>,
@@ -51,23 +52,38 @@ pub async fn update_heads(
         txn = Delete::<WorkspaceHead>::delete(
             sql_commit_cloud,
             txn,
-            ctx,
             cc_ctx.reponame.clone(),
             cc_ctx.workspace.clone(),
             delete_args,
         )
         .await?;
     }
-    for head in new_heads {
-        txn = Insert::<WorkspaceHead>::insert(
-            sql_commit_cloud,
-            txn,
-            ctx,
-            cc_ctx.reponame.clone(),
-            cc_ctx.workspace.clone(),
-            WorkspaceHead { commit: head },
-        )
-        .await?;
+    if !new_heads.is_empty() {
+        if justknobs::eval("scm/mononoke:commitcloud_bulk_inserts", None, None) {
+            let heads: Vec<WorkspaceHead> = new_heads
+                .into_iter()
+                .map(|commit| WorkspaceHead { commit })
+                .collect();
+            txn = InsertMany::<WorkspaceHead>::insert_many(
+                sql_commit_cloud,
+                txn,
+                cc_ctx.reponame.clone(),
+                cc_ctx.workspace.clone(),
+                heads,
+            )
+            .await?;
+        } else {
+            for head in new_heads {
+                txn = Insert::<WorkspaceHead>::insert(
+                    sql_commit_cloud,
+                    txn,
+                    cc_ctx.reponame.clone(),
+                    cc_ctx.workspace.clone(),
+                    WorkspaceHead { commit: head },
+                )
+                .await?;
+            }
+        }
     }
 
     Ok(txn)

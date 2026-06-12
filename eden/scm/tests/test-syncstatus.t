@@ -15,14 +15,14 @@
   > fbcodereview=
   > smartlog=
   > EOF
-  $ hg init repo
+  $ sl init repo
   $ cd repo
   $ touch foo
-  $ hg ci -qAm 'Differential Revision: https://phabricator.fb.com/D1'
+  $ sl ci -qAm 'Differential Revision: https://phabricator.fb.com/D1'
 
 # With an invalid arc configuration
 
-  $ hg log -T '{syncstatus}\n' -r .
+  $ sl log -T '{syncstatus}\n' -r .
   arcconfig configuration problem. No diff information can be provided.
   Error info: no .arcconfig found
   Error
@@ -37,7 +37,7 @@
   $ cat > $TESTTMP/mockduit << 'EOF'
   > [{}]
   > EOF
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{syncstatus}\n' -r .
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit sl log -T '{syncstatus}\n' -r .
   Error talking to phabricator. No diff information can be provided.
   Error info: Unexpected graphql response format
   Error
@@ -45,7 +45,7 @@
   $ cat > $TESTTMP/mockduit << 'EOF'
   > [{"errors": [{"message": "failed, yo"}]}]
   > EOF
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{syncstatus}\n' -r .
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit sl log -T '{syncstatus}\n' -r .
   Error talking to phabricator. No diff information can be provided.
   Error info: failed, yo
   Error
@@ -62,7 +62,7 @@
   >   "updated_time": 222
   > }]}}]}}]
   > EOF
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{syncstatus}\n' -r .
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit sl log -T '{syncstatus}\n' -r .
   Error talking to phabricator. No diff information can be provided.
   Error info: Unexpected graphql response format for D1
   Error
@@ -80,7 +80,7 @@
   >   "updated_time": 222
   > }]}}]}}]
   > EOF
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{phabcommit}\n' -r .
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit sl log -T '{phabcommit}\n' -r .
 
 # Hash field displayed
 
@@ -98,7 +98,7 @@
   >   "updated_time": 222
   > }]}}]}}]
   > EOF
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{phabcommit}\n' -r .
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit sl log -T '{phabcommit}\n' -r .
   abcd
 
 # Matching hash is sync
@@ -118,7 +118,7 @@
   > }]}}]}}]
   > EOF
 
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{syncstatus}\n' -r .
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit sl log -T '{syncstatus}\n' -r .
   sync
 
 # Non-matching hash is unsync
@@ -138,7 +138,7 @@
   > }]}}]}}]
   > EOF
 
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{syncstatus}\n' -r .
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit sl log -T '{syncstatus}\n' -r .
   unsync
 
 # Missing hash field is treated as unsync
@@ -154,7 +154,7 @@
   >   "updated_time": 222
   > }]}}]}}]
   > EOF
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{syncstatus}\n' -r .
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit sl log -T '{syncstatus}\n' -r .
   unsync
 
 # Non-matching hash when committed shows as committed
@@ -173,5 +173,5 @@
   >   "updated_time": 222
   > }]}}]}}]
   > EOF
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{syncstatus}\n' -r .
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit sl log -T '{syncstatus}\n' -r .
   committed

@@ -8,7 +8,8 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
+arc-swap = { version = "1.9.0", features = ["weak"] }
 arg_extensions = { version = "0.1.0", path = "../extensions" }
 async-trait = "0.1.86"
 base_app = { version = "0.1.0", path = "../base_app" }
@@ -20,7 +21,7 @@ bonsai_hg_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_hg
 bonsai_svnrev_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_svnrev_mapping" }
 bookmarks = { version = "0.1.0", path = "../../repo_attributes/bookmarks" }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cmdlib_caching = { version = "0.1.0", path = "../caching" }
 cmdlib_logging = { version = "0.1.0", path = "../log" }
 commit_graph_types = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph_types" }
@@ -29,13 +30,13 @@ config_args = { version = "0.1.0", path = "../config_args" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 derived_data_remote = { version = "0.1.0", path = "../../derived_data/remote" }
 environment = { version = "0.1.0", path = "../environment" }
-facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures-util = { version = "0.3.30", features = ["compat"] }
 futures_retry = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 megarepo_config = { version = "0.1.0", path = "../../megarepo_api/megarepo_config" }
 memcache = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 metaconfig_parser = { version = "0.1.0", path = "../../metaconfig/parser" }
@@ -47,9 +48,10 @@ mononoke_repos = { version = "0.1.0", path = "../../common/mononoke_repos" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 permission_checker = { version = "0.1.0", path = "../../common/permission_checker" }
 redactedblobstore = { version = "0.1.0", path = "../../blobstore/redactedblobstore" }
-regex = "1.12.2"
+regex = "1.12.3"
 rendezvous = { version = "0.1.0", path = "../../common/rendezvous" }
 repo_blobstore = { version = "0.1.0", path = "../../repo_attributes/repo_blobstore" }
+repo_derivation_queues = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues" }
 repo_factory = { version = "0.1.0", path = "../../repo_factory" }
 running = { version = "0.1.0", path = "../../common/running" }
 sapling-clientinfo = { version = "0.1.0", path = "../../../scm/lib/clientinfo" }
@@ -58,7 +60,7 @@ services = { version = "0.1.0", git = "https://github.com/facebookexperimental/r
 shutdown_timeout = { version = "0.1.0", path = "shutdown_timeout" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-strum = { version = "0.27.1", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 tls = { version = "0.1.0", path = "tls" }
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

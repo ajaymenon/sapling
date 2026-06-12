@@ -13,23 +13,23 @@ license = "MIT"
 name = "revisionstore"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
 blob = { version = "0.1.0", path = "../blob" }
 byteorder = "1.5"
 flume = "0.11.1"
 fn-error-context = "0.2"
-fs-err = { version = "3", features = ["tokio"] }
+fs-err = { version = "3.3.0", features = ["tokio"] }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
-http = "0.2"
+http = "=1.4.0"
 lfs_protocol = { version = "0.1.0", path = "../../../mononoke/common/lfs_protocol" }
-manifest-augmented-tree = { version = "0.1.0", path = "../manifest-augmented-tree" }
-once_cell = "1.21"
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
+moka = { version = "0.12.15", features = ["future", "sync"] }
+once_cell = "1.21.4"
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 paste = "1.0.14"
-quickcheck = "1.0"
+quickcheck = "1.1"
 quickcheck_arbitrary_derive = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-rand = { version = "0.8", features = ["small_rng"] }
+rand = "0.10.1"
 redacted = { version = "0.1.0", path = "../util/redacted" }
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
 sapling-configmodel = { version = "0.1.0", path = "../config/model" }
@@ -61,16 +61,16 @@ serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw
 sha1 = "0.10.5"
 sha2 = "0.10.6"
 thiserror = "2.0.18"
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
-tokio-stream = { version = "0.1.17", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
+tokio-stream = { version = "0.1.18", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-url = "2.5.4"
+url = "2.5.8"
 
 [dev-dependencies]
 maplit = "1.0"
-mockito = "1.4.0"
-rand_chacha = "0.3"
-tempfile = "3.22"
+mockito = "1.7.2"
+rand_chacha = "0.10"
+tempfile = "3.27.0"
 
 [features]
 default = []

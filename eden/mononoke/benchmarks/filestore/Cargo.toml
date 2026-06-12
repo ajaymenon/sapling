@@ -13,7 +13,7 @@ path = "benchmark_filestore.rs"
 test = false
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 blobstore_factory = { version = "0.1.0", path = "../../blobstore/factory" }
@@ -21,7 +21,7 @@ bytes = { version = "1.11.1", features = ["serde"] }
 cacheblob = { version = "0.1.0", path = "../../blobstore/cacheblob" }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cachelib = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
@@ -31,7 +31,7 @@ memblob = { version = "0.1.0", path = "../../blobstore/memblob" }
 mononoke_app = { version = "0.1.0", path = "../../cmdlib/mononoke_app" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 prefixblob = { version = "0.1.0", path = "../../blobstore/prefixblob" }
-rand = { version = "0.9", features = ["small_rng"] }
+rand = "0.10.1"
 throttledblob = { version = "0.1.0", path = "../../blobstore/throttledblob" }
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
-tokio-util = { version = "0.7.15", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
+tokio-util = { version = "0.7.18", features = ["full"] }

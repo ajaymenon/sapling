@@ -31,10 +31,13 @@ use pushrebase::PushrebaseOutcome;
 /// pushrebase to happen remotely.
 pub trait PushrebaseClient: Sync + Send {
     /// Pushrebase the given changesets to the given bookmark.
+    ///
+    /// Per-request control over `pushrebase_enable_merge_resolution` is
+    /// expressed via the `MERGE_RESOLUTION_OVERRIDE` pushvar; parsing
+    /// happens at the terminal `PushrebaseOntoBookmarkOp`.
     async fn pushrebase(
         &self,
         bookmark: &BookmarkKey,
-        // Must be a stack
         changesets: &[BonsaiChangeset],
         pushvars: Option<&HashMap<String, Bytes>>,
         cross_repo_push_source: CrossRepoPushSource,

@@ -233,6 +233,7 @@ mod tests {
     use borrowed::borrowed;
     use commit_graph::CommitGraph;
     use commit_graph::CommitGraphWriter;
+    use dbbookmarks::SqlBookmarks;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use git_source_of_truth::GitSourceOfTruthConfig;
@@ -278,6 +279,9 @@ mod tests {
 
         #[facet]
         bookmarks: dyn Bookmarks,
+
+        #[facet]
+        sql_bookmarks: SqlBookmarks,
 
         #[facet]
         phases: dyn Phases,
@@ -329,7 +333,7 @@ mod tests {
         context
             .add_extra(
                 CONVERT_REVISION_EXTRA.to_string(),
-                format!("{}", hash).as_bytes().to_vec(),
+                format!("{hash}").as_bytes().to_vec(),
             )
             .add_extra(HGGIT_SOURCE_EXTRA.to_string(), b"git".to_vec())
     }

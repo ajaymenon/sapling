@@ -1,7 +1,7 @@
 load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("mononoke")
+oncall("scm_server_treehugger")
 
 cpp_library(
     name = "lib",
@@ -12,7 +12,9 @@ cpp_library(
         "src/ffi.h",
     ],
     undefined_symbols = True,
-    deps = [],
+    deps = [
+        "//folly:singleton",
+    ],
     exported_deps = [
         "//eden/mononoke/common/adaptive_rate_limiter/cpp:adaptive_rate_limiter_cpp",
     ],

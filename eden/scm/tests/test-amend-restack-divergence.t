@@ -18,18 +18,21 @@ onto the newest successor of their parent.
   $ mkcommit a
   $ mkcommit b
   $ mkcommit c
-  $ hg prev
+  $ sl prev
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
   [*] add b (glob)
-  $ hg amend -m "successor 1" --no-rebase
-  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 7c3bad9141dcb46ff89abf5f61856facd56e476c
+  $ sl amend -m "successor 1" --no-rebase
+  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl up 7c3bad9141dcb46ff89abf5f61856facd56e476c
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg amend -m "successor 2" --no-rebase
-  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 7c3bad9141dcb46ff89abf5f61856facd56e476c
+  $ sl amend -m "successor 2" --no-rebase
+  warning: changing an old version of a commit will diverge your stack:
+  - 7c3bad9141dc -> f60c1f15a70e (amend)
+  proceed with amend (Yn)?  y
+  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  $ sl up 7c3bad9141dcb46ff89abf5f61856facd56e476c
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ showgraph
   o  cef323f40828 successor 2
@@ -41,7 +44,7 @@ onto the newest successor of their parent.
   │ @  7c3bad9141dc add b
   ├─╯
   o  1f0dee641bb7 add a
-  $ hg rebase --restack
+  $ sl rebase --restack
   rebasing 4538525df7e2 "add c"
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ showgraph
@@ -59,13 +62,13 @@ since the successor is obsolete.
   $ mkcommit a
   $ mkcommit b
   $ mkcommit c
-  $ hg prev
+  $ sl prev
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
   [*] add b (glob)
   $ echo b >> b
-  $ hg amend
-  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
+  $ sl amend
+  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
   $ showgraph
   @  c54ee8acf83d add b
   │
@@ -74,12 +77,15 @@ since the successor is obsolete.
   │ x  7c3bad9141dc add b
   ├─╯
   o  1f0dee641bb7 add a
-  $ hg up 7c3bad9141dcb46ff89abf5f61856facd56e476c
+  $ sl up 7c3bad9141dcb46ff89abf5f61856facd56e476c
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ echo c >> b
-  $ hg amend
-  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'hg restack' to rebase them
-  hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
+  $ sl amend
+  warning: changing an old version of a commit will diverge your stack:
+  - 7c3bad9141dc -> c54ee8acf83d (amend)
+  proceed with amend (Yn)?  y
+  hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
   $ showgraph
   @  2c965323ca2a add b
   │
@@ -90,8 +96,8 @@ since the successor is obsolete.
   │ x  7c3bad9141dc add b
   ├─╯
   o  1f0dee641bb7 add a
-  $ hg unamend
-  $ hg up -C c54ee8acf83d47ec674bca5bb6ba7be56227bd89
+  $ sl unamend
+  $ sl up -C c54ee8acf83d47ec674bca5bb6ba7be56227bd89
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ showgraph
   @  c54ee8acf83d add b

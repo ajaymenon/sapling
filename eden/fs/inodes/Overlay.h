@@ -7,16 +7,22 @@
 
 #pragma once
 #include <folly/File.h>
+#include <folly/Function.h>
 #include <folly/Range.h>
+#include <folly/Synchronized.h>
+#include <folly/container/F14Map.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
 #include <folly/synchronization/Baton.h>
+#include <folly/synchronization/LifoSem.h>
+#include <array>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 
-#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/RefPtr.h"
@@ -26,6 +32,7 @@
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/overlay/OverlayChecker.h"
 #include "eden/fs/inodes/overlay/gen-cpp2/overlay_types.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 
 #ifndef _WIN32
 #include "eden/fs/inodes/fscatalog/EphemeralFsInodeCatalog.h"
@@ -47,6 +54,7 @@ class FileContentStore;
 class DirEntry;
 class EdenConfig;
 class EdenStats;
+class ErrorLogger;
 
 using EdenStatsPtr = RefPtr<EdenStats>;
 
@@ -89,9 +97,9 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
       CaseSensitivity caseSensitive,
       InodeCatalogType inodeCatalogType,
       InodeCatalogOptions inodeCatalogOptions,
-      std::shared_ptr<StructuredLogger> logger,
+      std::shared_ptr<EdenFsEventsLogger> logger,
+      ErrorLogger& errorLogger,
       EdenStatsPtr stats,
-      bool windowsSymlinksEnabled,
       const EdenConfig& config);
 
   ~Overlay();
@@ -170,11 +178,18 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    *   TreeInode::create() or TreeInode::mkdir().  In this case
    *   inodeCreated() should be called immediately afterwards to register the
    *   new child Inode object.
-   *
-   * TODO: It would be easy to extend this function to allocate a range of
-   * inode values in one atomic operation.
    */
   InodeNumber allocateInodeNumber();
+
+  /**
+   * Allocate a contiguous range of inode numbers.
+   *
+   * Returns the first inode number in the range. The allocated range is
+   * [returned, returned + count). Uses a single atomic operation instead of
+   * count separate increments.
+   */
+  InodeNumber allocateInodeNumbers(uint64_t count);
+
 #ifndef _WIN32
 
   /**
@@ -188,11 +203,25 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
 
 #endif // !_WIN32
 
-  bool getWindowsSymlinksEnabled() const {
-    return windowsSymlinksEnabled_;
-  }
-
-  void saveOverlayDir(InodeNumber inodeNumber, const DirContents& dir);
+  /**
+   * Save a directory to the overlay.
+   *
+   * When isMaterialized is false, the directory contents match source control
+   * and can be reconstructed from the backing store. In this case, the write
+   * may use a faster but less crash-safe code path (direct write without
+   * temp+rename) since data loss on crash is recoverable.
+   *
+   * Callers that flush WAL state into the base file (maybeCompactWal,
+   * loadOverlayDir's WAL merge, recursive removal cleanup) must pass
+   * isMaterialized=true explicitly. WAL-tracked directories are by
+   * definition materialized — letting a non-crash-safe O_TRUNC rewrite
+   * race with a crash on those directories would leave a truncated base
+   * file plus a dropped WAL = lost user data.
+   */
+  void saveOverlayDir(
+      InodeNumber inodeNumber,
+      const DirContents& dir,
+      bool isMaterialized = true);
 
   /*
    * Load content of the directory from overlay. If the directory does not
@@ -211,6 +240,12 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    * Must only be called on trees.
    */
   void recursivelyRemoveOverlayDir(InodeNumber inodeNumber);
+
+  /**
+   * Like recursivelyRemoveOverlayDir, but performs the work on the background
+   * GC thread instead of blocking the caller.
+   */
+  void recursivelyRemoveOverlayDirBackground(InodeNumber inodeNumber);
 
   /**
    * Returns a future that completes once all previously-issued async
@@ -281,6 +316,17 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    */
   void maintenance();
 
+  /**
+   * Update a child entry in the overlay to mark it as materialized
+   * (clear its source control hash). When WAL is enabled, appends a
+   * MATERIALIZE entry to the WAL. When WAL is disabled, falls back
+   * to a full saveOverlayDir write.
+   */
+  void materializeChild(
+      InodeNumber parent,
+      PathComponentPiece childName,
+      const DirContents& content);
+
   /*
    * Returns a raw pointer to the inode catalog. This method should only be
    * used for testing.
@@ -297,6 +343,11 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
     return inodeCatalogType_;
   }
 
+  /**
+   * Build a Thrift `overlay::OverlayDir` from in-memory `DirContents`.
+   */
+  [[deprecated(
+      "Prefer direct serialization via InodeCatalog::saveOverlayEntries")]]
   overlay::OverlayDir serializeOverlayDir(
       InodeNumber inodeNumber,
       const DirContents& dir);
@@ -305,16 +356,102 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
     return localDir_;
   }
 
+  ErrorLogger& getErrorLogger() const {
+    return errorLogger_;
+  }
+
+  void setFsckSemaphore(folly::LifoSem* sem) {
+    fsckSemaphore_ = sem;
+  }
+
+  /**
+   * Optional callback invoked inside the fsck critical section
+   * (after semaphore acquire, before fsck work). Used by tests
+   * to observe concurrency behavior.
+   */
+  void setFsckCallback(folly::Function<void()> cb) {
+    fsckCallback_ = std::move(cb);
+  }
+
+  /**
+   * Optional callback invoked just before the fsck semaphore wait.
+   * Used by tests to know when a thread has reached the semaphore.
+   */
+  void setPreFsckSemaphoreCallback(folly::Function<void()> cb) {
+    preFsckSemaphoreCallback_ = std::move(cb);
+  }
+
  private:
   explicit Overlay(
       AbsolutePathPiece localDir,
       CaseSensitivity caseSensitive,
       InodeCatalogType inodeCatalogType,
       InodeCatalogOptions inodeCatalogOptions,
-      std::shared_ptr<StructuredLogger> logger,
+      std::shared_ptr<EdenFsEventsLogger> logger,
+      ErrorLogger& errorLogger,
       EdenStatsPtr stats,
-      bool windowsSymlinksEnabled_,
       const EdenConfig& config);
+
+  /**
+   * Returns true if the overlay should use WAL (Write-Ahead Log) for
+   * deferred directory writes. Computed once at construction as
+   * `overlayUseWal` config flag AND `InodeCatalog::supportsWal()`.
+   */
+  bool useWal() const {
+    return useWal_;
+  }
+
+  /**
+   * Whether this overlay's backing catalog can have WAL files on disk.
+   * Used for replay — we always replay WAL files if they exist,
+   * regardless of whether WAL is currently enabled via config. This
+   * ensures safe rollback when disabling the WAL.
+   */
+  bool canHaveWalFiles() const {
+    return inodeCatalog_->supportsWal();
+  }
+
+  friend class OverlayTestHelper;
+
+  /**
+   * Inline compaction with a hard byte cap. On each call:
+   *   - If `walFileSizeBytes >= walCompactionByteCap_`, compact
+   *     unconditionally.
+   *   - Else roll 1-in-`walCompactionMultiplier_ * max(content.size(), 10)`
+   *     and compact on a hit.
+   *
+   * The hard byte cap is a real upper bound on the on-disk WAL size; the
+   * probabilistic roll keeps the typical-case compaction rate
+   * proportional to directory size with no per-inode state.
+   *
+   * Inline (not background) by design: the existing `saveOverlayDir`
+   * path also runs synchronously under the contents lock, so the worst
+   * case matches pre-WAL behavior.
+   *
+   * Caller must hold the parent TreeInode's contents lock.
+   */
+  void maybeCompactWal(
+      InodeNumber parent,
+      const DirContents& content,
+      uint64_t walFileSizeBytes);
+
+  /**
+   * Append a WAL entry and immediately roll for inline compaction. This
+   * is the single entry point used by every WAL-using fast path in
+   * Overlay (`addChild`, `removeChild`, `renameChild`, `materializeChild`).
+   * Bundling the two steps in one call ensures the compaction trigger
+   * cannot be forgotten when a new WAL op is added later — a missed
+   * `maybeCompactWal` would let the WAL grow unbounded for that op.
+   *
+   * Callers must hold the parent TreeInode's contents lock so that
+   * `content` is consistent with the WAL file on disk.
+   */
+  void appendWalEntryAndCompact(
+      InodeNumber parent,
+      WalOpType op,
+      PathComponentPiece childName,
+      const overlay::OverlayEntry* entry,
+      const DirContents& content);
 
   /**
    * A request for the background GC thread.  There are three types of
@@ -336,7 +473,17 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
     struct MaintenanceRequest {};
     explicit GCRequest(MaintenanceRequest req) : requestType{std::move(req)} {}
 
-    std::variant<MaintenanceRequest, overlay::OverlayDir, FlushRequest>
+    /**
+     * Request to recursively remove an overlay directory tree in the
+     * background. The GC thread will load, remove, and recurse into children.
+     */
+    explicit GCRequest(InodeNumber ino) : requestType{ino} {}
+
+    std::variant<
+        MaintenanceRequest,
+        overlay::OverlayDir,
+        FlushRequest,
+        InodeNumber>
         requestType;
   };
 
@@ -355,6 +502,30 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
 
   // Serialize EdenFS overlay data structure into Thrift data structure
   overlay::OverlayEntry serializeOverlayEntry(const DirEntry& entry);
+
+  using OverlayEntryVisitor = folly::FunctionRef<
+      void(const std::string& name, const overlay::OverlayEntry& entry)>;
+  using OverlayEntrySource =
+      folly::FunctionRef<void(OverlayEntryVisitor visitor)>;
+
+  /**
+   * Iterate DirContents, validate each entry, serialize to OverlayEntry,
+   * and pass to the visitor. This is the save-side counterpart to
+   * buildDirEntries.
+   */
+  void visitDirEntries(
+      InodeNumber inodeNumber,
+      const DirContents& dir,
+      OverlayEntryVisitor visitor);
+
+  /**
+   * Process overlay entries from the given source, handling inode allocation
+   * and AppleDouble filtering. Appends processed entries to the output vector.
+   * Returns true if the overlay should be rewritten.
+   */
+  bool buildDirEntries(
+      OverlayEntrySource source,
+      folly::fbvector<std::pair<PathComponent, DirEntry>>& entries);
 
   bool tryIncOutstandingIORequests();
   void decOutstandingIORequests();
@@ -411,7 +582,7 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
 
   /**
    * This uint64_t holds two values, a single bit on the MSB that
-   * acts a boolean closed: True if the the Overlay has been closed with
+   * acts a boolean closed: True if the Overlay has been closed with
    * calling setClosed(). When this is true, reads and writes will throw an
    * error instead of applying an overlay change or read. On the rest of the
    * bits, the actual number of outstanding IO requests is held. This has been
@@ -424,12 +595,57 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   folly::Baton<> lastOutstandingRequestIsComplete_;
   CaseSensitivity caseSensitive_;
 
-  std::shared_ptr<StructuredLogger> structuredLogger_;
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
+  // Borrowed from ServerState. Valid for Overlay's lifetime because
+  // ServerState outlives all EdenMount instances.
+  ErrorLogger& errorLogger_;
   EdenStatsPtr stats_;
+
+  // Borrowed from EdenServer. Valid for Overlay's lifetime because
+  // EdenServer::unmountAll() completes before semaphore destruction.
+  folly::LifoSem* fsckSemaphore_{nullptr};
+
+  folly::Function<void()> fsckCallback_;
+  folly::Function<void()> preFsckSemaphoreCallback_;
 
   friend class IORequest;
 
-  bool windowsSymlinksEnabled_;
+  bool useDirectFileWrites_;
+
+  bool useWal_{false};
+  size_t walCompactionMultiplier_{3};
+  uint64_t walCompactionByteCap_{5'000'000};
+
+  /**
+   * RNG used by `maybeCompactWal` to roll for inline compaction.
+   * Production default uses `folly::Random::rand32()`. Tests inject a
+   * deterministic generator via `OverlayTestHelper` so threshold checks
+   * become reproducible.
+   */
+  std::function<uint32_t()> walCompactionRng_;
+
+  /**
+   * Drop the on-disk WAL file for `parent` after a full directory rewrite
+   * or removal. Idempotent (safe to call when no WAL exists). No-op for
+   * catalog types that never have WAL files on disk.
+   */
+  void clearWalAfterFullWrite(InodeNumber parent);
+
+  /**
+   * Replay any pending WAL entries for `parent` into `dir` so callers
+   * that consume the loaded directory (e.g., recursive removal) see the
+   * merged state.
+   *
+   * Steady-state cost is one fstatat (via hasWal) when no WAL exists;
+   * the dynamic_cast and replay are skipped entirely. When a WAL does
+   * exist, the cost is bounded by the inline-compaction threshold
+   * (3 * max(dirSize, 10)) — the deferred work the WAL was hiding.
+   *
+   * Caller is responsible for cleaning up the on-disk WAL file
+   * afterwards (e.g., via clearWalAfterFullWrite); this helper only
+   * mutates `dir`.
+   */
+  void mergeWalIntoOverlayDir(InodeNumber parent, overlay::OverlayDir& dir);
 };
 
 constexpr InodeCatalogType kDefaultInodeCatalogType =

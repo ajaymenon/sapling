@@ -2040,18 +2040,20 @@ class changeset_printer:
         if self.footer:
             self.ui.write(self.footer)
 
-    def show(self, ctx, revcache=None, matchfn=None, hunksfilterfn=None, **props):
+    def show(
+        self, ctx, revcache=None, matchfn=None, hunksfilterfn=None, prevfn=None, **props
+    ):
         props = props
         if revcache is None:
             revcache = {}
         if self.buffered:
             self.ui.pushbuffer(labeled=True)
-            self._show(ctx, revcache, matchfn, hunksfilterfn, props)
+            self._show(ctx, revcache, matchfn, hunksfilterfn, prevfn, props)
             self.hunk[ctx.rev()] = self.ui.popbufferlist()
         else:
-            self._show(ctx, revcache, matchfn, hunksfilterfn, props)
+            self._show(ctx, revcache, matchfn, hunksfilterfn, prevfn, props)
 
-    def _show(self, ctx, revcache, matchfn, hunksfilterfn, props):
+    def _show(self, ctx, revcache, matchfn, hunksfilterfn, prevfn, props):
         """show a single changeset or file revision"""
         changenode = ctx.node()
         rev = ctx.rev()
@@ -2129,16 +2131,19 @@ class changeset_printer:
                 )
         self.ui.write("\n")
 
-        self.showpatch(ctx, matchfn, hunksfilterfn=hunksfilterfn)
+        self.showpatch(ctx, matchfn, hunksfilterfn=hunksfilterfn, prevfn=prevfn)
 
-    def showpatch(self, ctx, matchfn, hunksfilterfn=None):
+    def showpatch(self, ctx, matchfn, hunksfilterfn=None, prevfn=None):
         if not matchfn:
             matchfn = self.matchfn
         if matchfn:
             stat = self.diffopts.get("stat")
             diff = self.diffopts.get("patch")
             diffopts = patch.diffallopts(self.ui, self.diffopts)
-            prevctx = ctx.p1()
+            if prevfn is not None:
+                prevctx = prevfn(ctx)
+            else:
+                prevctx = ctx.p1()
             if stat:
                 diffordiffstat(
                     self.ui,
@@ -2180,7 +2185,7 @@ class jsonchangeset(changeset_printer):
         else:
             self.ui.write("[]\n")
 
-    def _show(self, ctx, revcache, matchfn, hunksfilterfn, props):
+    def _show(self, ctx, revcache, matchfn, hunksfilterfn, prevfn, props):
         """show a single changeset or file revision"""
         rev = ctx.rev()
         if rev is None:
@@ -2267,7 +2272,10 @@ class jsonchangeset(changeset_printer):
             stat = self.diffopts.get("stat")
             diff = self.diffopts.get("patch")
             diffopts = patch.difffeatureopts(self.ui, self.diffopts, git=True)
-            prevctx = ctx.p1()
+            if prevfn is None:
+                prevctx = ctx.p1()
+            else:
+                prevctx = prevfn(ctx)
             if stat:
                 self.ui.pushbuffer()
                 diffordiffstat(
@@ -2351,7 +2359,7 @@ class changeset_templater(changeset_printer):
             self.footer += templater.stringify(self.t(self._parts["docfooter"]))
         return super(changeset_templater, self).close()
 
-    def _show(self, ctx, revcache, matchfn, hunksfilterfn, props):
+    def _show(self, ctx, revcache, matchfn, hunksfilterfn, prevfn, props):
         """show a single changeset or file revision"""
         props = props.copy()
         props.update(templatekw.keywords)
@@ -2382,7 +2390,7 @@ class changeset_templater(changeset_printer):
         # write changeset metadata, then patch if requested
         key = self._parts[self._tref]
         self.ui.writebytes(templater.byteify(self.t(key, **props)))
-        self.showpatch(ctx, matchfn, hunksfilterfn=hunksfilterfn)
+        self.showpatch(ctx, matchfn, hunksfilterfn=hunksfilterfn, prevfn=prevfn)
 
         if self._parts["footer"]:
             if not self.footer:
@@ -3189,14 +3197,20 @@ def getgraphlogrevs(repo, pats, opts):
         if not (revs.isdescending() or revs.istopo()):
             revs.sort(reverse=True)
     if limit is not None:
-        limitedrevs = []
-        for idx, rev in enumerate(revs):
-            if idx >= limit:
-                break
-            limitedrevs.append(rev)
-        revs = smartset.baseset(limitedrevs, repo=repo)
+        revs = _limitlogrevs(repo, revs, limit)
 
     return revs, expr, filematcher
+
+
+def _limitlogrevs(repo, revs, limit):
+    limitedrevs = []
+    reviter = revs.iterrev()
+    for _i in range(limit):
+        try:
+            limitedrevs.append(next(reviter))
+        except StopIteration:
+            break
+    return smartset.baseset(limitedrevs, repo=repo)
 
 
 def getlogrevs(repo, pats, opts):
@@ -3223,12 +3237,7 @@ def getlogrevs(repo, pats, opts):
             revs = repo.revs(expr) & revs
             revs.sort(reverse=True)
     if limit is not None:
-        limitedrevs = []
-        for idx, r in enumerate(revs):
-            if limit <= idx:
-                break
-            limitedrevs.append(r)
-        revs = smartset.baseset(limitedrevs, repo=repo)
+        revs = _limitlogrevs(repo, revs, limit)
 
     return revs, expr, filematcher
 
@@ -3359,11 +3368,15 @@ def displaygraph(
     out=None,
     on_output=None,
     graphnodeid_to_rev=None,
+    mutation=False,
 ):
     repogetrenamed = repogetrenamed or {}
     repofilematcher = repofilematcher or {}
     props = props or {}
     formatnode = _graphnodeformatter(ui, displayer)
+    prevfn = None
+    if mutation:
+        prevfn = mutation_prevfn
     if ui.plain("graph"):
         renderername = "ascii"
     else:
@@ -3443,7 +3456,12 @@ def displaygraph(
             revcache["xreponame"] = xreponame
         width = renderer.width(graphnodeid, parents)
         displayer.show(
-            ctx, revcache=revcache, matchfn=revmatchfn, _graphwidth=width, **props
+            ctx,
+            revcache=revcache,
+            matchfn=revmatchfn,
+            prevfn=prevfn,
+            _graphwidth=width,
+            **props,
         )
         # The Rust graph renderer works with unicode.
         msg = "".join(
@@ -3456,7 +3474,16 @@ def displaygraph(
         else:
             ui.write(nextrow)
         if on_output is not None:
-            on_output(ctx, nextrow)
+            on_output(
+                ctx,
+                nextrow,
+                {
+                    "width": width,
+                    "revcache": revcache,
+                    "matchfn": revmatchfn,
+                    "message": msg,
+                },
+            )
         displayer.flush(ctx)
 
     displayer.close()
@@ -3498,7 +3525,10 @@ class ShowAbbreviatedAncestorsWhen(Enum):
 def graphlog(ui, repo, pats: Tuple[str, ...], opts: Dict[str, Any]):
     # Parameters are identical to log command ones
     repogetrenamed, repofilematcher, repoids = {}, {}, {}
-    revdag = _logdagwalker(repo, pats, opts, repogetrenamed, repofilematcher, repoids)
+    mutation = opts.get("mutation")
+    revdag = _logdagwalker(
+        repo, pats, opts, repogetrenamed, repofilematcher, repoids, mutation
+    )
 
     ui.pager("log")
     displayer = show_changeset(ui, repo, opts, buffered=True)
@@ -3511,17 +3541,51 @@ def graphlog(ui, repo, pats: Tuple[str, ...], opts: Dict[str, Any]):
         repogetrenamed,
         repofilematcher,
         graphnodeid_to_rev=graphnodeid_to_rev,
+        mutation=mutation,
     )
 
 
-def _logdagwalker(repo, pats, opts, repogetrenamed, repofilematcher, repoids):
+def mutation_prevfn(ctx):
+    repo = ctx.repo()
+    cl = repo.changelog
+    node = ctx.node()
+    entry = repo._mutationstore.get(node)
+    if entry and len(entry.preds()) == 1 and not entry.split():
+        pred = entry.preds()[0]
+        # Skip, if the pred is not known locally.
+        if cl.filternodes([pred], local=True):
+            # Do not try to diff if the stack is rebased to another public commit.
+            # The diff will include public changes, and could be a waste of time.
+            # Ideally, we can show second-order diff (diff of two diffs),
+            # and no need for this protection.
+            rebased = repo.dageval(
+                lambda: set(headsancestors(ancestors([node]) & public()))
+                != set(headsancestors(ancestors([pred]) & public()))
+            )
+            if not rebased:
+                return repo[pred]
+
+    # fallback to regular p1 parent
+    return ctx.p1()
+
+
+def _logdagwalker(repo, pats, opts, repogetrenamed, repofilematcher, repoids, mutation):
     revs, expr, filematcher = getgraphlogrevs(repo, pats, opts)
+    dag = None
+    if mutation:
+        nodes = repo.changelog.tonodes(revs)
+        # Mutation dag might contain nodes unknown to the main dag. Filter them out via subdag.
+        # ".subdag" is a trade-off. If we migrate graphmod.dagwalker to not use rev numbers,
+        # then we might drop ".subdag" here. See also test-glob-mutation.t
+        dag = repo._mutationstore.getdag(nodes).subdag(nodes)
     template = opts.get("template") or ""
     if repo.root not in repoids:
         repoids[repo.root] = len(repoids)
     rid = repoids[repo.root]
     rev_to_graphnodeid = lambda rev: (rid, rev)
-    revdag = graphmod.dagwalker(repo, revs, template, idfunc=rev_to_graphnodeid)
+    revdag = graphmod.dagwalker(
+        repo, revs, template, idfunc=rev_to_graphnodeid, dag=dag
+    )
 
     getrenamed = None
     if opts.get("copies"):
@@ -3533,11 +3597,13 @@ def _logdagwalker(repo, pats, opts, repogetrenamed, repofilematcher, repoids):
     repogetrenamed[repo.root] = getrenamed
     repofilematcher[repo.root] = filematcher
     return _dagfollowxrepo(
-        repo, pats, opts, revdag, repogetrenamed, repofilematcher, repoids
+        repo, pats, opts, revdag, repogetrenamed, repofilematcher, repoids, mutation
     )
 
 
-def _dagfollowxrepo(repo, pats, opts, revdag, repogetrenamed, repofilematcher, repoids):
+def _dagfollowxrepo(
+    repo, pats, opts, revdag, repogetrenamed, repofilematcher, repoids, mutation
+):
     for item, is_last in iterutil.mark_last(revdag):
         # It currently doesn't handle multiple imports/merges. In those cases, the
         # xrepo operation can appear in the middle of the dag.
@@ -3559,6 +3625,7 @@ def _dagfollowxrepo(repo, pats, opts, revdag, repogetrenamed, repofilematcher, r
                     repogetrenamed,
                     repofilematcher,
                     repoids,
+                    mutation,
                 )
             ):
                 if is_first:
@@ -3654,6 +3721,7 @@ def add(ui, repo, match, prefix, explicitonly, **opts):
     # On case sensitive filesystems this serves no purpose.
     norm_to_exact = {normpath(f): f for f in files if match.exact(f)}
 
+    ignored_added = []
     for f in sorted(files):
         fn = normpath(f)
         if fn in norm_to_exact and f != norm_to_exact[fn]:
@@ -3678,6 +3746,20 @@ def add(ui, repo, match, prefix, explicitonly, **opts):
             names.append(f)
             if ui.verbose or not exact:
                 ui.status(_("adding %s\n") % match.rel(f))
+            if ignored(f) and f not in pctx:
+                ignored_added.append(match.rel(f))
+
+    if ignored_added:
+        ui.status(
+            _(
+                "the following files are ignored, but still added because they are explicitly specified:\n"
+            )
+        )
+        for p in ignored_added:
+            ui.status("  %s\n" % p)
+        ui.status(
+            _("(use '@prog@ debugignore <file>' to check why they are ignored)\n")
+        )
 
     if not opts.get(r"dry_run"):
         rejected = wctx.add(names, prefix)
@@ -3799,9 +3881,8 @@ def grep(ui, repo, table, matcher, pattern, **opts):
     biggrepclient = ui.config(
         "grep",
         "biggrepclient",
-        "/usr/local/fbprojects/packages/biggrep.client/stable/biggrep_client",
     )
-    biggreptier = ui.config("grep", "biggreptier", "biggrep.master")
+    biggreptier = ui.config("grep", "biggreptier")
     biggrepcorpus = ui.config("grep", "biggrepcorpus")
 
     # If true, we'll use biggrepclient to perform the grep against some
@@ -3816,6 +3897,9 @@ def grep(ui, repo, table, matcher, pattern, **opts):
             and os.path.exists(biggrepclient)
         ):
             biggrep = True
+
+    if not biggrepclient or not biggreptier or not biggrepcorpus:
+        biggrep = False
 
     args = []
 
@@ -3849,8 +3933,7 @@ def grep(ui, repo, table, matcher, pattern, **opts):
         # to apply for this.
     if opts.get("fixed_strings"):
         cmd.append("-F")
-        # using bgs rather than bgr switches the engine to fixed string matches
-        biggrepclient = "bgs"
+        biggreppattern = pattern
     if opts.get("perl_regexp"):
         cmd.append("-P")
         # re2 is already mostly pcre compatible, so there are no options
@@ -3858,11 +3941,12 @@ def grep(ui, repo, table, matcher, pattern, **opts):
 
     # Ask big grep to strip out the corpus dir (stripdir) and to include
     # the corpus revision on the first line.
+    bigrepengine = "apr_strmatch" if opts.get("fixed_strings") else "re2"
     biggrepcmd = [
         biggrepclient,
         biggreptier,
         biggrepcorpus,
-        "re2",
+        bigrepengine,
         "--stripdir",
         "-r",
         "--expression",
@@ -4799,6 +4883,8 @@ def buildcommittemplate(repo, ctx, ref, summaryfooter=""):
         t.t.cache.update({"summaryfooter": summaryfooter})
 
     # load extra aliases based on changed files
+    # Note: this feature allows executing arbitrary templates controlled by the
+    # repo content. Do not enable for untrusted repos!
     if repo.ui.configbool("experimental", "local-committemplate"):
         localtemplate = localcommittemplate(repo, ctx)
         t.t.cache.update((k, templater.unquotestring(v)) for k, v in localtemplate)
@@ -5394,8 +5480,8 @@ def checkunfinished(repo, op=None):
 
 
 afterresolvedstates = [
-    ("graftstate", _("@prog@ graft --continue")),
-    ("updatemergestate", _("@prog@ goto --continue")),
+    ("graftstate", "@prog@ graft --continue"),
+    ("updatemergestate", "@prog@ goto --continue"),
 ]
 
 
@@ -5412,7 +5498,7 @@ def howtocontinue(repo):
     contmsg = _("continue: %s")
     for f, msg in afterresolvedstates:
         if repo.localvfs.exists(f):
-            return contmsg % msg, True
+            return contmsg % _(msg), True
     if repo[None].dirty(missing=True, merge=False):
         return contmsg % _("@prog@ commit"), False
     return None, None
@@ -5455,7 +5541,7 @@ diffgraftopts = [
         "",
         "from-path",
         [],
-        _("re-map this path to correspondong --to-path (ADVANCED)"),
+        _("re-map this path to corresponding --to-path (ADVANCED)"),
         _("PATH"),
     ),
     (

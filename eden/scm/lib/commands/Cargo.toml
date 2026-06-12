@@ -10,7 +10,7 @@ repository = "https://github.com/facebook/sapling"
 license = "GPL-2.0-only"
 
 [dependencies]
-anyhow = { version = "1.0.98", features = ["backtrace"] }
+anyhow = { version = "1.0.102", features = ["backtrace"] }
 cmdcat = { version = "0.1.0", path = "commands/cmdcat" }
 cmdclone = { version = "0.1.0", path = "commands/cmdclone" }
 cmdconfig = { version = "0.1.0", path = "commands/cmdconfig" }
@@ -23,6 +23,7 @@ cmddebugdumpinternalconfig = { version = "0.1.0", path = "debugcommands/cmddebug
 cmddebugfilterid = { version = "0.1.0", path = "debugcommands/cmddebugfilterid" }
 cmddebugfsync = { version = "0.1.0", path = "debugcommands/cmddebugfsync" }
 cmddebuggitmodules = { version = "0.1.0", path = "debugcommands/cmddebuggitmodules" }
+cmddebughash = { version = "0.1.0", path = "debugcommands/cmddebughash" }
 cmddebughttp = { version = "0.1.0", path = "debugcommands/cmddebughttp" }
 cmddebuglfsreceive = { version = "0.1.0", path = "debugcommands/cmddebuglfsreceive" }
 cmddebuglfssend = { version = "0.1.0", path = "debugcommands/cmddebuglfssend" }
@@ -45,16 +46,18 @@ cmddebugtop = { version = "0.1.0", path = "debugcommands/cmddebugtop" }
 cmddebugwait = { version = "0.1.0", path = "debugcommands/cmddebugwait" }
 cmddebugwalkdetector = { version = "0.1.0", path = "debugcommands/cmddebugwalkdetector" }
 cmdgoto = { version = "0.1.0", path = "commands/cmdgoto" }
+cmdgrep = { version = "0.1.0", path = "commands/cmdgrep" }
 cmdpy = { version = "0.1.0", path = "cmdpy" }
 cmdroot = { version = "0.1.0", path = "commands/cmdroot" }
 cmdstatus = { version = "0.1.0", path = "commands/cmdstatus" }
 cmdversion = { version = "0.1.0", path = "commands/cmdversion" }
 cmdwhereami = { version = "0.1.0", path = "commands/cmdwhereami" }
-ctrlc = { version = "3.4.5", features = ["termination"] }
+cmdworktree = { version = "0.1.0", path = "commands/cmdworktree", optional = true }
+ctrlc = { version = "3.5.2", features = ["termination"] }
 flate2 = { version = "1.0.33", features = ["rust_backend"], default-features = false }
-hostname = "0.3"
-libc = "0.2.139"
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
+hostname = "0.4.2"
+libc = "0.2.186"
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 pycheckout = { version = "0.1.0", path = "../../saplingnative/bindings/modules/pycheckout" }
 pytracing = { version = "0.1.0", path = "../../saplingnative/bindings/modules/pytracing", default-features = false }
 pyworkingcopy = { version = "0.1.0", path = "../../saplingnative/bindings/modules/pyworkingcopy" }
@@ -72,6 +75,7 @@ sapling-hg-http = { version = "0.1.0", path = "../hg-http" }
 sapling-hg-metrics = { version = "0.1.0", path = "../hg-metrics" }
 sapling-hgplain = { version = "0.1.0", path = "../util/hgplain" }
 sapling-identity = { version = "0.1.0", path = "../identity" }
+sapling-indexedlog = { version = "0.1.0", path = "../indexedlog" }
 sapling-metrics = { version = "0.1.0", path = "../metrics" }
 sapling-metrics-render = { version = "0.1.0", path = "../metrics/render" }
 sapling-mincode = { version = "0.1.0", path = "../mincode" }
@@ -81,21 +85,22 @@ sapling-progress-model = { version = "0.1.0", path = "../progress/model" }
 sapling-progress-render = { version = "0.1.0", path = "../progress/render" }
 sapling-repo = { version = "0.1.0", path = "../repo", features = ["wdir"] }
 sapling-repourl = { version = "0.1.0", path = "../repo/url" }
-sapling-revisionstore = { version = "0.1.0", path = "../revisionstore" }
 sapling-runlog = { version = "0.1.0", path = "../runlog" }
 sapling-sampling = { version = "0.1.0", path = "../sampling" }
 sapling-testutil = { version = "0.1.0", path = "../util/testutil" }
+sapling-tracing-backtrace = { version = "0.1.0", path = "../tracing-backtrace" }
 sapling-tracing-collector = { version = "0.1.0", path = "../tracing-collector" }
-sapling-tracing-reload = { version = "0.1.0", path = "../tracing-reload" }
+sapling-tracing-dyn-layer = { version = "0.1.0", path = "../tracing-dyn-layer" }
+sapling-tracing-reload-states = { version = "0.1.0", path = "../tracing-reload/tracing-reload-states" }
 sapling-tracing-sampler = { version = "0.1.0", path = "../tracing-sampler" }
 sapling-version = { version = "0.1.0", path = "../version" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-tracing-subscriber = { version = "0.3.20", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
-zstd = { version = "0.13", features = ["experimental", "zstdmt"] }
+tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
+zstd = { version = "0.13.3", features = ["experimental", "zstdmt"] }
 
 [features]
 default = []
-eden = ["cmddebugwait/eden", "cmdgoto/eden", "pycheckout/eden", "pyworkingcopy/eden", "pyworkingcopyclient/eden", "sapling-clidispatch/eden"]
-fb = ["cmddebugdumpinternalconfig/fb", "cmddebugrefreshconfig/fb", "cmdpy/fb", "cmdversion/fb", "sapling-configloader/fb", "sapling-identity/fb"]
+eden = ["cmdclone/eden", "cmddebugwait/eden", "cmdgoto/eden", "cmdworktree", "pycheckout/eden", "pyworkingcopy/eden", "pyworkingcopyclient/eden", "sapling-clidispatch/eden"]
+fb = ["cmddebugdumpinternalconfig/fb", "cmddebugrefreshconfig/fb", "cmdpy/fb", "cmdversion/fb", "sapling-configloader/fb", "sapling-identity/fb", "sapling-indexedlog/metrics"]
 sl_oss = ["sapling-configloader/sl_oss"]

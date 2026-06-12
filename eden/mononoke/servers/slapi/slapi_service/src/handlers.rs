@@ -21,6 +21,7 @@ use futures::stream::TryStreamExt;
 use futures_stats::futures03::TimedFutureExt;
 use gotham::handler::HandlerError as GothamHandlerError;
 use gotham::handler::HandlerFuture;
+use gotham::helpers::http::Body;
 use gotham::middleware::state::StateMiddleware;
 use gotham::pipeline::new_pipeline;
 use gotham::pipeline::single_pipeline;
@@ -46,10 +47,8 @@ use gotham_ext::response::ResponseTryStreamExt;
 use gotham_ext::response::StreamBody;
 use gotham_ext::response::TryIntoResponse;
 use gotham_ext::response::build_response;
-use gotham_ext::response::encode_stream;
 use gotham_ext::state_ext::StateExt;
-use hyper::Body;
-use hyper::Response;
+use http::Response;
 use mime::Mime;
 use mononoke_api::Repo;
 use mononoke_macros::mononoke;
@@ -99,6 +98,8 @@ pub enum SaplingRemoteApiMethod {
     Blame,
     Bookmarks2,
     Capabilities,
+    CheckManifestPermission,
+    CheckPathPermission,
     CloudHistoricalVersions,
     CloudOtherRepoWorkspaces,
     CloudReferences,
@@ -149,6 +150,8 @@ impl fmt::Display for SaplingRemoteApiMethod {
             Self::Blame => "blame",
             Self::Bookmarks2 => "bookmarks2",
             Self::Capabilities => "capabilities",
+            Self::CheckManifestPermission => "check_manifest_permission",
+            Self::CheckPathPermission => "check_path_permission",
             Self::CloudHistoricalVersions => "cloud_historical_versions",
             Self::CloudOtherRepoWorkspaces => "cloud_other_repo_workspaces",
             Self::CloudReferences => "cloud_references",
@@ -191,7 +194,7 @@ impl fmt::Display for SaplingRemoteApiMethod {
             Self::UploadIdenticalChangesets => "upload_identical_changesets",
             Self::UploadTrees => "upload_trees",
         };
-        write!(f, "{}", name)
+        write!(f, "{name}")
     }
 }
 
@@ -227,7 +230,7 @@ impl ErrorFormatter for JsonErrorFormatter {
     type Body = Vec<u8>;
 
     fn format(&self, error: &Error, state: &State) -> Result<(Self::Body, Mime), Error> {
-        let message = format!("{:#}", error);
+        let message = format!("{error:#}");
 
         // Package the error message into a JSON response.
         let res = JsonError {
@@ -307,8 +310,7 @@ fn proxygen_health_handler(state: State) -> (State, &'static str) {
     } else {
         if let Some(request_load) = RequestLoad::try_borrow_from(&state) {
             let threshold =
-                justknobs::get_as::<i64>("scm/mononoke:edenapi_high_load_threshold", None)
-                    .unwrap_or_default();
+                justknobs::get_as::<i64>("scm/mononoke:edenapi_high_load_threshold", None);
             if threshold > 0 && request_load.0 > threshold {
                 return (state, HIGH_LOAD_SIGNAL);
             }
@@ -434,8 +436,10 @@ where
         }
 
         let identities = metadata.identities();
+        let identities_typed: Vec<_> = identities.iter().map(|i| i.to_typed_string()).collect();
         let identities: Vec<_> = identities.iter().map(|i| i.to_string()).collect();
         base_scuba.add(HttpScubaKey::ClientIdentities, identities);
+        base_scuba.add(HttpScubaKey::ClientIdentitiesTyped, identities_typed);
     }
 
     let reporting_loop = async move {
@@ -468,7 +472,7 @@ where
     T: ToWire + Send + 'static,
 {
     let stream = stream.and_then(|item| async move { to_cbor_bytes(&item.to_wire()) });
-    let stream = encode_stream(stream, encoding, None).capture_first_err();
+    let stream = stream.capture_first_err().encode(encoding);
     StreamBody::new(stream, cbor_mime())
 }
 
@@ -549,6 +553,8 @@ pub fn build_router<R: Send + Sync + Clone + 'static>(ctx: ServerContext<R>) -> 
         Handlers::setup::<lookup::LookupHandler>(route);
         Handlers::setup::<path_history::PathHistoryHandler>(route);
         Handlers::setup::<suffix_query::SuffixQueryHandler>(route);
+        Handlers::setup::<trees::CheckManifestPermissionHandler>(route);
+        Handlers::setup::<trees::CheckPathPermissionHandler>(route);
         Handlers::setup::<trees::UploadTreesHandler>(route);
         route.get("/:repo/health_check").to(health_handler);
         route

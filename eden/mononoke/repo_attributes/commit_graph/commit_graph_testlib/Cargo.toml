@@ -8,7 +8,7 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 commit_graph = { version = "0.1.0", path = "../commit_graph" }
@@ -17,14 +17,13 @@ context = { version = "0.1.0", path = "../../../servers/slapi/slapi_server/conte
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 in_memory_commit_graph_storage = { version = "0.1.0", path = "../in_memory_commit_graph_storage" }
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 maplit = "1.0"
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
-rand = { version = "0.9", features = ["small_rng"] }
+rand = "0.10.1"
 repo_identity = { version = "0.1.0", path = "../../repo_identity" }
 sapling-drawdag = { version = "0.1.0", path = "../../../../scm/lib/drawdag" }
-smallvec = { version = "1.15", features = ["impl_bincode", "serde", "specialization", "union"] }
-vec1 = { version = "1", features = ["serde"] }
+smallvec = { version = "1.15", features = ["impl_bincode", "serde", "specialization", "union", "write"] }
+vec1 = { version = "1.12.1", features = ["serde"] }
 
 [dev-dependencies]
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

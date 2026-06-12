@@ -37,26 +37,33 @@ Prepare a Sapling repo:
   $ drawdag <<'EOS'
   > A
   > EOS
-  $ hg go $A -q
+  $ sl go $A -q
 
 Test blame support subtree import
 
-  $ hg subtree import -q --url $GIT_URL --rev main --to-path bar -m "import gitrepo to bar"
+  $ sl subtree import -q --url $GIT_URL --rev main --to-path bar -m "import gitrepo to bar"
   $ echo 3 >> bar/alpha
-  $ hg ci -m "update bar/alpha"
-  $ hg blame bar/alpha
+  $ sl ci -m "update bar/alpha"
+  $ sl blame bar/alpha
   b6c31add3e60~: 1
   6a5b13188f04~: 2
   *: 3 (glob)
 
 Test commit's color
-  $ hg blame bar/alpha --color=debug
+  $ sl blame bar/alpha --color=debug
   [blame.age.old.xrepo|b6c31add3e60~: ]1
   [blame.age.old.xrepo|6a5b13188f04~: ]2
   [blame.age.old|* : ]3 (glob)
 
 Test blame support phabricator diff number
-  $ hg blame bar/alpha -p
+  $ sl blame bar/alpha -p
            : 1
    D1234567: 2
            : 3
+
+Test subtree import with --git-shallow-clone, blame should work
+
+  $ sl subtree import -q --url $GIT_URL --rev main --to-path bar2 -m "import gitrepo to bar2" --git-shallow-clone
+  $ sl blame bar2/alpha
+  b6c31add3e60~: 1
+  6a5b13188f04~: 2

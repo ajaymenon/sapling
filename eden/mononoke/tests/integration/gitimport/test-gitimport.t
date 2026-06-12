@@ -31,7 +31,7 @@
   $ git fetch "$GIT_REPO_ORIGIN" +refs/*:refs/* --prune -u
   From $TESTTMP/origin/repo-git
    - [deleted]         (none)     -> origin/master_bookmark
-     (refs/remotes/origin/HEAD has become dangling)
+  *refs/remotes/origin/HEAD has become dangling* (glob)
   $ git branch "a_ref_prefixed_by_remotes_origin"
   $ git update-ref refs/remotes/origin/a_ref_prefixed_by_remotes_origin a_ref_prefixed_by_remotes_origin
   $ git branch -d a_ref_prefixed_by_remotes_origin
@@ -64,16 +64,8 @@
   CommitRef {
       tree: "cb2ef838eb24e4667fee3a8b89c930234ae6e4bb",
       parents: [],
-      author: SignatureRef {
-          name: "mononoke",
-          email: "mononoke@mononoke",
-          time: "946684800 +0000",
-      },
-      committer: SignatureRef {
-          name: "mononoke",
-          email: "mononoke@mononoke",
-          time: "946684800 +0000",
-      },
+      author: "mononoke <mononoke@mononoke> 946684800 +0000",
+      committer: "mononoke <mononoke@mononoke> 946684800 +0000",
       encoding: None,
       message: "Add file1\n",
       extra_headers: [],

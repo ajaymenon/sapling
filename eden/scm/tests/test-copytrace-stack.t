@@ -18,7 +18,7 @@ Prepare a repo
 
 Rebase should succeed
 
-  $ hg rebase -s $B -d $C
+  $ sl rebase -s $B -d $C
   rebasing 4b097f0fb1bf "B"
   merging y and x to y
   rebasing 0918b4413bb6 "D"

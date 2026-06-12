@@ -169,7 +169,7 @@ impl StatisticsCollector {
         let repo = repos
             .repos()
             .get_by_name(&repo_name)
-            .ok_or_else(|| anyhow::anyhow!("Repo {} is not loaded on the server", repo_name))?;
+            .ok_or_else(|| anyhow::anyhow!("Repo {repo_name} is not loaded on the server"))?;
         let args = process.args.clone();
         let bookmark = BookmarkKey::new(&process.args.bookmark)?;
         let scuba_logger = if process.args.log_to_scuba {
@@ -692,6 +692,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                 SM_CLEANUP_TIMEOUT_SECS,
                 Arc::new(process),
                 true, // enable shard (repo) level healing
+                None,
             )?;
             let (sender, receiver) = tokio::sync::oneshot::channel::<bool>();
             executor.block_and_execute(receiver).await?;

@@ -27,7 +27,7 @@ import {TopBar} from './TopBar';
 import {TopLevelAlerts} from './TopLevelAlert';
 import {TopLevelErrors} from './TopLevelErrors';
 import {tracker} from './analytics';
-import {islDrawerState} from './drawerState';
+import {effectiveCommitInfoLocationAtom, islDrawerState} from './drawerState';
 import {t, T} from './i18n';
 import platform from './platform';
 import {useMainContentWidth} from './responsive';
@@ -89,22 +89,25 @@ function NullStateOrDrawers() {
 
 function ISLDrawers() {
   const setDrawerState = useSetAtom(islDrawerState);
+  const location = useAtomValue(effectiveCommitInfoLocationAtom);
   useCommand('ToggleSidebar', () => {
     setDrawerState(state => ({
       ...state,
-      right: {...state.right, collapsed: !state.right.collapsed},
+      [location]: {...state[location], collapsed: !state[location].collapsed},
     }));
   });
 
   return (
     <Drawers
-      rightLabel={
-        <>
-          <Icon icon="edit" />
-          <T>Commit Info</T>
-        </>
-      }
-      right={<CommitInfoSidebar />}
+      {...{
+        [location]: <CommitInfoSidebar />,
+        [`${location}Label`]: (
+          <>
+            <Icon icon="edit" />
+            <T>Commit Info</T>
+          </>
+        ),
+      }}
       errorBoundary={ErrorBoundary}>
       <MainContent />
       <CommandHistoryAndProgress />
@@ -161,9 +164,7 @@ function ISLNullState({repoError}: {repoError: RepositoryError}) {
         content = (
           <>
             <EmptyState>
-              <div>
-                <T>No folder opened</T>
-              </div>
+              <T>No folder opened</T>
               <p>
                 <T>Open a folder to get started.</T>
               </p>
@@ -174,9 +175,7 @@ function ISLNullState({repoError}: {repoError: RepositoryError}) {
         content = (
           <>
             <EmptyState>
-              <div>
-                <T>Not a valid repository</T>
-              </div>
+              <T>Not a valid repository</T>
               <p>
                 <T replace={{$cwd: <code>{repoError.cwd}</code>}}>
                   $cwd is not a valid Sapling repository. Clone or init a repository to use ISL.

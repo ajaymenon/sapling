@@ -52,7 +52,23 @@ pub enum UseCaseId {
     StarlarkMcp,
     #[strum(serialize = "vscode")]
     VSCode,
-    #[strum(serialize = "vscode_extension")]
+    #[strum(serialize = "vscode-buck")]
+    VSCodeBuck,
+    #[strum(serialize = "vscode-doctor")]
+    VSCodeDoctor,
+    #[strum(serialize = "vscode-eslint")]
+    VSCodeEslint,
+    #[strum(serialize = "vscode-filewatcher")]
+    VSCodeFilewatcher,
+    #[strum(serialize = "vscode-hg")]
+    VSCodeHg,
+    #[strum(serialize = "vscode-ios-component-kit")]
+    VSCodeIOSComponentKit,
+    #[strum(serialize = "vscode-tests")]
+    VSCodeTests,
+    #[strum(serialize = "vscode-update-tracker")]
+    VSCodeUpdateTracker,
+    #[strum(serialize = "vscode-extension")]
     VSCodeExtension,
     Unknown,
 }
@@ -177,6 +193,9 @@ impl UseCase {
             return Some(std::thread::spawn(move || {
                 get_remote_configs::<C>(
                     is_pub,
+                    // Use-case fetching doesn't run on cloud environments, so we'll never add a
+                    // service user to the x2p headers
+                    false,
                     remote_url,
                     limit,
                     http_config,

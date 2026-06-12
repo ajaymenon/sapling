@@ -6,8 +6,8 @@
  */
 
 use proc_macro::TokenStream;
-use proc_macro_error::abort;
-use proc_macro_error::proc_macro_error;
+use proc_macro_error2::abort;
+use proc_macro_error2::proc_macro_error;
 use quote::format_ident;
 use quote::quote;
 use syn::Attribute;
@@ -43,13 +43,7 @@ impl StackConfig {
     fn take_attr(&self, attrs: &mut Vec<Attribute>) -> Option<Attribute> {
         attrs
             .iter()
-            .position(|attr| {
-                if let Ok(meta) = attr.parse_meta() {
-                    meta.path().is_ident("stack")
-                } else {
-                    false
-                }
-            })
+            .position(|attr| attr.path().is_ident("stack"))
             .map(|pos| attrs.remove(pos))
     }
 }
@@ -69,12 +63,7 @@ impl VisitMut for StackConfig {
         };
 
         let config_field = if let Some(attr) = self.take_attr(&mut field.attrs) {
-            let meta = match attr.parse_meta() {
-                Ok(meta) => meta,
-                Err(e) => abort!(attr, "unable to parse attribute: {:?}", e),
-            };
-
-            ConfigField::new_with_meta(ident.clone(), &meta)
+            ConfigField::new_with_meta(ident.clone(), &attr.meta)
         } else {
             ConfigField::new(ident.clone())
         };

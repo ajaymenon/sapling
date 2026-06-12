@@ -6,16 +6,29 @@
 
 # pyre-strict
 
+import json
 import os
+import subprocess
 import sys
-from typing import Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
-from eden.fs.cli.util import is_apple_silicon
+from eden.fs.cli.util import is_apple_silicon, write_file_atomically
+
+
+SYSTEMD_ARGS_FILENAME = ".edenfs_start_args"
+SYSTEMD_STARTUP_LOG_FILENAME = ".edenfs_startup.log"
 
 
 class DaemonBinaryNotFound(Exception):
     def __init__(self) -> None:
         super().__init__("unable to find edenfs executable")
+
+
+class SystemdStartDaemonError(Exception):
+    """Raised when start_daemon_from_args_file cannot launch the daemon."""
+
+    pass
 
 
 def find_daemon_binary(explicit_daemon_binary: Optional[str]) -> str:
@@ -75,3 +88,66 @@ def _find_default_daemon_binary() -> Optional[str]:
         return candidate
 
     return None
+
+
+def write_systemd_args_file(
+    state_dir: Path, cmd: List[str], eden_env: Dict[str, str]
+) -> Path:
+    """Write the daemon command and environment to a JSON file.
+
+    This file is read by the 'eden systemd-start' subcommand which is invoked
+    by systemd's ExecStart/ExecReload.
+    """
+    args_file = state_dir / SYSTEMD_ARGS_FILENAME
+    data = {"cmd": cmd, "env": eden_env}
+    write_file_atomically(args_file, json.dumps(data).encode())
+    return args_file
+
+
+def start_daemon_from_args_file(args_file: str) -> int:
+    """Read the daemon command and environment from an args file, then spawn the daemon.
+
+    This is called by the `eden systemd-start` subcommand. When invoked via systemd
+    (ExecStart/ExecReload), it inherits ``NOTIFY_SOCKET`` from the current environment
+    so the daemon can report readiness.
+    """
+    try:
+        with open(args_file) as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        raise SystemdStartDaemonError(
+            f"args file {args_file} does not exist. Run 'eden start' to generate it."
+        ) from e
+    except json.JSONDecodeError as e:
+        raise SystemdStartDaemonError(
+            f"args file {args_file} contains invalid JSON: {e}. "
+            "Run 'eden start' to regenerate it."
+        ) from e
+
+    try:
+        cmd: List[str] = data["cmd"]
+        eden_env: Dict[str, str] = data["env"]
+    except KeyError as e:
+        raise SystemdStartDaemonError(
+            f"args file {args_file} is missing required key {e}. "
+            "Run 'eden start' to regenerate it."
+        ) from e
+
+    # Inherit NOTIFY_SOCKET from the current environment. systemd sets this
+    # for ExecStart/ExecReload processes in Type=notify services so the daemon
+    # can signal readiness and report its main PID.
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if not notify_socket:
+        raise SystemdStartDaemonError(
+            "NOTIFY_SOCKET is not set. "
+            "This command must be run by systemd as part of a Type=notify service."
+        )
+    eden_env["NOTIFY_SOCKET"] = notify_socket
+
+    # stdout/stderr are redirected by the systemd unit file
+    # (StandardOutput=file:/%I/.edenfs_startup.log) so the CLI can read
+    # the startup output after systemctl start returns.
+    try:
+        return subprocess.call(cmd, stdin=subprocess.DEVNULL, env=eden_env)
+    except OSError as e:
+        raise SystemdStartDaemonError(f"failed to execute {cmd[0]}: {e}") from e

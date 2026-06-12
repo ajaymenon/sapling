@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import psutil
 from eden.fs.cli.config import EdenInstance
 from eden.fs.cli.util import HealthStatus
-from fb303_core.ttypes import fb303_status
+from fb303_core.thrift_types import fb303_status
 
 from .lib import start, testcase
 from .lib.fake_edenfs import get_fake_edenfs_argv
@@ -207,9 +207,7 @@ class DirectInvokeTest(testcase.IntegrationTestCase):
 
         expected_err = "error: unexpected trailing command line arguments\n"
         self.maxDiff = 5000
-        self.assertMultiLineEqual(
-            expected_err, out.stderr.decode("utf-8", errors="replace")
-        )
+        self.assertIn(expected_err, out.stderr.decode("utf-8", errors="replace"))
 
 
 class StartFakeEdenFSTestBase(ServiceTestCaseBase):

@@ -7,8 +7,8 @@
 
 #include "eden/fs/inodes/sqlitecatalog/SqliteInodeCatalog.h"
 
+#include <fmt/core.h>
 #include <folly/File.h>
-#include <folly/Format.h>
 
 #include "eden/common/utils/Bug.h"
 #include "eden/fs/inodes/InodeNumber.h"
@@ -17,11 +17,11 @@
 
 namespace facebook::eden {
 
-class StructuredLogger;
+class EdenFsEventsLogger;
 
 SqliteInodeCatalog::SqliteInodeCatalog(
     AbsolutePathPiece path,
-    std::shared_ptr<StructuredLogger> logger,
+    std::shared_ptr<EdenFsEventsLogger> logger,
     SqliteTreeStore::SynchronousMode mode)
     : store_{path, std::move(logger), mode} {}
 
@@ -51,7 +51,8 @@ std::optional<overlay::OverlayDir> SqliteInodeCatalog::loadAndRemoveOverlayDir(
 
 void SqliteInodeCatalog::saveOverlayDir(
     InodeNumber inodeNumber,
-    overlay::OverlayDir&& odir) {
+    overlay::OverlayDir&& odir,
+    bool /*crashSafe*/) {
   return store_.saveTree(inodeNumber, std::move(odir));
 }
 
@@ -96,9 +97,9 @@ InodeNumber SqliteInodeCatalog::nextInodeNumber() {
 
 std::optional<fsck::InodeInfo> SqliteInodeCatalog::loadInodeInfo(
     InodeNumber number) {
-  auto inodeError = [number](auto&&... args) -> std::optional<fsck::InodeInfo> {
-    return {fsck::InodeInfo(
-        number, fsck::InodeType::Error, folly::sformat(args...))};
+  auto inodeError =
+      [number](std::string msg) -> std::optional<fsck::InodeInfo> {
+    return {fsck::InodeInfo(number, fsck::InodeType::Error, std::move(msg))};
   };
 
   if (!hasOverlayDir(number)) {
@@ -123,16 +124,10 @@ std::vector<InodeNumber> SqliteInodeCatalog::getAllParentInodeNumbers() {
 InodeNumber SqliteInodeCatalog::scanLocalChanges(
     std::shared_ptr<ReloadableConfig> config,
     AbsolutePathPiece mountPath,
-    [[maybe_unused]] bool windowsSymlinksEnabled,
     [[maybe_unused]] InodeCatalog::LookupCallback& callback) {
 #ifdef _WIN32
   windowsFsckScanLocalChanges(
-      config,
-      *this,
-      InodeCatalogType::Sqlite,
-      mountPath,
-      windowsSymlinksEnabled,
-      callback);
+      config, *this, InodeCatalogType::Sqlite, mountPath, callback);
 #else
   (void)config;
   (void)mountPath;

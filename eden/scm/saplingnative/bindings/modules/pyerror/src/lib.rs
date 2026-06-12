@@ -17,12 +17,14 @@ py_exception!(error, HttpError);
 py_exception!(error, IndexedLogError);
 py_exception!(error, InvalidRepoPath);
 py_exception!(error, LockContendedError);
+py_exception!(error, MaxFetchCountError);
 py_exception!(error, MetaLogError);
 py_exception!(error, NeedSlowPathError);
 py_exception!(error, NonUTF8Path);
 py_exception!(error, PathMatcherError);
 py_exception!(error, WorkingCopyError);
 py_exception!(error, RepoInitError);
+py_exception!(error, PermissionDeniedError);
 py_exception!(error, UncategorizedNativeError);
 py_exception!(error, TlsError);
 
@@ -46,9 +48,19 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
         "LockContendedError",
         py.get_type::<LockContendedError>(),
     )?;
+    m.add(
+        py,
+        "MaxFetchCountError",
+        py.get_type::<MaxFetchCountError>(),
+    )?;
     m.add(py, "MetaLogError", py.get_type::<MetaLogError>())?;
     m.add(py, "NeedSlowPathError", py.get_type::<NeedSlowPathError>())?;
     m.add(py, "PathMatcherError", py.get_type::<PathMatcherError>())?;
+    m.add(
+        py,
+        "PermissionDeniedError",
+        py.get_type::<PermissionDeniedError>(),
+    )?;
     m.add(
         py,
         "UncategorizedNativeError",
@@ -139,11 +151,11 @@ fn register_error_handlers() {
         }
 
         if e.is::<indexedlog::Error>() {
-            Some(PyErr::new::<IndexedLogError, _>(py, format!("{:?}", e)))
+            Some(PyErr::new::<IndexedLogError, _>(py, format!("{e:?}")))
         } else if e.is::<metalog::Error>() {
-            Some(PyErr::new::<MetaLogError, _>(py, format!("{:?}", e)))
+            Some(PyErr::new::<MetaLogError, _>(py, format!("{e:?}")))
         } else if e.is::<configmodel::Error>() {
-            Some(PyErr::new::<ConfigError, _>(py, format!("{:?}", e)))
+            Some(PyErr::new::<ConfigError, _>(py, format!("{e:?}")))
         } else if matches!(
             e.downcast_ref::<dag::Error>(),
             Some(dag::Error::NeedSlowPath(_))
@@ -157,11 +169,11 @@ fn register_error_handlers() {
         } else if e.is::<repo::errors::InitError>() {
             Some(PyErr::new::<RepoInitError, _>(py, e.to_string()))
         } else if e.is::<repo::errors::InvalidWorkingCopy>() {
-            Some(PyErr::new::<WorkingCopyError, _>(py, format!("{:#}", e)))
+            Some(PyErr::new::<WorkingCopyError, _>(py, format!("{e:#}")))
         } else if e.is::<cpython_ext::Error>() {
-            Some(PyErr::new::<NonUTF8Path, _>(py, format!("{}", e)))
+            Some(PyErr::new::<NonUTF8Path, _>(py, format!("{e}")))
         } else if e.is::<types::path::ParseError>() {
-            Some(PyErr::new::<InvalidRepoPath, _>(py, format!("{}", e)))
+            Some(PyErr::new::<InvalidRepoPath, _>(py, format!("{e}")))
         } else if let Some(e) = e.downcast_ref::<edenapi::SaplingRemoteApiError>() {
             match e {
                 edenapi::SaplingRemoteApiError::Http(http_client::HttpClientError::Tls(
@@ -172,21 +184,30 @@ fn register_error_handlers() {
         } else if let Some(e) = e.downcast_ref::<edenapi::types::ServerError>() {
             Some(PyErr::new::<HttpError, _>(py, e.to_string()))
         } else if e.is::<auth::MissingCerts>() || e.is::<auth::X509Error>() {
-            Some(PyErr::new::<CertificateError, _>(py, format!("{}", e)))
+            Some(PyErr::new::<CertificateError, _>(py, format!("{e}")))
         } else if let Some(e) = e.downcast_ref::<revisionstore::scmstore::KeyFetchError>() {
             use revisionstore::scmstore::KeyFetchError::*;
-            if let Other(e) = e {
-                specific_error_handler(py, e)
-            } else {
-                Some(PyErr::new::<FetchError, _>(py, format!("{}", e)))
+            match e {
+                MaxFetchCountExceeded(msg) => Some(PyErr::new::<MaxFetchCountError, _>(py, msg)),
+                Other(e) => specific_error_handler(py, e),
+                _ => Some(PyErr::new::<FetchError, _>(py, format!("{e}"))),
             }
         } else if let Some(e) = e.downcast_ref::<types::errors::NetworkError>() {
             // If we don't handle inner error specifically, default to
             // HttpError which will trigger the network doctor.
             specific_error_handler(py, &e.0)
                 .or_else(|| Some(PyErr::new::<HttpError, _>(py, e.0.to_string())))
+        } else if let Some(e) = e.downcast_ref::<types::errors::PermissionDenied>() {
+            Some(PyErr::new::<PermissionDeniedError, _>(
+                py,
+                (
+                    e.path.to_string(),
+                    format!("{}", e.hgid),
+                    e.request_acl.clone(),
+                ),
+            ))
         } else if e.is::<pathmatcher::Error>() {
-            Some(PyErr::new::<PathMatcherError, _>(py, format!("{}", e)))
+            Some(PyErr::new::<PathMatcherError, _>(py, format!("{e}")))
         } else if let Some(e) = e.downcast_ref::<checkout::CheckoutConflictsError>() {
             Some(PyErr::new::<CheckoutConflictsError, _>(
                 py,
@@ -202,7 +223,7 @@ fn register_error_handlers() {
     }
 
     fn fallback_error_handler(py: Python, e: &error::Error) -> Option<PyErr> {
-        let output = format!("{:?}", e);
+        let output = format!("{e:?}");
 
         if output.contains("SSL") || output.contains("certificate") {
             // Turn it into a TlsError which will trigger the network doctor.

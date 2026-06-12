@@ -24,6 +24,8 @@ struct Unit;
 
 namespace facebook::eden {
 
+class EdenFsEventsLogger;
+
 /*
  * NFS-specific options for PrivHelper NFS mount requests.
  */
@@ -62,10 +64,28 @@ struct UnmountOptions {
   bool expire = false;
 };
 
+struct SanityCheckResult {
+  // Stale bind mounts (redirections) under the checkout
+  uint32_t staleRedirectionMountsFound = 0;
+  uint32_t staleRedirectionMountsSucceeded = 0;
+  uint32_t staleRedirectionMountsFailed = 0;
+  // Whether a stale EdenFS checkout mount itself was found and unmounted
+  bool staleCheckoutMountUnmounted = false;
+};
+
 struct StopFileAccessMonitorResponse {
   std::string tmpOutputPath;
   std::string specifiedOutputPath;
   bool shouldUpload;
+};
+
+struct NamespaceInfo {
+  pid_t privhelperPid; // privhelper's getpid()
+  uint64_t rootMountNsInode; // /proc/1/ns/mnt
+  uint64_t privhelperMountNsInode; // privhelper's /proc/self/ns/mnt
+  uint64_t privhelperPidNsInode; // privhelper's /proc/self/ns/pid
+  uint64_t daemonMountNsInode; // /proc/{daemon_pid}/ns/mnt
+  uint64_t daemonPidNsInode; // /proc/{daemon_pid}/ns/pid
 };
 
 /**
@@ -184,6 +204,14 @@ class PrivHelper {
   [[nodiscard]] virtual folly::Future<pid_t> getServerPid() = 0;
 
   /**
+   * Get namespace and PID info from the privhelper process. Returns the
+   * privhelper's PID, the inode numbers of the root, privhelper, and daemon
+   * mount and PID namespaces.
+   */
+  [[nodiscard]] virtual folly::Future<NamespaceInfo> getNamespaceInfo(
+      pid_t daemonPid) = 0;
+
+  /**
    * Start File Access Monitor(FAM).
    *
    * @param paths A list of paths to be monitored by FAM.
@@ -210,6 +238,17 @@ class PrivHelper {
       int targetPriority) = 0;
 
   /**
+   * Configure the FUSE BDI read-ahead for the given mount.
+   *
+   * This writes to /sys/class/bdi/{major}:{minor}/read_ahead_kb.
+   * Should be called after FUSE_INIT completes, since the kernel's
+   * fuse_finish_init() overwrites bdi->ra_pages during the handshake.
+   */
+  [[nodiscard]] virtual folly::Future<folly::Unit> setFuseReadAhead(
+      folly::StringPiece mountPath,
+      uint32_t readAheadKb) = 0;
+
+  /**
    * setLogFileBlocking() is a wrapper around setLogFile() that blocks until
    * the call has completed.
    *
@@ -221,6 +260,15 @@ class PrivHelper {
   void setLogFileBlocking(folly::File logFile);
   void setDaemonTimeoutBlocking(std::chrono::nanoseconds duration);
   void setMemoryPriorityForProcessBlocking(pid_t pid, int targetPriority);
+  NamespaceInfo getNamespaceInfoBlocking(pid_t daemonPid);
+
+  /**
+   * Set the edenfs events logger for logging telemetry events from privhelper
+   * responses (e.g., stale mount cleanup results). Default no-op so that
+   * FakePrivHelper and StubPrivHelper need no changes.
+   */
+  virtual void setEdenFsEventsLogger(
+      std::shared_ptr<EdenFsEventsLogger> /* logger */) {}
 
   /*
    * Explicitly stop the privhelper process.

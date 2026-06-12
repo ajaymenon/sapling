@@ -11,6 +11,7 @@
 #include <folly/Range.h>
 #include <gtest/gtest_prod.h>
 #include <array>
+#include <map>
 #include <optional>
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/FileContentStore.h"
@@ -30,6 +31,7 @@ namespace overlay {
 class OverlayDir;
 }
 class InodePath;
+class WalPath;
 
 /**
  * Class to manage the on disk data.
@@ -157,6 +159,114 @@ class FsFileContentStore : public FileContentStore {
 
   std::optional<fsck::InodeInfo> loadInodeInfo(InodeNumber number);
 
+  /**
+   * Get the path to the WAL file for the given inode, relative to localDir.
+   * Same "XX/<inode>" layout as getFilePath, with ".wal" suffix appended.
+   */
+  static WalPath getWalPath(InodeNumber inodeNumber);
+
+  /**
+   * Append a single WAL entry for `parent`. Returns the new on-disk WAL
+   * file size in bytes after the append; used by the Overlay's
+   * compaction threshold as a heuristic upper bound on replay cost.
+   *
+   * For ADD, `entry` must be non-null and contains the child's overlay
+   * data. For REMOVE and MATERIALIZE, `entry` must be nullptr —
+   * passing a non-null entry is a caller bug and is XCHECK'd.
+   *
+   * Concurrency: the caller must serialize all calls for a given parent
+   * inode (the Overlay layer holds the parent TreeInode's contents lock,
+   * which provides this). The function is NOT internally synchronized;
+   * concurrent calls for the same parent would interleave the
+   * lseek + writeFull + ftruncate short-write recovery sequence and could
+   * drop a successful neighbor's write. Calls for different parents are
+   * safe — each opens its own fd against a distinct WAL file.
+   */
+  uint64_t appendWalEntry(
+      InodeNumber parent,
+      WalOpType op,
+      PathComponentPiece childName,
+      const overlay::OverlayEntry* entry);
+
+  /**
+   * Pre-process a WAL file into a collapsed net delta. Multiple operations
+   * on the same name are collapsed: e.g., ADD+REMOVE→REMOVE, ADD+MATERIALIZE
+   * →ADD(no hash). Returns an empty map if no WAL file exists.
+   *
+   * Crash-safety contract: callers SHOULD remove the WAL (via removeWal,
+   * or implicitly via saveOverlayDir's clearWalAfterFullWrite tail) after
+   * a successful read, so any torn tail left by a prior crash mid-append
+   * does not persist on disk. The parser stops at the first malformed or
+   * torn entry and returns the prefix that decoded successfully — but if
+   * the WAL is left in place, subsequent appendWalEntry calls land via
+   * O_APPEND past the tear, and the entries after the tear become
+   * permanently invisible to future loads. Removing the WAL after read
+   * lets the next append start from a clean file.
+   *
+   * The result.delta is a sorted std::map. Sorted iteration order matters
+   * for the direct-serialization load path in Overlay.cpp (introduced in a
+   * later commit): it feeds entries into a PathMapMutator whose
+   * insert_or_assign path falls into an O(N) compact() step on every
+   * out-of-order key. Returning sorted keys keeps that merge
+   * O(N + K log K) instead of O(K · N) for K WAL keys against N base entries.
+   *
+   * result.rawEntriesParsed counts well-formed WAL entries that were
+   * successfully decoded, regardless of whether they collapse against an
+   * earlier entry for the same name.
+   */
+  LoadWalResult loadWalDelta(
+      InodeNumber parent,
+      CaseSensitivity caseSensitive = CaseSensitivity::Sensitive);
+
+  /**
+   * Replay WAL entries into an OverlayDir. Returns the full LoadWalResult
+   * (rawEntriesParsed + parseErrors) so cold-path callers can surface the
+   * same OverlayStats counters that the hot loadWalDelta path bumps.
+   *
+   * Thin wrapper over loadWalDelta: parsing, bounds checks, and the
+   * crash-safety contract (callers should removeWal after a successful
+   * read — see loadWalDelta) live there. This function only folds the
+   * collapsed delta into the passed-in OverlayDir.
+   *
+   * Used by cold paths (recursive remove, GC, fsck). The hot direct-
+   * serialization load path uses loadWalDelta directly.
+   */
+  LoadWalResult replayWal(
+      InodeNumber parent,
+      overlay::OverlayDir& dir,
+      CaseSensitivity caseSensitive = CaseSensitivity::Sensitive);
+
+  /** Returns true iff a WAL file exists for the given directory inode. */
+  bool hasWal(InodeNumber parent);
+
+  /**
+   * Remove the WAL file for a directory inode. Missing files are not an
+   * error; any other failure throws.
+   */
+  void removeWal(InodeNumber parent);
+
+  /**
+   * Enumerate every directory inode that has a WAL file on disk. Scans
+   * the existing 256 shard directories for files with ".wal" suffix.
+   *
+   * Concurrency: caller is responsible for excluding concurrent WAL
+   * writers and removers. Intended to run during overlay load or fsck
+   * before any mounts are live; not safe to call concurrently with
+   * appendWalEntry / removeWal on the same parent.
+   *
+   * Filtering: only regular files whose name is the parent inode number
+   * rendered as base-10 with no leading zeros, suffixed by ".wal" (e.g.
+   * "12345.wal"), placed in the canonical shard (low byte of inode ==
+   * shard index) are returned. Symlinks, directories, zero-inode names,
+   * leading-zero duplicates, and wrong-shard placement are logged at
+   * WARN and skipped. Shard enumeration errors are also logged and the
+   * scan continues, so callers may receive a partial best-effort result.
+   *
+   * The returned vector is unsorted and may include entries for WAL
+   * files that get removed between the scan and the caller's use.
+   */
+  std::vector<InodeNumber> scanForWalFiles() const;
+
   static constexpr folly::StringPiece kMetadataFile{"metadata.table"};
 
   /**
@@ -176,11 +286,13 @@ class FsFileContentStore : public FileContentStore {
   static constexpr size_t kMaxDecimalInodeNumberLength = 20;
 
  private:
-  FRIEND_TEST(OverlayTest, getFilePath);
+  FRIEND_TEST(OverlayFilePathTest, getFilePath);
   friend class RawOverlayTest;
   friend class FsInodeCatalog;
 
   void initNewOverlay();
+  void ensureShardDirectories(int parentDirFd, mode_t mode);
+  void ensureShardedTmpDirectories(int overlayDirFd);
 
   /**
    * Return the next inode number from the kNextInodeNumberFile.  If the file
@@ -223,8 +335,23 @@ class FsFileContentStore : public FileContentStore {
   std::optional<overlay::OverlayDir> deserializeOverlayDir(
       InodeNumber inodeNumber);
 
-  folly::File
-  createOverlayFileImpl(InodeNumber inodeNumber, iovec* iov, size_t iovCount);
+  /**
+   * Load the raw serialized compact protocol bytes for a directory,
+   * returning the bytes after the header. Returns std::nullopt if no
+   * overlay file exists for this inode.
+   */
+  std::optional<std::string> loadRawOverlayDir(InodeNumber inodeNumber);
+
+  /**
+   * When crashSafe is true, uses temp-file + rename to protect against
+   * partial writes on process crash. When false, writes directly to the
+   * final path for better performance.
+   */
+  folly::File createOverlayFileImpl(
+      InodeNumber inodeNumber,
+      iovec* iov,
+      size_t iovCount,
+      bool crashSafe = true);
 
   /** Path to ".eden/CLIENT/local" */
   const AbsolutePath localDir_;
@@ -259,6 +386,10 @@ class FsInodeCatalog : public InodeCatalog {
     return false;
   }
 
+  bool supportsWal() const override {
+    return true;
+  }
+
   std::vector<InodeNumber> getAllParentInodeNumbers() override {
     return {};
   }
@@ -284,7 +415,18 @@ class FsInodeCatalog : public InodeCatalog {
    */
   bool initialized() const override;
 
-  void saveOverlayDir(InodeNumber inodeNumber, overlay::OverlayDir&& odir)
+  void saveOverlayDir(
+      InodeNumber inodeNumber,
+      overlay::OverlayDir&& odir,
+      bool crashSafe = true) override;
+
+  void saveOverlayEntries(
+      InodeNumber inodeNumber,
+      size_t count,
+      OverlayEntrySource source,
+      bool crashSafe = true) override;
+
+  bool loadOverlayEntries(InodeNumber inodeNumber, OverlayEntryLoader loader)
       override;
 
   std::optional<overlay::OverlayDir> loadOverlayDir(
@@ -303,6 +445,35 @@ class FsInodeCatalog : public InodeCatalog {
   void maintenance() override {}
 
   std::optional<fsck::InodeInfo> loadInodeInfo(InodeNumber number) override;
+
+  uint64_t appendWalEntry(
+      InodeNumber parent,
+      WalOpType op,
+      PathComponentPiece childName,
+      const overlay::OverlayEntry* entry) override {
+    return core_->appendWalEntry(parent, op, childName, entry);
+  }
+
+  bool hasWal(InodeNumber parent) override {
+    return core_->hasWal(parent);
+  }
+
+  void removeWal(InodeNumber parent) override {
+    core_->removeWal(parent);
+  }
+
+  LoadWalResult loadWalDelta(
+      InodeNumber parent,
+      CaseSensitivity caseSensitive = CaseSensitivity::Sensitive) override {
+    return core_->loadWalDelta(parent, caseSensitive);
+  }
+
+  LoadWalResult replayWal(
+      InodeNumber parent,
+      overlay::OverlayDir& dir,
+      CaseSensitivity caseSensitive = CaseSensitivity::Sensitive) override {
+    return core_->replayWal(parent, dir, caseSensitive);
+  }
 
  private:
   FsFileContentStore* core_;

@@ -5,20 +5,24 @@ oncall("sapling")
 rust_library(
     name = "context",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "lib": {"name": "context"},
-        "package": {
-            "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-            "homepage": "https://sapling-scm.com/",
-            "license": "MIT",
-            "name": "sapling-context",
-            "repository": "https://github.com/facebook/sapling",
+    autocargo = {
+        "cargo_toml_config": {
+            "lib": {"name": "context"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "MIT",
+                "name": "sapling-context",
+                "repository": "https://github.com/facebook/sapling",
+            },
         },
-    }},
+    },
     crate_root = "src/lib.rs",
     deps = [
+        "fbsource//third-party/rust:parking_lot",
         "//eden/scm/lib/config/model:configmodel",
         "//eden/scm/lib/io:io",
         "//eden/scm/lib/io/term/logger:termlogger",
+        "//eden/scm/lib/types:types",
     ],
 )

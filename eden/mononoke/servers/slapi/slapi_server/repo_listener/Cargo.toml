@@ -8,13 +8,14 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 base64 = { version = "0.22.1", features = ["alloc"] }
 bookmarks = { version = "0.1.0", path = "../../../../repo_attributes/bookmarks" }
+bookmarks_cache = { version = "0.1.0", path = "../../../../repo_attributes/bookmarks/bookmarks_cache" }
 bytes = { version = "1.11.1", features = ["serde"] }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cats = { version = "0.1.0", path = "../../../../common/cats" }
-chrono = { version = "0.4.41", features = ["clock", "serde", "std"], default-features = false }
+chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 connection_security_checker = { version = "0.1.0", path = "../../../../common/connection_security_checker" }
 context = { version = "0.1.0", path = "../context" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -25,9 +26,12 @@ futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimen
 gotham_ext = { version = "0.1.0", path = "../../../../common/gotham_ext" }
 hgproto = { version = "0.1.0", path = "../../../../common/hgproto" }
 hostname = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-http = "0.2"
-hyper = { version = "0.14.26", features = ["client", "http1", "http2", "stream"] }
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+http = "=1.4.0"
+http-body = "1.0.1"
+http-body-util = "0.1.0"
+hyper = { version = "1.10.1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
+justknobs_ext = { version = "0.1.0", path = "../../../../common/rust/justknobs_ext" }
 lazy_static = "1.5"
 metaconfig_types = { version = "0.1.0", path = "../../../../metaconfig/types" }
 metadata = { version = "0.1.0", path = "../../../../common/metadata" }
@@ -37,15 +41,16 @@ mononoke_configs = { version = "0.1.0", path = "../../../../common/mononoke_conf
 mononoke_macros = { version = "0.1.0", path = "../../../../common/mononoke_macros" }
 mononoke_types = { version = "0.1.0", path = "../../../../mononoke_types" }
 ods_counters = { version = "0.1.0", path = "../../../../common/ods_counters" }
-openssl = "0.10.72"
+openssl = "0.10.80"
 percent-encoding = "2.1"
 permission_checker = { version = "0.1.0", path = "../../../../common/permission_checker" }
-pin-project = "1.1.10"
+pin-project = "1.1.13"
 qps = { version = "0.1.0", path = "../qps" }
 quiet_stream = { version = "0.1.0", path = "../../../../common/quiet_stream" }
 rate_limiting = { version = "0.1.0", path = "../../../../common/rate_limiting" }
 repo_client = { version = "0.1.0", path = "../../../../repo_client" }
 repo_permission_checker = { version = "0.1.0", path = "../../../../repo_attributes/repo_permission_checker" }
+sapling-cats-constants = { version = "0.1.0", path = "../../../../../scm/lib/cats/constants" }
 sapling-clientinfo = { version = "0.1.0", path = "../../../../../scm/lib/clientinfo" }
 scribe_ext = { version = "0.1.0", path = "../../../../common/scribe_ext" }
 scuba_ext = { version = "0.1.0", path = "../../../../common/scuba_ext" }
@@ -58,7 +63,8 @@ stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust
 textwrap = { version = "0.16.0", features = ["terminal_size"] }
 thiserror = "2.0.18"
 time_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
 tokio-openssl = "0.6.5"
-tokio-util = { version = "0.7.15", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["full"] }
+tower-service = "0.3.3"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

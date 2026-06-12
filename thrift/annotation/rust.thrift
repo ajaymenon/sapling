@@ -344,6 +344,17 @@ struct Mod {
 @scope.Struct
 struct Adapter {
   1: string name;
+  /**
+   * If true, the adapter's `AdaptedType` is expected to implement
+   * `serde::Serialize` and `serde::Deserialize`. This allows the adapted field
+   * to be used in types that derive serde traits (via the `serde` codegen
+   * option or `@rust.Serde`).
+   *
+   * If false (default), using this adapter on a field with serde enabled will
+   * produce a validation error, since the compiler cannot verify that the
+   * `AdaptedType` implements the required serde traits.
+   */
+  2: bool serde = false;
 }
 
 /**
@@ -440,4 +451,37 @@ struct Derive {
 @scope.Service
 struct ServiceExn {
   1: bool anyhow_to_application_exn;
+}
+
+/**
+ * Controls the underlying integer type of a Rust enum (newtype struct).
+ *
+ * By default, Thrift enums in Rust use `i32` as the underlying type. This
+ * annotation allows choosing a smaller or unsigned type for memory optimization.
+ * The wire format remains i32 regardless of the underlying type.
+ *
+ * Example:
+ *
+ * ```
+ * @rust.EnumType{type = rust.EnumUnderlyingType.I8}
+ * enum SmallEnum {
+ *   A = 0,
+ *   B = 1,
+ * }
+ * ```
+ *
+ * will result in `pub struct SmallEnum(pub i8)` instead of the default
+ * `pub struct SmallEnum(pub i32)`.
+ */
+enum EnumUnderlyingType {
+  I8 = 0,
+  U8 = 1,
+  I16 = 2,
+  U16 = 3,
+  U32 = 4,
+}
+
+@scope.Enum
+struct EnumType {
+  1: EnumUnderlyingType type;
 }

@@ -49,7 +49,7 @@ impl Vertex {
     ///
     /// If `len(hex)` is an odd number, hex + '0' will be used.
     pub fn from_hex(hex: &[u8]) -> io::Result<Self> {
-        let mut bytes = vec![0u8; (hex.len() + 1) / 2];
+        let mut bytes = vec![0u8; hex.len().div_ceil(2)];
         for (i, byte) in hex.iter().enumerate() {
             let value = match byte {
                 b'0'..=b'9' => byte - b'0',
@@ -100,7 +100,7 @@ impl fmt::Debug for Vertex {
         } else {
             // Do not use hex if it looks like an ASCII identifier.
             match std::str::from_utf8(self.as_ref()) {
-                Ok(s) => write!(f, "{}", s),
+                Ok(s) => write!(f, "{s}"),
                 Err(_) => write!(f, "{}", self.to_hex()),
             }
         }
@@ -248,7 +248,7 @@ impl fmt::Display for Id {
 
 impl fmt::Debug for Id {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 

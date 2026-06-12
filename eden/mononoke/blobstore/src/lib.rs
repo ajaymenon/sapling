@@ -334,7 +334,7 @@ pub trait Blobstore: fmt::Display + fmt::Debug + Send + Sync {
     ) -> Result<Option<BlobstoreGetData>>;
 
     /// Adds ability to specify the put behaviour explicitly so that even if per process default was
-    /// IfAbsent once could chose to OverwriteAndLog. Expected to be used only in admin tools
+    /// IfAbsent one could choose to OverwriteAndLog. Expected to be used only in admin tools
     async fn put_explicit<'a>(
         &'a self,
         ctx: &'a CoreContext,
@@ -396,7 +396,7 @@ pub trait Blobstore: fmt::Display + fmt::Debug + Send + Sync {
         let value = self
             .get(ctx, old_key)
             .await?
-            .with_context(|| format!("key {} not present", old_key))?;
+            .with_context(|| format!("key {old_key} not present"))?;
         Ok(self.put(ctx, new_key, value.bytes).await?)
     }
 
@@ -695,7 +695,7 @@ impl<L: Loadable + Sync + std::fmt::Debug, S: KeyedBlobstore> StoreLoadable<S> f
     ) -> Result<Self::Value, LoadableError> {
         self.load(ctx, store)
             .watched()
-            .with_label(format!("{:?}", self).as_str())
+            .with_label(format!("{__self:?}").as_str())
             .with_max_poll(BLOBSTORE_MAX_POLL_TIME_MS)
             .await
     }
@@ -722,7 +722,7 @@ impl<'a, A: KeyedBlobstore, B: KeyedBlobstore> BlobCopier for GenericBlobstoreCo
             .source
             .get(ctx, &key)
             .await?
-            .with_context(|| format!("key {} not present", key))?;
+            .with_context(|| format!("key {key} not present"))?;
         self.target.put(ctx, key, value.into_bytes()).await?;
         Ok(())
     }
@@ -748,7 +748,7 @@ where
             *t,
             id.load(ctx, blobstore)
                 .watched()
-                .with_label(format!("{:?}", id).as_str())
+                .with_label(format!("{id:?}").as_str())
                 .with_max_poll(BLOBSTORE_MAX_POLL_TIME_MS)
                 .await?,
         ))

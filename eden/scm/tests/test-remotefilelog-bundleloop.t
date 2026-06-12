@@ -9,7 +9,7 @@
   $ setconfig "remotefilelog.cachepath=$TESTTMP/cache" 'extensions.remotefilelog='
 
   $ newrepo
-  $ echo remotefilelog >> .hg/requires
+  $ echo remotefilelog >> .sl/requires
   $ drawdag << 'EOS'
   > E  # E/X=1 (renamed from Y)
   > |
@@ -20,11 +20,11 @@
   > A  # A/X=1
   > EOS
 
-  $ hg bundle --all "$TESTTMP/bundle" --traceback -q
+  $ sl bundle --all "$TESTTMP/bundle" --traceback -q
 
   $ newrepo
-  $ echo remotefilelog >> .hg/requires
-  $ hg unbundle "$TESTTMP/bundle"
+  $ echo remotefilelog >> .sl/requires
+  $ sl unbundle "$TESTTMP/bundle"
   adding changesets
   adding manifests
   adding file changes

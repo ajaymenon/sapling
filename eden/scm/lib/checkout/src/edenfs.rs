@@ -23,6 +23,7 @@ use anyhow::bail;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use context::CoreContext;
+use manifest::FsNodeMetadata;
 use manifest::Manifest;
 use pathmatcher::AlwaysMatcher;
 use progress_model::ProgressBar;
@@ -41,6 +42,7 @@ use types::RepoPath;
 use types::workingcopy_client::CheckoutConflict;
 use types::workingcopy_client::CheckoutMode;
 use types::workingcopy_client::ConflictType;
+use vfs::RemoveOptions;
 use workingcopy::client::WorkingCopyClient;
 use workingcopy::util::walk_treestate;
 use workingcopy::workingcopy::LockedWorkingCopy;
@@ -93,6 +95,7 @@ fn actionmap_from_eden_conflicts(
             }
             ConflictType::UntrackedAdded | ConflictType::RemovedModified => {
                 let conflict_path = conflict.path.as_repo_path();
+                let mut is_ignored = false;
                 if conflict.conflict_type == ConflictType::UntrackedAdded {
                     let file_state = treestate
                         .normalized_get(conflict_path.as_str().as_bytes())?
@@ -111,6 +114,8 @@ fn actionmap_from_eden_conflicts(
                         // some particular edge cases when we want to treat
                         // unknown files as special during checkout
                         unknown.push(conflict_path.to_owned());
+                    } else {
+                        is_ignored = true;
                     }
                 } else if let Some(file_state) =
                     treestate.normalized_get(conflict_path.as_str().as_bytes())?
@@ -123,11 +128,35 @@ fn actionmap_from_eden_conflicts(
                         removed.push(conflict_path.to_owned());
                     }
                 }
-                let meta = target_manifest.get_file(conflict_path)?.context(format!(
-                    "file metadata for {} not found at destination commit",
-                    conflict_path
-                ))?;
-                Some(Action::Update(UpdateAction::new(None, meta)))
+                match target_manifest.get(conflict_path)? {
+                    Some(FsNodeMetadata::File(meta)) => {
+                        Some(Action::Update(UpdateAction::new(None, meta)))
+                    }
+                    Some(FsNodeMetadata::Directory(_)) => {
+                        // The conflict path is a directory in the destination
+                        // (e.g. an untracked file/symlink being replaced by a
+                        // tracked directory). EdenFS handles directory creation,
+                        // but only if the local file is out of the way.
+                        if is_ignored {
+                            // Remove the ignored file so EdenFS can create the
+                            // directory during the NORMAL checkout.
+                            wc.vfs().remove(
+                                conflict_path,
+                                RemoveOptions::IGNORE_MISSING_PATH
+                                    | RemoveOptions::IGNORE_NON_FILE_OR_SYMLINK
+                                    | RemoveOptions::PRUNE_EMPTY_PARENTS,
+                            )?;
+                        } else {
+                            bail!(
+                                "{conflict_path}: local file conflicts with a directory in the destination commit"
+                            );
+                        }
+                        None
+                    }
+                    None => {
+                        bail!("file metadata for {conflict_path} not found at destination commit");
+                    }
+                }
             }
             ConflictType::ModifiedRemoved => {
                 let conflict_path = conflict.path.as_repo_path();
@@ -138,12 +167,10 @@ fn actionmap_from_eden_conflicts(
                 let conflict_path = conflict.path.as_repo_path();
                 modified.push(conflict_path.to_owned());
                 let old_meta = source_manifest.get_file(conflict_path)?.context(format!(
-                    "file metadata for {} not found at source commit",
-                    conflict_path
+                    "file metadata for {conflict_path} not found at source commit"
                 ))?;
                 let new_meta = target_manifest.get_file(conflict_path)?.context(format!(
-                    "file metadata for {} not found at target commit",
-                    conflict_path
+                    "file metadata for {conflict_path} not found at target commit"
                 ))?;
                 changed_metadata_to_action(old_meta, new_meta)
             }
@@ -319,7 +346,7 @@ fn edenfs_noconflict_checkout(
     let apply_result = plan.apply_store(repo.file_store()?.as_ref())?;
     for (path, err) in apply_result.remove_failed {
         ctx.logger
-            .warn(format!("update failed to remove {}: {:#}!\n", path, err));
+            .warn(format!("update failed to remove {path}: {err:#}!\n"));
     }
 
     Ok(())
@@ -406,7 +433,7 @@ fn get_conflicts_with_progress(
                 Ok(())
             })?;
         }
-        client.checkout(node, tree_node, mode)
+        client.checkout(&ctx.config, node, tree_node, mode)
     })
 }
 
@@ -522,7 +549,7 @@ fn is_edenfs_redirect_okay(wc: &WorkingCopy) -> anyhow::Result<Option<bool>> {
     }
 
     #[cfg(unix)]
-    let root_device_inode = vfs.metadata(RepoPath::empty())?.dev();
+    let root_device_inode = vfs.root().metadata()?.dev();
     for (path, kind) in redirections.into_iter() {
         let path_metadata = match vfs.metadata(RepoPath::from_str(path.as_str())?) {
             Ok(m) => m,

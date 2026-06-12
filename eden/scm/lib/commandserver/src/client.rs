@@ -26,7 +26,7 @@ pub fn run_via_commandserver(args: Vec<String>, config: &dyn Config) -> anyhow::
     let (should, reason) = should_run_remotely(&args);
     if !should {
         tracing::debug!("skipped using commandserver: {}", reason);
-        anyhow::bail!("skipped using commandserver: {}", reason);
+        anyhow::bail!("skipped using commandserver: {reason}");
     }
 
     // For now, the server does not fork and can only be used with "exclusive".
@@ -95,12 +95,11 @@ pub fn run_via_commandserver(args: Vec<String>, config: &dyn Config) -> anyhow::
     // On Windows, terminate the server on Ctrl+C event. The server will kill
     // the pager process. We use an "AtExit" handler to handle Ctrl+C.
     #[cfg(windows)]
-    let server_killer = atexit::AtExit::new({
+    let server_killer = atexit::AtExit::new("terminating server", {
         Box::new(move || {
             let _ = procutil::terminate_pid(props.pid, Some(Default::default()));
         })
     })
-    .named("terminating server".into())
     .queued();
 
     // Send the run_command request.
@@ -179,13 +178,13 @@ fn forward_signals(props: &ProcessProps) {
         libc::SIGCONT,
         libc::SIGTSTP,
     ] {
-        unsafe { libc::signal(sig, forward_signal_group as _) };
+        unsafe { libc::signal(sig, forward_signal_group as *const () as _) };
     }
 
     // The main process is expected to setup SIGUSR* handler.
     // But child processes in the group is not ready, so we
     // only send SIGUSR* to the process, not the group.
     for sig in [libc::SIGUSR1, libc::SIGUSR2] {
-        unsafe { libc::signal(sig, forward_signal_process as _) };
+        unsafe { libc::signal(sig, forward_signal_process as *const () as _) };
     }
 }

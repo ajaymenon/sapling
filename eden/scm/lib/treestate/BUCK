@@ -5,22 +5,24 @@ oncall("sapling")
 rust_library(
     name = "treestate",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "lib": {"name": "treestate"},
-        "package": {
-            "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-            "homepage": "https://sapling-scm.com/",
-            "license": "MIT",
-            "name": "sapling-treestate",
-            "repository": "https://github.com/facebook/sapling",
+    autocargo = {
+        "cargo_toml_config": {
+            "lib": {"name": "treestate"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "MIT",
+                "name": "sapling-treestate",
+                "repository": "https://github.com/facebook/sapling",
+            },
         },
-    }},
+    },
     crate_root = "src/lib.rs",
     test_deps = [
         "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:pretty_assertions",
         "fbsource//third-party/rust:quickcheck",
-        "fbsource//third-party/rust:rand_08",
+        "fbsource//third-party/rust:rand",
         "fbsource//third-party/rust:rand_chacha",
         "fbsource//third-party/rust:tempfile",
     ],

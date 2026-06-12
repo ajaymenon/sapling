@@ -26,7 +26,7 @@ use fbinit::FacebookInit;
 use futures_stats::TimedTryFutureExt;
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt as _;
 use rand::distr::Alphanumeric;
 use rand::rng;
 use tokio::sync::Semaphore;
@@ -193,14 +193,14 @@ impl Client for ThriftClient {
                     );
                 }
                 ErrorHandlingStrategy::Abort => {
-                    sample.fail(format!("{:?}", error).as_str());
+                    sample.fail(format!("{error:?}").as_str());
                     let _ = SCUBA_CLIENT.log(sample);
                     break Err(error);
                 }
             };
 
             if attempts > MAX_RETRY_ATTEMPTS {
-                sample.fail(format!("{:?}", error).as_str());
+                sample.fail(format!("{error:?}").as_str());
                 sample.add_bool("max_retry_reached", true);
                 let _ = SCUBA_CLIENT.log(sample);
                 break Err(error);

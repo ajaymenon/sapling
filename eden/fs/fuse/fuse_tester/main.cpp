@@ -16,7 +16,6 @@
 #include <sysexits.h>
 #include <csignal>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/EnumValue.h"
 #include "eden/common/utils/PathFuncs.h"
@@ -28,6 +27,7 @@
 #include "eden/fs/privhelper/PrivHelperImpl.h"
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 
 using namespace facebook::eden;
 using namespace std::chrono_literals;
@@ -130,6 +130,8 @@ int main(int argc, char** argv) {
   auto dispatcher =
       std::make_unique<TestDispatcher>(std::move(stats), identity);
 
+  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+
   folly::Logger straceLogger{"eden.strace"};
 
   auto channel = makeFuseChannel(
@@ -142,7 +144,8 @@ int main(int argc, char** argv) {
       &straceLogger,
       std::make_shared<ProcessInfoCache>(),
       /*fsEventLogger=*/nullptr,
-      /*structuredLogger=*/std::make_shared<NullStructuredLogger>(),
+      /*edenFsEventsLogger=*/nullptr,
+      /*errorLogger=*/noopErrorLogger,
       std::chrono::seconds(60),
       /*notifications=*/nullptr,
       CaseSensitivity::Sensitive,

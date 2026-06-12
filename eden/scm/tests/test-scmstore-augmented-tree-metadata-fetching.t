@@ -15,10 +15,10 @@
   > EOS
 
   $ newclientrepo client server
-  $ hg pull -q -r $A
+  $ sl pull -q -r $A
 
 Sanity check that children metadata isn't fetched by default:
-  $ hg debugscmstore -r $A dir --mode=tree
+  $ sl debugscmstore -r $A dir --mode=tree
   Successfully fetched tree: (
       Key {
           path: RepoPathBuf(
@@ -49,8 +49,10 @@ Sanity check that children metadata isn't fetched by default:
                               augmented_manifest_size: 481,
                           },
                       ),
+                      has_acl: None,
                   },
                   true,
+                  Hg,
               ),
           ),
           parents: None,
@@ -61,7 +63,7 @@ Sanity check that children metadata isn't fetched by default:
   $ setconfig remotefilelog.cachepath=$TESTTMP/cache2
 
 Fetch a tree with children metadata, make sure directories aux data also returned:
-  $ hg debugscmstore -r $A dir --mode=tree --config scmstore.tree-metadata-mode=always
+  $ sl debugscmstore -r $A dir --mode=tree --config scmstore.tree-metadata-mode=always
   Successfully fetched tree: (
       Key {
           path: RepoPathBuf(
@@ -101,6 +103,9 @@ Fetch a tree with children metadata, make sure directories aux data also returne
                                                   augmented_manifest_id: Blake3("16f534257ecef0fc9254628292cd025db76e73e1c013419fca0b7f02f9fb91c6"),
                                                   augmented_manifest_size: 208,
                                               },
+                                          ),
+                                          has_acl: Some(
+                                              false,
                                           ),
                                       },
                                   ),
@@ -161,8 +166,10 @@ Fetch a tree with children metadata, make sure directories aux data also returne
                               augmented_manifest_size: 481,
                           },
                       ),
+                      has_acl: None,
                   },
                   true,
+                  Hg,
               ),
           ),
           parents: None,
@@ -171,7 +178,7 @@ Fetch a tree with children metadata, make sure directories aux data also returne
   )
 
 We should also have aux data for the files available as a side effect of tree fetching:
-  $ hg debugscmstore -r $A dir/file1 --mode=file --fetch-mode=LOCAL
+  $ sl debugscmstore -r $A dir/file1 --mode=file --fetch-mode=LOCAL
   Successfully fetched file: StoreFile {
       content: None,
       aux_data: Some(
@@ -191,7 +198,7 @@ We should also have aux data for the files available as a side effect of tree fe
 
 Fetch mode can also trigger tree metadata fetch:
 
-  $ hg debugscmstore -r $A dir --mode=tree --fetch-mode='LOCAL|REMOTE|PREFETCH'
+  $ sl debugscmstore -r $A dir --mode=tree --fetch-mode='LOCAL|REMOTE|PREFETCH'
   Successfully fetched tree: (
       Key {
           path: RepoPathBuf(
@@ -231,6 +238,9 @@ Fetch mode can also trigger tree metadata fetch:
                                                   augmented_manifest_id: Blake3("16f534257ecef0fc9254628292cd025db76e73e1c013419fca0b7f02f9fb91c6"),
                                                   augmented_manifest_size: 208,
                                               },
+                                          ),
+                                          has_acl: Some(
+                                              false,
                                           ),
                                       },
                                   ),
@@ -291,8 +301,10 @@ Fetch mode can also trigger tree metadata fetch:
                               augmented_manifest_size: 481,
                           },
                       ),
+                      has_acl: None,
                   },
                   true,
+                  Hg,
               ),
           ),
           parents: None,
@@ -302,13 +314,13 @@ Fetch mode can also trigger tree metadata fetch:
 
 
   $ newclientrepo client2 server
-  $ hg pull -q -r $A
+  $ sl pull -q -r $A
   $ setconfig remotefilelog.cachepath=$TESTTMP/cache4
 
 Show we can fetch tree aux data even if plain tree is already available locally.
 
 First fetch plain tree:
-  $ hg debugscmstore -r $A dir --mode=tree --config scmstore.fetch-tree-aux-data=false
+  $ sl debugscmstore -r $A dir --mode=tree --config scmstore.fetch-tree-aux-data=false
   Successfully fetched tree: (
       Key {
           path: RepoPathBuf(
@@ -334,8 +346,10 @@ First fetch plain tree:
                       ),
                       children: None,
                       tree_aux_data: None,
+                      has_acl: None,
                   },
                   true,
+                  Hg,
               ),
           ),
           parents: None,
@@ -344,7 +358,7 @@ First fetch plain tree:
   )
 
 Verify we do have tree locally, but don't have aux data locally:
-  $ hg debugscmstore -r $A dir --mode=tree --fetch-mode=LOCAL
+  $ sl debugscmstore -r $A dir --mode=tree --fetch-mode=LOCAL
   Successfully fetched tree: (
       Key {
           path: RepoPathBuf(
@@ -362,6 +376,7 @@ Verify we do have tree locally, but don't have aux data locally:
                               size: None,
                               flags: None,
                           },
+                          acl_children_indices: None,
                           content: OnceCell(Uninit),
                           compressed_content: Some(
                               b"\x8c\x00\x00\x00\xf1Mdir\x00ac934ed5f01e06c92b6c95661b2ccaf2a734509ft\nfile1\x00a58629e4c3c5a5d14b5810b2e35681bb84319167/\x00\xf0\x1c2\x00ecbe8b3047eb5d9bb298f516d451f64491812e07\n",
@@ -369,6 +384,7 @@ Verify we do have tree locally, but don't have aux data locally:
                       },
                       tree_aux: None,
                   },
+                  Hg,
               ),
           ),
           parents: None,
@@ -376,7 +392,7 @@ Verify we do have tree locally, but don't have aux data locally:
       },
   )
 
-  $ hg debugscmstore -r $A dir --mode=tree --aux-only --fetch-mode=LOCAL
+  $ sl debugscmstore -r $A dir --mode=tree --aux-only --fetch-mode=LOCAL
   Failed to fetch tree: (
       Key {
           path: RepoPathBuf(
@@ -396,7 +412,7 @@ Verify we do have tree locally, but don't have aux data locally:
 
 Can fetch remotely:
 
-  $ LOG=eagerepo=debug hg debugscmstore -r $A dir --mode=tree --aux-only
+  $ LOG=eagerepo=debug sl debugscmstore -r $A dir --mode=tree --aux-only
   DEBUG eagerepo::api: trees * (glob)
   Successfully fetched tree: (
       Key {
@@ -419,7 +435,7 @@ Can fetch remotely:
 
 Make sure repeat query doesn't trigger another edenapi fetch:
 
-  $ LOG=eagerepo=debug hg debugscmstore -r $A dir --mode=tree --aux-only
+  $ LOG=eagerepo=debug sl debugscmstore -r $A dir --mode=tree --aux-only
   Successfully fetched tree: (
       Key {
           path: RepoPathBuf(

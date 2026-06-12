@@ -107,7 +107,7 @@ pub trait KeyStore: Send + Sync {
 
         let key = Key::new(path.to_owned(), hgid);
         match self.get_content_iter(fctx, vec![key])?.next() {
-            None => Err(anyhow::format_err!("{}@{}: not found remotely", path, hgid)),
+            None => Err(anyhow::format_err!("{path}@{hgid}: not found remotely")),
             Some(Err(e)) => Err(e),
             Some(Ok((_k, data))) => Ok(data),
         }
@@ -142,20 +142,19 @@ pub trait KeyStore: Send + Sync {
         &self,
         _opts: InsertOpts,
         _path: &RepoPath,
-        _data: &[u8],
+        _data: Blob,
     ) -> anyhow::Result<HgId> {
         anyhow::bail!("store {} is read-only", self.type_name())
     }
 
-    /// Write pending changes to disk.
-    /// For some implementations, this also includes `refresh()`.
+    /// Write pending in-memory data to disk. Unlike sync(), flush() should be a no-op if
+    /// there are no pending writes.
     fn flush(&self) -> anyhow::Result<()> {
         anyhow::bail!("store {} is read-only", self.type_name())
     }
 
-    /// Refresh the store so it might pick up new contents written by other processes.
-    /// For some implementations, this also includes `flush()`.
-    fn refresh(&self) -> anyhow::Result<()> {
+    /// Write pending in-memory data to disk and reload stores from disk.
+    fn sync(&self) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -237,7 +236,7 @@ pub trait FileStore: KeyStore + 'static {
     ) -> anyhow::Result<FileAuxData> {
         let key = Key::new(path.to_owned(), id);
         match self.get_aux_iter(fctx, vec![key])?.next() {
-            None => Err(anyhow::format_err!("{}@{}: not found remotely", path, id)),
+            None => Err(anyhow::format_err!("{path}@{id}: not found remotely")),
             Some(Err(e)) => Err(e),
             Some(Ok((_k, aux))) => Ok(aux),
         }
@@ -275,7 +274,7 @@ pub trait FileStore: KeyStore + 'static {
         &self,
         mut opts: InsertOpts,
         path: &RepoPath,
-        data: &[u8],
+        data: Blob,
     ) -> anyhow::Result<HgId> {
         opts.kind = Kind::File;
         KeyStore::insert_data(self, opts, path, data)
@@ -339,6 +338,27 @@ pub trait TreeEntry: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Get children entries that will be denied permission when fetched.
+    fn permission_denied_children(
+        &self,
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, String)>>> {
+        self.filter_permission_denied(self.children_with_acls()?)
+    }
+
+    /// Filter caller-selected `has_acl` directory children to those denied permission when fetched.
+    fn filter_permission_denied(
+        &self,
+        _children_with_acl: Vec<(PathComponentBuf, HgId)>,
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, String)>>> {
+        Ok(Box::new(std::iter::empty()))
+    }
+
+    /// Get directory children that have `has_acl` set, without triggering
+    /// permission checks. Returns `(path_component, manifest_id)` pairs.
+    fn children_with_acls(&self) -> anyhow::Result<Vec<(PathComponentBuf, HgId)>> {
+        Ok(Vec::new())
+    }
+
     /// Get number of entries, if available. Useful to pre-allocate vector capacity, etc.
     fn size_hint(&self) -> Option<usize>;
 }
@@ -393,6 +413,26 @@ pub trait TreeStore: KeyStore {
                 Ok(Some(data)) => Ok((k, data)),
             });
         Ok(Box::new(iter))
+    }
+
+    /// Fetch a single tree with full metadata.
+    /// Tries local first, falls back to remote via `get_tree_iter`.
+    /// Unary remote fetches are discouraged - prefer `get_tree_iter`.
+    fn get_tree(
+        &self,
+        fctx: FetchContext,
+        path: &RepoPath,
+        id: HgId,
+    ) -> anyhow::Result<Arc<dyn TreeEntry>> {
+        if let Some(tree) = self.get_local_tree(path, id)? {
+            return Ok(tree);
+        }
+        let key = Key::new(path.to_owned(), id);
+        match self.get_tree_iter(fctx, vec![key])?.next() {
+            Some(Ok((_, tree))) => Ok(tree),
+            Some(Err(e)) => Err(e),
+            None => Err(anyhow::format_err!("{path}@{id}: tree not found")),
+        }
     }
 
     /// List metadata of the given trees.
@@ -453,7 +493,7 @@ pub trait TreeStore: KeyStore {
     ) -> anyhow::Result<TreeAuxData> {
         let key = Key::new(path.to_owned(), id);
         match self.get_tree_aux_data_iter(fctx, vec![key.clone()])?.next() {
-            None => Err(anyhow::format_err!("{}@{}: not found remotely", path, id)),
+            None => Err(anyhow::format_err!("{path}@{id}: not found remotely")),
             Some(Err(e)) => Err(e),
             Some(Ok((_k, aux))) => Ok(aux),
         }
@@ -468,8 +508,11 @@ pub trait TreeStore: KeyStore {
     ) -> anyhow::Result<Id20> {
         opts.kind = Kind::Tree;
         let data = basic_serialize_tree(items, self.format())?;
-        KeyStore::insert_data(self, opts, path, &data)
+        KeyStore::insert_data(self, opts, path, data.into())
     }
+
+    /// Record that a permission-denied tree was encountered at the given path.
+    fn record_permission_denied(&self, _err: types::errors::PermissionDenied) {}
 
     /// Obtains a snapshot of the store state.
     /// Usually it is just `Arc::clone` under the hood.
@@ -478,7 +521,7 @@ pub trait TreeStore: KeyStore {
 }
 
 /// Options used by `insert_data`
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 pub struct InsertOpts {
     /// Parent hashes.
     /// For Hg it's required and affects SHA1.
@@ -498,6 +541,38 @@ pub struct InsertOpts {
     /// Hg flags to use. Used for legacy LFS support.
     #[serde(default)]
     pub hg_flags: u32,
+
+    /// Avoid insert if data is already in store.
+    #[serde(default)]
+    pub read_before_write: bool,
+
+    /// Indices (in manifest blob order) of directory children that have ACL.
+    #[serde(default)]
+    pub acl_children_indices: Option<Vec<u32>>,
+
+    /// Require durable storage that won't rotate out. When false, the store
+    /// may use non-permanent storage (e.g. a shared cache) that can be
+    /// reclaimed. Defaults to true.
+    #[serde(default = "default_true")]
+    pub permanent: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for InsertOpts {
+    fn default() -> Self {
+        Self {
+            parents: Vec::new(),
+            kind: Kind::default(),
+            forced_id: None,
+            hg_flags: 0,
+            read_before_write: false,
+            permanent: true,
+            acl_children_indices: None,
+        }
+    }
 }
 
 /// Distinguish between a file and a tree.

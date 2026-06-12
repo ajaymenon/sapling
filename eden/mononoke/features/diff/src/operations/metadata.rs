@@ -8,30 +8,29 @@
 use std::ops::Range;
 
 use anyhow::Context;
-use anyhow::anyhow;
 use bytes::Bytes;
 use context::CoreContext;
 use futures::try_join;
 use lazy_static::lazy_static;
 use mononoke_types::ContentId;
 use mononoke_types::ContentMetadataV2;
-use regex::Regex;
 #[cfg(test)]
 use mononoke_types::MPath;
 #[cfg(test)]
 use mononoke_types::NonRootMPath;
+use regex::Regex;
 
 use crate::error::DiffError;
 use crate::types::DiffContentType;
 use crate::types::DiffFileType;
 use crate::types::DiffGeneratedStatus;
 use crate::types::DiffSingleInput;
-use crate::types::Repo;
 use crate::types::MetadataDiff;
 use crate::types::MetadataFileInfo;
 use crate::types::MetadataLinesCount;
+use crate::types::Repo;
 use crate::utils::content::get_file_info_from_changeset_path;
-use crate::utils::content::load_content;
+use crate::utils::content::get_lfs_pointer;
 use crate::utils::whitespace::strip_horizontal_whitespace;
 
 // This logic comes from `mononoke_api/src/changeset_path_diff.rs`
@@ -62,6 +61,7 @@ enum ParsedFileContent {
     Text(TextFile),
     NonUtf8,
     Binary,
+    LfsPointer,
 }
 
 impl FileGeneratedSpan {
@@ -98,14 +98,16 @@ impl FileGeneratedSpan {
             }
         }
 
-        Ok(match (
-            found_generated_annotation,
-            manual_sections_ranges.is_empty(),
-        ) {
-            (true, true) => FileGeneratedSpan::FullyGenerated,
-            (true, false) => FileGeneratedSpan::PartiallyGenerated(manual_sections_ranges),
-            (false, _) => FileGeneratedSpan::NotGenerated,
-        })
+        Ok(
+            match (
+                found_generated_annotation,
+                manual_sections_ranges.is_empty(),
+            ) {
+                (true, true) => FileGeneratedSpan::FullyGenerated,
+                (true, false) => FileGeneratedSpan::PartiallyGenerated(manual_sections_ranges),
+                (false, _) => FileGeneratedSpan::NotGenerated,
+            },
+        )
     }
 }
 
@@ -164,10 +166,13 @@ impl ParsedFileContent {
         ctx: &CoreContext,
         repo: &impl Repo,
         content_id: ContentId,
+        is_lfs: bool,
     ) -> Result<Self, DiffError> {
+        if is_lfs {
+            return Ok(ParsedFileContent::LfsPointer);
+        }
         // Load content metadata from blobstore
-        let metadata = crate::utils::content::get_content_metadata(ctx, repo, &content_id)
-            .await?;
+        let metadata = crate::utils::content::get_content_metadata(ctx, repo, &content_id).await?;
 
         let parsed_content = if metadata.is_binary {
             ParsedFileContent::Binary
@@ -213,7 +218,11 @@ async fn calculate_lines_count(
     }
 }
 
-fn diff_files(old_text_file: &TextFile, new_text_file: &TextFile, ignore_whitespace: bool) -> MetadataLinesCount {
+fn diff_files(
+    old_text_file: &TextFile,
+    new_text_file: &TextFile,
+    ignore_whitespace: bool,
+) -> MetadataLinesCount {
     let old_content = if ignore_whitespace {
         strip_horizontal_whitespace(&old_text_file.file_content)
     } else {
@@ -293,6 +302,7 @@ fn convert_content_type_to_diff(parsed_content: &ParsedFileContent) -> DiffConte
         ParsedFileContent::Text(_) => DiffContentType::Text,
         ParsedFileContent::NonUtf8 => DiffContentType::NonUtf8,
         ParsedFileContent::Binary => DiffContentType::Binary,
+        ParsedFileContent::LfsPointer => DiffContentType::LfsPointer,
     }
 }
 
@@ -326,7 +336,7 @@ fn create_file_info(
 async fn get_file_details_from_input(
     ctx: &CoreContext,
     repo: &impl Repo,
-    input: &DiffSingleInput,
+    input: DiffSingleInput,
 ) -> Result<(Option<DiffFileType>, Option<ParsedFileContent>), DiffError> {
     match input {
         DiffSingleInput::ChangesetPath(changeset_input) => {
@@ -337,7 +347,8 @@ async fn get_file_details_from_input(
                 repo,
                 changeset_input.changeset_id,
                 non_root_mpath,
-            ).await?;
+            )
+            .await?;
 
             let (content_id, file_type) = match file_info {
                 Some((cid, ft)) => (Some(cid), Some(convert_file_type_to_diff(ft))),
@@ -348,24 +359,41 @@ async fn get_file_details_from_input(
             let parsed_file_content = match (&content_id, &file_type) {
                 (_, Some(DiffFileType::GitSubmodule)) => None,
                 (Some(content_id), _) => {
-                    Some(ParsedFileContent::new(ctx, repo, *content_id).await?)
-                },
+                    // Check if this is an LFS pointer — if so, report LfsPointer content
+                    // type instead of analyzing the actual (potentially binary) content
+                    let is_lfs = get_lfs_pointer(
+                        ctx,
+                        repo,
+                        changeset_input.changeset_id,
+                        changeset_input.path,
+                        content_id,
+                    )
+                    .await?
+                    .is_some();
+                    Some(ParsedFileContent::new(ctx, repo, *content_id, is_lfs).await?)
+                }
                 (None, _) => None,
             };
 
             Ok((file_type, parsed_file_content))
         }
         DiffSingleInput::Content(content_input) => {
-            let parsed_file_content = Some(ParsedFileContent::new(ctx, repo, content_input.content_id).await?);
+            // If an LFS pointer was provided with this content input, report as LfsPointer
+            let parsed_file_content = Some(
+                ParsedFileContent::new(
+                    ctx,
+                    repo,
+                    content_input.content_id,
+                    content_input.lfs_pointer.is_some(),
+                )
+                .await?,
+            );
 
             // For content-only inputs, we don't have file type information
             Ok((None, parsed_file_content))
         }
-        DiffSingleInput::String(_string_input) => {
-            let file_content = load_content(ctx, repo, input)
-                .await?
-                // For string inputs we will never get None here
-                .ok_or_else(|| DiffError::internal(anyhow!("Failed to load content from String input")))?;
+        DiffSingleInput::String(string_input) => {
+            let file_content = Bytes::from(string_input.content.into_bytes());
 
             let is_binary = file_content.contains(&0u8);
             let is_utf8 = std::str::from_utf8(&file_content).is_ok();
@@ -400,7 +428,10 @@ async fn get_file_details_from_input(
             let parsed_file_content = if is_binary {
                 Some(ParsedFileContent::Binary)
             } else if is_utf8 {
-                Some(ParsedFileContent::Text(TextFile::new(file_content, metadata)?))
+                Some(ParsedFileContent::Text(TextFile::new(
+                    file_content,
+                    metadata,
+                )?))
             } else {
                 Some(ParsedFileContent::NonUtf8)
             };
@@ -421,19 +452,22 @@ pub async fn metadata(
     other_pair: Option<(DiffSingleInput, &impl Repo)>,
     ignore_whitespace: bool,
 ) -> Result<MetadataDiff, DiffError> {
-
     // Get file information directly from inputs
     let (base_file_details, other_file_details) = try_join!(
         async {
-            if let Some((base_input, base_repo)) = &base_pair {
-                get_file_details_from_input(ctx, *base_repo, base_input).await.map(Some)
+            if let Some((base_input, base_repo)) = base_pair {
+                get_file_details_from_input(ctx, base_repo, base_input)
+                    .await
+                    .map(Some)
             } else {
                 Ok(Some((None, None)))
             }
         },
         async {
-            if let Some((other_input, other_repo)) = &other_pair {
-                get_file_details_from_input(ctx, *other_repo, other_input).await.map(Some)
+            if let Some((other_input, other_repo)) = other_pair {
+                get_file_details_from_input(ctx, other_repo, other_input)
+                    .await
+                    .map(Some)
             } else {
                 Ok(Some((None, None)))
             }
@@ -465,15 +499,21 @@ pub async fn metadata(
 #[cfg(test)]
 mod tests {
 
+    use blobstore::Loadable;
     use fbinit::FacebookInit;
     use mononoke_macros::mononoke;
+    use mononoke_types::FileType;
+    use mononoke_types::GitLfs;
+    use repo_blobstore::RepoBlobstoreRef;
     use test_repo_factory;
     use tests_utils::BasicTestRepo;
     use tests_utils::CreateCommitContext;
 
     use super::*;
     use crate::types::DiffInputChangesetPath;
+    use crate::types::DiffInputContent;
     use crate::types::DiffSingleInput;
+    use crate::types::LfsPointer as DiffLfsPointer;
 
     async fn init_test_repo(ctx: &CoreContext) -> Result<BasicTestRepo, DiffError> {
         let repo = test_repo_factory::build_empty(ctx.fb)
@@ -515,8 +555,13 @@ mod tests {
             replacement_path: None,
         });
 
-        let metadata_diff =
-            metadata(&ctx, Some((base_input, &repo)), Some((other_input, &repo)), false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            Some((base_input, &repo)),
+            Some((other_input, &repo)),
+            false,
+        )
+        .await?;
 
         // Check file info
         assert_eq!(
@@ -583,8 +628,13 @@ mod tests {
             replacement_path: None,
         });
 
-        let metadata_diff =
-            metadata(&ctx, Some((base_input, &repo)), Some((other_input, &repo)), false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            Some((base_input, &repo)),
+            Some((other_input, &repo)),
+            false,
+        )
+        .await?;
 
         // Check that content type is binary
         assert_eq!(
@@ -608,9 +658,7 @@ mod tests {
         let repo = init_test_repo(&ctx).await?;
 
         // Test with one empty file and one with content
-        let base_cs = CreateCommitContext::new_root(&ctx, &repo)
-            .commit()
-            .await?;
+        let base_cs = CreateCommitContext::new_root(&ctx, &repo).commit().await?;
 
         let other_cs = CreateCommitContext::new(&ctx, &repo, vec![base_cs])
             .add_file("new_file.txt", "new content\nline2\n")
@@ -628,8 +676,13 @@ mod tests {
             replacement_path: None,
         });
 
-        let metadata_diff =
-            metadata(&ctx, Some((base_input, &repo)), Some((other_input, &repo)), false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            Some((base_input, &repo)),
+            Some((other_input, &repo)),
+            false,
+        )
+        .await?;
 
         // Base file doesn't exist
         assert_eq!(metadata_diff.base_file_info.file_type, None);
@@ -731,7 +784,8 @@ mod tests {
             None::<(DiffSingleInput, &BasicTestRepo)>,
             None::<(DiffSingleInput, &BasicTestRepo)>,
             false,
-        ).await?;
+        )
+        .await?;
 
         // Both files don't exist
         assert_eq!(metadata_diff.base_file_info.file_type, None);
@@ -751,7 +805,11 @@ mod tests {
         let repo = init_test_repo(&ctx).await?;
 
         // Create a generated file
-        let generated_content = "// @generated\nGenerated content\nMore generated content\n";
+        let generated_content = concat!(
+            "// @",
+            "generated\n",
+            "Generated content\nMore generated content\n"
+        );
         let cs = CreateCommitContext::new_root(&ctx, &repo)
             .add_file("generated.txt", generated_content)
             .commit()
@@ -763,7 +821,13 @@ mod tests {
             replacement_path: None,
         });
 
-        let metadata_diff = metadata(&ctx, None::<(DiffSingleInput, &BasicTestRepo)>, Some((input, &repo)), false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            None::<(DiffSingleInput, &BasicTestRepo)>,
+            Some((input, &repo)),
+            false,
+        )
+        .await?;
 
         // Check that generated status is detected
         assert_eq!(
@@ -809,7 +873,13 @@ mod tests {
             replacement_path: None,
         });
 
-        let metadata_diff = metadata(&ctx, None::<(DiffSingleInput, &BasicTestRepo)>, Some((input, &repo)), false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            None::<(DiffSingleInput, &BasicTestRepo)>,
+            Some((input, &repo)),
+            false,
+        )
+        .await?;
 
         // Check that partially generated status is detected
         assert_eq!(
@@ -840,10 +910,18 @@ mod tests {
             content: "line1\nmodified line2\nline3\n".to_string(),
         });
 
-        let metadata_diff =
-            metadata(&ctx, Some((base_input, &repo)), Some((other_input, &repo)), false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            Some((base_input, &repo)),
+            Some((other_input, &repo)),
+            false,
+        )
+        .await?;
 
-        assert_eq!(metadata_diff.base_file_info.file_type, Some(DiffFileType::Regular));
+        assert_eq!(
+            metadata_diff.base_file_info.file_type,
+            Some(DiffFileType::Regular)
+        );
         assert_eq!(
             metadata_diff.base_file_info.content_type,
             Some(DiffContentType::Text)
@@ -853,7 +931,10 @@ mod tests {
             Some(DiffGeneratedStatus::NonGenerated)
         );
 
-        assert_eq!(metadata_diff.other_file_info.file_type, Some(DiffFileType::Regular));
+        assert_eq!(
+            metadata_diff.other_file_info.file_type,
+            Some(DiffFileType::Regular)
+        );
         assert_eq!(
             metadata_diff.other_file_info.content_type,
             Some(DiffContentType::Text)
@@ -886,15 +967,23 @@ mod tests {
         });
 
         // Test None vs String - should show addition
-        let metadata_diff =
-            metadata(&ctx, None::<(DiffSingleInput, &BasicTestRepo)>, Some((string_input.clone(), &repo)), false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            None::<(DiffSingleInput, &BasicTestRepo)>,
+            Some((string_input.clone(), &repo)),
+            false,
+        )
+        .await?;
 
         // Base file doesn't exist
         assert_eq!(metadata_diff.base_file_info.file_type, None);
         assert_eq!(metadata_diff.base_file_info.content_type, None);
 
         // Other file exists
-        assert_eq!(metadata_diff.other_file_info.file_type, Some(DiffFileType::Regular));
+        assert_eq!(
+            metadata_diff.other_file_info.file_type,
+            Some(DiffFileType::Regular)
+        );
         assert_eq!(
             metadata_diff.other_file_info.content_type,
             Some(DiffContentType::Text)
@@ -905,10 +994,19 @@ mod tests {
         assert_eq!(lines_count.deleted_lines, 0);
 
         // Test String vs None - should show deletion
-        let metadata_diff = metadata(&ctx, Some((string_input, &repo)), None::<(DiffSingleInput, &BasicTestRepo)>, false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            Some((string_input, &repo)),
+            None::<(DiffSingleInput, &BasicTestRepo)>,
+            false,
+        )
+        .await?;
 
         // Base file exists
-        assert_eq!(metadata_diff.base_file_info.file_type, Some(DiffFileType::Regular));
+        assert_eq!(
+            metadata_diff.base_file_info.file_type,
+            Some(DiffFileType::Regular)
+        );
         assert_eq!(
             metadata_diff.base_file_info.content_type,
             Some(DiffContentType::Text)
@@ -940,8 +1038,13 @@ mod tests {
             content: String::from_utf8_lossy(b"different\x00binary").to_string(),
         });
 
-        let metadata_diff =
-            metadata(&ctx, Some((base_input, &repo)), Some((other_input, &repo)), false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            Some((base_input, &repo)),
+            Some((other_input, &repo)),
+            false,
+        )
+        .await?;
 
         // Check that content type is binary
         assert_eq!(
@@ -974,9 +1077,13 @@ mod tests {
             content: "some content\n".to_string(),
         });
 
-        let metadata_diff =
-            metadata(&ctx, Some((empty_input.clone(), &repo)), Some((non_empty_input, &repo)), false)
-                .await?;
+        let metadata_diff = metadata(
+            &ctx,
+            Some((empty_input.clone(), &repo)),
+            Some((non_empty_input, &repo)),
+            false,
+        )
+        .await?;
 
         // Both should be text files
         assert_eq!(
@@ -994,9 +1101,13 @@ mod tests {
         assert_eq!(lines_count.deleted_lines, 0);
 
         // Test two empty strings
-        let metadata_diff =
-            metadata(&ctx, Some((empty_input.clone(), &repo)), Some((empty_input, &repo)), false)
-                .await?;
+        let metadata_diff = metadata(
+            &ctx,
+            Some((empty_input.clone(), &repo)),
+            Some((empty_input, &repo)),
+            false,
+        )
+        .await?;
         let lines_count = metadata_diff.lines_count.unwrap();
         assert_eq!(lines_count.added_lines, 0);
         assert_eq!(lines_count.deleted_lines, 0);
@@ -1019,8 +1130,13 @@ mod tests {
             content: "Plain text\n".to_string(),
         });
 
-        let metadata_diff =
-            metadata(&ctx, Some((special_input, &repo)), Some((plain_input, &repo)), false).await?;
+        let metadata_diff = metadata(
+            &ctx,
+            Some((special_input, &repo)),
+            Some((plain_input, &repo)),
+            false,
+        )
+        .await?;
 
         // Should handle special characters as text
         assert_eq!(
@@ -1153,9 +1269,318 @@ mod tests {
         .await?;
 
         // Binary files should not have line counts
-        assert!(metadata_diff.lines_count.is_none(), "Binary files should not have line counts");
-        assert_eq!(metadata_diff.base_file_info.content_type, Some(DiffContentType::Binary));
-        assert_eq!(metadata_diff.other_file_info.content_type, Some(DiffContentType::Binary));
+        assert!(
+            metadata_diff.lines_count.is_none(),
+            "Binary files should not have line counts"
+        );
+        assert_eq!(
+            metadata_diff.base_file_info.content_type,
+            Some(DiffContentType::Binary)
+        );
+        assert_eq!(
+            metadata_diff.other_file_info.content_type,
+            Some(DiffContentType::Binary)
+        );
+
+        Ok(())
+    }
+
+    async fn init_test_repo_with_lfs(ctx: &CoreContext) -> Result<BasicTestRepo, DiffError> {
+        let mut factory =
+            test_repo_factory::TestRepoFactory::new(ctx.fb).map_err(DiffError::internal)?;
+        factory.with_config_override(|config| {
+            config.git_configs.git_lfs_interpret_pointers = true;
+        });
+        let repo = factory.build().await.map_err(DiffError::internal)?;
+        Ok(repo)
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_metadata_lfs_changeset_path(fb: FacebookInit) -> Result<(), DiffError> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo = init_test_repo_with_lfs(&ctx).await?;
+
+        // Create commits with LFS-tracked binary content.
+        // With git_lfs_interpret_pointers enabled, the actual content is stored
+        // but the file change is marked as an LFS pointer.
+        let base_content = b"binary\x00lfs\x01content\x02base".as_slice();
+        let other_content = b"binary\x00lfs\x01content\x02other".as_slice();
+
+        let base_cs = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file_with_type_and_lfs(
+                "large_file.bin",
+                base_content,
+                FileType::Regular,
+                GitLfs::canonical_pointer(),
+            )
+            .commit()
+            .await?;
+
+        let other_cs = CreateCommitContext::new(&ctx, &repo, vec![base_cs])
+            .add_file_with_type_and_lfs(
+                "large_file.bin",
+                other_content,
+                FileType::Regular,
+                GitLfs::canonical_pointer(),
+            )
+            .commit()
+            .await?;
+
+        let base_input = DiffSingleInput::ChangesetPath(DiffInputChangesetPath {
+            changeset_id: base_cs,
+            path: create_non_root_path("large_file.bin")?,
+            replacement_path: None,
+        });
+        let other_input = DiffSingleInput::ChangesetPath(DiffInputChangesetPath {
+            changeset_id: other_cs,
+            path: create_non_root_path("large_file.bin")?,
+            replacement_path: None,
+        });
+
+        let metadata_diff = metadata(
+            &ctx,
+            Some((base_input, &repo)),
+            Some((other_input, &repo)),
+            false,
+        )
+        .await?;
+
+        // Both sides should report LfsPointer content type instead of Binary
+        assert_eq!(
+            metadata_diff.base_file_info.content_type,
+            Some(DiffContentType::LfsPointer)
+        );
+        assert_eq!(
+            metadata_diff.other_file_info.content_type,
+            Some(DiffContentType::LfsPointer)
+        );
+
+        // LFS files should not have line counts (same as binary)
+        assert!(metadata_diff.lines_count.is_none());
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_metadata_lfs_file_creation(fb: FacebookInit) -> Result<(), DiffError> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo = init_test_repo_with_lfs(&ctx).await?;
+
+        // Create a base commit without the LFS file, then add it
+        let base_cs = CreateCommitContext::new_root(&ctx, &repo).commit().await?;
+
+        let other_cs = CreateCommitContext::new(&ctx, &repo, vec![base_cs])
+            .add_file_with_type_and_lfs(
+                "new_lfs_file.bin",
+                b"binary\x00lfs\x01new".as_slice(),
+                FileType::Regular,
+                GitLfs::canonical_pointer(),
+            )
+            .commit()
+            .await?;
+
+        let base_input = DiffSingleInput::ChangesetPath(DiffInputChangesetPath {
+            changeset_id: base_cs,
+            path: create_non_root_path("new_lfs_file.bin")?,
+            replacement_path: None,
+        });
+        let other_input = DiffSingleInput::ChangesetPath(DiffInputChangesetPath {
+            changeset_id: other_cs,
+            path: create_non_root_path("new_lfs_file.bin")?,
+            replacement_path: None,
+        });
+
+        let metadata_diff = metadata(
+            &ctx,
+            Some((base_input, &repo)),
+            Some((other_input, &repo)),
+            false,
+        )
+        .await?;
+
+        // Base side doesn't exist
+        assert_eq!(metadata_diff.base_file_info.content_type, None);
+        assert_eq!(metadata_diff.base_file_info.file_type, None);
+
+        // Other side should be LfsPointer
+        assert_eq!(
+            metadata_diff.other_file_info.content_type,
+            Some(DiffContentType::LfsPointer)
+        );
+        assert_eq!(
+            metadata_diff.other_file_info.file_type,
+            Some(DiffFileType::Regular)
+        );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_metadata_lfs_vs_non_lfs(fb: FacebookInit) -> Result<(), DiffError> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo = init_test_repo_with_lfs(&ctx).await?;
+
+        // Create a commit with both an LFS file and a normal text file
+        let cs = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file_with_type_and_lfs(
+                "lfs_file.bin",
+                b"binary\x00lfs\x01content".as_slice(),
+                FileType::Regular,
+                GitLfs::canonical_pointer(),
+            )
+            .add_file("normal_file.txt", "just plain text\n")
+            .commit()
+            .await?;
+
+        // Check LFS file is reported as LfsPointer
+        let lfs_input = DiffSingleInput::ChangesetPath(DiffInputChangesetPath {
+            changeset_id: cs,
+            path: create_non_root_path("lfs_file.bin")?,
+            replacement_path: None,
+        });
+
+        let lfs_metadata = metadata(
+            &ctx,
+            None::<(DiffSingleInput, &BasicTestRepo)>,
+            Some((lfs_input, &repo)),
+            false,
+        )
+        .await?;
+        assert_eq!(
+            lfs_metadata.other_file_info.content_type,
+            Some(DiffContentType::LfsPointer)
+        );
+
+        // Check normal file is still reported as Text
+        let text_input = DiffSingleInput::ChangesetPath(DiffInputChangesetPath {
+            changeset_id: cs,
+            path: create_non_root_path("normal_file.txt")?,
+            replacement_path: None,
+        });
+
+        let text_metadata = metadata(
+            &ctx,
+            None::<(DiffSingleInput, &BasicTestRepo)>,
+            Some((text_input, &repo)),
+            false,
+        )
+        .await?;
+        assert_eq!(
+            text_metadata.other_file_info.content_type,
+            Some(DiffContentType::Text)
+        );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_metadata_lfs_content_input(fb: FacebookInit) -> Result<(), DiffError> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo = init_test_repo(&ctx).await?;
+
+        // Create a commit to get a valid ContentId in the blobstore
+        let cs = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("file.txt", "some text content\n")
+            .commit()
+            .await?;
+
+        // Get the content ID from the changeset
+        let changeset = cs
+            .load(&ctx, repo.repo_blobstore())
+            .await
+            .map_err(DiffError::internal)?;
+        let content_id = match changeset
+            .file_changes_map()
+            .get(&create_non_root_path("file.txt")?)
+        {
+            Some(mononoke_types::FileChange::Change(tracked)) => tracked.content_id(),
+            _ => panic!("Expected file change"),
+        };
+
+        // Test with Content input that has lfs_pointer set — should report LfsPointer
+        let lfs_input = DiffSingleInput::Content(DiffInputContent {
+            content_id,
+            path: Some(create_non_root_path("file.txt")?),
+            lfs_pointer: Some(DiffLfsPointer {
+                sha256: "abcdef1234567890".to_string(),
+                size: 1024,
+            }),
+        });
+
+        let metadata_diff = metadata(
+            &ctx,
+            None::<(DiffSingleInput, &BasicTestRepo)>,
+            Some((lfs_input, &repo)),
+            false,
+        )
+        .await?;
+
+        assert_eq!(
+            metadata_diff.other_file_info.content_type,
+            Some(DiffContentType::LfsPointer)
+        );
+
+        // Test with Content input without lfs_pointer — should report Text
+        let text_input = DiffSingleInput::Content(DiffInputContent {
+            content_id,
+            path: Some(create_non_root_path("file.txt")?),
+            lfs_pointer: None,
+        });
+
+        let metadata_diff = metadata(
+            &ctx,
+            None::<(DiffSingleInput, &BasicTestRepo)>,
+            Some((text_input, &repo)),
+            false,
+        )
+        .await?;
+
+        assert_eq!(
+            metadata_diff.other_file_info.content_type,
+            Some(DiffContentType::Text)
+        );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_metadata_lfs_no_lfs_config(fb: FacebookInit) -> Result<(), DiffError> {
+        let ctx = CoreContext::test_mock(fb);
+        // Use a repo WITHOUT LFS enabled
+        let repo = init_test_repo(&ctx).await?;
+
+        // Create a commit with an LFS-marked file in a non-LFS repo.
+        // Without git_lfs_interpret_pointers, get_lfs_pointer() returns None
+        // so the content type falls through to normal analysis (Binary in this case).
+        let cs = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file_with_type_and_lfs(
+                "file.bin",
+                b"binary\x00content".as_slice(),
+                FileType::Regular,
+                GitLfs::canonical_pointer(),
+            )
+            .commit()
+            .await?;
+
+        let input = DiffSingleInput::ChangesetPath(DiffInputChangesetPath {
+            changeset_id: cs,
+            path: create_non_root_path("file.bin")?,
+            replacement_path: None,
+        });
+
+        let metadata_diff = metadata(
+            &ctx,
+            None::<(DiffSingleInput, &BasicTestRepo)>,
+            Some((input, &repo)),
+            false,
+        )
+        .await?;
+
+        // Without LFS config, should fall through to Binary, not LfsPointer
+        assert_eq!(
+            metadata_diff.other_file_info.content_type,
+            Some(DiffContentType::Binary)
+        );
 
         Ok(())
     }

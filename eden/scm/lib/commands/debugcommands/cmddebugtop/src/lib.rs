@@ -9,11 +9,13 @@ use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
 
+use ascii_tree::row::Alignment;
+use ascii_tree::row::Row;
+use ascii_tree::row::Rows;
 use clidispatch::ReqCtx;
 use clidispatch::io::IsTty;
 use cliparser::define_flags;
 use cmdutil::Result;
-use comfy_table::Table;
 use debugtop::TableGenerator;
 use repo::repo::Repo;
 
@@ -43,27 +45,35 @@ pub fn run(ctx: ReqCtx<DebugTopOpts>, repo: &Repo) -> Result<u8> {
     let mut table_generator = match TableGenerator::new(ctx.opts.columns, reap_delay) {
         Err(unexpected_columns) => {
             for column in unexpected_columns.iter() {
-                write!(stderr, "Error: column \"{}\" was not expected\n", column)?;
+                write!(stderr, "Error: column \"{column}\" was not expected\n")?;
             }
             return Ok(22);
         }
         Ok(table_generator) => table_generator,
     };
 
+    let num_columns = table_generator.column_titles().len();
+
     loop {
-        let mut table = Table::new();
-        table.set_header(table_generator.column_titles());
         let entries = runlog::FileStore::entry_iter(repo.shared_dot_hg_path())?;
-        for row in table_generator.generate_rows(entries, chrono::offset::Utc::now) {
-            table.add_row(row);
-        }
+        let header = Row {
+            columns: table_generator.column_titles().clone(),
+        };
+        let data_rows = table_generator.generate_rows(entries, chrono::offset::Utc::now);
+        let rows = Rows {
+            rows: std::iter::once(header)
+                .chain(data_rows.map(|columns| Row { columns }))
+                .collect(),
+            column_alignments: vec![Alignment::Left; num_columns],
+            column_min_widths: vec![0; num_columns],
+            column_max_widths: vec![usize::MAX; num_columns],
+        };
+
         if !running_in_tty {
-            write!(stdout, "{}\n", table)?;
+            write!(stdout, "{rows}\n")?;
             break;
         }
-        ctx.core
-            .io
-            .set_progress_str(format!("{}\n", table).as_str())?;
+        ctx.core.io.set_progress_str(format!("{rows}\n").as_str())?;
         sleep(Duration::from_millis(refresh_rate));
     }
 

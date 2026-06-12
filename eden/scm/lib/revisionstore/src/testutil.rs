@@ -145,13 +145,13 @@ impl RemoteDataStore for FakeRemoteDataStore {
 
 impl HgIdDataStore for FakeRemoteDataStore {
     fn get(&self, key: StoreKey) -> Result<StoreResult<Vec<u8>>> {
-        match self.prefetch(&[key.clone()]) {
+        match self.prefetch(std::slice::from_ref(&key)) {
             Err(_) => Ok(StoreResult::NotFound(key)),
             Ok(_) => self.store.get(key),
         }
     }
 
-    fn refresh(&self) -> Result<()> {
+    fn sync(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -190,7 +190,7 @@ impl HgIdHistoryStore for FakeRemoteHistoryStore {
         }
     }
 
-    fn refresh(&self) -> Result<()> {
+    fn sync(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -395,7 +395,7 @@ pub(crate) fn setconfig(
     name: &str,
     value: &str,
 ) {
-    config.insert(format!("{}.{}", section, name), value.to_string());
+    config.insert(format!("{section}.{name}"), value.to_string());
 }
 
 #[cfg(test)]
@@ -578,7 +578,7 @@ mod lfs_mocks {
         set("lfs.use-client-certs", "false");
         set(
             "experimental.lfs.user-agent",
-            &format!("mercurial/revisionstore/unittests/{}", agent_suffix),
+            &format!("mercurial/revisionstore/unittests/{agent_suffix}"),
         );
         set("lfs.threshold", "4");
         set("remotefilelog.lfs", "true");

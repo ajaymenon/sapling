@@ -74,8 +74,9 @@ int main(int argc, char** argv) {
       nextInodeNumber,
       lookup,
       FLAGS_num_error_discovery_threads);
-  checker.scanForErrors();
   if (FLAGS_dry_run || FLAGS_force) {
+    checker.scanForErrors(
+        /*progressCallback=*/[](auto) {}, /*includeWalChildren=*/true);
     checker.logErrors();
     fsInodeCatalog->close(nextInodeNumber);
   } else {

@@ -167,29 +167,25 @@ impl RendezVousConnection {
             fetch_single: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
-                    "commit_graph.fetch_single.{}",
-                    name
+                    "commit_graph.fetch_single.{name}"
                 ))),
             ),
             fetch_linear_prefetch: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
-                    "commit_graph.fetch_linear_prefetch.{}",
-                    name
+                    "commit_graph.fetch_linear_prefetch.{name}"
                 ))),
             ),
             fetch_skip_tree_prefetch: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
-                    "commit_graph.fetch_skip_tree_prefetch.{}",
-                    name
+                    "commit_graph.fetch_skip_tree_prefetch.{name}"
                 ))),
             ),
             fetch_exact_skip_tree_prefetch: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
-                    "commit_graph.fetch_exact_skip_tree_prefetch.{}",
-                    name
+                    "commit_graph.fetch_exact_skip_tree_prefetch.{name}"
                 ))),
             ),
         }
@@ -983,7 +979,7 @@ mononoke_queries! {
         "
     }
 
-    read SelectChangesetsIdsBounds(repo_id: RepositoryId) -> (u64, u64) {
+    read SelectChangesetsIdsBounds(repo_id: RepositoryId) -> (Option<u64>, Option<u64>) {
         "SELECT min(id), max(id)
          FROM commit_graph_edges
          WHERE repo_id = {repo_id}"
@@ -1270,7 +1266,7 @@ impl SqlCommitGraphStorage {
                                 ),
                                 parents: ChangesetNodeParents::new(),
                                 subtree_sources: ChangesetNodeSubtreeSources::new(),
-                                merge_ancestor,
+                                merge_ancestor_or_root: merge_ancestor,
                                 skip_tree_parent,
                                 skip_tree_skew_ancestor,
                                 p1_linear_skew_ancestor,
@@ -1400,12 +1396,11 @@ impl SqlCommitGraphStorage {
         }
 
         let sql_query_tel = ctx.sql_query_telemetry();
-        let should_apply_fallback = self.should_apply_fallback()?;
+        let should_apply_fallback = self.should_apply_fallback();
 
         if let Some(target) = prefetch.target() {
             let steps_limit =
-                justknobs::get_as::<u64>("scm/mononoke:commit_graph_prefetch_step_limit", None)
-                    .unwrap_or(DEFAULT_PREFETCH_STEP_LIMIT);
+                justknobs::get_as::<u64>("scm/mononoke:commit_graph_prefetch_step_limit", None);
 
             let fetched_edges = match target {
                 PrefetchTarget::LinearAncestors { steps, generation } => {
@@ -1545,7 +1540,7 @@ impl SqlCommitGraphStorage {
         )
         .await?;
         let cs_id_and_origin_to_edges =
-            Self::collect_changeset_edges_impl(&fetched_rows, self.should_apply_fallback()?);
+            Self::collect_changeset_edges_impl(&fetched_rows, self.should_apply_fallback());
         Ok(cs_id_and_origin_to_edges
             .into_iter()
             .map(|((cs_id, _origin_cs_id), (id, edges))| (cs_id, (id, ChangesetEdges::from(edges))))
@@ -1628,7 +1623,10 @@ impl SqlCommitGraphStorage {
             &self.repo_identity.id(),
         )
         .await?;
-        Ok(rows.first().map(|(lo, hi)| *lo..*hi + 1))
+        Ok(rows.first().and_then(|(lo, hi)| match (lo, hi) {
+            (Some(lo), Some(hi)) => Some(*lo..*hi + 1),
+            _ => None,
+        }))
     }
 
     /// Fetch the oldest `limit` changesets from all changesets that have auto-increment ids
@@ -1775,11 +1773,11 @@ impl SqlCommitGraphStorage {
                     e.parent_count(),
                     e.subtree_source_count(),
                     maybe_get_id(e.parents::<Parents>().next())?,
-                    maybe_get_id(e.merge_ancestor::<Parents>())?,
+                    maybe_get_id(e.merge_ancestor_or_root::<Parents>())?,
                     maybe_get_id(e.skip_tree_parent::<Parents>())?,
                     maybe_get_id(e.skip_tree_skew_ancestor::<Parents>())?,
                     maybe_get_id(e.skip_tree_skew_ancestor::<FirstParentLinear>())?,
-                    maybe_get_id(e.merge_ancestor::<ParentsAndSubtreeSources>())?,
+                    maybe_get_id(e.merge_ancestor_or_root::<ParentsAndSubtreeSources>())?,
                     maybe_get_id(e.skip_tree_parent::<ParentsAndSubtreeSources>())?,
                     maybe_get_id(e.skip_tree_skew_ancestor::<ParentsAndSubtreeSources>())?,
                 ))
@@ -1874,12 +1872,12 @@ impl SqlCommitGraphStorage {
 
 impl SqlCommitGraphStorage {
     /// Check if fallback should be applied for this repository
-    fn should_apply_fallback(&self) -> Result<bool> {
-        Ok(!justknobs::eval(
+    fn should_apply_fallback(&self) -> bool {
+        !justknobs::eval(
             "scm/mononoke:commit_graph_disable_subtree_source_fallback",
             None,
             Some(self.repo_identity.name()),
-        )?)
+        )
     }
 }
 
@@ -1890,18 +1888,14 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
     }
 
     async fn add_many(&self, ctx: &CoreContext, many_edges: Vec1<ChangesetEdges>) -> Result<usize> {
+        let max_retry_attempts =
+            justknobs::get_as::<usize>("scm/mononoke:commit_graph_storage_sql_retries_num", None);
         Ok(
             retry(|_| self._add_many(ctx, &many_edges), Duration::from_secs(1))
                 .exponential_backoff(1.2)
                 .jitter(Duration::from_secs(2))
                 .retry_if(|_attempt, err| should_retry_query(err))
-                .max_attempts(
-                    justknobs::get_as::<usize>(
-                        "scm/mononoke:commit_graph_storage_sql_retries_num",
-                        None,
-                    )
-                    .unwrap_or(1),
-                )
+                .max_attempts(max_retry_attempts)
                 .await?
                 .0,
         )
@@ -1969,7 +1963,9 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
             &edges.parent_count(),
             &edges.subtree_source_count(),
             &edges.parents::<Parents>().next().map(|node| node.cs_id),
-            &edges.merge_ancestor::<Parents>().map(|node| node.cs_id),
+            &edges
+                .merge_ancestor_or_root::<Parents>()
+                .map(|node| node.cs_id),
             &edges.skip_tree_parent::<Parents>().map(|node| node.cs_id),
             &edges
                 .skip_tree_skew_ancestor::<Parents>()
@@ -1978,7 +1974,7 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
                 .skip_tree_skew_ancestor::<FirstParentLinear>()
                 .map(|node| node.cs_id),
             &edges
-                .merge_ancestor::<ParentsAndSubtreeSources>()
+                .merge_ancestor_or_root::<ParentsAndSubtreeSources>()
                 .map(|node| node.cs_id),
             &edges
                 .skip_tree_parent::<ParentsAndSubtreeSources>()
@@ -2064,7 +2060,7 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
             .await?
             .remove(&cs_id)
             .map(|edges| edges.into())
-            .ok_or_else(|| anyhow!("Missing changeset from sql commit graph storage: {}", cs_id))
+            .ok_or_else(|| anyhow!("Missing changeset from sql commit graph storage: {cs_id}"))
     }
 
     async fn maybe_fetch_edges(
@@ -2097,7 +2093,7 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
                 unfetched_ids
                     .into_iter()
                     .fold(String::new(), |mut acc, cs_id| {
-                        let _ = write!(acc, "{}, ", cs_id);
+                        let _ = write!(acc, "{cs_id}, ");
                         acc
                     })
             );

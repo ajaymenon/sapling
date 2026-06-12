@@ -18,15 +18,12 @@ use manifest::File;
 use manifest::FileMetadata;
 use manifest::FsNodeMetadata;
 use once_cell::sync::OnceCell;
-use pathmatcher::DirectoryMatch;
-use pathmatcher::Matcher;
 use types::HgId;
-use types::Key;
 use types::PathComponentBuf;
 use types::RepoPath;
 use types::RepoPathBuf;
+use types::tree::TreeItemFlag;
 
-use crate::store;
 use crate::store::InnerStore;
 
 // Allows sending link between threads, but disallows general copying.
@@ -77,12 +74,31 @@ pub enum LinkData {
 }
 pub use self::LinkData::*;
 
+/// Result of materializing a durable tree entry's children.
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub enum MaybeLinks {
+    /// The tree was fetched successfully.
+    Links(BTreeMap<PathComponentBuf, Link>),
+    /// Access to this tree was denied by a path ACL.
+    PermissionDenied(types::errors::PermissionDenied),
+}
+
 // TODO: Use Vec instead of BTreeMap
 /// The inner structure of a durable link.
-#[derive(Debug)]
 pub struct DurableEntry {
     pub hgid: HgId,
-    pub links: OnceCell<BTreeMap<PathComponentBuf, Link>>,
+    pub links: OnceCell<MaybeLinks>,
+    tree_entry: OnceCell<Arc<dyn storemodel::TreeEntry>>,
+}
+
+impl std::fmt::Debug for DurableEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableEntry")
+            .field("hgid", &self.hgid)
+            .field("links", &self.links)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Link {
@@ -94,6 +110,17 @@ impl Link {
 
     pub fn durable(hgid: HgId) -> Link {
         Link::new(LinkData::Durable(Arc::new(DurableEntry::new(hgid))))
+    }
+
+    pub fn durable_permission_denied(err: types::errors::PermissionDenied) -> Link {
+        let hgid = err.hgid;
+        let links = OnceCell::new();
+        links.set(MaybeLinks::PermissionDenied(err)).unwrap();
+        Link::new(LinkData::Durable(Arc::new(DurableEntry {
+            hgid,
+            links,
+            tree_entry: OnceCell::new(),
+        })))
     }
 
     pub fn ephemeral() -> Link {
@@ -126,15 +153,6 @@ impl Link {
         match self.as_ref() {
             Leaf(metadata) => Some(File::new(path, *metadata)),
             _ => None,
-        }
-    }
-
-    pub fn matches(&self, matcher: &impl Matcher, path: &RepoPath) -> Result<bool> {
-        match self.as_ref() {
-            Leaf(_) => matcher.matches_file(path),
-            Durable(_) | Ephemeral(_) => {
-                Ok(matcher.matches_directory(path)? != DirectoryMatch::Nothing)
-            }
         }
     }
 
@@ -182,10 +200,10 @@ impl LinkData {
     ) -> Result<&mut BTreeMap<PathComponentBuf, Link>> {
         loop {
             match self {
-                Leaf(_) => bail!("Path {} is a file but a directory was expected.", parent),
+                Leaf(_) => bail!("Path {parent} is a file but a directory was expected."),
                 Ephemeral(links) => return Ok(links),
                 &mut Durable(ref entry) => {
-                    let durable_links = entry.materialize_links(store, parent, None)?;
+                    let durable_links = entry.materialize_links(store, parent)?;
                     *self = Ephemeral(durable_links.clone());
                 }
             };
@@ -198,50 +216,89 @@ impl DurableEntry {
         DurableEntry {
             hgid,
             links: OnceCell::new(),
+            tree_entry: OnceCell::new(),
+        }
+    }
+
+    pub fn with_links(hgid: HgId, links: OnceCell<MaybeLinks>) -> Self {
+        DurableEntry {
+            hgid,
+            links,
+            tree_entry: OnceCell::new(),
+        }
+    }
+
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(self.links.get(), Some(MaybeLinks::PermissionDenied(_)))
+    }
+
+    pub fn permission_denied_error(&self) -> Option<&types::errors::PermissionDenied> {
+        match self.links.get() {
+            Some(MaybeLinks::PermissionDenied(err)) => Some(err),
+            _ => None,
         }
     }
 
     /// Returns true if links have already been materialized.
     pub fn links_initialized(&self) -> bool {
-        self.links.get().is_some()
+        matches!(self.links.get(), Some(MaybeLinks::Links(_)))
+    }
+
+    pub fn get_tree_entry(&self) -> Option<&Arc<dyn storemodel::TreeEntry>> {
+        self.tree_entry.get()
     }
 
     pub fn materialize_links(
         &self,
         store: &InnerStore,
         path: &RepoPath,
-        prefetched_data: Option<&minibytes::Bytes>,
     ) -> Result<&BTreeMap<PathComponentBuf, Link>> {
-        self.links.get_or_try_init(|| {
-            let entry = match prefetched_data {
-                Some(data) => store::Entry(data.clone(), store.format()),
-                None => store.get_entry(path, self.hgid).with_context(|| {
-                    format!("failed fetching from store ({}, {})", path, self.hgid)
-                })?,
+        let maybe = self.links.get_or_try_init(|| -> Result<MaybeLinks> {
+            let tree_entry = match store.get_tree_entry(path, self.hgid) {
+                Ok(entry) => entry,
+                Err(err) => match err.downcast::<types::errors::PermissionDenied>() {
+                    Ok(perm_denied) => return Ok(MaybeLinks::PermissionDenied(perm_denied)),
+                    Err(err) => {
+                        return Err(err.context(format!(
+                            "failed fetching from store ({}, {})",
+                            path, self.hgid
+                        )))
+                    }
+                },
             };
 
             let mut links = BTreeMap::new();
-            for element_result in entry.elements() {
-                let element = element_result.with_context(|| {
+            for item_result in tree_entry.iter()? {
+                let (component, hgid, flag) = item_result.with_context(|| {
                     format!(
-                        "failed to deserialize manifest entry {:?} for ({}, {}) (store: {:?}, format: {:?})",
-                        entry,
+                        "failed to deserialize manifest entry for ({}, {}) (store: {:?}, format: {:?})",
                         path,
                         self.hgid,
                         store.type_name(),
                         store.format(),
                     )
                 })?;
-                let link = match element.flag {
-                    store::Flag::File(file_type) => {
-                        Link::leaf(FileMetadata::new(element.hgid, file_type))
+                let link = match flag {
+                    TreeItemFlag::File(file_type) => {
+                        Link::leaf(FileMetadata::new(hgid, file_type))
                     }
-                    store::Flag::Directory => Link::durable(element.hgid),
+                    TreeItemFlag::Directory => Link::durable(hgid),
                 };
-                links.insert(element.component, link);
+                links.insert(component.to_owned(), link);
             }
-            Ok(links)
-        })
+
+            let _ = self.tree_entry.set(tree_entry);
+
+            Ok(MaybeLinks::Links(links))
+        })?;
+        match maybe {
+            MaybeLinks::Links(links) => Ok(links),
+            MaybeLinks::PermissionDenied(err) => {
+                let mut err = err.clone();
+                err.path = path.to_owned();
+                Err(err.into())
+            }
+        }
     }
 }
 
@@ -339,16 +396,23 @@ impl DirLink {
         let links = match self.link.as_ref() {
             Leaf(_) => panic!("programming error: directory cannot be a leaf node"),
             Ephemeral(links) => links,
-            Durable(entry) => entry.materialize_links(store, &self.path, None)?,
+            Durable(entry) => entry.materialize_links(store, &self.path)?,
         };
         Ok(links.iter())
     }
 
-    /// Create a `Key` (path/hgid pair) corresponding to this directory. Keys are used
-    /// by the Eden API to fetch data from the server, making this representation useful
-    /// for interacting with Mercurial's data fetching code.
-    pub fn key(&self) -> Option<Key> {
-        Some(Key::new(self.path.clone(), self.hgid().clone()?))
+    pub fn is_permission_denied(&self) -> bool {
+        match self.link.as_ref() {
+            Durable(entry) => entry.is_permission_denied(),
+            _ => false,
+        }
+    }
+
+    pub fn permission_denied_error(&self) -> Option<&types::errors::PermissionDenied> {
+        match self.link.as_ref() {
+            Durable(entry) => entry.permission_denied_error(),
+            _ => None,
+        }
     }
 }
 

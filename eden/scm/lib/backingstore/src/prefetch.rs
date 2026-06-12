@@ -51,6 +51,7 @@ pub(crate) struct Config {
     pub(crate) max_initial_lag: u64,
     pub(crate) min_ratio: f64,
     pub(crate) min_interval: Duration,
+    pub(crate) skip_lfs: bool,
 }
 
 impl Default for Config {
@@ -59,6 +60,7 @@ impl Default for Config {
             max_initial_lag: 1000,
             min_ratio: 0.1,
             min_interval: Duration::from_millis(10),
+            skip_lfs: true,
         }
     }
 }
@@ -481,10 +483,11 @@ fn prefetch(
             }
 
             // Use IGNORE_RESULT optimization since we don't care about the data.
-            let fctx = FetchContext::new_with_cause(
+            let fctx = FetchContext::new_with_mode_and_cause(
                 FetchMode::AllowRemote | FetchMode::IGNORE_RESULT,
                 FetchCause::EdenWalkPrefetch,
-            );
+            )
+            .with_skip_lfs(config.skip_lfs);
 
             // An important implementation detail for us: the scmstore FileStore spawns a thread
             // when you fetch more than 1_000 keys (i.e. this method will operate asynchronously if
@@ -670,6 +673,7 @@ mod test {
     use anyhow::anyhow;
     use manifest::FileMetadata;
     use manifest_tree::TreeManifest;
+    use manifest_tree::testutil;
     use manifest_tree::testutil::TestStore;
     use pathmatcher::TreeMatcher;
     use rand_chacha::ChaChaRng;
@@ -690,10 +694,15 @@ mod test {
         let exclude_dir: RepoPathBuf = "excludeme".to_string().try_into()?;
 
         // Insert a few files into the file store.
-        let foo_hgid = file_store.insert_data(Default::default(), &foo_path, b"foo content")?;
-        let bar_hgid = file_store.insert_data(Default::default(), &bar_path, b"bar content")?;
-        let exclude_hgid =
-            file_store.insert_data(Default::default(), &exclude_path, b"excluded content")?;
+        let foo_hgid =
+            file_store.insert_data(Default::default(), &foo_path, b"foo content".into())?;
+        let bar_hgid =
+            file_store.insert_data(Default::default(), &bar_path, b"bar content".into())?;
+        let exclude_hgid = file_store.insert_data(
+            Default::default(),
+            &exclude_path,
+            b"excluded content".into(),
+        )?;
 
         let mut mf = TreeManifest::ephemeral(store.clone());
 
@@ -823,10 +832,15 @@ mod test {
         let exclude_dir: RepoPathBuf = "excludeme".to_string().try_into()?;
 
         // Insert a few files into the file store.
-        let foo_hgid = file_store.insert_data(Default::default(), &foo_path, b"foo content")?;
-        let bar_hgid = file_store.insert_data(Default::default(), &bar_path, b"bar content")?;
-        let exclude_hgid =
-            file_store.insert_data(Default::default(), &exclude_path, b"excluded content")?;
+        let foo_hgid =
+            file_store.insert_data(Default::default(), &foo_path, b"foo content".into())?;
+        let bar_hgid =
+            file_store.insert_data(Default::default(), &bar_path, b"bar content".into())?;
+        let exclude_hgid = file_store.insert_data(
+            Default::default(),
+            &exclude_path,
+            b"excluded content".into(),
+        )?;
 
         let mut mf = TreeManifest::ephemeral(store.clone());
 
@@ -846,21 +860,11 @@ mod test {
             FileMetadata::new(exclude_hgid, types::FileType::Regular),
         )?;
 
-        // Finalize and store tree data, capturing tree hgids by path
-        let mut tree_hgids: HashMap<RepoPathBuf, HgId> = HashMap::new();
-        for (path, id, text, _p1, _p2) in mf.finalize(Vec::new())? {
-            store.insert_data(Default::default(), &path, text.as_ref())?;
-            tree_hgids.insert(path, id);
-        }
-        let root_hgid = *tree_hgids
-            .get(&RepoPathBuf::new())
-            .expect("should have root hgid");
+        let root_hgid = mf.persist(&[])?;
         let dir_path: RepoPathBuf = "dir".to_string().try_into()?;
-        let dir_hgid = *tree_hgids.get(&dir_path).expect("should have dir hgid");
+        let dir_hgid = testutil::get_hgid(&mf, &dir_path);
         let excludeme_path: RepoPathBuf = "excludeme".to_string().try_into()?;
-        let excludeme_hgid = *tree_hgids
-            .get(&excludeme_path)
-            .expect("should have excludeme hgid");
+        let excludeme_hgid = testutil::get_hgid(&mf, &excludeme_path);
 
         // Create a fresh durable manifest from the root hgid to ensure fetches happen
         let mf = TreeManifest::durable(store.clone(), root_hgid);
@@ -969,6 +973,10 @@ mod test {
         fn get_root_id(&self, _commit_id: &HgId) -> anyhow::Result<HgId> {
             unimplemented!()
         }
+
+        fn get_by_root_id(&self, _root_id: &HgId) -> anyhow::Result<TreeManifest> {
+            unimplemented!()
+        }
     }
 
     #[test]
@@ -989,17 +997,20 @@ mod test {
 
         // Insert a few files into the file store.
         let dir1_foo_hgid =
-            file_store.insert_data(Default::default(), &dir1_foo_path, b"foo content")?;
+            file_store.insert_data(Default::default(), &dir1_foo_path, b"foo content".into())?;
         let dir1_bar_hgid =
-            file_store.insert_data(Default::default(), &dir1_bar_path, b"bar content")?;
+            file_store.insert_data(Default::default(), &dir1_bar_path, b"bar content".into())?;
         let dir2_foo_hgid =
-            file_store.insert_data(Default::default(), &dir2_foo_path, b"foo content!")?;
+            file_store.insert_data(Default::default(), &dir2_foo_path, b"foo content!".into())?;
         let dir2_bar_hgid =
-            file_store.insert_data(Default::default(), &dir2_bar_path, b"bar content!")?;
+            file_store.insert_data(Default::default(), &dir2_bar_path, b"bar content!".into())?;
         let dir3_foo_hgid =
-            file_store.insert_data(Default::default(), &dir3_foo_path, b"foo content!!")?;
-        let exclude_hgid =
-            file_store.insert_data(Default::default(), &exclude_path, b"excluded content")?;
+            file_store.insert_data(Default::default(), &dir3_foo_path, b"foo content!!".into())?;
+        let exclude_hgid = file_store.insert_data(
+            Default::default(),
+            &exclude_path,
+            b"excluded content".into(),
+        )?;
 
         let mut mf = TreeManifest::ephemeral(tree_store.clone());
 
@@ -1035,14 +1046,7 @@ mod test {
         )?;
 
         // Finalize and store tree data
-        let mut root_hgid = None;
-        for (path, id, text, _p1, _p2) in mf.finalize(Vec::new())? {
-            tree_store.insert_data(Default::default(), &path, text.as_ref())?;
-            if path.is_empty() {
-                root_hgid = Some(id);
-            }
-        }
-        let root_hgid = root_hgid.expect("should have root hgid");
+        let root_hgid = mf.persist(&[])?;
 
         let mut rng = ChaChaRng::from_seed([0u8; 32]);
         let stub_commit_id = HgId::random(&mut rng);
@@ -1079,9 +1083,7 @@ mod test {
         for exp_hgid in &expected_file_hgids {
             assert!(
                 fetches.iter().any(|f| f.hgid == *exp_hgid),
-                "expected hgid {:?} in fetches {:?}",
-                exp_hgid,
-                fetches
+                "expected hgid {exp_hgid:?} in fetches {fetches:?}"
             );
         }
 
@@ -1127,9 +1129,7 @@ mod test {
         for exp_hgid in &expected_file_hgids {
             assert!(
                 fetches.iter().any(|f| f.hgid == *exp_hgid),
-                "expected hgid {:?} in fetches {:?}",
-                exp_hgid,
-                fetches
+                "expected hgid {exp_hgid:?} in fetches {fetches:?}"
             );
         }
 
@@ -1145,8 +1145,10 @@ mod test {
         let foo_path: RepoPathBuf = "dir1/foo".to_string().try_into()?;
         let bar_path: RepoPathBuf = "dir2/bar".to_string().try_into()?;
 
-        let foo_hgid = file_store.insert_data(Default::default(), &foo_path, b"foo content")?;
-        let bar_hgid = file_store.insert_data(Default::default(), &bar_path, b"bar content")?;
+        let foo_hgid =
+            file_store.insert_data(Default::default(), &foo_path, b"foo content".into())?;
+        let bar_hgid =
+            file_store.insert_data(Default::default(), &bar_path, b"bar content".into())?;
 
         let mut mf = TreeManifest::ephemeral(tree_store.clone());
 
@@ -1161,19 +1163,11 @@ mod test {
             FileMetadata::new(bar_hgid, types::FileType::Regular),
         )?;
 
-        // Finalize and store tree data, capturing tree hgids by path
-        let mut tree_hgids: HashMap<RepoPathBuf, HgId> = HashMap::new();
-        for (path, id, text, _p1, _p2) in mf.finalize(Vec::new())? {
-            tree_store.insert_data(Default::default(), &path, text.as_ref())?;
-            tree_hgids.insert(path, id);
-        }
-        let root_hgid = *tree_hgids
-            .get(&RepoPathBuf::new())
-            .expect("should have root hgid");
+        let root_hgid = mf.persist(&[])?;
         let dir1_path: RepoPathBuf = "dir1".to_string().try_into()?;
-        let dir1_hgid = *tree_hgids.get(&dir1_path).expect("should have dir1 hgid");
+        let dir1_hgid = testutil::get_hgid(&mf, &dir1_path);
         let dir2_path: RepoPathBuf = "dir2".to_string().try_into()?;
-        let dir2_hgid = *tree_hgids.get(&dir2_path).expect("should have dir2 hgid");
+        let dir2_hgid = testutil::get_hgid(&mf, &dir2_path);
 
         let mut detector = walkdetector::Detector::new();
         detector.set_walk_threshold(2);
@@ -1257,11 +1251,50 @@ mod test {
     }
 
     #[test]
+    fn test_config_skip_lfs_defaults_true() {
+        let config = Config::default();
+        assert!(config.skip_lfs);
+    }
+
+    #[test]
+    fn test_prefetch_passes_skip_lfs() -> anyhow::Result<()> {
+        let tree_store = Arc::new(TestStore::new());
+        let file_store = Arc::new(TestStore::new());
+
+        let path: RepoPathBuf = "file.txt".to_string().try_into()?;
+        let hgid = file_store.insert_data(Default::default(), &path, b"content".into())?;
+
+        let mut mf = TreeManifest::ephemeral(tree_store);
+        mf.insert(path, FileMetadata::new(hgid, types::FileType::Regular))?;
+
+        let detector = walkdetector::Detector::new();
+        let handle = prefetch(
+            Config::default(),
+            mf,
+            file_store.clone(),
+            detector,
+            PrefetchWork::FileContent("".to_string().try_into()?, 0, None),
+            None,
+        );
+
+        while !handle.is_done() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let contexts = file_store.fetch_contexts();
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts[0].skip_lfs());
+
+        Ok(())
+    }
+
+    #[test]
     fn test_should_pause_prefetch() -> anyhow::Result<()> {
         let config = Config {
             min_ratio: 0.1,
             max_initial_lag: 20,
             min_interval: Duration::from_millis(1),
+            ..Default::default()
         };
 
         let mut detector = walkdetector::Detector::new();

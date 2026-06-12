@@ -9,11 +9,17 @@
 
 #include "eden/fs/fuse/FuseDispatcher.h"
 
+#include <limits>
+
 #include <folly/test/TestUtils.h>
 #include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
+#include "eden/fs/inodes/EdenMount.h"
+#include "eden/fs/inodes/InodeMap.h"
+#include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/model/Blob.h"
 #include "eden/fs/store/ObjectFetchContext.h"
+#include "eden/fs/testharness/FakeFuse.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/StoredObject.h"
 #include "eden/fs/testharness/TestMount.h"
@@ -140,6 +146,205 @@ TEST(RawEdenDispatcherTest, lookup_returns_valid_inode_for_good_file) {
   EXPECT_NE(0u, entry.nodeid);
   EXPECT_NE(0, entry.attr.ino);
   EXPECT_EQ(entry.nodeid, entry.attr.ino);
+}
+
+TEST(RawEdenDispatcherTest, lookup_updates_last_used_time) {
+  FakeTreeBuilder builder;
+  builder.setFile("hello", "world");
+  TestMount mount{builder};
+
+  // Lookup to load the inode and get its number
+  auto entry =
+      mount.getDispatcher()
+          ->lookup(
+              0, kRootNodeId, "hello"_pc, ObjectFetchContext::getNullContext())
+          .get(0ms);
+  auto ino = InodeNumber{entry.nodeid};
+  auto inode = mount.getEdenMount()->getInodeMap()->lookupInode(ino).get(0ms);
+  auto timeAfterLookup = inode->getLastFsRequestTime();
+
+  // Advance the clock
+  mount.getClock().advance(60s);
+
+  // Another lookup should update lastFsRequestTime
+  mount.getDispatcher()
+      ->lookup(0, kRootNodeId, "hello"_pc, ObjectFetchContext::getNullContext())
+      .get(0ms);
+  auto timeAfterSecondLookup = inode->getLastFsRequestTime();
+  EXPECT_GT(
+      timeAfterSecondLookup.toTimespec().tv_sec,
+      timeAfterLookup.toTimespec().tv_sec);
+}
+
+TEST(RawEdenDispatcherTest, getattr_updates_last_used_time) {
+  FakeTreeBuilder builder;
+  builder.setFile("hello", "world");
+  TestMount mount{builder};
+
+  // Lookup to load the inode
+  auto entry =
+      mount.getDispatcher()
+          ->lookup(
+              0, kRootNodeId, "hello"_pc, ObjectFetchContext::getNullContext())
+          .get(0ms);
+  auto ino = InodeNumber{entry.nodeid};
+  auto inode = mount.getEdenMount()->getInodeMap()->lookupInode(ino).get(0ms);
+
+  // Advance the clock
+  mount.getClock().advance(60s);
+
+  // getattr should update lastFsRequestTime
+  auto timeBefore = inode->getLastFsRequestTime();
+  mount.getDispatcher()
+      ->getattr(ino, ObjectFetchContext::getNullContext())
+      .get(0ms);
+  auto timeAfter = inode->getLastFsRequestTime();
+  EXPECT_GT(timeAfter.toTimespec().tv_sec, timeBefore.toTimespec().tv_sec);
+}
+
+TEST(RawEdenDispatcherTest, lookup_returns_infinite_ttl_without_pressure_gc) {
+  FakeTreeBuilder builder;
+  builder.setFile("hello", "world");
+  TestMount mount{builder};
+
+  auto entry =
+      mount.getDispatcher()
+          ->lookup(
+              0, kRootNodeId, "hello"_pc, ObjectFetchContext::getNullContext())
+          .get(0ms);
+  // Without pressure-based GC, TTL should be the default infinite value
+  EXPECT_EQ(
+      static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
+      entry.entry_valid);
+  EXPECT_EQ(
+      static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
+      entry.attr_valid);
+}
+
+TEST(RawEdenDispatcherTest, lookup_returns_configured_negative_dcache_ttl) {
+  TestMount mount{FakeTreeBuilder{}};
+
+  mount.updateEdenConfig({
+      {"fuse:negative-dcache-ttl-seconds", "7"},
+  });
+
+  auto entry = mount.getDispatcher()
+                   ->lookup(
+                       0,
+                       kRootNodeId,
+                       "missing"_pc,
+                       ObjectFetchContext::getNullContext())
+                   .get(0ms);
+
+  EXPECT_EQ(0u, entry.nodeid);
+  EXPECT_EQ(7u, entry.entry_valid);
+  EXPECT_EQ(7u, entry.attr_valid);
+}
+
+TEST(RawEdenDispatcherTest, lookup_returns_dynamic_ttl_with_pressure_gc) {
+  FakeTreeBuilder builder;
+  builder.setFile("hello", "world");
+  TestMount mount{builder};
+
+  // Enable pressure-based GC with known settings
+  mount.updateEdenConfig({
+      {"experimental:enable-pressure-based-gc", "true"},
+      {"mount:gc-pressure-min-inodes", "10"},
+      {"mount:gc-pressure-max-inodes", "10000"},
+      {"mount:fuse-ttl-max-seconds", "3600"},
+      {"mount:fuse-ttl-min-seconds", "1"},
+  });
+  mount.getEdenMount()->updateInodePressurePolicy();
+
+  auto entry =
+      mount.getDispatcher()
+          ->lookup(
+              0, kRootNodeId, "hello"_pc, ObjectFetchContext::getNullContext())
+          .get(0ms);
+  // With very few inodes (below min of 10), TTL should be max value of 3600
+  EXPECT_EQ(3600u, entry.entry_valid);
+  EXPECT_EQ(3600u, entry.attr_valid);
+}
+
+TEST(RawEdenDispatcherTest, getattr_returns_dynamic_ttl_with_pressure_gc) {
+  FakeTreeBuilder builder;
+  builder.setFile("hello", "world");
+  TestMount mount{builder};
+
+  mount.updateEdenConfig({
+      {"experimental:enable-pressure-based-gc", "true"},
+      {"mount:gc-pressure-min-inodes", "10"},
+      {"mount:gc-pressure-max-inodes", "10000"},
+      {"mount:fuse-ttl-max-seconds", "3600"},
+      {"mount:fuse-ttl-min-seconds", "1"},
+  });
+  mount.getEdenMount()->updateInodePressurePolicy();
+
+  // First lookup to get the inode number
+  auto entry =
+      mount.getDispatcher()
+          ->lookup(
+              0, kRootNodeId, "hello"_pc, ObjectFetchContext::getNullContext())
+          .get(0ms);
+
+  // Now getattr on that inode
+  auto attr =
+      mount.getDispatcher()
+          ->getattr(
+              InodeNumber{entry.nodeid}, ObjectFetchContext::getNullContext())
+          .get(0ms);
+  EXPECT_EQ(3600u, attr.timeout_seconds);
+}
+
+TEST(
+    RawEdenDispatcherTest,
+    pressure_gc_collapse_grace_collapses_recent_subtree) {
+#ifndef __linux__
+  GTEST_SKIP() << "FakeFuse invalidation tests are Linux-only";
+#else
+  FakeTreeBuilder builder;
+  builder.setFile("dir/file.txt", "contents");
+  builder.setFile("dir/cold.txt", "not loaded");
+  TestMount mount{builder};
+
+  mount.updateEdenConfig({
+      {"experimental:enable-pressure-based-gc", "true"},
+      {"mount:pressure-gc-collapse-grace", "5s"},
+  });
+
+  auto fuse = std::make_shared<FakeFuse>();
+  mount.startFuseAndWait(fuse);
+
+  auto dirEntry =
+      mount.getDispatcher()
+          ->lookup(
+              0, kRootNodeId, "dir"_pc, ObjectFetchContext::getNullContext())
+          .get(0ms);
+  mount.getDispatcher()
+      ->lookup(
+          0,
+          InodeNumber{dirEntry.nodeid},
+          "file.txt"_pc,
+          ObjectFetchContext::getNullContext())
+      .get(0ms);
+
+  mount.getClock().advance(6s);
+  auto cutoff = folly::to<std::chrono::system_clock::time_point>(
+                    mount.getClock().getRealtime()) -
+      10s;
+
+  auto numInvalidated = mount.getEdenMount()
+                            ->getRootInode()
+                            ->handleChildrenNotAccessedRecently(
+                                cutoff, ObjectFetchContext::getNullContext())
+                            .get(10s);
+  EXPECT_EQ(1u, numInvalidated);
+
+  mount.getEdenMount()->flushInvalidations().get(10s);
+  fuse->close();
+  mount.getEdenMount()->getFsChannelCompletionFuture().within(10s).getVia(
+      mount.getServerExecutor().get());
+#endif
 }
 
 TEST(RawEdenDispatcherTest, lookup_returns_valid_inode_for_bad_file) {

@@ -15,8 +15,8 @@ use criterion::Criterion;
 use criterion::Throughput;
 use futures::stream::FuturesUnordered;
 use futures::stream::TryStreamExt;
-use rand::Rng;
-use rand::RngCore;
+use rand::Rng as _;
+use rand::RngExt as _;
 use rand::rng;
 use tokio::runtime::Handle;
 
@@ -35,7 +35,7 @@ pub fn benchmark(
         for concurrency in [4, 16, 256] {
             group.throughput(Throughput::Bytes(size as u64 * concurrency as u64));
             group.bench_with_input(
-                BenchmarkId::from_parameter(format!("{} x{}", size, concurrency)),
+                BenchmarkId::from_parameter(format!("{size} x{concurrency}")),
                 &size,
                 |b, &size| {
                     let blocks: Vec<_> = std::iter::repeat_n((), concurrency)

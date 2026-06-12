@@ -16,7 +16,6 @@
 #include <folly/stop_watch.h>
 #include <optional>
 
-#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/FileUtils.h"
 #include "eden/common/utils/PathFuncs.h"
@@ -29,6 +28,7 @@
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/store/ObjectStore.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/LogEvent.h"
 
@@ -69,8 +69,7 @@ PrjfsDispatcherImpl::PrjfsDispatcherImpl(EdenMount* mount)
     : PrjfsDispatcher(mount->getStats().copy()),
       mount_{mount},
       dotEdenConfig_{makeDotEdenConfig(*mount)},
-      symlinksEnabled_{
-          mount_->getCheckoutConfig()->getEnableWindowsSymlinks()} {}
+      symlinksEnabled_{true} {}
 
 EdenTimestamp PrjfsDispatcherImpl::getLastCheckoutTime() const {
   return mount_->getLastCheckoutTime();
@@ -90,8 +89,6 @@ ImmediateFuture<std::vector<PrjfsDirEntry>> PrjfsDispatcherImpl::opendir(
                         path,
                         isRoot,
                         objectStore = mount_->getObjectStore(),
-                        symlinksSupported = mount_->getCheckoutConfig()
-                                                ->getEnableWindowsSymlinks(),
                         context = context.copy()](
                            std::variant<std::shared_ptr<const Tree>, TreeEntry>
                                treeOrTreeEntry) mutable {
@@ -109,8 +106,7 @@ ImmediateFuture<std::vector<PrjfsDirEntry>> PrjfsDispatcherImpl::opendir(
                       ImmediateFuture<uint64_t>(0ull));
                 } else {
                   auto optSymlinkTargetFut =
-                      (symlinksSupported &&
-                       treeEntry.second.getDtype() == dtype_t::Symlink)
+                      treeEntry.second.getDtype() == dtype_t::Symlink
                       ? std::make_optional(
                             objectStore
                                 ->getBlob(
@@ -790,15 +786,11 @@ ImmediateFuture<OnDiskState> getOnDiskState(
     return recheckDiskState(
         mount, path, receivedAt, retry, OnDiskStateTypes::MaterializedFile);
   } else if (fileType == boost::filesystem::symlink_file) {
-    if (mount.getCheckoutConfig()->getEnableWindowsSymlinks()) {
-      auto symlinkTarget = boost::filesystem::read_symlink(boostPath, ec);
-      if (ec.value() == 0) {
-        return OnDiskState(
-            OnDiskStateTypes::MaterializedSymlink, symlinkTarget);
-      }
-      return getOnDiskState(mount, path, receivedAt, retry + 1);
+    auto symlinkTarget = boost::filesystem::read_symlink(boostPath, ec);
+    if (ec.value() == 0) {
+      return OnDiskState(OnDiskStateTypes::MaterializedSymlink, symlinkTarget);
     }
-    return OnDiskState(OnDiskStateTypes::MaterializedFile);
+    return getOnDiskState(mount, path, receivedAt, retry + 1);
   } else if (fileType == boost::filesystem::reparse_file) {
     // Boost reports anything that is a reparse point which is not a symlink a
     // reparse_file. In particular, socket are reported as such.
@@ -967,9 +959,9 @@ ImmediateFuture<folly::Unit> recursivelyUpdateChildrens(
   // with the ones in the inode.
   PathMap<folly::Unit> map{CaseSensitivity::Insensitive};
   {
-    auto content = tree->getContents().rlock();
-    map.reserve(direntNames.size() + content->entries.size());
-    for (const auto& entry : content->entries) {
+    auto contents = tree->lockContentsRead();
+    map.reserve(direntNames.size() + contents->entries.size());
+    for (const auto& entry : contents->entries) {
       map.emplace(entry.first, folly::unit);
     }
   }
@@ -1189,7 +1181,7 @@ ImmediateFuture<folly::Unit> fileNotificationImpl(
 }
 
 /**
- * Matches EdenFS's view of a file/directory to it's state on disk. This is
+ * Matches EdenFS's view of a file/directory to its state on disk. This is
  * mostly used in response to notifications about file modifications from PrjFS.
  * But can also be used to correct EdenFS's view of a file.
  *
@@ -1245,7 +1237,7 @@ ImmediateFuture<folly::Unit> fileNotification(
             // test, these should be treated as fatal errors, so we don't let
             // errors silently pass tests. In release builds, let's be less
             // aggressive and just log.
-            mount.getServerState()->getStructuredLogger()->logEvent(
+            mount.getServerState()->getEdenFsEventsLogger()->logEvent(
                 PrjFSFileNotificationFailure{
                     folly::exceptionStr(ew).toStdString(), path.asString()});
             if (dfatal_error) {
@@ -1467,6 +1459,39 @@ PrjfsDispatcherImpl::waitForPendingNotifications() {
                 &PrjfsStats::filesystemSyncFailure);
             ew.throw_exception();
           });
+}
+
+folly::coro::now_task<folly::Unit>
+PrjfsDispatcherImpl::co_waitForPendingNotifications() {
+  // Since the executor is a SequencedExecutor, and the fileNotification
+  // function blocks in the executor, the body of the lambda will only be
+  // executed when all previously enqueued notifications have completed.
+  //
+  // Note that this synchronization only guarantees that writes from a the
+  // calling application thread have completed when the future complete. Writes
+  // made by a concurrent process or a different thread may still be in
+  // ProjectedFS queue and therefore may still be pending when the future
+  // complete. This is expected and therefore not a bug.
+  //
+  // We use folly::via to guarantee scheduling onto the notification executor's
+  // queue. This ensures the lambda runs after all previously enqueued
+  // notifications have completed. co_viaIfAsync cannot be used here because it
+  // may skip the reschedule if already on the executor, which would defeat the
+  // purpose of waiting for pending notifications.
+  folly::stop_watch<std::chrono::microseconds> timer{};
+  try {
+    co_await folly::via(
+        getNotificationExecutor(), [this, timer = std::move(timer)]() {
+          this->mount_->getStats()->addDuration(
+              &PrjfsStats::filesystemSync, timer.elapsed());
+          this->mount_->getStats()->increment(
+              &PrjfsStats::filesystemSyncSuccessful);
+        });
+  } catch (...) {
+    this->mount_->getStats()->increment(&PrjfsStats::filesystemSyncFailure);
+    throw;
+  }
+  co_return folly::unit;
 }
 
 } // namespace facebook::eden

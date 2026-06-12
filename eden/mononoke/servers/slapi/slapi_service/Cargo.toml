@@ -8,8 +8,8 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
-async-compression = { version = "0.4.9", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
+anyhow = "1.0.102"
+async-compression = { version = "0.4.42", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
 async-stream = "0.3"
 async-trait = "0.1.86"
 base64 = { version = "0.22.1", features = ["alloc"] }
@@ -18,6 +18,7 @@ bonsai_hg_mapping = { version = "0.1.0", path = "../../../repo_attributes/bonsai
 bookmarks = { version = "0.1.0", path = "../../../repo_attributes/bookmarks" }
 bookmarks_movement = { version = "0.1.0", path = "../../../repo_attributes/bookmarks/bookmarks_movement" }
 bytes = { version = "1.11.1", features = ["serde"] }
+cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 commit_cloud_types = { version = "0.1.0", path = "../../../features/commit_cloud/types" }
 commit_graph = { version = "0.1.0", path = "../../../repo_attributes/commit_graph/commit_graph" }
@@ -29,15 +30,15 @@ futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_types = { version = "0.1.0", path = "../../../git/git_types" }
-gotham = "0.7.4"
-gotham_derive = "0.7.0"
+gotham = "0.8"
+gotham_derive = "0.8"
 gotham_ext = { version = "0.1.0", path = "../../../common/gotham_ext" }
 hex = { version = "0.4.3", features = ["alloc"] }
 hooks = { version = "0.1.0", path = "../../../features/hooks" }
-http = "0.2"
-hyper = { version = "0.14.26", features = ["client", "http1", "http2", "stream"] }
+http = "=1.4.0"
+http-body-util = "0.1.0"
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
 lazy_static = "1.5"
 manifest = { version = "0.1.0", path = "../../../manifest" }
 maplit = "1.0"
@@ -50,14 +51,15 @@ mononoke_configs = { version = "0.1.0", path = "../../../common/mononoke_configs
 mononoke_macros = { version = "0.1.0", path = "../../../common/mononoke_macros" }
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
 nonzero_ext = "0.2"
-once_cell = "1.21"
+once_cell = "1.21.4"
 permission_checker = { version = "0.1.0", path = "../../../common/permission_checker" }
-pin-project = "1.1.10"
-rand = { version = "0.9", features = ["small_rng"] }
+pin-project = "1.1.13"
+rand = "0.10.1"
 rate_limiting = { version = "0.1.0", path = "../../../common/rate_limiting" }
 rayon = "1.11.0"
 repo_blobstore = { version = "0.1.0", path = "../../../repo_attributes/repo_blobstore" }
 repo_identity = { version = "0.1.0", path = "../../../repo_attributes/repo_identity" }
+sapling-cats-constants = { version = "0.1.0", path = "../../../../scm/lib/cats/constants" }
 sapling-clientinfo = { version = "0.1.0", path = "../../../../scm/lib/clientinfo" }
 sapling-dag-types = { version = "0.1.0", path = "../../../../scm/lib/dag/dag-types" }
 sapling-edenapi_types = { version = "0.1.0", path = "../../../../scm/lib/edenapi/types" }
@@ -65,21 +67,22 @@ sapling-revisionstore_types = { version = "0.1.0", path = "../../../../scm/lib/r
 sapling-types = { version = "0.1.0", path = "../../../../scm/lib/types" }
 scuba_ext = { version = "0.1.0", path = "../../../common/scuba_ext" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_cbor = "0.11"
+serde_cbor = "0.11.2"
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 sha2 = "0.10.6"
-smallvec = { version = "1.15", features = ["impl_bincode", "serde", "specialization", "union"] }
-sorted_vector_map = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+smallvec = { version = "1.15", features = ["impl_bincode", "serde", "specialization", "union", "write"] }
+sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 streaming_clone = { version = "0.1.0", path = "../../../repo_client/streaming_clone" }
 thiserror = "2.0.18"
 time_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 time_window_counter = { version = "0.1.0", path = "../../../common/time_window_counter" }
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
-tokio-util = { version = "0.7.15", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
+tokio-util = { version = "0.7.18", features = ["full"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-vec1 = { version = "1", features = ["serde"] }
+vec1 = { version = "1.12.1", features = ["serde"] }
 
 [dev-dependencies]
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 rate_limiting_config = { version = "0.1.0", path = "../../../../../configerator/structs/scm/mononoke/ratelimiting" }
+restricted_paths = { version = "0.1.0", path = "../../../repo_attributes/restricted_paths" }

@@ -13,9 +13,9 @@ license = "MIT"
 name = "metalog"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 hex = { version = "0.4.3", features = ["alloc"] }
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-hgtime = { version = "0.1.0", path = "../hgtime" }
 sapling-indexedlog = { version = "0.1.0", path = "../indexedlog" }
 sapling-mincode = { version = "0.1.0", path = "../mincode" }
@@ -28,7 +28,7 @@ serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-quickcheck = "1.0"
-rand_chacha = "0.3"
-rand_core = { version = "0.6.4", features = ["getrandom", "std"], default-features = false }
-tempfile = "3.22"
+quickcheck = "1.1"
+rand_chacha = "0.10"
+rand_core = { version = "0.10.1", default-features = false }
+tempfile = "3.27.0"

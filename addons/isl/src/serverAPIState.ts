@@ -19,6 +19,7 @@ import type {
   SubscriptionResultsData,
   UncommittedChanges,
   ValidatedRepoInfo,
+  WorktreeInfo,
 } from './types';
 
 import {Set as ImSet} from 'immutable';
@@ -35,13 +36,14 @@ import {
   REMOTE_MASTER_BOOKMARK,
 } from './BookmarksData';
 import serverAPI from './ClientToServerAPI';
+import {hiddenMasterFeatureAvailableAtom, shouldHideMasterAtom} from './HiddenMasterData';
 import type {InternalTypes} from './InternalTypes';
 import {latestSuccessorsMapAtom, successionTracker} from './SuccessionTracker';
 import {Dag, DagCommitInfo} from './dag/dag';
 import {readInterestingAtoms, serializeAtomsState} from './debug/getInterestingAtoms';
 import {atomFamilyWeak, configBackedAtom, readAtom, writeAtom} from './jotaiUtils';
 import platform from './platform';
-import {atomResetOnCwdChange, repositoryData} from './repositoryData';
+import {atomResetOnCwdChange, atomResetOnRepoChange, repositoryData} from './repositoryData';
 import {registerCleanup, registerDisposable} from './utils';
 
 export {repositoryData};
@@ -166,6 +168,7 @@ export const mostRecentSubscriptionIds: Record<SubscriptionKind, string> = {
   mergeConflicts: '',
   submodules: '',
   subscribedFullRepoBranches: '',
+  worktreeInfo: '',
 };
 
 /**
@@ -246,7 +249,7 @@ export const uncommittedChangesFetchError = atom(get => {
   return get(latestUncommittedChangesData).error;
 });
 
-export const mergeConflicts = atom<MergeConflicts | undefined>(undefined);
+export const mergeConflicts = atomResetOnRepoChange<MergeConflicts | undefined>(undefined);
 registerCleanup(
   mergeConflicts,
   subscriptionEffect('mergeConflicts', data => {
@@ -308,13 +311,22 @@ export const latestDag = atom(get => {
   const recommendedBookmarksAvailable = get(recommendedBookmarksAvailableAtom);
   const enableRecommended = bookmarksData.useRecommendedBookmark && recommendedBookmarksAvailable;
   const recommendedBookmarks = get(recommendedBookmarksAtom);
+  const shouldHideMaster = get(shouldHideMasterAtom);
+  const hiddenMasterFeatureAvailable = get(hiddenMasterFeatureAvailableAtom);
   const commitDag = undefined; // will be populated from `commits`
 
   const dag = Dag.fromDag(commitDag, successorMap)
     .add(
       commits.map(c => {
         return DagCommitInfo.fromCommitInfo(
-          filterBookmarks(bookmarksData, c, Boolean(enableRecommended), recommendedBookmarks),
+          filterBookmarks(
+            bookmarksData,
+            c,
+            Boolean(enableRecommended),
+            recommendedBookmarks,
+            shouldHideMaster,
+            hiddenMasterFeatureAvailable,
+          ),
         );
       }),
     )
@@ -327,6 +339,8 @@ function filterBookmarks(
   commit: CommitInfo,
   enableRecommended: boolean,
   recommendedBookmarks: Set<string>,
+  shouldHideMaster: boolean,
+  hiddenMasterFeatureAvailable: boolean,
 ): CommitInfo {
   if (commit.phase !== 'public') {
     return commit;
@@ -335,7 +349,20 @@ function filterBookmarks(
   const hiddenBookmarks = new Set(bookmarksData.hiddenRemoteBookmarks);
 
   const bookmarkFilter = (b: string) => {
-    // Always hide hidden bookmarks
+    // When hidden master feature is available, handle remote/master visibility separately
+    if (b === REMOTE_MASTER_BOOKMARK && hiddenMasterFeatureAvailable) {
+      const visibility = bookmarksData.masterBookmarkVisibility;
+      if (visibility === 'show') {
+        return true;
+      }
+      if (visibility === 'hide') {
+        return false;
+      }
+      // visibility === 'auto' or undefined - use sitevar config
+      return !shouldHideMaster;
+    }
+
+    // For all other bookmarks (and remote/master when feature is not available), hide if in hidden list
     if (hiddenBookmarks.has(b)) {
       return false;
     }
@@ -503,5 +530,14 @@ registerCleanup(
   subscribedFullRepoBranches,
   subscriptionEffect('subscribedFullRepoBranches', data => {
     writeAtom(subscribedFullRepoBranches, _ => data);
+  }),
+);
+
+export const worktreeInfoData = atom<WorktreeInfo | undefined>(undefined);
+
+registerCleanup(
+  worktreeInfoData,
+  subscriptionEffect('worktreeInfo', data => {
+    writeAtom(worktreeInfoData, _ => data);
   }),
 );

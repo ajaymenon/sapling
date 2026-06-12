@@ -142,6 +142,7 @@ fn log_clone_info(clone_type_str: &str, reponame: &str, ctx: &ReqCtx<CloneOpts>)
     }
 }
 
+#[cfg(feature = "eden")]
 fn run_eden(
     reponame: &str,
     destination: &Path,
@@ -270,7 +271,7 @@ fn run_non_eden(
 
     let target_rev = match get_update_target(&logger, &repo, &ctx.opts)? {
         Some((id, name)) => {
-            logger.info(format!("Checking out '{}'", name));
+            logger.info(format!("Checking out '{name}'"));
 
             logger.verbose(|| {
                 format!(
@@ -339,7 +340,7 @@ pub fn run(mut ctx: ReqCtx<CloneOpts>) -> Result<u8> {
             deprecate(
                 &config,
                 option_config,
-                format!("the {} option has been deprecated", option_name),
+                format!("the {option_name} option has been deprecated"),
             )?;
         }
     }
@@ -409,7 +410,7 @@ pub fn run(mut ctx: ReqCtx<CloneOpts>) -> Result<u8> {
     let reponame = match config.get_opt::<String>("remotefilelog", "reponame")? {
         // This gets the reponame from the --configfile config.
         Some(c) => {
-            logger.verbose(|| format!("Repo name is {} from config", c));
+            logger.verbose(|| format!("Repo name is {c} from config"));
             c
         }
         None => match source.repo_name() {
@@ -469,7 +470,10 @@ pub fn run(mut ctx: ReqCtx<CloneOpts>) -> Result<u8> {
     }
 
     if use_eden {
+        #[cfg(feature = "eden")]
         run_eden(reponame.as_str(), destination.as_path(), &ctx, config)?;
+        #[cfg(not(feature = "eden"))]
+        anyhow::bail!("eden is not enabled in this build")
     } else {
         run_non_eden(reponame.as_str(), destination.as_path(), &ctx, config)?;
     }
@@ -491,41 +495,43 @@ fn try_clone_metadata(
         let dest_preexists = destination.exists();
         let destination = destination.to_owned();
         let debug = ctx.global_opts.debug;
-        atexit::AtExit::new(Box::new(move || {
-            let cleanup_res = (|| -> Result<()> {
-                let removal_dir = if dest_preexists {
-                    let ident =
-                        identity::sniff_dir(&destination)?.unwrap_or_else(identity::default);
-                    destination.join(ident.dot_dir())
-                } else {
-                    destination.to_path_buf()
-                };
+        atexit::AtExit::new(
+            "clone cleanup",
+            Box::new(move || {
+                let cleanup_res = (|| -> Result<()> {
+                    let removal_dir = if dest_preexists {
+                        let ident =
+                            identity::sniff_dir(&destination)?.unwrap_or_else(identity::default);
+                        destination.join(ident.dot_dir())
+                    } else {
+                        destination.to_path_buf()
+                    };
 
-                if !debug {
-                    // Give some retries to clean up the failed repo. If we are running async in
-                    // another thread, the clone process could still be creating files while we are
-                    // deleting them.
-                    let mut attempt = 0;
-                    loop {
-                        attempt += 1;
-                        let res = fs_err::remove_dir_all(&removal_dir);
-                        if res.is_ok() || attempt >= 10 {
-                            break res;
-                        }
-                    }?;
+                    if !debug {
+                        // Give some retries to clean up the failed repo. If we are running async in
+                        // another thread, the clone process could still be creating files while we are
+                        // deleting them.
+                        let mut attempt = 0;
+                        loop {
+                            attempt += 1;
+                            let res = fs_err::remove_dir_all(&removal_dir);
+                            if res.is_ok() || attempt >= 10 {
+                                break res;
+                            }
+                        }?;
+                    }
+
+                    Ok(())
+                })();
+
+                if let Err(err) = cleanup_res {
+                    logger.warn(format!(
+                        "Error cleaning up incomplete clone {}: {err:?}",
+                        destination.to_string_lossy()
+                    ));
                 }
-
-                Ok(())
-            })();
-
-            if let Err(err) = cleanup_res {
-                logger.warn(format!(
-                    "Error cleaning up incomplete clone {}: {err:?}",
-                    destination.to_string_lossy()
-                ));
-            }
-        }))
-        .named("clone cleanup".into())
+            }),
+        )
         .queued()
     };
 
@@ -559,7 +565,7 @@ fn clone_metadata(
     let mut repo_config_file_content = includes.into_iter().fold(String::new(), |mut out, file| {
         use std::fmt::Write;
 
-        let _ = write!(out, "%include {}\n", file);
+        let _ = write!(out, "%include {file}\n");
         out
     });
 
@@ -657,7 +663,7 @@ fn clone_metadata(
                 &mut commits.write(),
                 bookmark_names,
             )?;
-            logger.verbose(|| format!("Pulled bookmarks {:?}", bookmark_ids));
+            logger.verbose(|| format!("Pulled bookmarks {bookmark_ids:?}"));
 
             if repo
                 .config()
@@ -780,10 +786,8 @@ fn get_update_target(
     }
 
     if !clone_opts.updaterev.is_empty() {
-        return Ok(Some((
-            repo.resolve_commit(None, &clone_opts.updaterev)?,
-            clone_opts.updaterev.clone(),
-        )));
+        let id = repo.resolve_commit(&clone_opts.updaterev)?.local()?;
+        return Ok(Some((id, clone_opts.updaterev.clone())));
     }
 
     let selective_bookmarks = get_selective_bookmarks(repo)?;
@@ -794,15 +798,14 @@ fn get_update_target(
         })?
         .clone();
 
-    match repo.resolve_commit_opt(None, &main_bookmark)? {
+    match repo.resolve_commit_opt(&main_bookmark)? {
         Some(id) => Ok(Some((id, main_bookmark))),
         None => {
             logger.info(format!(
-                "Server has no '{}' bookmark - trying tip.",
-                main_bookmark,
+                "Server has no '{main_bookmark}' bookmark - trying tip.",
             ));
 
-            if let Some(tip) = repo.resolve_commit_opt(None, "tip")? {
+            if let Some(tip) = repo.resolve_commit_opt("tip")? {
                 return Ok(Some((tip, "tip".to_string())));
             }
 

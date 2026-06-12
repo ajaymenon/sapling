@@ -17,7 +17,7 @@
   >   |/
   >   A
   > EOS
-  >   hg log -Gr: -T '{rev} {desc}'
+  >   sl log -Gr: -T '{rev} {desc}'
   > }
 
 With segmented changelog, revs are large numbers:

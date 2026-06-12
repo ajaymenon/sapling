@@ -8,15 +8,15 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
 commit_graph_types = { version = "0.1.0", path = "../commit_graph_types" }
 context = { version = "0.1.0", path = "../../../servers/slapi/slapi_server/context" }
-facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures_retry = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
 metaconfig_types = { version = "0.1.0", path = "../../../metaconfig/types" }
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
 rendezvous = { version = "0.1.0", path = "../../../common/rendezvous" }
@@ -24,7 +24,7 @@ repo_identity = { version = "0.1.0", path = "../../repo_identity" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql_construct = { version = "0.1.0", path = "../../../common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "../../../common/rust/sql_ext" }
-vec1 = { version = "1", features = ["serde"] }
+vec1 = { version = "1.12.1", features = ["serde"] }
 
 [dev-dependencies]
 commit_graph_testlib = { version = "0.1.0", path = "../commit_graph_testlib" }

@@ -21,6 +21,8 @@ include "thrift/annotation/thrift.thrift"
 @thrift.AllowLegacyMissingUris
 package;
 
+namespace py3 eden.mononoke.mononoke_types.serialization
+
 /// A blake2 hash.
 @rust.NewType
 @rust.Type{name = "smallvec::SmallVec<[u8; 32]>"}
@@ -75,6 +77,8 @@ typedef Id DeletedManifestId
 @rust.NewType
 typedef Id DeletedManifestV2Id
 @rust.NewType
+typedef Id DirectoryBranchClusterManifestId
+@rust.NewType
 typedef Id FastlogBatchId
 @rust.NewType
 typedef Id FileUnodeId
@@ -100,3 +104,15 @@ typedef Id SkeletonManifestId
 typedef Id TestManifestId
 @rust.NewType
 typedef Id TestShardedManifestId
+@rust.NewType
+typedef Id AclManifestId
+@rust.NewType
+typedef Id AclManifestEntryBlobId
+@rust.NewType
+typedef Id HistoryManifestFileId
+@rust.NewType
+typedef Id HistoryManifestDeletedNodeId
+@rust.NewType
+typedef Id HistoryManifestDirectoryId
+@rust.NewType
+typedef Id ShardedMapV2NodeHistoryManifestId

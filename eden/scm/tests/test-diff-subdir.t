@@ -8,22 +8,22 @@
 # GNU General Public License version 2 or any later version.
 
   $ eagerepo
-  $ hg init
+  $ sl init
 
   $ mkdir alpha
   $ touch alpha/one
   $ mkdir beta
   $ touch beta/two
 
-  $ hg add alpha/one beta/two
-  $ hg ci -m start
+  $ sl add alpha/one beta/two
+  $ sl ci -m start
 
   $ echo 1 > alpha/one
   $ echo 2 > beta/two
 
 # everything
 
-  $ hg diff --nodates
+  $ sl diff --nodates
   diff -r * alpha/one (glob)
   --- a/alpha/one
   +++ b/alpha/one
@@ -37,7 +37,7 @@
 
 # beta only
 
-  $ hg diff --nodates beta
+  $ sl diff --nodates beta
   diff -r * beta/two (glob)
   --- a/beta/two
   +++ b/beta/two
@@ -47,7 +47,7 @@
 # inside beta
 
   $ cd beta
-  $ hg diff --nodates .
+  $ sl diff --nodates .
   diff -r * beta/two (glob)
   --- a/beta/two
   +++ b/beta/two
@@ -57,7 +57,7 @@
 # relative to beta
 
   $ cd ..
-  $ hg diff --nodates --root beta
+  $ sl diff --nodates --root beta
   diff -r * two (glob)
   --- a/two
   +++ b/two
@@ -67,7 +67,7 @@
 # inside beta
 
   $ cd beta
-  $ hg diff --nodates --root .
+  $ sl diff --nodates --root .
   diff -r * two (glob)
   --- a/two
   +++ b/two

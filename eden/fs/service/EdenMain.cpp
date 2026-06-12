@@ -12,11 +12,11 @@
 
 #include <fb303/FollyLoggingHandler.h>
 #include <fb303/TFunctionStatHandler.h>
+#include <fmt/format.h>
 #include <folly/Conv.h>
 #include <folly/MapUtil.h>
-#include <folly/executors/FunctionScheduler.h>
+#include <folly/String.h>
 #include <folly/init/Init.h>
-#include <folly/logging/Init.h>
 #include <folly/logging/LogConfigParser.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/Unistd.h>
@@ -26,6 +26,11 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #endif
+#include <sys/stat.h>
+#if defined(__linux__) && __has_include(<systemd/sd-daemon.h>)
+#include <systemd/sd-daemon.h> // @manual, autodeps cannot do linux-only dep
+#define EDEN_HAVE_SYSTEMD 1
+#endif
 #include <thrift/lib/cpp2/Flags.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
 #ifdef __APPLE__
@@ -34,7 +39,6 @@
 #include <filesystem>
 
 #include "eden/common/telemetry/SessionInfo.h"
-#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/Bug.h"
 #include "eden/common/utils/UserInfo.h"
 #include "eden/fs/config/CheckoutConfig.h"
@@ -53,6 +57,7 @@
 #include "eden/fs/store/FilteredBackingStore.h"
 #include "eden/fs/store/filter/HgSparseFilter.h"
 #include "eden/fs/store/sl/SaplingBackingStore.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/IScribeLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/WinStackTrace.h"
@@ -77,6 +82,44 @@ using std::string;
 namespace facebook::eden {
 
 namespace {
+
+#ifdef __linux__
+// TODO: Remove these fallback functions once all privhelper daemons include
+// the getNamespaceInfo method.
+std::optional<uint64_t> getNamespaceInode(const char* path) {
+  struct stat st = {};
+  if (::stat(path, &st) == 0) {
+    return st.st_ino;
+  }
+  XLOGF(DBG5, "Failed to stat {}: {}", path, folly::errnoStr(errno));
+  return std::nullopt;
+}
+
+std::optional<bool> checkIsRootMountNamespace() {
+  auto self = getNamespaceInode("/proc/self/ns/mnt");
+  auto root = getNamespaceInode("/proc/1/ns/mnt");
+  if (self.has_value() && root.has_value()) {
+    return *self == *root;
+  }
+  return std::nullopt;
+}
+
+// Helper macro to convert optional to string for logging
+#define OPT_TO_STRING(opt) \
+  ((opt).has_value() ? folly::to<std::string>(*(opt)) : "nullopt")
+
+std::optional<std::string> readCgroup() {
+  std::string contents;
+  if (folly::readFile("/proc/self/cgroup", contents)) {
+    // Trim trailing newline(s) for cleaner logging.
+    while (!contents.empty() && contents.back() == '\n') {
+      contents.pop_back();
+    }
+    return contents;
+  }
+  return std::nullopt;
+}
+#endif
 
 EdenStatsPtr getGlobalEdenStats() {
   // A running EdenFS daemon only needs a single EdenStats instance. Avoid
@@ -142,14 +185,16 @@ std::shared_ptr<SaplingBackingStore> createSaplingBackingStore(
   return std::make_shared<SaplingBackingStore>(
       repoPath,
       config.getMountPath(),
+      config.getClientDirectory(),
       config.getCaseSensitive(),
       params.sharedStats.copy(),
       params.serverState->getThreadPool().get(),
       reloadableConfig,
       std::move(runtimeOptions),
-      params.serverState->getStructuredLogger(),
+      params.serverState->getEdenFsEventsLogger(),
+      params.serverState->getErrorLogger(),
       std::make_unique<BackingStoreLogger>(
-          params.serverState->getStructuredLogger(),
+          params.serverState->getEdenFsEventsLogger(),
           params.serverState->getProcessInfoCache()),
       &params.serverState->getFaultInjector());
 }
@@ -328,6 +373,49 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
 
   folly::stop_watch<> daemonStart;
 
+#ifdef __linux__
+  auto cgroupInfo = readCgroup();
+
+  std::optional<uint64_t> daemonMountNamespace;
+  std::optional<uint64_t> daemonPidNamespace;
+  std::optional<bool> isDaemonInRootMountNamespace;
+  std::optional<bool> isPrivhelperInRootMountNamespace;
+  std::optional<uint64_t> rootMountNsInode;
+  std::optional<uint64_t> privhelperMountNamespace;
+  std::optional<uint64_t> privhelperPidNamespace;
+  try {
+    auto nsInfo = privHelper->getNamespaceInfoBlocking(getpid());
+    rootMountNsInode = nsInfo.rootMountNsInode;
+    privhelperMountNamespace = nsInfo.privhelperMountNsInode;
+    privhelperPidNamespace = nsInfo.privhelperPidNsInode;
+    daemonMountNamespace = nsInfo.daemonMountNsInode;
+    daemonPidNamespace = nsInfo.daemonPidNsInode;
+    isDaemonInRootMountNamespace =
+        (nsInfo.daemonMountNsInode == nsInfo.rootMountNsInode);
+    isPrivhelperInRootMountNamespace =
+        (nsInfo.privhelperMountNsInode == nsInfo.rootMountNsInode);
+  } catch (const std::exception& ex) {
+    // TODO: Remove this fallback once all privhelper daemons include the
+    // getNamespaceInfo method.
+    XLOGF(
+        WARN,
+        "Failed to get namespace info from privhelper (falling back to "
+        "local detection): {}",
+        ex.what());
+    daemonMountNamespace = getNamespaceInode("/proc/self/ns/mnt");
+    daemonPidNamespace = getNamespaceInode("/proc/self/ns/pid");
+    isDaemonInRootMountNamespace = checkIsRootMountNamespace();
+  }
+#else
+  std::optional<uint64_t> daemonMountNamespace;
+  std::optional<uint64_t> daemonPidNamespace;
+  std::optional<std::string> cgroupInfo;
+  std::optional<bool> isDaemonInRootMountNamespace;
+  std::optional<bool> isPrivhelperInRootMountNamespace;
+  std::optional<uint64_t> privhelperMountNamespace;
+  std::optional<uint64_t> privhelperPidNamespace;
+#endif
+
   std::vector<std::string> originalCommandLine{argv, argv + argc};
 
   // Make sure to run this before any flag values are read.
@@ -428,6 +516,39 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
           daemonPid, daemonMemoryPriority.value());
     }
 
+#ifdef __linux__
+    XLOGF(
+        DBG2,
+        "Namespace detection: daemon(mnt={}, pid={}), privhelper(mnt={}, pid={}), "
+        "rootMountNsInode={}, isDaemonInRootMountNamespace={}, "
+        "isPrivhelperInRootMountNamespace={}",
+        OPT_TO_STRING(daemonMountNamespace),
+        OPT_TO_STRING(daemonPidNamespace),
+        OPT_TO_STRING(privhelperMountNamespace),
+        OPT_TO_STRING(privhelperPidNamespace),
+        OPT_TO_STRING(rootMountNsInode),
+        OPT_TO_STRING(isDaemonInRootMountNamespace),
+        OPT_TO_STRING(isPrivhelperInRootMountNamespace));
+
+    if (edenConfig->requireRootMountNamespace.getValue()) {
+      // To avoid disruption, we assume that the daemon and privhelper are in
+      // the root mount namespace unless we can prove otherwise.
+      bool daemonInRootNs = isDaemonInRootMountNamespace.value_or(true);
+      bool privhelperInRootNs = isPrivhelperInRootMountNamespace.value_or(true);
+
+      if (!daemonInRootNs || !privhelperInRootNs) {
+        auto errorMsg = fmt::format(
+            "EdenFS cannot start: daemon in root mount namespace = {}, "
+            "privhelper in root mount namespace = {}.\n To allow this "
+            "behavior, set core.require-root-mount-namespace config to false",
+            daemonInRootNs,
+            privhelperInRootNs);
+        XLOG(ERR, errorMsg);
+        startupLogger->exitUnsuccessfully(kExitCodeError, errorMsg);
+      }
+    }
+#endif // __linux__
+
     server.emplace(
         std::move(originalCommandLine),
         std::move(identity),
@@ -448,63 +569,98 @@ int runEdenMain(EdenMain&& main, int argc, char** argv) {
     auto startTimeInSeconds =
         std::chrono::duration<double>{daemonStart.elapsed()}.count();
     if (server) {
-      server->getServerState()->getStructuredLogger()->logEvent(
-          DaemonStart{startTimeInSeconds, FLAGS_takeover, false /*success*/});
+      server->getServerState()->getEdenFsEventsLogger()->logEvent(
+          DaemonStart{
+              startTimeInSeconds,
+              FLAGS_takeover,
+              false /*success*/,
+              daemonMountNamespace,
+              daemonPidNamespace,
+              privhelperMountNamespace,
+              privhelperPidNamespace,
+              isDaemonInRootMountNamespace,
+              isPrivhelperInRootMountNamespace,
+              cgroupInfo});
     }
     startupLogger->exitUnsuccessfully(
         kExitCodeError, "error starting EdenFS: ", folly::exceptionStr(ex));
   }
 
   std::move(prepareFuture)
-      .thenTry(
-          [startupLogger,
-           structuredLogger = server->getServerState()->getStructuredLogger(),
-           daemonStart](folly::Try<folly::Unit>&& result) {
-            // If an error occurred this means that we failed to mount all of
-            // the mount points.
-            //
-            // Mount errors are fine. We have still started and will
-            // continue running, so we can report successful startup.
-            if (result.hasException()) {
-              // Log an overall error message here.
-              // We will have already logged more detailed messages for each
-              // mount failure when it occurred.
-              startupLogger->warn(
-                  "did not successfully remount all repositories: ",
-                  result.exception().what());
-            }
-            auto startTimeInSeconds =
-                std::chrono::duration<double>{daemonStart.elapsed()}.count();
-            startupLogger->success(startTimeInSeconds);
-          })
-      .ensure(
-          [daemonStart,
-           structuredLogger = server->getServerState()->getStructuredLogger(),
-           takeover = FLAGS_takeover,
-           &server] {
-            // This value is slightly different from `startTimeInSeconds`
-            // we pass into `startupLogger->success()`, but should be
-            // identical.
-            auto startTimeInSeconds =
-                std::chrono::duration<double>{daemonStart.elapsed()}.count();
-            // Here we log a success even if we did not successfully remount
-            // all repositories (if prepareFuture had an exception). In the
-            // future it would be helpful to log number of successful vs
-            // unsuccessful remounts
-            structuredLogger->logEvent(
-                DaemonStart{startTimeInSeconds, takeover, true /*success*/});
+      .thenTry([startupLogger, daemonStart](folly::Try<folly::Unit>&& result) {
+        // If an error occurred this means that we failed to mount all of
+        // the mount points.
+        //
+        // Mount errors are fine. We have still started and will
+        // continue running, so we can report successful startup.
+        if (result.hasException()) {
+          // Log an overall error message here.
+          // We will have already logged more detailed messages for each
+          // mount failure when it occurred.
+          startupLogger->warn(
+              "did not successfully remount all repositories: ",
+              result.exception().what());
+        }
+        auto startTimeInSeconds =
+            std::chrono::duration<double>{daemonStart.elapsed()}.count();
+#ifdef EDEN_HAVE_SYSTEMD
+        auto sdNotifyMsg = fmt::format("MAINPID={}\nREADY=1", getpid());
+        auto sdNotifyResult = sd_notify(0, sdNotifyMsg.c_str());
+        if (sdNotifyResult > 0) {
+          XLOGF(INFO, "notified systemd: MAINPID={}", getpid());
+        } else if (sdNotifyResult == 0) {
+          XLOG(INFO, "sd_notify: NOTIFY_SOCKET not set");
+        } else {
+          XLOGF(ERR, "sd_notify failed: {}", folly::errnoStr(-sdNotifyResult));
+        }
+#endif
+        startupLogger->success(startTimeInSeconds);
+      })
+      .ensure([daemonStart,
+               edenFsEventsLogger =
+                   server->getServerState()->getEdenFsEventsLogger(),
+               takeover = FLAGS_takeover,
+               daemonMountNamespace,
+               daemonPidNamespace,
+               privhelperMountNamespace,
+               privhelperPidNamespace,
+               isDaemonInRootMountNamespace,
+               isPrivhelperInRootMountNamespace,
+               cgroupInfo,
+               &server] {
+        // This value is slightly different from `startTimeInSeconds`
+        // we pass into `startupLogger->success()`, but should be
+        // identical.
+        auto startTimeInSeconds =
+            std::chrono::duration<double>{daemonStart.elapsed()}.count();
+        // Here we log a success even if we did not successfully remount
+        // all repositories (if prepareFuture had an exception). In the
+        // future it would be helpful to log number of successful vs
+        // unsuccessful remounts
+        edenFsEventsLogger->logEvent(
+            DaemonStart{
+                startTimeInSeconds,
+                takeover,
+                true /*success*/,
+                daemonMountNamespace,
+                daemonPidNamespace,
+                privhelperMountNamespace,
+                privhelperPidNamespace,
+                isDaemonInRootMountNamespace,
+                isPrivhelperInRootMountNamespace,
+                cgroupInfo});
 
 #ifndef _WIN32
-            // Check for previous heartbeat files and handle crash detection
-            server->checkForPreviousHeartbeat(takeover);
+        // Check for previous heartbeat files and handle crash detection
+        server->checkForPreviousHeartbeat(takeover);
 
-            // Create a new heartbeat file
-            server->createOrUpdateEdenHeartbeatFile();
+        // Create a new heartbeat file
+        server->createOrUpdateEdenHeartbeatFile();
 #else
-            // On Windows, EdenFS does not create a heartbeat file.
-            (void)server;
+        // On Windows, EdenFS does not create a heartbeat file.
+        (void)server;
 #endif
-          });
+      });
 
   while (true) {
     main.runServer(server.value());

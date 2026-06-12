@@ -67,7 +67,15 @@ Example
 
 """
 
-from sapling import cmdutil, error, extensions, merge as mergemod, registrar, util
+from sapling import (
+    cmdutil,
+    error,
+    extensions,
+    merge as mergemod,
+    rcutil,
+    registrar,
+    util,
+)
 from sapling.i18n import _
 
 from .sparse import (
@@ -82,11 +90,52 @@ from .sparse import (
     _showsubcmdlogic,
     getcommonopts,
     normalizeprofile,
+    readsparseconfig,
     SparseMixin,
 )
 
 cmdtable = {}
 command = registrar.command(cmdtable)
+
+# Config section and key prefix for filter configs
+FILTER_CONFIG_SECTION = "clone"
+FILTER_CONFIG_PREFIX = "eden-sparse-filter"
+DISABLED_FILTER_CONFIG_PREFIX = "disabled-eden-sparse-filter"
+
+
+def _get_local_hgrc_path(repo):
+    """Get the path to the local repo config file."""
+    configfilename = repo.ui.identity.configrepofile()
+    return repo.localvfs.join(configfilename)
+
+
+def _set_filter_config(repo, filter_path, enabled=True):
+    """Write a filter config entry to the local repo config file.
+
+    If enabled=True, writes to:
+        clone.eden-sparse-filter.<alias> = <filter_path>
+    and removes any existing disabled entry.
+
+    If enabled=False, writes to:
+        clone.disabled-eden-sparse-filter.<alias> = <filter_path>
+    and removes any existing manually enabled entry.
+    """
+    hgrc_path = _get_local_hgrc_path(repo)
+    # Use a sanitized version of the path as the alias/key
+    alias = filter_path.replace("/", "_").replace(".", "_")
+    enabled_key = "%s.%s" % (FILTER_CONFIG_PREFIX, alias)
+    disabled_key = "%s.%s" % (DISABLED_FILTER_CONFIG_PREFIX, alias)
+
+    if enabled:
+        rcutil.editconfig(
+            repo.ui, hgrc_path, FILTER_CONFIG_SECTION, enabled_key, filter_path
+        )
+        rcutil.editconfig(repo.ui, hgrc_path, FILTER_CONFIG_SECTION, disabled_key, None)
+    else:
+        rcutil.editconfig(
+            repo.ui, hgrc_path, FILTER_CONFIG_SECTION, disabled_key, filter_path
+        )
+        rcutil.editconfig(repo.ui, hgrc_path, FILTER_CONFIG_SECTION, enabled_key, None)
 
 
 def uisetup(ui) -> None:
@@ -113,6 +162,37 @@ def extsetup(ui) -> None:
 
 def _wraprepo(ui, repo) -> None:
     class EdenSparseRepo(repo.__class__, SparseMixin):
+        def writesparseconfig(self, include, exclude, profiles):
+            disable_sync = self.ui.configbool("edensparse", "disable-filter-sync")
+
+            old_profiles = set()
+            # When filter sync is enabled, _applysparsetoworkingcopy will write
+            # the sparseconfig on our behalf when checkout runs.
+            if not disable_sync:
+                if self.localvfs.exists("sparse"):
+                    content = self.localvfs.readutf8("sparse")
+                    rawconfig = readsparseconfig(self, content, filename="sparse")
+                    old_profiles = set(rawconfig.profiles)
+            else:
+                # When filter sync is disabled, we manually write the sparseconfig
+                SparseMixin.writesparseconfig(self, include, exclude, profiles)
+                return
+
+            # Sync filter config changes to .hg/hgrc
+            new_profiles = set(profiles)
+            added_profiles = new_profiles - old_profiles
+            removed_profiles = old_profiles - new_profiles
+
+            for profile in added_profiles:
+                _set_filter_config(self, profile, enabled=True)
+
+            for profile in removed_profiles:
+                _set_filter_config(self, profile, enabled=False)
+
+            # Reload config so Rust code picks up the new filter values
+            if added_profiles or removed_profiles:
+                self.ui.reloadconfigs(self.root)
+
         def _applysparsetoworkingcopy(
             self, force, origsparsematch, sparsematch, pending
         ):

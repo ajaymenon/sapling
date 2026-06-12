@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type
 
 import eden.dirstate
-import facebook.eden.ttypes as eden_ttypes
 from eden.fs.cli import hg_util, proc_utils
 from eden.fs.cli.config import EdenCheckout, InProgressCheckoutError
 from eden.fs.cli.doctor.problem import (
@@ -26,6 +25,10 @@ from eden.fs.cli.doctor.problem import (
     UnexpectedCheckError,
 )
 from eden.fs.cli.util import get_tip_commit_hash
+from eden.fs.service.eden.thrift_types import (
+    ResetParentCommitsParams,
+    WorkingDirectoryParents,
+)
 
 try:
     from .facebook import reclone_remediation
@@ -217,11 +220,16 @@ class DirstateChecker(HgFileChecker):
 
         # pyre-fixme[16]: `Optional` has no attribute `__getitem__`.
         if self._new_parents[0] != self._old_snapshot:
-            parents = eden_ttypes.WorkingDirectoryParents(parent1=self._new_parents[0])
-            if self._new_parents[1] != self._null_commit_id:
-                parents.parent2 = self._new_parents[1]
-            params = eden_ttypes.ResetParentCommitsParams()
-            with self.checkout.instance.get_thrift_client_legacy() as client:
+            parent2 = (
+                self._new_parents[1]
+                if self._new_parents[1] != self._null_commit_id
+                else None
+            )
+            parents = WorkingDirectoryParents(
+                parent1=self._new_parents[0], parent2=parent2
+            )
+            params = ResetParentCommitsParams()
+            with self.checkout.instance.get_thrift_client() as client:
                 client.resetParentCommits(bytes(self.checkout.path), parents, params)
 
     def _commit_hex(self, commit: bytes) -> str:
@@ -252,7 +260,8 @@ class DirstateChecker(HgFileChecker):
 
 class HgrcChecker(HgFileChecker):
     def __init__(self, checkout: EdenCheckout) -> None:
-        super().__init__(checkout, "hgrc")
+        config_name = hg_util.config_file_for_dot_dir(checkout.hg_dot_path.name)
+        super().__init__(checkout, config_name)
 
     def repair(self) -> None:
         hgrc_data = hg_util.get_hgrc_data(self.checkout)
@@ -355,8 +364,8 @@ class AbandonedTransactionChecker(HgChecker):
 class EdenFsInterruptedCheckout(Problem):
     def __init__(self, checkout: EdenCheckout, ex: InProgressCheckoutError) -> None:
         remediation = f"""\
-Please run `hg go {ex.to_commit}` to resume the checkout.
-If there are conflicts, run `hg go --clean {ex.to_commit}` to discard changes, or `hg go --merge {ex.to_commit}` to merge.
+Please run `sl go {ex.to_commit}` to resume the checkout.
+If there are conflicts, run `sl go --clean {ex.to_commit}` to discard changes, or `sl go --merge {ex.to_commit}` to merge.
 """
         super().__init__(
             f"EdenFS was killed or crashed while updating from {ex.from_commit} to {ex.to_commit}.",

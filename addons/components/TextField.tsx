@@ -5,75 +5,49 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {ForwardedRef, ReactNode} from 'react';
+import type {ReactNode} from 'react';
 import type {ReactProps} from './utils';
 
-import * as stylex from '@stylexjs/stylex';
-import {forwardRef, useId} from 'react';
+import {useId} from 'react';
+import {cn} from 'shared/cn';
 import {Column} from './Flex';
+import css from './TextField.module.css';
+export {default as textFieldStyles} from './TextField.module.css';
 
-export const textFieldStyles = stylex.create({
-  root: {
-    gap: 0,
-  },
-  label: {
-    marginBlock: '1px',
-  },
-  input: {
-    boxSizing: 'border-box',
-    height: '26px',
-    padding: '0 9px',
-    marginBlock: 0,
-    minWidth: '100px',
-    width: '100%',
-    background: 'var(--input-background)',
-    color: 'var(--input-foreground)',
-    border: '1px solid var(--dropdown-border)',
-    outline: {
-      default: 'none',
-      ':focus-visible': '1px solid var(--focus-border)',
-    },
-    outlineOffset: '-1px',
-  },
-});
-
-export const TextField = forwardRef(
-  (
-    {
-      children,
-      xstyle,
-      containerXstyle,
-      value,
-      width,
-      ...rest
-    }: {
-      children?: ReactNode;
-      xstyle?: stylex.StyleXStyles;
-      containerXstyle?: stylex.StyleXStyles;
-      value?: string;
-      width?: string;
-      placeholder?: string;
-      readOnly?: boolean;
-    } & ReactProps<HTMLInputElement>,
-    ref: ForwardedRef<HTMLInputElement>,
-  ) => {
-    const id = useId();
-    return (
-      <Column xstyle={[textFieldStyles.root, containerXstyle ?? null]} style={{width}} alignStart>
-        {children && (
-          <label htmlFor={id} {...stylex.props(textFieldStyles.label)}>
-            {children}
-          </label>
-        )}
-        <input
-          {...stylex.props(textFieldStyles.input, xstyle)}
-          type="text"
-          id={id}
-          value={value}
-          {...rest}
-          ref={ref}
-        />
-      </Column>
-    );
-  },
-);
+export function TextField({
+  children,
+  className: classNameProp,
+  containerClassName,
+  value,
+  width,
+  ref,
+  ...rest
+}: {
+  children?: ReactNode;
+  className?: string;
+  containerClassName?: string;
+  value?: string;
+  width?: string;
+  placeholder?: string;
+  readOnly?: boolean;
+  ref?: React.Ref<HTMLInputElement>;
+} & ReactProps<HTMLInputElement>) {
+  const id = useId();
+  return (
+    <Column className={cn(css.root, containerClassName)} style={{width}} alignStart>
+      {children && (
+        <label htmlFor={id} className={css.label}>
+          {children}
+        </label>
+      )}
+      <input
+        className={cn(css.input, classNameProp)}
+        type="text"
+        id={id}
+        value={value}
+        {...rest}
+        ref={ref}
+      />
+    </Column>
+  );
+}

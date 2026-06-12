@@ -12,16 +12,16 @@
 
   $ setconfig remotefilelog.reponame=server
 
-  $ hg init server
+  $ sl init server
   $ cd server
   $ setconfig infinitepush.server=yes infinitepush.indextype=disk infinitepush.storetype=disk infinitepush.reponame=testrepo
 
 Make the clone of the server
-  $ hg clone ssh://user@dummy/server client -q
+  $ sl clone ssh://user@dummy/server client -q
   $ cd client
   $ setconfig commitcloud.servicetype=local commitcloud.servicelocation="$TESTTMP"
 
-Tests for hg cloud sl
+Tests for sl cloud sl
   $ cat > $TESTTMP/usersmartlogdata << EOF
   > {
   >   "smartlog": {
@@ -29,7 +29,7 @@ Tests for hg cloud sl
   >   }
   > }
   > EOF
-  $ hg cloud sl
+  $ sl cloud sl
   the repository is not connected to any workspace, assuming the 'default' workspace
   commitcloud: searching draft commits for the 'user/test/default' workspace for the 'server' repo
   Smartlog:
@@ -98,7 +98,7 @@ Tests for hg cloud sl
   > }
   > EOF
 
-  $ hg cloud sl
+  $ sl cloud sl
   the repository is not connected to any workspace, assuming the 'default' workspace
   commitcloud: searching draft commits for the 'user/test/default' workspace for the 'server' repo
   Smartlog:
@@ -395,7 +395,7 @@ Tests for hg cloud sl
   > }
   > EOF
 
-  $ hg cloud sl
+  $ sl cloud sl
   the repository is not connected to any workspace, assuming the 'default' workspace
   commitcloud: searching draft commits for the 'user/test/default' workspace for the 'server' repo
   Smartlog:
@@ -841,7 +841,7 @@ Tests for hg cloud sl
   > }
   > EOF
 
-  $ hg cloud sl
+  $ sl cloud sl
   the repository is not connected to any workspace, assuming the 'default' workspace
   commitcloud: searching draft commits for the 'user/test/default' workspace for the 'server' repo
   Smartlog:
@@ -1188,7 +1188,7 @@ Tests for hg cloud sl
   > }
   > EOF
 
-  $ hg cloud sl
+  $ sl cloud sl
   the repository is not connected to any workspace, assuming the 'default' workspace
   commitcloud: searching draft commits for the 'user/test/default' workspace for the 'server' repo
   Smartlog:
@@ -1420,7 +1420,7 @@ Tests for hg cloud sl
   > }
   > EOF
 
-  $ hg cloud sl
+  $ sl cloud sl
   the repository is not connected to any workspace, assuming the 'default' workspace
   commitcloud: searching draft commits for the 'user/test/default' workspace for the 'server' repo
   Smartlog:
@@ -1498,7 +1498,7 @@ Tests for hg cloud sl
   > }
   > EOF
 
-  $ hg cloud sl
+  $ sl cloud sl
   the repository is not connected to any workspace, assuming the 'default' workspace
   commitcloud: searching draft commits for the 'user/test/default' workspace for the 'server' repo
   Smartlog:
@@ -1634,7 +1634,7 @@ Tests for hg cloud sl
   > }
   > EOF
  
-  $ hg cloud sl -T {"node"}
+  $ sl cloud sl -T {"node"}
   the repository is not connected to any workspace, assuming the 'default' workspace
   commitcloud: searching draft commits for the 'user/test/default' workspace for the 'server' repo
   Smartlog:

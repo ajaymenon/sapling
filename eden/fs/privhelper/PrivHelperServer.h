@@ -8,9 +8,12 @@
 #pragma once
 
 #include <eden/common/utils/SpawnedProcess.h>
+#ifndef __APPLE__
+#include <folly/File.h>
+#endif
 #include <sys/types.h>
 #include <limits>
-#include <set>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include "eden/common/utils/UnixSocket.h"
@@ -109,6 +112,30 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
       folly::io::Cursor& cursor,
       UnixSocket::Message& request);
   std::string findMatchingMountPrefix(folly::StringPiece path);
+  struct RegisteredMount {
+#ifndef __APPLE__
+    folly::File rootFd;
+#endif
+  };
+#ifndef __APPLE__
+  struct FuseMountResult {
+    folly::File fuseDev;
+    RegisteredMount registeredMount;
+  };
+  struct CheckedMountPoint {
+    folly::File targetFd;
+    SanityCheckResult sanityResult;
+  };
+#endif
+  RegisteredMount openRegisteredMount(const std::string& mountPath);
+  void registerMountPoint(const std::string& mountPath);
+  void registerMountPoint(
+      const std::string& mountPath,
+      RegisteredMount registeredMount);
+  void unmountRegisteredMount(
+      const std::string& mountPath,
+      const RegisteredMount& registeredMount,
+      UnmountOptions options);
 
   UnixSocket::Message processSetDaemonTimeout(
       folly::io::Cursor& cursor,
@@ -117,16 +144,23 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
       folly::io::Cursor& cursor,
       UnixSocket::Message& request);
   UnixSocket::Message processGetPid();
+  UnixSocket::Message processGetNamespaceInfo(folly::io::Cursor& cursor);
   UnixSocket::Message processStartFam(folly::io::Cursor& cursor);
   UnixSocket::Message processStopFam();
   UnixSocket::Message processSetMemoryPriorityForProcess(
       folly::io::Cursor& cursor);
+  UnixSocket::Message processSetFuseReadAhead(folly::io::Cursor& cursor);
 
   void unmountStaleMount(const std::string& mountPoint);
 
+  // Clean up stale redirection mounts under a checkout path that were left
+  // behind when EdenFS crashed without properly unmounting.
+  SanityCheckResult cleanupStaleBindMounts(const std::string& checkoutPath);
+
   // Uses stat to determine if there's a stale mount point at the given path. If
-  // there is, force unmounts it.
-  void detectAndUnmountStaleMount(
+  // there is, force unmounts it. Returns true if a stale mount was found and
+  // unmounted.
+  bool detectAndUnmountStaleMount(
       const std::string& mountPoint,
       bool isNFS,
       bool isHardMount);
@@ -137,11 +171,26 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
    * This will check that the user has RW access to every path component
    * leading to the mount point. A std::domain_error exception will be raised
    * if the user doesn't have access to the mount point.
+   *
+   * When performBindMountCleanup is true (the default), stale redirection
+   * bind mounts under the checkout are detached after the checkout path passes
+   * the ownership and access checks. The takeover path passes false because
+   * the kernel preserves legitimate bind mounts (e.g. Sapling redirections like
+   * buck-out) across a graceful restart, and running cleanup there would
+   * unmount live user state.
    */
-  void sanityCheckMountPoint(
+  SanityCheckResult sanityCheckMountPoint(
       const std::string& mountPoint,
       bool isNFS = false,
-      bool isHardMount = false);
+      bool isHardMount = false,
+      bool performBindMountCleanup = true);
+#ifndef __APPLE__
+  CheckedMountPoint openAndSanityCheckMountPoint(
+      const std::string& mountPoint,
+      bool isNFS = false,
+      bool isHardMount = false,
+      bool performBindMountCleanup = true);
+#endif
 
   // These methods are virtual so we can override them during unit tests
   virtual folly::File
@@ -149,8 +198,32 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   virtual void nfsMount(std::string mountPath, NFSMountOptions options);
   virtual void unmount(const char* mountPath, UnmountOptions options);
   // Both clientPath and mountPath must be existing directories.
-  virtual void bindMount(const char* clientPath, const char* mountPath);
-  virtual void bindUnmount(const char* mountPath);
+  virtual void insecureBindMount(const char* clientPath, const char* mountPath);
+  virtual void bindMount(
+      const char* clientPath,
+      const char* mountPath,
+      folly::StringPiece mountRoot);
+  virtual bool useModernMountApi() const;
+#ifndef __APPLE__
+  FuseMountResult fuseMountByFd(
+      folly::File targetFd,
+      const char* mountPath,
+      bool readOnly,
+      const char* vfsType);
+  RegisteredMount nfsMountByFd(
+      folly::File targetFd,
+      const std::string& mountPath,
+      const NFSMountOptions& options);
+#endif
+
+ protected:
+  folly::File openBindMountTarget(
+      folly::StringPiece mountRoot,
+      folly::StringPiece mountPath);
+
+ private:
+  virtual void insecureBindUnmount(const char* mountPath);
+  virtual void bindUnmount(const char* mountPath, folly::StringPiece mountRoot);
   virtual void setLogFile(folly::File logFile);
   virtual void setDaemonTimeout(std::chrono::nanoseconds duration);
   virtual void setMemoryPriorityForProcess(pid_t pid, int priority);
@@ -165,7 +238,7 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
 
   // The privhelper server only has a single thread,
   // so we don't need to lock the following state
-  std::set<std::string> mountPoints_;
+  std::map<std::string, RegisteredMount> mountPoints_;
 };
 
 } // namespace facebook::eden

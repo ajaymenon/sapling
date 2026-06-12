@@ -77,14 +77,14 @@ ImmediateFuture<InodeNumber> NfsDispatcherImpl::getParent(
       });
 }
 
-ImmediateFuture<folly::Unit> NfsDispatcherImpl::updateLastUsedTime(
+ImmediateFuture<folly::Unit> NfsDispatcherImpl::updateLastFsRequestTime(
     InodeNumber ino) {
   return inodeMap_->lookupInode(ino)
       .thenValue([](const InodePtr& inode) {
-        inode->updateNfsLastUsedTime();
+        inode->updateLastFsRequestTime();
         return folly::unit;
       })
-      .thenError([&ino](folly::exception_wrapper&& ew) {
+      .thenError([ino](folly::exception_wrapper&& ew) {
         XLOGF(
             DBG9,
             "Cannot update the last access time for inode: {} error: {}",

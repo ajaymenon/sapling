@@ -26,13 +26,13 @@ namespace overlay {
 class OverlayDir;
 }
 struct InodeNumber;
-class StructuredLogger;
+class EdenFsEventsLogger;
 
 class SqliteInodeCatalog : public InodeCatalog {
  public:
   explicit SqliteInodeCatalog(
       AbsolutePathPiece path,
-      std::shared_ptr<StructuredLogger> logger,
+      std::shared_ptr<EdenFsEventsLogger> logger,
       SqliteTreeStore::SynchronousMode mode =
           SqliteTreeStore::SynchronousMode::Normal);
 
@@ -49,6 +49,10 @@ class SqliteInodeCatalog : public InodeCatalog {
 
   bool supportsSemanticOperations() const override {
     return true;
+  }
+
+  bool supportsWal() const override {
+    return false;
   }
 
   std::vector<InodeNumber> getAllParentInodeNumbers() override;
@@ -68,8 +72,10 @@ class SqliteInodeCatalog : public InodeCatalog {
   std::optional<overlay::OverlayDir> loadAndRemoveOverlayDir(
       InodeNumber inodeNumber) override;
 
-  void saveOverlayDir(InodeNumber inodeNumber, overlay::OverlayDir&& odir)
-      override;
+  void saveOverlayDir(
+      InodeNumber inodeNumber,
+      overlay::OverlayDir&& odir,
+      bool crashSafe = true) override;
 
   void removeOverlayDir(InodeNumber inodeNumber) override;
 
@@ -100,7 +106,6 @@ class SqliteInodeCatalog : public InodeCatalog {
   InodeNumber scanLocalChanges(
       std::shared_ptr<ReloadableConfig> config,
       AbsolutePathPiece mountPath,
-      bool windowsSymlinksEnabled,
       InodeCatalog::LookupCallback& callback) override;
 
   void maintenance() override {

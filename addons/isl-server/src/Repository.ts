@@ -35,6 +35,7 @@ import type {
   SubmodulesByRoot,
   UncommittedChanges,
   ValidatedRepoInfo,
+  WorktreeInfo,
 } from 'isl/src/types';
 import type {Comparison} from 'shared/Comparison';
 import type {EjecaChildProcess, EjecaOptions} from 'shared/ejeca';
@@ -74,8 +75,10 @@ import {
   findDotDir,
   findRoot,
   findRoots,
+  findSharedRoot,
   getConfigs,
   getExecParams,
+  listWorktrees,
   runCommand,
   setConfig,
 } from './commands';
@@ -117,12 +120,14 @@ export class Repository {
   private uncommittedChanges: FetchedUncommittedChanges | null = null;
   private smartlogCommits: FetchedCommits | null = null;
   private submodulesByRoot: SubmodulesByRoot | undefined = undefined;
+  private worktreeInfo: WorktreeInfo | undefined = undefined;
   private submodulePathCache: ImSet<RepoRelativePath> | undefined = undefined;
 
   private mergeConflictsEmitter = new TypedEventEmitter<'change', MergeConflicts | undefined>();
   private uncommittedChangesEmitter = new TypedEventEmitter<'change', FetchedUncommittedChanges>();
   private smartlogCommitsChangesEmitter = new TypedEventEmitter<'change', FetchedCommits>();
   private submodulesChangesEmitter = new TypedEventEmitter<'change', SubmodulesByRoot>();
+  private worktreeInfoEmitter = new TypedEventEmitter<'change', WorktreeInfo | undefined>();
 
   private smartlogCommitsBeginFetchingEmitter = new TypedEventEmitter<'start', undefined>();
   private uncommittedChangesBeginFetchingEmitter = new TypedEventEmitter<'start', undefined>();
@@ -133,6 +138,7 @@ export class Repository {
     () => this.smartlogCommitsChangesEmitter.removeAllListeners(),
     () => this.smartlogCommitsBeginFetchingEmitter.removeAllListeners(),
     () => this.uncommittedChangesBeginFetchingEmitter.removeAllListeners(),
+    () => this.worktreeInfoEmitter.removeAllListeners(),
   ];
   public onDidDispose(callback: () => unknown): void {
     this.disposables.push(callback);
@@ -243,6 +249,7 @@ export class Repository {
         this.fetchUncommittedChanges();
         this.fetchSmartlogCommits();
         this.checkForMergeConflicts();
+        this.refreshWorktreeInfo();
 
         this.codeReviewProvider?.triggerDiffSummariesFetch(
           // We could choose to only fetch the diffs that changed (`newDiffs`) rather than all diffs,
@@ -750,7 +757,7 @@ export class Repository {
         } else {
           break;
         }
-      } catch (err) {
+      } catch (_err) {
         break;
       }
     }
@@ -923,6 +930,46 @@ export class Repository {
     }
   });
 
+  getWorktreeInfo(): WorktreeInfo | undefined {
+    return this.worktreeInfo;
+  }
+
+  subscribeToWorktreeInfoChanges(
+    callback: (result: WorktreeInfo | undefined) => unknown,
+  ): Disposable {
+    this.worktreeInfoEmitter.on('change', callback);
+    return {
+      dispose: () => {
+        this.worktreeInfoEmitter.off('change', callback);
+      },
+    };
+  }
+
+  refreshWorktreeInfo = serializeAsyncCall(async () => {
+    try {
+      const ctx = this.initialConnectionContext;
+      const gkEnabled = await Internal.fetchFeatureFlag?.(ctx, 'isl_worktrees');
+      if (gkEnabled === false) {
+        return;
+      }
+      const [sharedRoot, worktrees] = await Promise.all([findSharedRoot(ctx), listWorktrees(ctx)]);
+      const repoRoot = this.info.repoRoot;
+      const worktreeEntries =
+        worktrees.length > 0 ? worktrees : [{path: repoRoot, role: 'main' as const}];
+      const worktreeInfo: WorktreeInfo | undefined =
+        sharedRoot != null
+          ? {
+              sharedRoot,
+              worktrees: worktreeEntries,
+            }
+          : undefined;
+      this.worktreeInfo = worktreeInfo;
+      this.worktreeInfoEmitter.emit('change', worktreeInfo);
+    } catch (err) {
+      this.initialConnectionContext.logger.error('Failed to refresh worktree info:', err);
+    }
+  });
+
   /** Return the latest fetched value for SmartlogCommits. */
   getSmartlogCommits(): FetchedCommits | null {
     return this.smartlogCommits;
@@ -1048,6 +1095,13 @@ export class Repository {
       return;
     }
 
+    // Recommended bookmarks (e.g., fbcode/warm_opt) are specific to fbsource.
+    // Skip for other repos to avoid pulling bookmarks that don't exist on the remote.
+    if (!this.info.repoRoot.includes('fbsource')) {
+      onFetched?.([]);
+      return;
+    }
+
     try {
       const bookmarks = await Internal.getRecommendedBookmarks(this.initialConnectionContext);
       onFetched?.((this.recommendedBookmarks = bookmarks.map((b: string) => `remote/${b}`)));
@@ -1055,6 +1109,40 @@ export class Repository {
     } catch (err) {
       this.initialConnectionContext.logger.error('Error fetching recommended bookmarks:', err);
       onFetched?.([]);
+    }
+  }
+
+  public async fetchAndSetHiddenMasterConfig(
+    onFetched?: (config: Record<string, Array<string>> | null, odType: string | null) => void,
+  ) {
+    if (!Internal.fetchHiddenMasterBranchConfig) {
+      return;
+    }
+
+    try {
+      const [config, odType] = await Promise.all([
+        Internal.fetchHiddenMasterBranchConfig(this.initialConnectionContext).catch(
+          (err: unknown) => {
+            this.initialConnectionContext.logger.warn(
+              'Failed to fetch hidden master branch config:',
+              err,
+            );
+            return null;
+          },
+        ),
+        Internal.getDevEnvType?.().catch((err: unknown) => {
+          this.initialConnectionContext.logger.warn('Failed to fetch OD type:', err);
+          return null;
+        }),
+      ]);
+
+      onFetched?.(config ?? {}, odType ?? '');
+    } catch (err) {
+      this.initialConnectionContext.logger.error(
+        'Error fetching hidden master branch config:',
+        err,
+      );
+      onFetched?.({}, '');
     }
   }
 
@@ -1282,7 +1370,7 @@ export class Repository {
       .map(rawObject => {
         try {
           return JSON.parse(rawObject) as {hash: Hash; backingup: 'True' | 'False'; date: string};
-        } catch (err) {
+        } catch (_err) {
           return null;
         }
       })
@@ -1551,6 +1639,21 @@ export class Repository {
     );
   }
 
+  /**
+   * Use the code review provider to fetch authored diff commit hashes,
+   * then unhide them so they are visible in the smartlog.
+   */
+  public async pullFetchedDiffs(): Promise<void> {
+    const hashes = await this.codeReviewProvider?.fetchAuthoredDiffs?.();
+    if (hashes == null || hashes.length === 0) {
+      return;
+    }
+
+    const revset = hashes.join(' + ');
+    // Use `sl unhide` instead of `sl pull` since pull doesn't support using '- hidden()'
+    await runCommand(this.initialConnectionContext, ['unhide', '-r', `(${revset}) - hidden()`]);
+  }
+
   public async getActiveAlerts(ctx: RepositoryContext): Promise<Array<Alert>> {
     const result = await this.runCommand(['config', '-Tjson', 'alerts'], 'GetAlertsCommand', ctx, {
       reject: false,
@@ -1563,7 +1666,7 @@ export class Repository {
       const alerts = parseAlerts(configs);
       ctx.logger.info('Found active alerts:', alerts);
       return alerts;
-    } catch (e) {
+    } catch (_e) {
       return [];
     }
   }
@@ -1581,6 +1684,7 @@ export class Repository {
     ctx: RepositoryContext,
     comparison: Comparison,
     contextLines = 4,
+    ignoreWhitespace?: boolean,
   ): Promise<string> {
     const output = await this.runCommand(
       [
@@ -1592,11 +1696,34 @@ export class Repository {
         '--nodate',
         '--unified',
         String(contextLines),
+        ...(ignoreWhitespace ? ['-w'] : []),
       ],
       'DiffCommand',
       ctx,
     );
     return output.stdout;
+  }
+
+  /**
+   * Get the list of changed files for a given comparison.
+   * Uses `sl status` with the appropriate revset arguments.
+   */
+  public async getFilesChangedForComparison(
+    ctx: RepositoryContext,
+    comparison: Comparison,
+  ): Promise<Array<ChangedFile>> {
+    const output = await this.runCommand(
+      ['status', ...revsetArgsForComparison(comparison), '-Tjson', '--copies'],
+      'StatusForComparisonCommand',
+      ctx,
+    );
+    if (!output.stdout.trim()) {
+      return [];
+    }
+    return (JSON.parse(output.stdout) as Array<ChangedFile>).map(change => ({
+      ...change,
+      path: removeLeadingPathSep(change.path),
+    }));
   }
 
   public runCommand(

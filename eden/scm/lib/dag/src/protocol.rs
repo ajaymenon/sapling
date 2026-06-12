@@ -86,7 +86,7 @@ impl fmt::Display for AncestorPath {
 
 impl fmt::Debug for AncestorPath {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self)?;
+        write!(f, "{self}")?;
         if self.batch_size != 1 {
             write!(f, "(+{})", self.batch_size)?;
         }
@@ -144,10 +144,8 @@ impl RemoteIdConvertProtocol for () {
         &self,
         paths: Vec<AncestorPath>,
     ) -> Result<Vec<(AncestorPath, Vec<Vertex>)>> {
-        let msg = format!(
-            "Asked to resolve {:?} in graph but remote protocol is not configured",
-            paths
-        );
+        let msg =
+            format!("Asked to resolve {paths:?} in graph but remote protocol is not configured");
         crate::errors::programming(msg)
     }
 
@@ -379,7 +377,7 @@ impl<M: IdConvert, DagStore: IdDagStore> Process<RequestLocationToName, Response
         let map = &self.0;
         let dag = &self.1;
 
-        let path_names: Vec<(AncestorPath, Vec<Vertex>)> = stream::iter(request.paths.into_iter())
+        let path_names: Vec<(AncestorPath, Vec<Vertex>)> = stream::iter(request.paths)
             .then(|path| async move {
                 let id = map.vertex_id(path.x.clone()).await?;
                 let mut id = dag.first_ancestor_nth(id, path.n)?;

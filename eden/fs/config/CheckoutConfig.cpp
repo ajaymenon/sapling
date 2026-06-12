@@ -15,12 +15,14 @@
 #include <folly/io/IOBuf.h>
 #include <folly/json/json.h>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 
 #include "eden/common/utils/FileUtils.h"
 #include "eden/common/utils/PathMap.h"
 #include "eden/common/utils/SystemError.h"
 #include "eden/common/utils/Throw.h"
+#include "eden/fs/config/TomlFileUtil.h"
 #include "eden/fs/utils/FilterUtils.h"
 
 using folly::ByteRange;
@@ -49,7 +51,6 @@ constexpr folly::StringPiece kReCas{"recas"};
 constexpr folly::StringPiece kReUseCase{"use-case"};
 #ifdef _WIN32
 constexpr folly::StringPiece kRepoGuid{"guid"};
-constexpr folly::StringPiece kEnableWindowsSymlinks{"enable-windows-symlinks"};
 #endif
 
 // Files of interest in the client directory.
@@ -259,15 +260,15 @@ void writeWorkingCopyParentAndCheckedOutRevisision(
   // 4-byte identifier: "eden"
   cursor.push(ByteRange{kSnapshotFileMagic});
   // 4-byte format version identifier
-  cursor.writeBE<uint32_t>(
-      kSnapshotFormatWorkingCopyParentAndCheckedOutRevisionVersion);
+  cursor.writeBE<uint32_t>(static_cast<uint32_t>(
+      kSnapshotFormatWorkingCopyParentAndCheckedOutRevisionVersion));
 
   // Working copy parent
-  cursor.writeBE<uint32_t>(workingCopyString.size());
+  cursor.writeBE<uint32_t>(static_cast<uint32_t>(workingCopyString.size()));
   cursor.push(folly::StringPiece{workingCopyString});
 
   // Checked out commit
-  cursor.writeBE<uint32_t>(checkedOutString.size());
+  cursor.writeBE<uint32_t>(static_cast<uint32_t>(checkedOutString.size()));
   cursor.push(folly::StringPiece{checkedOutString});
 
   writeFileAtomicWithRetry(path, ByteRange{buf->data(), buf->length()}).value();
@@ -306,17 +307,18 @@ void CheckoutConfig::setCheckoutInProgress(const RootId& from, const RootId& to)
   // 4-byte identifier: "eden"
   cursor.push(ByteRange{kSnapshotFileMagic});
   // 4-byte format version identifier
-  cursor.writeBE<uint32_t>(kSnapshotFormatCheckoutInProgressVersion);
+  cursor.writeBE<uint32_t>(
+      static_cast<uint32_t>(kSnapshotFormatCheckoutInProgressVersion));
 
   // PID of this process
-  cursor.writeBE<uint32_t>(getpid());
+  cursor.writeBE<uint32_t>(static_cast<uint32_t>(getpid()));
 
   // From:
-  cursor.writeBE<uint32_t>(fromString.size());
+  cursor.writeBE<uint32_t>(static_cast<uint32_t>(fromString.size()));
   cursor.push(folly::StringPiece{fromString});
 
   // To:
-  cursor.writeBE<uint32_t>(toString.size());
+  cursor.writeBE<uint32_t>(static_cast<uint32_t>(toString.size()));
   cursor.push(folly::StringPiece{toString});
 
   writeFileAtomicWithRetry(
@@ -344,7 +346,7 @@ std::unique_ptr<std::unordered_map<std::string, std::string>>
 CheckoutConfig::getLatestRedirectionTargets() const {
   // Extract repository name from the client config file
   auto configPath = clientDirectory_ + kCheckoutConfig;
-  auto configRoot = cpptoml::parse_file(configPath.c_str());
+  auto configRoot = parseTomlFile(configPath);
   auto redirection_targets =
       std::make_unique<std::unordered_map<std::string, std::string>>();
   // Load redirection targets
@@ -372,7 +374,7 @@ std::unique_ptr<CheckoutConfig> CheckoutConfig::loadFromClientDirectory(
     AbsolutePathPiece clientDirectory) {
   // Extract repository name from the client config file
   auto configPath = clientDirectory + kCheckoutConfig;
-  auto configRoot = cpptoml::parse_file(configPath.c_str());
+  auto configRoot = parseTomlFile(configPath);
 
   // Construct CheckoutConfig object
   auto config = std::make_unique<CheckoutConfig>(mountPath, clientDirectory);
@@ -438,11 +440,6 @@ std::unique_ptr<CheckoutConfig> CheckoutConfig::loadFromClientDirectory(
 #ifdef _WIN32
   auto guid = repository->get_as<std::string>(kRepoGuid.str());
   config->repoGuid_ = guid ? Guid{*guid} : Guid::generate();
-
-  auto windowsSymlinksEnabled =
-      repository->get_as<bool>(kEnableWindowsSymlinks.str());
-  config->enableWindowsSymlinks_ =
-      windowsSymlinksEnabled ? *windowsSymlinksEnabled : false;
 #endif
 
   return config;

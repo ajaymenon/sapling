@@ -237,6 +237,18 @@ def callcatch(ui, req, func):
             ui.warn(_(" empty string\n"))
         else:
             ui.warn("\n%r\n" % util.ellipsis(inst.args[1]))
+    except error.PermissionDeniedError as inst:
+        path, hgid, request_acl = inst.args
+        rctx = getattr(getattr(ui, "_uiconfig", None), "_rctx", None)
+        if rctx:
+            msg = bindings.context.format_permission_denied(
+                rctx, path, hgid, request_acl
+            )
+        else:
+            msg = "path '%s' is restricted by ACL '%s'" % (path, request_acl)
+        ui.warn("%s\n" % msg, error=_("abort"))
+        if req:
+            req._permission_denied_handled = True
     except error.CensoredNodeError as inst:
         ui.warn(_("file censored %s!\n") % inst, error=_("abort"))
     except error.CommitLookupError as inst:
@@ -285,6 +297,7 @@ def callcatch(ui, req, func):
     except (
         error.ConfigError,
         error.InvalidRepoPath,
+        error.MaxFetchCountError,
         error.NonUTF8PathError,
         error.PathMatcherError,
         error.RepoInitError,
@@ -783,6 +796,13 @@ def origpath(ui, repo, filepath):
     origbackupdir = origvfs.dirname(filepathfromroot)
     if not origvfs.isdir(origbackupdir) or origvfs.islink(origbackupdir):
         ui.note(_("creating directory: %s\n") % origvfs.join(origbackupdir))
+
+        # The configured backup root itself may be a file or symlink. Handle
+        # that here instead of requiring the VFS to support a non-directory root.
+        origbackuproot = origvfs.join("")
+        if os.path.isfile(origbackuproot) or os.path.islink(origbackuproot):
+            ui.note(_("removing conflicting file: %s\n") % origbackuproot)
+            util.unlink(origbackuproot)
 
         # Remove any files that conflict with the backup file's path
         for f in reversed(list(util.finddirs(filepathfromroot))):

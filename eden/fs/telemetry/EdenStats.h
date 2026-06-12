@@ -40,6 +40,7 @@ struct InodeMetadataTableStats;
 struct BlobCacheStats;
 struct TreeCacheStats;
 struct ScmStatusCacheStats;
+struct TakeoverStats;
 struct FakeStats;
 
 class EdenStats : public RefCounted {
@@ -95,6 +96,7 @@ class EdenStats : public RefCounted {
   ThreadLocal<BlobCacheStats> blobCacheStats_;
   ThreadLocal<TreeCacheStats> treeCacheStats_;
   ThreadLocal<ScmStatusCacheStats> scmStatusCacheStats_;
+  ThreadLocal<TakeoverStats> takeoverStats_;
   ThreadLocal<FakeStats> fakeStats_;
 };
 
@@ -172,6 +174,11 @@ template <>
 inline ScmStatusCacheStats&
 EdenStats::getStatsForCurrentThread<ScmStatusCacheStats>() {
   return *scmStatusCacheStats_.get();
+}
+
+template <>
+inline TakeoverStats& EdenStats::getStatsForCurrentThread<TakeoverStats>() {
+  return *takeoverStats_.get();
 }
 
 template <>
@@ -348,6 +355,30 @@ struct NfsStats : StatsGroup<NfsStats> {
   Counter nfsCommitSuccessful{"nfs.commit_successful"};
   Counter nfsCommitFailure{"nfs.commit_failure"};
 
+  // Backpressure
+  Counter nfsBackpressureJukebox{"nfs.backpressure_jukebox"};
+  Counter nfsInflightAtRequest{"nfs.inflight_at_request"};
+
+  // NFS GC invalidation counters
+  Counter nfsInvalidationGcAttempt{"nfs.invalidation.gc.attempt"};
+  Counter nfsInvalidationGcSuccess{"nfs.invalidation.gc.success"};
+  Counter nfsInvalidationGcFailure{"nfs.invalidation.gc.failure"};
+  Counter nfsInvalidationGcEnoent{"nfs.invalidation.gc.enoent"};
+
+  Counter nfsInvalidationGcClearFsRefcountAttempt{
+      "nfs.invalidation.gc.clear_fs_refcount.attempt"};
+  Counter nfsInvalidationGcClearFsRefcountCleared{
+      "nfs.invalidation.gc.clear_fs_refcount.cleared"};
+  Counter nfsInvalidationGcClearFsRefcountSkipped{
+      "nfs.invalidation.gc.clear_fs_refcount.skipped_not_loaded_or_remembered"};
+
+  // Phase timing (aggregate across all NFS procedures)
+  Duration nfsPhaseAccept{"nfs.phase_accept_us"};
+  Duration nfsPhaseQueueWait{"nfs.phase_queue_wait_us"};
+  Duration nfsPhaseProcessing{"nfs.phase_processing_us"};
+  Duration nfsPhaseWriteWait{"nfs.phase_write_wait_us"};
+  Duration nfsPhaseTotal{"nfs.phase_total_us"};
+
   // NFS error counters
   Counter nfsErrorPerm{"nfs.error.perm"};
   Counter nfsErrorNoEnt{"nfs.error.noent"};
@@ -498,6 +529,10 @@ struct ObjectStoreStats : StatsGroup<ObjectStoreStats> {
       "object_store.get_blob_metadata.backing_store"};
   Counter getBlobAuxDataFromBlob{"object_store.get_blob_metadata.blob"};
   Counter getBlobAuxDataFailed{"object_store.get_blob_metadata_failed"};
+
+  Counter checkPermission{"object_store.check_permission"};
+  Counter checkPermissionFromBackingStore{
+      "object_store.check_permission.backing_store"};
 };
 
 /**
@@ -608,6 +643,7 @@ struct OverlayStats : StatsGroup<OverlayStats> {
   Duration removeChild{"overlay.remove_child_us"};
   Duration removeChildren{"overlay.remove_children_us"};
   Duration renameChild{"overlay.rename_child_us"};
+  Duration materializeChild{"overlay.materialize_child_us"};
   Counter loadOverlayDirSuccessful{"overlay.load_overlay_dir_successful"};
   Counter loadOverlayDirFailure{"overlay.load_overlay_dir_failure"};
   Counter saveOverlayDirSuccessful{"overlay.save_overlay_dir_successful"};
@@ -636,6 +672,20 @@ struct OverlayStats : StatsGroup<OverlayStats> {
   Counter removeChildrenFailure{"overlay.remove_children_failure"};
   Counter renameChildSuccessful{"overlay.rename_child_successful"};
   Counter renameChildFailure{"overlay.rename_child_failure"};
+  Counter materializeChildSuccessful{"overlay.materialize_child_successful"};
+  Counter materializeChildFailure{"overlay.materialize_child_failure"};
+
+  // WAL for deferred overlay directory writes (overlay:use-wal config gate).
+  Counter walAppend{"overlay.wal_append"};
+  Counter walReplay{"overlay.wal_replay"};
+  Counter walEntriesReplayed{"overlay.wal_entries_replayed"};
+  Counter walParseFailure{"overlay.wal_parse_failure"};
+  Counter walCompaction{"overlay.wal_compaction"};
+  // Wall time spent inside the synchronous saveOverlayDir triggered by
+  // maybeCompactWal. Bounded by kCompactionCap, but worth a histogram
+  // because compaction runs on the FUSE/NFS dispatch thread under the
+  // parent contents lock.
+  Duration walCompactionInline{"overlay.wal_compaction_inline_us"};
 };
 
 struct InodeMapStats : StatsGroup<InodeMapStats> {
@@ -670,6 +720,18 @@ struct ScmStatusCacheStats : StatsGroup<TreeCacheStats> {
   Counter getMiss{"scm_status_cache.get_miss"};
   Counter insertEviction{"scm_status_cache.insert_eviction"};
   Counter objectDrop{"scm_status_cache.object_drop"};
+};
+
+/**
+ * Tracks duration and outcome of the graceful restart (takeover) protocol.
+ * sendFailure is measured on the old daemon (which stays alive on failure).
+ * receiveSuccess is measured on the new daemon (which stays alive on success).
+ */
+struct TakeoverStats : StatsGroup<TakeoverStats> {
+  Duration send{"takeover.send_us"};
+  Counter sendFailure{"takeover.send_failure"};
+  Duration receive{"takeover.receive_us"};
+  Counter receiveSuccess{"takeover.receive_success"};
 };
 
 /*

@@ -53,6 +53,13 @@ cpp_library(
 )
 
 cpp_library(
+    name = "xplat_keys",
+    headers = [
+        "XplatKeys.h",
+    ],
+)
+
+cpp_library(
     name = "scribe_logger",
     headers = [
         "IScribeLogger.h",
@@ -116,16 +123,112 @@ cpp_library(
 )
 
 cpp_library(
+    name = "error_logger",
+    srcs = [
+        "ErrorLogger.cpp",
+    ],
+    headers = [
+        "ErrorLogger.h",
+    ],
+    deps = [
+        ":error_info",
+        ":stack_trace_uploader",
+        "//eden/fs/config:config",
+    ],
+    exported_deps = [":structured_logger"],
+)
+
+cpp_library(
+    name = "throw_trace_capture",
+    srcs = [
+        "ThrowTraceCapture.cpp",
+    ],
+    headers = [
+        "ThrowTraceCapture.h",
+    ],
+    exported_linker_flags = select({
+        "DEFAULT": [],
+        "ovr_config//os:linux": [
+            "-Wl,--wrap=__cxa_throw",
+        ],
+    }),
+    deps = [
+        "//eden/fs/rust/backtrace_ffi:backtrace-ffi",
+        "//eden/fs/rust/backtrace_ffi:backtrace-ffi@header",
+    ] + select({
+        "DEFAULT": [],
+        "ovr_config//os:macos": [
+            "//folly/debugging/exception_tracer:exception_tracer_callbacks",
+        ],
+    }),
+)
+
+cpp_library(
+    name = "stack_trace_uploader",
+    srcs = [
+        "StackTraceUploader.cpp",
+    ],
+    headers = [
+        "StackTraceUploader.h",
+    ],
+    deps = [
+        "fbsource//third-party/fmt:fmt",
+        "//eden/fs/rust/manifold_ffi:manifold-ffi",
+        "//eden/fs/rust/manifold_ffi:manifold-ffi@header",
+        "//folly:random",
+        "//folly/executors:cpu_thread_pool_executor",
+        "//folly/logging:logging",
+    ],
+    exported_deps = [],
+)
+
+cpp_library(
+    name = "error_info",
+    srcs = [
+        "EdenComponent.cpp",
+        "EdenErrorInfo.cpp",
+        "EdenErrorInfoBuilder.cpp",
+        "ErrorArg.cpp",
+    ],
+    headers = [
+        "DaemonError.h",
+        "EdenComponent.h",
+        "EdenErrorInfo.h",
+        "EdenErrorInfoBuilder.h",
+        "ErrorArg.h",
+    ],
+    deps = [
+        "fbsource//third-party/fmt:fmt",
+        ":throw_trace_capture",
+        "//folly:demangle",
+    ],
+    exported_deps = [
+        "//eden/common/telemetry:log_info",
+        "//folly/json:dynamic",
+    ],
+)
+
+cpp_library(
     name = "structured_logger",
     srcs = [
+        "EdenFsEventsLogger.cpp",
         "EdenStructuredLogger.cpp",
     ],
     headers = [
+        "EdenFsEventsLogger.h",
         "EdenStructuredLogger.h",
+    ],
+    deps = [
+        ":stats",
+        ":xplat_keys",
+        "//eden/common/telemetry:structured_logger_factory",
+        "//eden/fs/config:config",
     ],
     exported_deps = [
         "//eden/common/telemetry:log_info",
         "//eden/common/telemetry:scribe_logger",
         "//eden/common/telemetry:structured_logger",
+        "//eden/common/utils:ref_ptr",
+        "//eden/fs/telemetry/facebook:xplat_logger",  # @manual
     ],
 )

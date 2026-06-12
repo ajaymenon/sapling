@@ -219,11 +219,11 @@ impl Renderer<'_> {
             );
 
             let (current_x, _) = self.changes.current_cursor_position();
-            self.changes.add(self.config.truncate_by_width(
-                &line,
-                self.config.term_width - current_x,
-                "…",
-            ));
+            self.changes.add(
+                self.config
+                    .truncate_by_width(&line, self.config.term_width - current_x, "…")
+                    .into_owned(),
+            );
 
             self.changes.add("\r\n");
 
@@ -383,7 +383,7 @@ mod test {
         let output = inner(bars, 0, 0);
 
         if !output.is_empty() {
-            format!("\n{}\n", output)
+            format!("\n{output}\n")
         } else {
             output
         }

@@ -32,6 +32,7 @@ use futures::try_join;
 use futures_stats::TimedFutureExt;
 use futures_stats::TimedTryFutureExt;
 use itertools::Itertools;
+use manifest::Manifest;
 use manifest::PathTree;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::BonsaiChangeset;
@@ -42,7 +43,6 @@ use mononoke_types::FileChange;
 use mononoke_types::GitLfs;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
-use mononoke_types::fsnode::FsnodeEntry;
 use mononoke_types::path::MPath;
 use repo_authorization::RepoWriteOperation;
 use repo_blobstore::RepoBlobstore;
@@ -83,6 +83,7 @@ impl CreateCopyInfo {
         &self,
         stack_changes: Option<&PathTree<CreateChangeType>>,
         stack_parents: &[ChangesetContext<R>],
+        copy_from_path_mode: CreateChangesetCheckMode,
     ) -> Result<(), MononokeError> {
         if let Some(stack_changes) = stack_changes {
             // Since this is a stacked commit, there is only one parent.
@@ -112,6 +113,11 @@ impl CreateCopyInfo {
                     )));
                 }
             }
+            // The remaining branch checks the parent's content manifest, so
+            // skip it when the bypass is requested.
+            if matches!(copy_from_path_mode, CreateChangesetCheckMode::Skip) {
+                return Ok(());
+            }
             // The copy-from path wasn't touched in the stack, check it was in
             // at least one of the stack's parents.
             for parent_ctx in stack_parents {
@@ -133,6 +139,9 @@ impl CreateCopyInfo {
                     stack_parents.len()
                 ))
             })?;
+            if matches!(copy_from_path_mode, CreateChangesetCheckMode::Skip) {
+                return Ok(());
+            }
             // Check the file exists in that parent.
             if parent_ctx
                 .path_with_content(self.path.clone())
@@ -271,8 +280,7 @@ impl CreateChangeFileContents {
                     .await?
                     .ok_or_else(|| {
                         MononokeError::InvalidRequest(format!(
-                            "File id '{}' is not available in this repo",
-                            file_id
+                            "File id '{file_id}' is not available in this repo"
                         ))
                     })?
                     .total_size;
@@ -343,11 +351,14 @@ impl CreateChange {
         repo_blobstore: RepoBlobstore,
         stack_changes: Option<&PathTree<CreateChangeType>>,
         stack_parents: &[ChangesetContext<R>],
+        copy_from_path_mode: CreateChangesetCheckMode,
     ) -> Result<(), MononokeError> {
         let file = match self {
             CreateChange::Tracked(file, copy_info) => {
                 if let Some(copy_info) = copy_info {
-                    copy_info.check_valid(stack_changes, stack_parents).await?;
+                    copy_info
+                        .check_valid(stack_changes, stack_parents, copy_from_path_mode)
+                        .await?;
                 }
                 file
             }
@@ -632,8 +643,7 @@ pub(crate) async fn verify_deleted_files_existed_in_a_parent<R: MononokeRepo>(
                     deletions_to_remove.insert(deleted_file.clone());
                 } else {
                     return Err(MononokeError::InvalidRequest(format!(
-                        "Deleted file '{}' was deleted earlier in the stack",
-                        deleted_file
+                        "Deleted file '{deleted_file}' was deleted earlier in the stack"
                     )));
                 }
             }
@@ -643,8 +653,7 @@ pub(crate) async fn verify_deleted_files_existed_in_a_parent<R: MononokeRepo>(
                         deletions_to_remove.insert(deleted_file.clone());
                     } else {
                         return Err(MononokeError::InvalidRequest(format!(
-                            "Deleted file '{}' was deleted earlier in the stack through replacement of '{}'",
-                            deleted_file, prefix
+                            "Deleted file '{deleted_file}' was deleted earlier in the stack through replacement of '{prefix}'"
                         )));
                     }
                 }
@@ -681,13 +690,11 @@ pub(crate) async fn verify_deleted_files_existed_in_a_parent<R: MononokeRepo>(
         let path_count = deleted_files.len().saturating_sub(parent_files.len());
         if path_count == 1 {
             Err(MononokeError::InvalidRequest(format!(
-                "Deleted file '{}' does not exist in any parent",
-                non_existent_path
+                "Deleted file '{non_existent_path}' does not exist in any parent"
             )))
         } else {
             Err(MononokeError::InvalidRequest(format!(
-                "{} deleted files ('{}', ...) do not exist in any parent",
-                path_count, non_existent_path
+                "{path_count} deleted files ('{non_existent_path}', ...) do not exist in any parent"
             )))
         }
     }
@@ -759,8 +766,7 @@ pub(crate) async fn verify_no_noop_file_changes<R: MononokeRepo>(
         .try_for_each_concurrent(10, async |(path, change)| {
             if is_noop_file_change(parent_ctxs, stack_changes.as_ref(), path, change).await? {
                 return Err(MononokeError::InvalidRequest(format!(
-                    "Found no-op file change at path '{}'. File changes that don't change file content are not allowed",
-                    path
+                    "Found no-op file change at path '{path}'. File changes that don't change file content are not allowed"
                 )));
             }
             Ok(())
@@ -802,11 +808,16 @@ pub(crate) fn is_prefix_changed(path: &MPath, paths: &PathTree<CreateChangeType>
 /// Verify that any files in `prefix_paths` that exist in any of
 /// `parent_ctxs`, as modified by the existing stack changes, have been marked
 /// as deleted in `path_changes`.
+///
+/// `prefix_files_deleted_mode` only controls the parent-traversal half of the
+/// check (which depends on derived data of the parents). The stack-local half
+/// always runs because it is cheap and self-consistent.
 pub(crate) async fn verify_prefix_files_deleted<R: MononokeRepo>(
     parent_ctxs: &[ChangesetContext<R>],
     stack_changes: Option<&PathTree<CreateChangeType>>,
     mut prefix_paths: BTreeSet<MPath>,
     path_changes: &PathTree<CreateChangeType>,
+    prefix_files_deleted_mode: CreateChangesetCheckMode,
 ) -> Result<(), MononokeError> {
     if let Some(stack_changes) = stack_changes {
         // Remove any prefix paths that have already been deleted earlier in the stack.
@@ -827,6 +838,9 @@ pub(crate) async fn verify_prefix_files_deleted<R: MononokeRepo>(
                 )));
             }
         }
+    }
+    if matches!(prefix_files_deleted_mode, CreateChangesetCheckMode::Skip) {
+        return Ok(());
     }
     // Check that any prefix path that exists in any parent is being deleted.
     stream::iter(parent_ctxs.iter().map(Ok))
@@ -861,9 +875,11 @@ async fn check_addless_union_conflicts<R: MononokeRepo>(
         return Ok(());
     }
 
-    let root_fsnodes: Vec<_> = stream::iter(changesets.iter().map(|cs_ctx| async move {
-        Ok::<_, MononokeError>(cs_ctx.root_fsnode_id().await?.into_fsnode_id())
-    }))
+    let root_manifest_ids: Vec<_> = stream::iter(
+        changesets
+            .iter()
+            .map(|cs_ctx| async move { cs_ctx.root_content_manifest_id().await }),
+    )
     .boxed()
     .buffered(10)
     .try_collect()
@@ -873,24 +889,24 @@ async fn check_addless_union_conflicts<R: MononokeRepo>(
 
     let conflict_paths = bounded_traversal::bounded_traversal_stream(
         256,
-        Some((root_fsnodes, MPath::ROOT)),
-        move |(fsnodes_to_check, current_path)| {
+        Some((root_manifest_ids, MPath::ROOT)),
+        move |(manifest_ids_to_check, current_path)| {
             Box::pin(async move {
                 let mut leaf_content: BTreeMap<MPathElement, HashSet<_>> = BTreeMap::new();
                 let mut trees: BTreeMap<MPathElement, BTreeSet<_>> = BTreeMap::new();
 
-                for fsnode in fsnodes_to_check {
-                    let fsnode = fsnode.load(ctx, store).await?;
-                    for (path_element, entry) in fsnode.list() {
+                for manifest_id in manifest_ids_to_check {
+                    let manifest = manifest_id.load(ctx, store).await?;
+                    let entries: Vec<_> = manifest.list(ctx, store).await?.try_collect().await?;
+                    for (path_element, entry) in entries {
                         match entry {
-                            FsnodeEntry::Directory(directory) => trees
+                            manifest::Entry::Tree(id) => {
+                                trees.entry(path_element.clone()).or_default().insert(id)
+                            }
+                            manifest::Entry::Leaf(file) => leaf_content
                                 .entry(path_element.clone())
                                 .or_default()
-                                .insert(*directory.id()),
-                            FsnodeEntry::File(file) => leaf_content
-                                .entry(path_element.clone())
-                                .or_default()
-                                .insert(*file),
+                                .insert(file),
                         };
                     }
                 }
@@ -920,14 +936,14 @@ async fn check_addless_union_conflicts<R: MononokeRepo>(
                 // If we already have new content for a path, then we don't recurse into it
                 let recurse: Vec<_> = trees
                     .into_iter()
-                    .filter_map(|(path_element, fsnodes)| {
+                    .filter_map(|(path_element, manifest_ids)| {
                         let path = current_path.join_element(Some(&path_element));
                         let fix_exists = fix_paths
                             .get(&path)
                             .is_some_and(CreateChangeType::is_modification);
 
-                        if !fix_exists && fsnodes.len() > 1 {
-                            Some((fsnodes.into_iter().collect(), path))
+                        if !fix_exists && manifest_ids.len() > 1 {
+                            Some((manifest_ids.into_iter().collect(), path))
                         } else {
                             None
                         }
@@ -967,6 +983,8 @@ pub struct CreateChangesetChecks {
     pub noop_file_changes: CreateChangesetCheckMode,
     pub deleted_files_existed_in_a_parent: CreateChangesetCheckMode,
     pub empty_changeset: CreateChangesetCheckMode,
+    pub copy_from_path: CreateChangesetCheckMode,
+    pub prefix_files_deleted: CreateChangesetCheckMode,
 }
 
 impl CreateChangesetChecks {
@@ -976,11 +994,57 @@ impl CreateChangesetChecks {
             noop_file_changes: CreateChangesetCheckMode::Check,
             deleted_files_existed_in_a_parent: CreateChangesetCheckMode::Check,
             empty_changeset: CreateChangesetCheckMode::Check,
+            copy_from_path: CreateChangesetCheckMode::Check,
+            prefix_files_deleted: CreateChangesetCheckMode::Check,
         }
+    }
+
+    /// Returns true if any check is set to `Skip`.
+    pub fn any_bypass_requested(&self) -> bool {
+        use CreateChangesetCheckMode::Skip;
+        self.noop_file_changes == Skip
+            || self.deleted_files_existed_in_a_parent == Skip
+            || self.empty_changeset == Skip
+            || self.copy_from_path == Skip
+            || self.prefix_files_deleted == Skip
     }
 }
 
 impl<R: MononokeRepo> RepoContext<R> {
+    pub async fn enforce_create_commit_check_bypass(
+        &self,
+        checks: &CreateChangesetChecks,
+    ) -> Result<(), MononokeError> {
+        if !checks.any_bypass_requested() {
+            return Ok(());
+        }
+        if self
+            .authorization_context()
+            .check_create_commit_check_bypass(self.ctx(), self.repo())
+            .await
+            .is_permitted()
+        {
+            return Ok(());
+        }
+        let enforce = justknobs::eval(
+            "scm/mononoke:create_commit_bypass_config_enforce",
+            None,
+            Some(self.name()),
+        );
+        let log_tag = if enforce {
+            "create_commit bypass not permitted by service_write_restrictions"
+        } else {
+            "create_commit bypass would not be permitted by service_write_restrictions"
+        };
+        self.ctx().scuba().clone().log_with_msg(log_tag, None);
+        if enforce {
+            return Err(MononokeError::AuthorizationError(
+                "create_commit bypass not permitted by service_write_restrictions".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn save_changesets(
         &self,
         changesets: Vec<BonsaiChangeset>,
@@ -1083,7 +1147,7 @@ impl<R: MononokeRepo> RepoContext<R> {
                 .changeset(ChangesetSpecifier::Bonsai(parent_id.clone()))
                 .await?
                 .ok_or_else(|| {
-                    MononokeError::InvalidRequest(format!("Parent {} does not exist", parent_id))
+                    MononokeError::InvalidRequest(format!("Parent {parent_id} does not exist"))
                 })?;
             Ok::<_, MononokeError>(parent_ctx)
         }))
@@ -1239,6 +1303,7 @@ impl<R: MononokeRepo> RepoContext<R> {
                     stack_changes.as_ref(),
                     prefix_paths,
                     path_changes,
+                    checks.prefix_files_deleted,
                 )
                 .timed()
                 .await
@@ -1296,6 +1361,7 @@ impl<R: MononokeRepo> RepoContext<R> {
                                     blobstore.clone(),
                                     stack_changes.as_ref(),
                                     &stack_parent_ctxs,
+                                    checks.copy_from_path,
                                 )
                                 .await?;
                             Ok::<_, MononokeError>((path, change))
@@ -1336,7 +1402,7 @@ impl<R: MononokeRepo> RepoContext<R> {
                 "scm/mononoke:create_changeset_stack_noop_file_changes_check",
                 None,
                 Some(self.name()),
-            )?
+            )
         {
             // When to build another stack of PathTrees that contains the content_id for each file change
             let mut stack_changes_stack = vec![None];
@@ -1359,45 +1425,42 @@ impl<R: MononokeRepo> RepoContext<R> {
             }
 
             if checks.noop_file_changes == CreateChangesetCheckMode::Fix {
-                file_changes_stack = stream::iter(
-                    file_changes_stack
-                        .into_iter()
-                        .zip(stack_changes_stack.into_iter()),
-                )
-                .map(Ok)
-                .map_ok(async |(file_changes, stack_changes)| {
-                    Ok::<_, MononokeError>(
-                        remove_noop_file_changes(&stack_parent_ctxs, stack_changes, file_changes)
-                            .try_timed()
-                            .await?
+                file_changes_stack =
+                    stream::iter(file_changes_stack.into_iter().zip(stack_changes_stack))
+                        .map(Ok)
+                        .map_ok(async |(file_changes, stack_changes)| {
+                            Ok::<_, MononokeError>(
+                                remove_noop_file_changes(
+                                    &stack_parent_ctxs,
+                                    stack_changes,
+                                    file_changes,
+                                )
+                                .try_timed()
+                                .await?
+                                .log_future_stats(
+                                    self.ctx().scuba().clone(),
+                                    "Removing no no-op file changes",
+                                    None,
+                                ),
+                            )
+                        })
+                        .try_buffered(10)
+                        .try_collect::<Vec<_>>()
+                        .await?;
+            } else {
+                stream::iter(file_changes_stack.iter().zip(stack_changes_stack))
+                    .map(Ok)
+                    .try_for_each_concurrent(10, async |(file_changes, stack_changes)| {
+                        verify_no_noop_file_changes(&stack_parent_ctxs, stack_changes, file_changes)
+                            .timed()
+                            .await
                             .log_future_stats(
                                 self.ctx().scuba().clone(),
-                                "Removing no no-op file changes",
+                                "Verify no no-op file changes",
                                 None,
-                            ),
-                    )
-                })
-                .try_buffered(10)
-                .try_collect::<Vec<_>>()
-                .await?;
-            } else {
-                stream::iter(
-                    file_changes_stack
-                        .iter()
-                        .zip(stack_changes_stack.into_iter()),
-                )
-                .map(Ok)
-                .try_for_each_concurrent(10, async |(file_changes, stack_changes)| {
-                    verify_no_noop_file_changes(&stack_parent_ctxs, stack_changes, file_changes)
-                        .timed()
-                        .await
-                        .log_future_stats(
-                            self.ctx().scuba().clone(),
-                            "Verify no no-op file changes",
-                            None,
-                        )
-                })
-                .await?;
+                            )
+                    })
+                    .await?;
             }
         };
 
@@ -1448,13 +1511,13 @@ impl<R: MononokeRepo> RepoContext<R> {
         let mut new_changesets = Vec::new();
         let mut new_changeset_ids = Vec::new();
         let mut parents = stack_parents;
-        for (info, file_changes) in info_stack.into_iter().zip(file_changes_stack.into_iter()) {
+        for (info, file_changes) in info_stack.into_iter().zip(file_changes_stack) {
             if checks.empty_changeset != CreateChangesetCheckMode::Skip
                 && justknobs::eval(
                     "scm/mononoke:create_changeset_stack_empty_changeset_check",
                     None,
                     Some(self.name()),
-                )?
+                )
                 && file_changes.is_empty()
                 // exclude merge commits
                 && parents.len() <= 1
@@ -1494,8 +1557,7 @@ impl<R: MononokeRepo> RepoContext<R> {
             .freeze()
             .map_err(|e| {
                 MononokeError::InvalidRequest(format!(
-                    "Changes create invalid bonsai changeset: {}",
-                    e
+                    "Changes create invalid bonsai changeset: {e}"
                 ))
             })?;
 

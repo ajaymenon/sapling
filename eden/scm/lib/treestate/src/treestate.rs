@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
 use std::iter::Iterator;
-use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -398,7 +397,7 @@ impl TreeState {
     }
 
     pub fn metadata_bytes(&self) -> &[u8] {
-        self.root.metadata().deref()
+        self.root.metadata()
     }
 
     pub fn metadata(&self) -> Result<BTreeMap<String, String>> {
@@ -426,7 +425,7 @@ impl TreeState {
         (1..).map_while(|i| match self.metadata() {
             Err(err) => Some(Err(err)),
             Ok(metadata) => metadata
-                .get(&format!("p{}", i))
+                .get(&format!("p{i}"))
                 .map(|parent_hash| HgId::from_str(parent_hash).map_err(|e| e.into())),
         })
     }
@@ -570,7 +569,7 @@ impl TreeState {
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
+    use rand::RngExt as _;
     use rand::SeedableRng;
     use rand_chacha::ChaChaRng;
     use tempfile::tempdir;
@@ -696,7 +695,7 @@ mod tests {
         let mut state = TreeState::new(directory, true).expect("open").0;
         let mut rng = ChaChaRng::from_seed([0; 32]);
         for path in &SAMPLE_PATHS {
-            let file = rng.r#gen();
+            let file = rng.random();
             state.insert(path, &file).expect("insert");
         }
         state
@@ -708,7 +707,7 @@ mod tests {
         let mut state = new_treestate(dir.path());
         let mut rng = ChaChaRng::from_seed([0; 32]);
         for path in &SAMPLE_PATHS {
-            let file: FileStateV2 = rng.r#gen();
+            let file: FileStateV2 = rng.random();
             assert_eq!(state.get(path).unwrap().unwrap(), &file);
         }
         assert_eq!(state.len(), SAMPLE_PATHS.len());
@@ -737,7 +736,7 @@ mod tests {
                 .expect("open");
         let mut rng = ChaChaRng::from_seed([0; 32]);
         for path in &SAMPLE_PATHS {
-            let file: FileStateV2 = rng.r#gen();
+            let file: FileStateV2 = rng.random();
             assert_eq!(state.get(path).unwrap().unwrap(), &file);
         }
         assert_eq!(state.len(), SAMPLE_PATHS.len());
@@ -753,7 +752,7 @@ mod tests {
                 .expect("open");
         let mut rng = ChaChaRng::from_seed([0; 32]);
         for path in &SAMPLE_PATHS {
-            let file: FileStateV2 = rng.r#gen();
+            let file: FileStateV2 = rng.random();
             assert_eq!(state.get(path).unwrap().unwrap(), &file);
         }
         assert_eq!(state.len(), SAMPLE_PATHS.len());
@@ -795,7 +794,7 @@ mod tests {
         let mut state = TreeState::new(dir.as_ref(), true).expect("open").0;
 
         let mut rng = ChaChaRng::from_seed([0; 32]);
-        let mut file = rng.r#gen();
+        let mut file = rng.random();
         state.insert(b"dir/file", &file).unwrap();
         assert_eq!(
             state.normalize_path(b"dir/file").unwrap().as_ref(),
@@ -830,7 +829,7 @@ mod tests {
         let mut state = TreeState::new(dir.as_ref(), false).expect("open").0;
 
         let mut rng = ChaChaRng::from_seed([0; 32]);
-        let mut file = rng.r#gen();
+        let mut file = rng.random();
         state.insert(b"dir/file", &file).unwrap();
         assert_eq!(
             std::str::from_utf8(state.normalize_path(b"dir/file").unwrap().as_ref()).unwrap(),
@@ -980,9 +979,9 @@ mod tests {
         assert_eq!(ts.pending_change_count(), 0);
 
         let mut rng = ChaChaRng::from_seed([0; 32]);
-        ts.insert("foo", &rng.r#gen())?;
-        ts.insert("bar", &rng.r#gen())?;
-        ts.insert("baz", &rng.r#gen())?;
+        ts.insert("foo", &rng.random())?;
+        ts.insert("bar", &rng.random())?;
+        ts.insert("baz", &rng.random())?;
         assert_eq!(ts.pending_change_count(), 3);
 
         ts.remove("foo")?;
@@ -1008,7 +1007,7 @@ mod tests {
         let mut ts = TreeState::new(dir.path(), false)?.0;
 
         let mut rng = ChaChaRng::from_seed([0; 32]);
-        ts.insert("a/b/c/d", &rng.r#gen())?;
+        ts.insert("a/b/c/d", &rng.random())?;
 
         assert_eq!(ts.normalize_path(b"A").unwrap().as_ref(), b"A");
         assert_eq!(ts.normalize_path(b"A/a").unwrap().as_ref(), b"a/a");

@@ -356,6 +356,47 @@ pub async fn assert_ancestors_difference_segment_slices(
     Ok(())
 }
 
+pub async fn assert_ancestors_difference_segment_slices_with_external_parents(
+    graph: &CommitGraph,
+    ctx: &CoreContext,
+    heads: &[&str],
+    common: &[&str],
+    slice_size: u64,
+    expected_slices: &[&[&str]],
+    expected_external_parents: &[&str],
+) -> Result<()> {
+    let heads = heads.iter().copied().map(name_cs_id).collect();
+    let common = common.iter().copied().map(name_cs_id).collect();
+
+    let (slices_stream, external_parents) = graph
+        .ancestors_difference_segment_slices_with_external_parents(ctx, heads, common, slice_size)
+        .await?;
+
+    assert_eq!(
+        slices_stream
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .map(|slice| { slice.into_iter().map(cs_id_name).collect::<Vec<_>>() })
+            .collect::<Vec<_>>(),
+        expected_slices
+            .iter()
+            .map(|slice| { slice.iter().map(|s| s.to_string()).collect::<Vec<_>>() })
+            .collect::<Vec<_>>()
+    );
+
+    let mut actual_parents: Vec<_> = external_parents.into_iter().map(cs_id_name).collect();
+    actual_parents.sort();
+    let mut expected_parents: Vec<_> = expected_external_parents
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    expected_parents.sort();
+    assert_eq!(actual_parents, expected_parents);
+
+    Ok(())
+}
+
 pub async fn assert_topological_order(
     graph: &CommitGraph,
     ctx: &CoreContext,
@@ -627,11 +668,20 @@ pub async fn assert_segmented_slice_ancestors(
         .map(name_cs_id)
         .collect::<BoundaryChangesets>();
 
-    let (slices, boundary_changesets) = graph
+    let slices_with_boundaries = graph
         .segmented_slice_ancestors(ctx, heads, common, slice_size)
         .await?;
 
-    assert_eq!(slices, expected_slices);
+    // Extract slices and flatten boundaries for comparison
+    let slices: Vec<&SegmentedSliceDescription> =
+        slices_with_boundaries.iter().map(|s| &s.slice).collect();
+    let boundary_changesets: BoundaryChangesets = slices_with_boundaries
+        .iter()
+        .flat_map(|s| s.boundaries.iter())
+        .cloned()
+        .collect();
+
+    assert_eq!(slices, expected_slices.iter().collect::<Vec<_>>());
     assert_eq!(boundary_changesets, expected_boundary_changesets);
 
     Ok(())
@@ -754,7 +804,7 @@ pub async fn assert_changeset_ids_to_locations(
         if graph.is_ancestor_of_any(ctx, target, heads.clone()).await? {
             let location = locations.get(&target).ok_or_else(|| {
                 anyhow!(
-                    "changeset_ids_to_locations didn't return location for {} which is an ancestor of heads {:?}", target, heads
+                    "changeset_ids_to_locations didn't return location for {target} which is an ancestor of heads {heads:?}"
                 )
             })?;
             // Verify that the returned location resolves to the target.

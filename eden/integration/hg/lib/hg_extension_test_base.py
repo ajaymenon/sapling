@@ -81,7 +81,6 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
 
     repo: hgrepo.HgRepository
     backing_repo: hgrepo.HgRepository
-    enable_windows_symlinks: bool = False
     inode_catalog_type: Optional[str] = None
     backing_store_type: Optional[str] = None
     adtl_repos: List[Tuple[hgrepo.HgRepository, Optional[hgrepo.HgRepository]]] = []
@@ -99,7 +98,6 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
             self.backing_repo.path,
             self.mount,
             allow_empty=True,
-            enable_windows_symlinks=self.enable_windows_symlinks,
             backing_store=self.backing_store_type,
         )
 
@@ -115,18 +113,16 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
         if configs is None:
             configs = {}
         if (inode_catalog_type := self.inode_catalog_type) is not None:
-            configs["overlay"] = [f'inode-catalog-type = "{inode_catalog_type}"']
-        if self.enable_status_cache:
-            configs["hg"] = ["enable-scm-status-cache = true"]
+            configs.setdefault("overlay", []).append(
+                f'inode-catalog-type = "{inode_catalog_type}"'
+            )
+        enabled = "true" if self.enable_status_cache else "false"
+        configs.setdefault("hg", []).append(f"enable-scm-status-cache = {enabled}")
         return configs
 
     def create_backing_repo(self) -> hgrepo.HgRepository:
-        if self.enable_windows_symlinks:
-            init_configs = ["experimental.windows-symlinks=True"]
-        else:
-            init_configs = []
         hgrc = self.get_hgrc()
-        repo = self.create_hg_repo("main", hgrc=hgrc, init_configs=init_configs)
+        repo = self.create_hg_repo("main", hgrc=hgrc)
         self.populate_backing_repo(repo)
         return repo
 
@@ -205,6 +201,8 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
             f"{backing_repo.path}",
             "--config",
             f"edenfs.command={cmd}",
+            "--config",
+            f"edenfs.legacy_command={cmd}",
             "--config",
             f"edenfs.basepath={self.eden._base_dir}",
             *clone_args,
@@ -495,6 +493,12 @@ class FilteredHgTestCase(EdenHgTestCase, metaclass=abc.ABCMeta):
         hgrc["experimental"]["filter-version"] = "V1"
         hgrc["experimental"]["use-filter-storage"] = "True"
 
+        # Disable filter syncing behavior by default for tests.
+        # Tests that want to exercise the filter sync behavior can override this.
+        if not hgrc.has_section("edensparse"):
+            hgrc.add_section("edensparse")
+        hgrc["edensparse"]["disable-filter-sync"] = "True"
+
         # Add configs that insert warnings into .hg/sparse
         if not hgrc.has_section("sparse"):
             hgrc.add_section("sparse")
@@ -583,6 +587,7 @@ MixinList = List[Tuple[str, List[Type[Any]]]]
 
 def _replicate_hg_test(
     test_class: Type[EdenHgTestCase],
+    run_coroutines: bool = True,
 ) -> Iterable[Tuple[str, Type[EdenHgTestCase]]]:
     tree_variants: MixinList = [("TreeOnly", [])]
     if eden.config.HAVE_NFS:
@@ -602,7 +607,13 @@ def _replicate_hg_test(
             for scm_label, scm_mixins in scm_variants:
 
                 class VariantHgRepoTest(
-                    *tree_mixins, *overlay_mixins, *scm_mixins, test_class
+                    # pyrefly: ignore [invalid-inheritance]
+                    *tree_mixins,
+                    # pyrefly: ignore [invalid-inheritance]
+                    *overlay_mixins,
+                    # pyrefly: ignore [invalid-inheritance]
+                    *scm_mixins,
+                    test_class,
                 ):
                     pass
 
@@ -610,6 +621,16 @@ def _replicate_hg_test(
                     f"{tree_label}{overlay_label}{scm_label}",
                     typing.cast(Type[EdenHgTestCase], VariantHgRepoTest),
                 )
+
+    if run_coroutines:
+
+        class CoroutinesVariantHgRepoTest(testcase.CoroutinesTestMixin, test_class):
+            pass
+
+        yield (
+            "Coroutines",
+            typing.cast(Type[EdenHgTestCase], CoroutinesVariantHgRepoTest),
+        )
 
 
 def _replicate_filteredhg_test(
@@ -620,7 +641,7 @@ def _replicate_filteredhg_test(
         tree_variants.append(("TreeOnlyNFS", [testcase.NFSTestMixin]))
 
     for tree_label, tree_mixins in tree_variants:
-
+        # pyrefly: ignore [invalid-inheritance]
         class VariantHgRepoTest(*tree_mixins, test_class):
             pass
 
@@ -643,7 +664,7 @@ def _replicate_status_cache_enabled_test(
     ]
     for hg_test_label, hg_test_class in _replicate_hg_test(test_class):
         for cache_config_label, cache_config_mixins in cache_config_variants:
-
+            # pyrefly: ignore [invalid-inheritance]
             class VariantHgRepoTest(*cache_config_mixins, hg_test_class):
                 pass
 

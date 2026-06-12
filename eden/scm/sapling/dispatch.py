@@ -70,6 +70,7 @@ class request:
         self.ui = ui
         self.repo = repo
         self.skipprehooks = skipprehooks
+        self._permission_denied_handled = False
 
         # The repo, if any, that ends up being used for command execution.
         self.cmdrepo = None
@@ -286,6 +287,25 @@ def _formatargs(args):
     return " ".join(util.shellquote(a) for a in args)
 
 
+def _check_permission_denied_paths(req, ret):
+    """Warn about permission-denied paths and optionally change exit code."""
+    if req._permission_denied_handled:
+        return ret
+
+    rctx = getattr(getattr(req.ui, "_uiconfig", None), "_rctx", None)
+    if rctx is None:
+        return ret
+
+    warnings, exit_nonzero = bindings.context.check_permission_denied(rctx)
+    for warning in warnings:
+        req.ui.warn(warning)
+
+    if exit_nonzero:
+        return ret if ret else 1
+
+    return ret
+
+
 def dispatch(req):
     "run the command specified in req.args"
     if req.ferr:
@@ -340,6 +360,7 @@ def dispatch(req):
 
     try:
         ret = _runcatch(req)
+        ret = _check_permission_denied_paths(req, ret)
     except error.ProgrammingError as inst:
         req.ui.warn(_("** ProgrammingError: %s\n") % inst)
         if inst.hint:
@@ -856,10 +877,6 @@ def _dispatch(req):
     if req.repo:
         uis.add(req.repo.ui)
 
-    if req.earlyoptions["profile"]:
-        for ui_ in uis:
-            ui_.setconfig("profiling", "enabled", "true", "--profile")
-
     with profiling.profile(lui) as profiler:
         # progress behavior might be changed by extensions
         progress.init()
@@ -962,8 +979,6 @@ def _dispatch(req):
                 )
 
             ui.atexit(print_time)
-        if options["profile"]:
-            profiler.start()
 
         for ui_ in uis:
             ui_.deriveconfigfromclioptions(options)

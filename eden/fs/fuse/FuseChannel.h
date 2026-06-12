@@ -31,6 +31,7 @@
 #include "eden/common/utils/ImmediateFuture.h"
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/fuse/FuseDispatcher.h"
+#include "eden/fs/fuse/FuseFeatures.h"
 #include "eden/fs/inodes/FsChannel.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/utils/FsChannelTypes.h"
@@ -48,11 +49,13 @@ struct Unit;
 
 namespace facebook::eden {
 
+class EdenFsEventsLogger;
+class ErrorLogger;
 class Notifier;
 class FsEventLogger;
 class FuseRequestContext;
+class FuseTransport;
 class PrivHelper;
-class StructuredLogger;
 
 #ifndef _WIN32
 
@@ -293,6 +296,22 @@ class FuseChannel final : public FsChannel {
    * fuseTraceBusCapacity -
    *      The maximum number of FuseTraceEvents that can be buffered in the
    *      trace bus at any one time. This data feeds into `eden trace fs`.
+   * fuseBdiReadAheadKb -
+   *      If set, configures the FUSE BDI read-ahead after FUSE_INIT completes
+   *      by writing to /sys/class/bdi/{major}:{minor}/read_ahead_kb.
+   * fuseMaxPages -
+   *      The maximum number of pages per FUSE read request. Set to 0 to use
+   *      the kernel default (32). Maximum 256 (1MB).
+   * useIoUring -
+   *      Whether to use io_uring for FUSE request/reply transport instead of
+   *      traditional /dev/fuse read/write when the running kernel is known to
+   *      support Eden's graceful restart flow safely.
+   * ioUringKernelReleaseRegex -
+   *      RE2 regex matched against Linux kernel release strings (`uname -r`)
+   *      where Eden may negotiate io_uring when useIoUring is enabled.
+   * ioUringQueueDepth -
+   *      The io_uring queue depth to use when the io_uring transport is
+   *      enabled.
    */
   FuseChannel(
       PrivHelper* privHelper,
@@ -304,7 +323,8 @@ class FuseChannel final : public FsChannel {
       const folly::Logger* straceLogger,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       std::shared_ptr<FsEventLogger> fsEventLogger,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
+      ErrorLogger& errorLogger,
       folly::Duration requestTimeout,
       std::shared_ptr<Notifier> notifier,
       CaseSensitivity caseSensitive,
@@ -314,7 +334,12 @@ class FuseChannel final : public FsChannel {
       std::chrono::nanoseconds highFuseRequestsLogInterval,
       std::chrono::nanoseconds longRunningFSRequestThreshold,
       bool useWriteBackCache,
-      size_t fuseTraceBusCapacity);
+      size_t fuseTraceBusCapacity,
+      std::optional<uint32_t> fuseBdiReadAheadKb = std::nullopt,
+      uint32_t fuseMaxPages = 0,
+      bool useIoUring = false,
+      std::string ioUringKernelReleaseRegex = {},
+      uint32_t ioUringQueueDepth = 8);
 
   FuseChannel(const FuseChannel&) = delete;
   FuseChannel(FuseChannel&&) = delete;
@@ -341,6 +366,36 @@ class FuseChannel final : public FsChannel {
   const char* getName() const override {
     return "fuse";
   }
+
+  const char* getTransportName() const;
+  const char* getDesiredTransportName() const;
+  void logTakeoverTransportMismatch(const fuse_init_out& connInfo) const;
+  bool usesIoUringTransport() const;
+  size_t getTransportBufferSize() const {
+    return bufferSize_;
+  }
+  size_t getTransportWorkerThreadCount() const {
+    return configuredWorkerThreadCount_;
+  }
+  int getFuseDeviceFd() const {
+    return fuseDevice_.fd();
+  }
+  bool isStopRequested() const {
+    return stop_.load(std::memory_order_relaxed);
+  }
+  bool hasPendingRequests() const {
+    return state_.rlock()->pendingRequests != 0;
+  }
+  bool isFuseDeviceValidForWrites() const {
+    return isFuseDeviceValid(state_.rlock()->stopReason);
+  }
+  void dispatchRequestFromTransport(
+      const fuse_in_header& header,
+      folly::ByteRange arg,
+      pid_t myPid);
+  void requestSessionExitFromTransport(StopReason reason);
+  void notifyTransportWorkerReady(size_t queueId, size_t expectedWorkerCount);
+  void logUnmountEventAndExit();
 
   /**
    * Initialize the FuseChannel; until this completes successfully,
@@ -375,14 +430,20 @@ class FuseChannel final : public FsChannel {
    * The connInfo parameter specifies the connection data that was already
    * negotiated by the previous owner of the FuseDevice.
    *
-   * This function will immediately set up the thread pool used to service
-   * incoming fuse requests.
+   * This function starts the thread pool used to service incoming fuse
+   * requests.
    *
    * Returns a StopFuture that will be fulfilled when the FuseChannel has
    * stopped.  This future can be used to detect if the FuseChannel has been
    * unmounted or stopped because of an error or any other reason.
    */
   StopFuture initializeFromTakeover(fuse_init_out connInfo);
+
+  /**
+   * Returns a Future that completes when the takeover transport is ready to
+   * service requests.
+   */
+  folly::Future<folly::Unit> takeoverReadyFuture();
 
   /**
    * Uses the configured PrivHelper to unmount this FUSE mount from the
@@ -552,8 +613,16 @@ class FuseChannel final : public FsChannel {
     return processAccessLog_;
   }
 
-  std::shared_ptr<StructuredLogger> getStructuredLogger() const {
-    return structuredLogger_;
+  std::shared_ptr<EdenFsEventsLogger> getEdenFsEventsLogger() const {
+    return edenFsEventsLogger_;
+  }
+
+  ErrorLogger& getErrorLogger() const {
+    return errorLogger_;
+  }
+
+  const std::string& getMountPath() const {
+    return mountPath_.asString();
   }
 
   std::chrono::nanoseconds getLongRunningFSRequestThreshold() const {
@@ -562,6 +631,10 @@ class FuseChannel final : public FsChannel {
 
   ImmediateFuture<folly::Unit> waitForPendingWrites() override {
     return folly::unit;
+  }
+
+  folly::coro::now_task<folly::Unit> co_waitForPendingWrites() override {
+    co_return folly::unit;
   }
 
   std::shared_ptr<Notifier> getNotifier() const {
@@ -661,7 +734,6 @@ class FuseChannel final : public FsChannel {
   };
 
   friend struct fmt::formatter<facebook::eden::FuseChannel::InvalidationEntry>;
-
   FRIEND_TEST(FuseChannelTest, formatting_inode);
   FRIEND_TEST(FuseChannelTest, formatting_dir);
   FRIEND_TEST(FuseChannelTest, formatting_flush);
@@ -809,6 +881,10 @@ class FuseChannel final : public FsChannel {
       folly::ByteRange arg);
 
  private:
+#if EDEN_HAVE_FUSE_IO_URING
+  bool isKernelAllowedForIoUring(folly::StringPiece kernelRelease) const;
+#endif
+
   void setThreadSigmask();
   void initWorkerThread() noexcept;
   void fuseWorkerThread() noexcept;
@@ -818,6 +894,7 @@ class FuseChannel final : public FsChannel {
   void sendInvalidateInode(InodeNumber ino, int64_t off, int64_t len);
   void sendInvalidateEntry(InodeNumber parent, PathComponentPiece name);
   void readInitPacket();
+  void maybeSetFuseReadAhead();
   void startWorkerThreads();
 
   /**
@@ -848,14 +925,26 @@ class FuseChannel final : public FsChannel {
    * fuse worker threads provided by the MountPoint.
    */
   void processSession();
+  void fulfillTakeoverReadiness();
+  void failTakeoverReadiness(folly::exception_wrapper&& ew);
+
+  // Update the effective number of worker threads. For traditional dev/fuse, it
+  // is configured. For io_uring, it is the number of CPU cores.
+  void updateEffectiveWorkerThreadCount();
+  void dispatchRequest(
+      const fuse_in_header& header,
+      folly::ByteRange arg,
+      pid_t myPid);
+  void sendRawReplyDevFuse(const iovec iov[], size_t count) const;
 
   /**
    * Requests that the worker threads terminate their processing loop.
    */
   void requestSessionExit(StopReason reason);
-  void requestSessionExit(
+  bool requestSessionExitLocked(
       const folly::Synchronized<State>::LockedPtr& state,
       StopReason reason);
+  void requestTransportStopWakeup();
 
   PrivHelper* const privHelper_;
 
@@ -864,10 +953,15 @@ class FuseChannel final : public FsChannel {
    */
   const size_t bufferSize_{0};
   std::shared_ptr<folly::Executor> threadPool_;
-  const size_t numThreads_;
+  // The number of worker threads that are configured to be created.
+  const size_t configuredWorkerThreadCount_;
+  // The number of worker threads that are actually created. When using
+  // io_uring, this is the number of CPU cores on the machine.
+  size_t effectiveWorkerThreadCount_{0};
   std::unique_ptr<FuseDispatcher> dispatcher_;
   const folly::Logger* const straceLogger_;
-  const std::shared_ptr<StructuredLogger> structuredLogger_;
+  const std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
+  ErrorLogger& errorLogger_;
   const AbsolutePath mountPath_;
   const folly::Duration requestTimeout_;
   std::shared_ptr<Notifier> const notifier_;
@@ -899,6 +993,11 @@ class FuseChannel final : public FsChannel {
    */
   std::chrono::nanoseconds longRunningFSRequestThreshold_;
   bool useWriteBackCache_;
+  std::optional<uint32_t> fuseBdiReadAheadKb_;
+  uint32_t fuseMaxPages_{0};
+  bool useIoUring_{false};
+  std::string ioUringKernelReleaseRegex_;
+  uint32_t ioUringQueueDepth_{8};
 
   /*
    * connInfo_ is modified during the initialization process,
@@ -923,6 +1022,7 @@ class FuseChannel final : public FsChannel {
    *   destroyed in the same thread that creates the StopData object.
    */
   folly::File fuseDevice_;
+  std::unique_ptr<FuseTransport> transport_;
 
   /*
    * Mutable state that is accessed from the worker threads.
@@ -932,7 +1032,11 @@ class FuseChannel final : public FsChannel {
   folly::once_flag unmountLogFlag_;
   folly::Synchronized<State> state_;
   folly::Promise<StopFuture> initPromise_;
+  folly::Promise<folly::Unit> takeoverReadyPromise_;
   folly::Promise<FsStopDataPtr> sessionCompletePromise_;
+  std::atomic<size_t> takeoverReadyWorkerCount_{0};
+  std::atomic<bool> takeoverReadinessStarted_{false};
+  std::atomic<bool> takeoverReadyFinished_{false};
 
   folly::Synchronized<TelemetryState> telemetryState_;
 

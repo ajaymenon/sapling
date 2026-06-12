@@ -25,12 +25,14 @@ use gotham_ext::middleware::ScubaMiddlewareState;
 use gotham_ext::response::BytesBody;
 use gotham_ext::response::build_error_response;
 use gotham_ext::response::build_response;
-use hyper::HeaderMap;
+use http::HeaderMap;
 use slapi_service::handlers::JsonErrorFormatter;
 use slapi_service::handlers::handler::BasicPathExtractor;
 use slapi_service::handlers::handler::PathExtractorWithRepo;
+use stats::prelude::*;
 
 use super::error_formatter::GitErrorFormatter;
+use super::lfs_redirect::lfs_redirect_handler;
 use crate::model::GitServerContext;
 use crate::model::RepositoryParams;
 use crate::model::ServiceType;
@@ -39,6 +41,11 @@ use crate::read;
 use crate::service::slapi_compat::GitHandlers;
 use crate::write;
 
+define_stats! {
+    prefix = "mononoke.git.server";
+    container_memory: dynamic_singleton_counter("{}", (counter_name: String)),
+}
+
 fn capability_advertisement_handler(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
         let (future_stats, res) = read::capability_advertisement(&mut state).timed().await;
@@ -46,7 +53,7 @@ fn capability_advertisement_handler(mut state: State) -> Pin<Box<HandlerFuture>>
         match res {
             Ok(res) => Ok((state, res)),
             Err(err) => {
-                println!("Encountered error {:?}", err);
+                println!("Encountered error {err:?}");
                 build_error_response(err, state, &GitErrorFormatter)
             }
         }
@@ -61,7 +68,7 @@ fn upload_pack_handler(mut state: State) -> Pin<Box<HandlerFuture>> {
         match res {
             Ok(res) => Ok((state, res)),
             Err(err) => {
-                println!("Encountered error {:?}", err);
+                println!("Encountered error {err:?}");
                 build_error_response(err, state, &GitErrorFormatter)
             }
         }
@@ -76,7 +83,7 @@ fn receive_pack_handler(mut state: State) -> Pin<Box<HandlerFuture>> {
         match res {
             Ok(res) => Ok((state, res)),
             Err(err) => {
-                println!("Encountered error {:?}", err);
+                println!("Encountered error {err:?}");
                 build_error_response(err, state, &GitErrorFormatter)
             }
         }
@@ -91,7 +98,7 @@ fn clone_bundle_handler(mut state: State) -> Pin<Box<HandlerFuture>> {
         match res {
             Ok(res) => Ok((state, res)),
             Err(err) => {
-                println!("Encountered error {:?}", err);
+                println!("Encountered error {err:?}");
                 build_error_response(err, state, &GitErrorFormatter)
             }
         }
@@ -110,12 +117,23 @@ fn health_handler(state: State) -> Pin<Box<HandlerFuture>> {
             tokio::time::sleep(std::time::Duration::from_secs(wait_time)).await;
         }
 
-        let res = gotham::helpers::http::response::create_response(
+        let mut res = gotham::helpers::http::response::create_response(
             &state,
             http::status::StatusCode::OK,
             mime::TEXT_PLAIN,
             "I_AM_ALIVE\n",
         );
+
+        let fb = GitServerContext::borrow_from(&state).fb();
+        let avg_window =
+            justknobs::get_as::<i64>("scm/mononoke:git_server_healthcheck_load_avg_secs", None);
+        if avg_window > 0 {
+            let counter = format!("container_memory_usage_percent.avg.{avg_window}");
+            if let Some(load) = STATS::container_memory.get_value(fb, (counter,)) {
+                res.headers_mut().insert("X-FB-Load", load.into());
+            }
+        }
+
         Ok((state, res))
     }
     .boxed()
@@ -178,6 +196,11 @@ pub fn build_router(context: GitServerContext) -> Router {
             .get("/repos/git/:server_type/*repository/clone.bundle")
             .with_path_extractor::<RepositoryParams>()
             .to(clone_bundle_handler);
+
+        route
+            .post("/repos/git/:server_type/*repository/info/lfs/objects/batch")
+            .with_path_extractor::<RepositoryParams>()
+            .to(lfs_redirect_handler);
 
         route.get("/health_check").to(health_handler);
         route.get("/flamegraph").to(flamegraph_handler);

@@ -56,8 +56,8 @@ import queryGraphQL from '../github/queryGraphQL';
 import {parseSaplingStackBody} from '../saplingStack';
 import {getPathForChange, getTreeEntriesForChange} from '../utils';
 import {atom} from 'jotai';
-import {atomFamily} from 'jotai-family';
 import {atomWithStorage} from 'jotai/utils';
+import {atomFamily} from 'jotai-family';
 import {createRequestHeaders} from 'shared/github/auth';
 import rejectAfterTimeout from 'shared/rejectAfterTimeout';
 import {notEmpty} from 'shared/utils';
@@ -393,7 +393,7 @@ export const gitHubPullRequestForParamsAtom = atomFamily(
       const token = localStorage.getItem('github.token');
       if (token == null) {
         // Return a never-settling promise to indicate we're waiting for auth
-        // eslint-disable-next-line @typescript-eslint/no-empty-function
+         
         return new Promise<PullRequest | null>(() => {});
       }
 
@@ -1910,6 +1910,17 @@ export type NotificationMessage = {
 } | null;
 
 export const notificationMessageAtom = atom<NotificationMessage>(null);
+
+// =============================================================================
+// Auth Error Message
+// =============================================================================
+
+/**
+ * Stores an error message to display on the login page, typically used when
+ * the user's token has expired or been revoked. This is set when a 401 error
+ * is encountered and cleared when the user successfully logs in.
+ */
+export const authErrorMessageAtom = atom<string | null>(null);
 
 // =============================================================================
 // Stacked Pull Requests

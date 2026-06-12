@@ -140,29 +140,29 @@ pub async fn fetch_manifest_envelope_opt<B: KeyedBlobstore>(
     if node_id == HgManifestId::new(NULL_HASH) {
         return Ok(None);
     }
+
     let blobstore_key = node_id.blobstore_key();
     let bytes = blobstore
         .get(ctx, &blobstore_key)
         .await
         .context("While fetching manifest envelope blob")?;
-    (|| {
-        let blobstore_bytes = match bytes {
-            Some(bytes) => bytes,
-            None => return Ok(None),
-        };
-        let envelope = HgManifestEnvelope::from_blob(blobstore_bytes.into())?;
-        if node_id.into_nodehash() != envelope.node_id() {
-            bail!(
-                "Manifest ID mismatch (requested: {}, got: {})",
-                node_id,
-                envelope.node_id()
-            );
+    match bytes {
+        Some(blobstore_bytes) => {
+            let envelope =
+                HgManifestEnvelope::from_blob(blobstore_bytes.into()).with_context(|| {
+                    MononokeHgBlobError::ManifestDeserializeFailed(blobstore_key.clone())
+                })?;
+            if node_id.into_nodehash() != envelope.node_id() {
+                bail!(
+                    "Manifest ID mismatch (requested: {}, got: {})",
+                    node_id,
+                    envelope.node_id()
+                );
+            }
+            Ok(Some(envelope))
         }
-        Ok(Some(envelope))
-    })()
-    .context(MononokeHgBlobError::ManifestDeserializeFailed(
-        blobstore_key,
-    ))
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -212,10 +212,7 @@ impl HgBlobManifest {
             .watched()
             .with_max_poll(blobstore::BLOBSTORE_MAX_POLL_TIME_MS)
             .await
-            .context(format!(
-                "When loading manifest {} from blobstore",
-                manifestid
-            ))
+            .context(format!("When loading manifest {manifestid} from blobstore"))
         }
     }
 
@@ -325,14 +322,14 @@ impl<Store: Send + Sync> Manifest<Store> for HgBlobManifest {
 }
 
 fn parse_hg_entry(data: &[u8]) -> Result<Entry<HgManifestId, (FileType, HgFileNodeId)>> {
-    ensure!(data.len() >= 40, "hash too small: {:?}", data);
+    ensure!(data.len() >= 40, "hash too small: {data:?}");
 
     let (hash, flags) = data.split_at(40);
     let hash = str::from_utf8(hash)
         .map_err(Error::from)
         .and_then(|hash| hash.parse::<HgNodeHash>())
-        .with_context(|| format!("malformed hash: {:?}", hash))?;
-    ensure!(flags.len() <= 1, "More than 1 flag: {:?}", flags);
+        .with_context(|| format!("malformed hash: {hash:?}"))?;
+    ensure!(flags.len() <= 1, "More than 1 flag: {flags:?}");
 
     let hg_entry_id = if flags.is_empty() {
         Entry::Leaf((FileType::Regular, HgFileNodeId::new(hash)))
@@ -341,7 +338,7 @@ fn parse_hg_entry(data: &[u8]) -> Result<Entry<HgManifestId, (FileType, HgFileNo
             b'l' => Entry::Leaf((FileType::Symlink, HgFileNodeId::new(hash))),
             b'x' => Entry::Leaf((FileType::Executable, HgFileNodeId::new(hash))),
             b't' => Entry::Tree(HgManifestId::new(hash)),
-            unk => bail!("Unknown flag {}", unk),
+            unk => bail!("Unknown flag {unk}"),
         }
     };
 

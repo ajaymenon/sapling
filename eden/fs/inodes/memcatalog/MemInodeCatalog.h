@@ -32,6 +32,10 @@ class MemInodeCatalog : public InodeCatalog {
     return true;
   }
 
+  bool supportsWal() const override {
+    return false;
+  }
+
   std::vector<InodeNumber> getAllParentInodeNumbers() override;
 
   /**
@@ -58,8 +62,10 @@ class MemInodeCatalog : public InodeCatalog {
   std::optional<overlay::OverlayDir> loadAndRemoveOverlayDir(
       InodeNumber inodeNumber) override;
 
-  void saveOverlayDir(InodeNumber inodeNumber, overlay::OverlayDir&& odir)
-      override;
+  void saveOverlayDir(
+      InodeNumber inodeNumber,
+      overlay::OverlayDir&& odir,
+      bool crashSafe = true) override;
 
   /**
    * Remove the overlay directory data associated with the passed InodeNumber.
@@ -93,7 +99,6 @@ class MemInodeCatalog : public InodeCatalog {
   InodeNumber scanLocalChanges(
       std::shared_ptr<ReloadableConfig> config,
       AbsolutePathPiece mountPath,
-      bool windowsSymlinksEnabled,
       InodeCatalog::LookupCallback& callback) override;
 
   void maintenance() override {}

@@ -12,6 +12,7 @@ import type {Context} from './SplitDiffView/types';
 
 import deepEqual from 'fast-deep-equal';
 import {Button} from 'isl-components/Button';
+import {Checkbox} from 'isl-components/Checkbox';
 import {Dropdown} from 'isl-components/Dropdown';
 import {ErrorBoundary, ErrorNotice} from 'isl-components/ErrorNotice';
 import {Icon} from 'isl-components/Icon';
@@ -50,11 +51,24 @@ function mapResult<T, U>(result: Result<T>, fn: (t: T) => U): Result<U> {
   return result.error == null ? {value: fn(result.value)} : result;
 }
 
+const comparisonIgnoreWhitespace = localStorageBackedAtom<boolean>(
+  'isl.comparison-ignore-whitespace',
+  true,
+);
+
 const currentComparisonData = atomFamilyWeak((comparison: Comparison) =>
-  atomLoadableWithRefresh<Result<Array<ParsedDiff>>>(async () => {
-    serverAPI.postMessage({type: 'requestComparison', comparison});
-    const event = await serverAPI.nextMessageMatching('comparison', event =>
-      deepEqual(comparison, event.comparison),
+  atomLoadableWithRefresh<Result<Array<ParsedDiff>>>(async get => {
+    const ignoreWhitespace = get(comparisonIgnoreWhitespace);
+    serverAPI.postMessage({
+      type: 'requestComparison',
+      comparison,
+      ...(ignoreWhitespace ? {ignoreWhitespace} : {}),
+    });
+    const event = await serverAPI.nextMessageMatching(
+      'comparison',
+      event =>
+        deepEqual(comparison, event.comparison) &&
+        (event.ignoreWhitespace ?? false) === ignoreWhitespace,
     );
     return mapResult(event.data.diff, parsePatchAndFilter);
   }),
@@ -74,9 +88,11 @@ const comparisonDisplayMode = localStorageBackedAtom<ComparisonDisplayMode | 're
 export default function ComparisonView({
   comparison,
   dismiss,
+  focusedFile,
 }: {
   comparison: Comparison;
   dismiss?: () => void;
+  focusedFile?: string;
 }) {
   const compared = useAtomValue(currentComparisonData(comparison));
 
@@ -105,9 +121,8 @@ export default function ComparisonView({
       comparison.type === ComparisonType.SinceLastCodeReviewSubmit ? (
         <EmptyState>
           <T>No Content Changes</T>
-          <br />
           <Subtle>
-            <T> This commit might have been rebased</T>
+            <T>This commit might have been rebased</T>
           </Subtle>
         </EmptyState>
       ) : (
@@ -116,7 +131,10 @@ export default function ComparisonView({
         </EmptyState>
       );
   } else {
-    const files = data.value ?? [];
+    let files = data.value ?? [];
+    if (focusedFile != null) {
+      files = files.filter(f => f.newFileName === focusedFile || f.oldFileName === focusedFile);
+    }
     sortFilesByType(files);
     const fileGroups = group(files, file => generatedStatuses[file.newFileName ?? '']);
     content = (
@@ -171,6 +189,7 @@ export default function ComparisonView({
         collapsedFiles={collapsedFiles}
         setCollapsedFile={setCollapsedFile}
         dismiss={dismiss}
+        focusedFile={focusedFile}
       />
       <div className="comparison-view-details">{content}</div>
     </div>
@@ -187,11 +206,13 @@ function ComparisonViewHeader({
   collapsedFiles,
   setCollapsedFile,
   dismiss,
+  focusedFile,
 }: {
   comparison: Comparison;
   collapsedFiles: Map<string, boolean>;
   setCollapsedFile: (path: string, collapsed: boolean) => unknown;
   dismiss?: () => void;
+  focusedFile?: string;
 }) {
   const setComparisonMode = useSetAtom(currentComparisonMode);
   const [compared, reloadComparison] = useAtom(currentComparisonData(comparison));
@@ -250,32 +271,36 @@ function ComparisonViewHeader({
               <Icon icon="refresh" data-testid="comparison-refresh-button" />
             </Button>
           </Tooltip>
-          <Button
-            onClick={() => {
-              for (const file of data?.value ?? []) {
-                if (file.newFileName) {
-                  setCollapsedFile(file.newFileName, false);
+          {focusedFile == null && (
+            <Button
+              onClick={() => {
+                for (const file of data?.value ?? []) {
+                  if (file.newFileName) {
+                    setCollapsedFile(file.newFileName, false);
+                  }
                 }
-              }
-            }}
-            disabled={isLoading || allFilesExpanded}
-            icon>
-            <Icon icon="unfold" slot="start" />
-            <T>Expand all files</T>
-          </Button>
-          <Button
-            onClick={() => {
-              for (const file of data?.value ?? []) {
-                if (file.newFileName) {
-                  setCollapsedFile(file.newFileName, true);
+              }}
+              disabled={isLoading || allFilesExpanded}
+              icon>
+              <Icon icon="unfold" slot="start" />
+              <T>Expand all files</T>
+            </Button>
+          )}
+          {focusedFile == null && (
+            <Button
+              onClick={() => {
+                for (const file of data?.value ?? []) {
+                  if (file.newFileName) {
+                    setCollapsedFile(file.newFileName, true);
+                  }
                 }
-              }
-            }}
-            icon
-            disabled={isLoading || noFilesExpanded}>
-            <Icon icon="fold" slot="start" />
-            <T>Collapse all files</T>
-          </Button>
+              }}
+              icon
+              disabled={isLoading || noFilesExpanded}>
+              <Icon icon="fold" slot="start" />
+              <T>Collapse all files</T>
+            </Button>
+          )}
           <Tooltip trigger="click" component={() => <ComparisonSettingsDropdown />}>
             <Button icon>
               <Icon icon="ellipsis" />
@@ -295,6 +320,7 @@ function ComparisonViewHeader({
 
 function ComparisonSettingsDropdown() {
   const [mode, setMode] = useAtom(comparisonDisplayMode);
+  const [ignoreWhitespace, setIgnoreWhitespace] = useAtom(comparisonIgnoreWhitespace);
   return (
     <div className="dropdown-field">
       <RadioGroup
@@ -307,6 +333,9 @@ function ComparisonSettingsDropdown() {
         current={mode}
         onChange={setMode}
       />
+      <Checkbox checked={ignoreWhitespace} onChange={setIgnoreWhitespace}>
+        <T>Ignore Whitespace</T>
+      </Checkbox>
     </div>
   );
 }

@@ -34,6 +34,8 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::Shared;
 use futures::future::TryFutureExt;
+use futures::future::try_join;
+use futures::future::try_join_all;
 use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
@@ -42,6 +44,7 @@ use futures_stats::TimedTryFutureExt;
 use lock_ext::LockExt;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
+use mononoke_types::MPath;
 use scuba_ext::FutureStatsScubaExt;
 use tracing::Instrument;
 
@@ -49,7 +52,9 @@ use super::DerivationAssignment;
 use super::DerivedDataManager;
 use crate::context::DerivationContext;
 use crate::derivable::BonsaiDerivable;
+use crate::derivable::DerivableUntopologically;
 use crate::derivable::DerivationDependencies;
+use crate::derivable::PipelineDerivable;
 use crate::error::DerivationError;
 use crate::error::SharedDerivationError;
 
@@ -202,54 +207,101 @@ impl DerivedDataManager {
                 .context("failed to derive dependent types")?;
 
                 let derivation_ctx = self.derivation_context(rederivation);
-
-                let last_derived = self
-                    .commit_graph()
-                    .ancestors_frontier_with(&ctx, heads.clone(), |csid| {
-                        borrowed!(ctx, derivation_ctx);
-                        async move {
-                            Ok(derivation_ctx
-                                .fetch_derived::<Derivable>(ctx, csid)
-                                .await?
-                                .is_some())
-                        }
-                    })
-                    .await
-                    .map_err(Into::<DerivationError>::into)?;
                 let batch_size =
                     override_batch_size.unwrap_or(derivation_ctx.batch_size::<Derivable>());
-                let count = self
-                    .commit_graph()
-                    .ancestors_difference_segments(&ctx, heads.to_vec(), last_derived.clone())
-                    .await?
-                    .into_iter()
-                    .map(|segment| segment.length)
-                    .sum();
                 let rederivation = derivation_ctx.rederivation.clone();
-                self.commit_graph()
-                    .ancestors_difference_segment_slices(
-                        &ctx,
-                        heads.to_vec(),
-                        last_derived,
-                        batch_size,
-                    )
-                    .await
-                    .map_err(Into::<DerivationError>::into)?
-                    .try_for_each(|batch| {
-                        borrowed!(ctx, self as ddm);
-                        cloned!(rederivation);
-                        async move {
-                            ddm.derive_exactly_batch::<Derivable>(
-                                ctx,
-                                batch.to_vec(),
-                                rederivation,
+
+                let mut gap_slices: Vec<Vec<ChangesetId>> = Vec::new();
+                let mut count: u64 = 0;
+                let mut current_heads = heads;
+
+                loop {
+                    let last_derived = self
+                        .commit_graph()
+                        .ancestors_frontier_with(&ctx, current_heads.clone(), |csid| {
+                            borrowed!(ctx, derivation_ctx);
+                            async move {
+                                Ok(derivation_ctx
+                                    .fetch_derived::<Derivable>(ctx, csid)
+                                    .await?
+                                    .is_some())
+                            }
+                        })
+                        .await
+                        .map_err(Into::<DerivationError>::into)?;
+
+                    let (slices_stream, external_parents) = self
+                        .commit_graph()
+                        .ancestors_difference_segment_slices_with_external_parents(
+                            &ctx,
+                            current_heads,
+                            last_derived,
+                            batch_size,
+                        )
+                        .await
+                        .map_err(Into::<DerivationError>::into)?;
+
+                    // Check for gaps: external parents that should be
+                    // derived but aren't (monotonicity violation).
+                    let gap_parents: Vec<_> = stream::iter(external_parents)
+                        .map(|cs_id| {
+                            borrowed!(ctx, derivation_ctx);
+                            async move {
+                                let derived = derivation_ctx
+                                    .fetch_derived::<Derivable>(ctx, cs_id)
+                                    .await?
+                                    .is_some();
+                                anyhow::Ok((cs_id, derived))
+                            }
+                        })
+                        .buffered(100)
+                        .try_filter_map(|(cs_id, derived)| async move {
+                            Ok(if derived { None } else { Some(cs_id) })
+                        })
+                        .try_collect()
+                        .await?;
+
+                    if gap_parents.is_empty() {
+                        // No gaps — stream current slices (which fill the
+                        // deepest gap), then process accumulated slices
+                        // from earlier iterations in reverse order.
+                        let mut slices_stream = std::pin::pin!(slices_stream);
+                        while let Some(batch) = slices_stream.try_next().await? {
+                            count += batch.len() as u64;
+                            self.derive_exactly_batch::<Derivable>(
+                                &ctx,
+                                batch,
+                                rederivation.clone(),
                             )
                             .await?;
-                            Ok(())
                         }
-                    })
-                    .await
-                    .map_err(Into::<DerivationError>::into)?;
+                        gap_slices.reverse();
+                        for batch in gap_slices {
+                            count += batch.len() as u64;
+                            self.derive_exactly_batch::<Derivable>(
+                                &ctx,
+                                batch,
+                                rederivation.clone(),
+                            )
+                            .await?;
+                        }
+                        break;
+                    }
+
+                    // Gaps found — collect and defer these slices.
+                    let mut slices: Vec<Vec<ChangesetId>> = slices_stream.try_collect().await?;
+                    slices.reverse();
+                    gap_slices.extend(slices);
+
+                    tracing::warn!(
+                        "Derivation of {} found {} gap parent(s) not derived \
+                         due to broken monotonicity, filling gaps",
+                        Derivable::NAME,
+                        gap_parents.len(),
+                    );
+                    current_heads = gap_parents;
+                }
+
                 Ok(count)
             }
         }
@@ -370,16 +422,16 @@ impl DerivedDataManager {
         }
     }
 
-    /// Derive or retrieve derived data for a changeset using other derived data types
-    /// without requiring data to be derived for the parents of the changeset.
-    pub async fn derive_from_predecessor<Derivable>(
+    /// Derive or retrieve derived data for a changeset without requiring data to be
+    /// derived for the parents of the changeset.
+    pub async fn unsafe_derive_untopologically<Derivable>(
         &self,
         ctx: &CoreContext,
         csid: ChangesetId,
         rederivation: Option<Arc<dyn Rederivation>>,
     ) -> Result<Derivable, DerivationError>
     where
-        Derivable: BonsaiDerivable,
+        Derivable: DerivableUntopologically,
     {
         if let Some(value) = self.fetch_derived(ctx, csid, rederivation.clone()).await? {
             return Ok(value);
@@ -393,11 +445,10 @@ impl DerivedDataManager {
             .map_err(Error::from)?;
 
         let ctx = ctx.clone_and_reset();
-        let ctx = self.set_derivation_session_class(ctx);
+        let ctx = self.set_derivation_session_class(ctx)?;
 
-        let mut derived_data_scuba = self.derived_data_scuba::<Derivable>();
+        let mut derived_data_scuba = self.derived_data_scuba::<Derivable>(&ctx);
         derived_data_scuba.add_changeset(&bonsai);
-        derived_data_scuba.add_metadata(ctx.metadata());
 
         derived_data_scuba.log_derivation_start(&ctx);
 
@@ -419,7 +470,7 @@ impl DerivedDataManager {
         };
 
         let (derive_stats, derived) =
-            Derivable::derive_from_predecessor(&ctx, &derivation_ctx, bonsai)
+            Derivable::unsafe_derive_untopologically(&ctx, &derivation_ctx, bonsai)
                 .timed()
                 .await;
         derivation_ctx.flush(&ctx).await?;
@@ -475,7 +526,7 @@ impl DerivedDataManager {
             let overall_timeout = Duration::from_millis(justknobs::get_as::<u64>(
                 "scm/mononoke_timeouts:remote_derivation_client_timeout_ms",
                 None,
-            )?);
+            ));
             // The maximum number of times to try remote derivation before giving up.
             const RETRY_ATTEMPTS_LIMIT: u32 = 10;
             // How long to wait between requests to the remote derivation service, either to
@@ -483,7 +534,7 @@ impl DerivedDataManager {
             let retry_delay = Duration::from_millis(justknobs::get_as::<u64>(
                 "scm/mononoke_timeouts:remote_derivation_client_retry_delay_ms",
                 None,
-            )?);
+            ));
             let request = DeriveRequest {
                 repo_name: self.repo_name().to_string(),
                 derived_data_type: DerivedDataType {
@@ -496,7 +547,7 @@ impl DerivedDataManager {
                 priority,
             };
             let mut request_state = DerivationState::NotRequested;
-            let mut derived_data_scuba = self.derived_data_scuba::<Derivable>();
+            let mut derived_data_scuba = self.derived_data_scuba::<Derivable>(ctx);
             derived_data_scuba.add_changeset_id(csid);
 
             // Try to perform remote derivation.  Capture the error so that we
@@ -506,9 +557,7 @@ impl DerivedDataManager {
                     "scm/mononoke:derived_data_disable_remote_derivation",
                     None,
                     Some(self.repo_name()),
-                )
-                .unwrap_or_default()
-                {
+                ) {
                     // Remote derivation has been disabled, fall back to local derivation.
                     return Ok(None);
                 }
@@ -517,8 +566,7 @@ impl DerivedDataManager {
                     derived_data_scuba.log_remote_derivation_end(
                         ctx,
                         Some(format!(
-                            "Remote derivation timed out after {:?}",
-                            overall_timeout
+                            "Remote derivation timed out after {overall_timeout:?}"
                         )),
                     );
                     break DerivationError::Timeout(Derivable::NAME, overall_timeout);
@@ -577,7 +625,7 @@ impl DerivedDataManager {
                     Err(e) => {
                         if attempt >= RETRY_ATTEMPTS_LIMIT {
                             derived_data_scuba
-                                .log_remote_derivation_end(ctx, Some(format!("{:#}", e)));
+                                .log_remote_derivation_end(ctx, Some(format!("{e:#}")));
                             break DerivationError::Failed(Derivable::NAME, attempt, e);
                         }
                         attempt += 1;
@@ -586,19 +634,8 @@ impl DerivedDataManager {
                 }
             };
 
-            // Derivation has failed or timed out.  Consider falling back to local derivation.
-            if justknobs::eval(
-                "scm/mononoke:derived_data_enable_remote_derivation_local_fallback",
-                None,
-                Some(self.repo_name()),
-            )
-            .unwrap_or_default()
-            {
-                // Discard the error and fall back to local derivation.
-                Ok(None)
-            } else {
-                Err(derivation_error)
-            }
+            // Derivation has failed or timed out.
+            Err(derivation_error)
         } else {
             // Derivation is not enabled, perform local derivation.
             Ok(None)
@@ -744,7 +781,7 @@ impl DerivedDataManager {
             for bonsai in bonsais.iter() {
                 let csid = bonsai.get_changeset_id();
                 if ancestors.contains_key(&csid) {
-                    return Err(anyhow!("batch not in topological order at {}", csid).into());
+                    return Err(anyhow!("batch not in topological order at {csid}").into());
                 }
                 for parent in bonsai.parents() {
                     if !seen.contains(&parent) {
@@ -797,7 +834,7 @@ impl DerivedDataManager {
                 .context("a batch dependency has not been derived")?;
 
             let ctx = ctx.clone_and_reset();
-            let ctx = self.set_derivation_session_class(ctx.clone());
+            let ctx = self.set_derivation_session_class(ctx.clone())?;
             borrowed!(ctx);
 
             let csid_range = if let (Some(first), Some(last)) = (bonsais.first(), bonsais.last()) {
@@ -813,10 +850,9 @@ impl DerivedDataManager {
                 None
             };
 
-            let mut derived_data_scuba = self.derived_data_scuba::<Derivable>();
+            let mut derived_data_scuba = self.derived_data_scuba::<Derivable>(ctx);
             derived_data_scuba.add_changesets(&bonsais);
             derived_data_scuba.log_batch_derivation_start(ctx);
-            derived_data_scuba.add_metadata(ctx.metadata());
             let (overall_stats, result) = async {
                 let derivation_ctx_ref = &derivation_ctx;
                 let (batch_duration, derived) = {
@@ -853,14 +889,31 @@ impl DerivedDataManager {
                 // are persisted.
                 let (persist_stats, persisted) = async {
                     let derivation_ctx_ref = &derivation_ctx;
-                    let csids = stream::iter(derived.into_iter())
-                        .map(|(csid, derived)| async move {
-                            derived.store_mapping(ctx, derivation_ctx_ref, csid).await?;
-                            Ok::<_, Error>(csid)
-                        })
-                        .buffer_unordered(100)
-                        .try_collect::<Vec<_>>()
+                    let csids = if justknobs::eval(
+                        "scm/mononoke:derived_data_use_store_mapping_batch",
+                        None,
+                        None,
+                    ) {
+                        let csids: Vec<_> = derived.keys().copied().collect();
+                        Derivable::store_mapping_batch(
+                            ctx,
+                            derivation_ctx_ref,
+                            derived.into_iter().collect(),
+                        )
                         .await?;
+                        csids
+                    } else {
+                        stream::iter(derived.into_iter())
+                            .map(|(csid, derived)| async move {
+                                derived
+                                    .store_mapping(ctx, derivation_ctx_ref, csid)
+                                    .await?;
+                                Ok::<_, Error>(csid)
+                            })
+                            .buffer_unordered(100)
+                            .try_collect::<Vec<_>>()
+                            .await?
+                    };
 
                     derivation_ctx.flush(ctx).await?;
                     if let Some(rederivation) = rederivation {
@@ -901,6 +954,247 @@ impl DerivedDataManager {
         .await
     }
 
+    /// Derive data for a specific stage of a batch of changesets.
+    ///
+    /// This method orchestrates derivation pipeline, where a derived data type
+    /// is computed in multiple stages (e.g., subtrees of a manifest) that can
+    /// run independently across machines.
+    ///
+    /// The provided batch of changesets must be in topological order.
+    /// Parent stage outputs are fetched for parents outside the batch;
+    /// the trait implementation handles ordering within the batch.
+    ///
+    /// Types with cross-type derived-data dependencies are supported; the
+    /// dependency data must already be derived for the batch (the derivation
+    /// pipeline co-manages dependencies in the same pipeline so they are
+    /// derived in lockstep).
+    pub async fn derive_stage_batch<Derivable>(
+        &self,
+        ctx: &CoreContext,
+        csids: Vec<ChangesetId>,
+        payload: &crate::stage_payload::DerivationStagePayload,
+    ) -> Result<Duration, DerivationError>
+    where
+        Derivable: PipelineDerivable,
+    {
+        let stage_path = payload.path().clone();
+        let stage_path_display = stage_path.to_string();
+        let crate::stage_payload::DerivationStagePayload::Manifest(manifest_payload) = payload;
+        let dep_paths: Vec<MPath> = manifest_payload
+            .deps
+            .iter()
+            .map(|element| stage_path.join(std::iter::once(element)))
+            .collect();
+
+        async {
+            self.check_enabled::<Derivable>()?;
+
+            let mut derivation_ctx = self.derivation_context(None);
+            derivation_ctx.enable_write_batching();
+            let derivation_ctx_ref = &derivation_ctx;
+
+            let mut derived_data_scuba = self.derived_data_scuba::<Derivable>(ctx);
+            derived_data_scuba.add_stage_id(&stage_path_display);
+
+            let ctx = ctx.clone_and_reset();
+            let ctx = self.set_derivation_session_class(ctx)?;
+            borrowed!(ctx);
+
+            let (overall_stats, result) = async {
+                let setup_start = Instant::now();
+
+                // Load all bonsais for this batch.
+                let bonsais = stream::iter(csids.iter().copied().map(async |csid| {
+                    let bonsai = csid.load(ctx, derivation_ctx_ref.blobstore()).await?;
+                    Ok::<_, Error>(bonsai)
+                }))
+                .buffered(100)
+                .try_collect::<Vec<_>>()
+                .await?;
+
+                derived_data_scuba.add_changesets(&bonsais);
+
+                // Collect parent csids that are outside the batch.
+                let batch_set: HashSet<ChangesetId> = csids.iter().copied().collect();
+                let mut external_parent_csids: Vec<ChangesetId> = vec![];
+                for bonsai in bonsais.iter() {
+                    for parent in bonsai.parents() {
+                        if !batch_set.contains(&parent) {
+                            external_parent_csids.push(parent);
+                        }
+                    }
+                }
+                external_parent_csids.sort();
+                external_parent_csids.dedup();
+
+                // Kick off all fetches concurrently: parents + each dependency stage.
+                let parent_fetch = Derivable::fetch_stage_outputs(
+                    ctx,
+                    derivation_ctx_ref,
+                    &stage_path,
+                    external_parent_csids.clone(),
+                );
+
+                let dep_fetches = dep_paths.iter().map(async |dep_path| {
+                    let outputs = Derivable::fetch_stage_outputs(
+                        ctx,
+                        derivation_ctx_ref,
+                        dep_path,
+                        csids.clone(),
+                    )
+                    .await?;
+                    Ok::<_, Error>((dep_path.clone(), outputs))
+                });
+
+                let (fetched_parents, dep_results) =
+                    try_join(parent_fetch, try_join_all(dep_fetches)).await?;
+
+                // Resolve parent stage outputs. For parents missing a stage
+                // output (transitionary period where the stage config changed),
+                // fetch the full derived value and extract the stage output.
+                // The caller must ensure that either the stage output or the
+                // full derived value exists for every external parent.
+                let fallback: HashMap<ChangesetId, Derivable::StageOutput> =
+                    stream::iter(
+                        external_parent_csids
+                            .into_iter()
+                            .filter(|csid| !fetched_parents.contains_key(csid))
+                            .map(async |parent_csid| {
+                                let derived = derivation_ctx_ref
+                                    .fetch_dependency::<Derivable>(ctx, parent_csid)
+                                    .await?;
+                                let stage_output = Derivable::extract_stage_output_from_derived(
+                                    ctx,
+                                    derivation_ctx_ref,
+                                    &derived,
+                                    &stage_path,
+                                )
+                                .await?;
+                                Ok::<_, Error>((parent_csid, stage_output))
+                            }),
+                    )
+                    .buffered(100)
+                    .try_collect()
+                    .await?;
+                let parents: HashMap<ChangesetId, Derivable::StageOutput> =
+                    fetched_parents.into_iter().chain(fallback).collect();
+
+                // Build dependency outputs map from the concurrent fetch results.
+                let mut dependency_outputs: HashMap<
+                    ChangesetId,
+                    HashMap<MPath, Derivable::StageOutput>,
+                > = Default::default();
+                for (dep_path, dep_outputs) in dep_results {
+                    for &csid in &csids {
+                        let output = dep_outputs
+                            .get(&csid)
+                            .ok_or_else(|| {
+                                DerivationError::from(anyhow!(
+                                    "missing dependency stage output for path {dep_path}, changeset {csid}",
+                                ))
+                            })?;
+                        dependency_outputs
+                            .entry(csid)
+                            .or_default()
+                            .insert(dep_path.clone(), output.clone());
+                    }
+                }
+
+                derived_data_scuba.log_batch_derivation_start(ctx);
+
+                let setup_duration = setup_start.elapsed();
+                derived_data_scuba.add_setup_duration(setup_duration);
+
+                let derivation_ctx_ref = &derivation_ctx;
+                let (batch_duration, derived) = {
+                    let (stats, derived) = Derivable::derive_stage_batch(
+                        ctx,
+                        derivation_ctx_ref,
+                        bonsais,
+                        payload,
+                        parents,
+                        dependency_outputs,
+                    )
+                    .try_timed()
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to derive {} stage '{}' batch",
+                            Derivable::NAME,
+                            stage_path_display,
+                        )
+                    })?;
+                    (stats.completion_time, derived)
+                };
+
+                // Flush blobstore before persisting outputs.
+                derivation_ctx.flush(ctx).await?;
+
+                // Store stage outputs with a fresh write-batching context.
+                let mut store_ctx = self.derivation_context(None);
+                store_ctx.enable_write_batching();
+
+                Derivable::store_stage_outputs(ctx, &store_ctx, &stage_path, derived.clone())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to store {} stage '{}' outputs",
+                            Derivable::NAME,
+                            stage_path_display,
+                        )
+                    })?;
+
+                store_ctx.flush(ctx).await?;
+
+                Ok(batch_duration)
+            }
+            .timed()
+            .await;
+
+            derived_data_scuba.log_batch_derivation_end(ctx, &overall_stats, result.as_ref().err());
+
+            Ok(result?)
+        }
+        .instrument(tracing::info_span!(
+            "derive_stage",
+            repo = %self.repo_name(),
+            ddt = %Derivable::NAME,
+            stage = %stage_path_display,
+        ))
+        .await
+    }
+
+    /// Check if a specific derivation pipeline stage has been derived for a changeset.
+    pub async fn is_stage_derived<Derivable>(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        stage_path: &MPath,
+    ) -> Result<bool, DerivationError>
+    where
+        Derivable: PipelineDerivable,
+    {
+        let derivation_ctx = self.derivation_context(None);
+        let outputs =
+            Derivable::fetch_stage_outputs(ctx, &derivation_ctx, stage_path, vec![csid]).await?;
+        Ok(outputs.contains_key(&csid))
+    }
+
+    /// Verify that a stage output is consistent with the canonical derived
+    /// value, delegating to the type's `verify_stage` implementation.
+    pub async fn verify_stage_output<Derivable>(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        stage_path: &MPath,
+    ) -> Result<bool, DerivationError>
+    where
+        Derivable: PipelineDerivable,
+    {
+        let derivation_ctx = self.derivation_context(None);
+        Ok(Derivable::verify_stage(ctx, &derivation_ctx, csid, stage_path).await?)
+    }
+
     /// Fetch derived data for a changeset if it has previously been derived.
     pub async fn fetch_derived<Derivable>(
         &self,
@@ -926,7 +1220,7 @@ impl DerivedDataManager {
     where
         Derivable: BonsaiDerivable,
     {
-        self.check_enabled::<Derivable>()?;
+        self.check_readable::<Derivable>()?;
         let derivation_ctx = self.derivation_context(rederivation);
         let derived = derivation_ctx.fetch_derived::<Derivable>(ctx, csid).await?;
         Ok(derived)
@@ -958,7 +1252,7 @@ impl DerivedDataManager {
     where
         Derivable: BonsaiDerivable,
     {
-        self.check_enabled::<Derivable>()?;
+        self.check_readable::<Derivable>()?;
         let derivation_ctx = self.derivation_context(rederivation);
         let derived = derivation_ctx
             .fetch_derived_direct::<Derivable>(ctx, csid)
@@ -997,7 +1291,7 @@ impl DerivedDataManager {
         } else {
             (csids, future::ready(Ok(HashMap::new())).right_future())
         };
-        self.check_enabled::<Derivable>()?;
+        self.check_readable::<Derivable>()?;
         let derivation_ctx = self.derivation_context(rederivation);
         let mut derived = derivation_ctx
             .fetch_derived_batch::<Derivable>(ctx, csids)

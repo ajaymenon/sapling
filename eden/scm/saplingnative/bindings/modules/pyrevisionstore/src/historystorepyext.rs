@@ -89,7 +89,7 @@ impl<T: HgIdHistoryStore + ?Sized> HgIdHistoryStorePyExt for T {
                     results.append(py, key_tuple.into_object());
                 }
                 StoreKey::Content(_, _) => {
-                    return Err(format_err!("Unsupported key: {:?}", key)).map_pyerr(py);
+                    return Err(format_err!("Unsupported key: {key:?}")).map_pyerr(py);
                 }
             }
         }
@@ -122,7 +122,7 @@ impl<T: HgIdHistoryStore + ?Sized> HgIdHistoryStorePyExt for T {
     }
 
     fn refresh_py(&self, py: Python) -> PyResult<PyNone> {
-        self.refresh().map_pyerr(py)?;
+        self.sync().map_pyerr(py)?;
         Ok(PyNone)
     }
 }

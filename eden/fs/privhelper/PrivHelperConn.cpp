@@ -58,7 +58,8 @@ UnixSocket::Message serializeRequestPacket(
   Appender appender(&msg.data, kDefaultBufferSize);
 
   appender.write<uint32_t>(PRIVHELPER_CURRENT_VERSION);
-  appender.write<uint32_t>(sizeof(PrivHelperConn::PrivHelperPacketMetadata));
+  appender.write<uint32_t>(
+      static_cast<uint32_t>(sizeof(PrivHelperConn::PrivHelperPacketMetadata)));
   appender.write<uint32_t>(xid);
   appender.write<uint32_t>(static_cast<uint32_t>(type));
   return msg;
@@ -92,7 +93,7 @@ std::optional<T> deserializeOption(Cursor& cursor) {
 }
 
 void serializeString(Appender& a, StringPiece str) {
-  a.write<uint32_t>(str.size());
+  a.write<uint32_t>(static_cast<uint32_t>(str.size()));
   a.push(ByteRange(str));
 }
 
@@ -102,7 +103,7 @@ std::string deserializeString(Cursor& cursor) {
 }
 
 void serializeBool(Appender& a, bool b) {
-  a.write<uint8_t>(b);
+  a.write<uint8_t>(static_cast<uint8_t>(b));
 }
 
 bool deserializeBool(Cursor& cursor) {
@@ -126,7 +127,7 @@ uint16_t deserializeUint16(Cursor& cursor) {
 }
 
 void serializeUint32(Appender& a, uint64_t val) {
-  a.write<uint32_t>(val);
+  a.write<uint32_t>(static_cast<uint32_t>(val));
 }
 
 uint32_t deserializeUint32(Cursor& cursor) {
@@ -284,7 +285,7 @@ void PrivHelperConn::serializeResponsePacket(
       PRIVHELPER_CURRENT_VERSION,
       sizeof(packet));
   cursor.write<uint32_t>(PRIVHELPER_CURRENT_VERSION);
-  cursor.write<uint32_t>(sizeof(packet.metadata));
+  cursor.write<uint32_t>(static_cast<uint32_t>(sizeof(packet.metadata)));
   cursor.write<uint32_t>(packet.metadata.transaction_id);
   cursor.write<uint32_t>(packet.metadata.msg_type);
 }
@@ -422,7 +423,7 @@ UnixSocket::Message PrivHelperConn::serializeTakeoverStartupRequest(
   Appender appender(&msg.data, kDefaultBufferSize);
 
   serializeString(appender, mountPoint);
-  appender.write<uint32_t>(bindMounts.size());
+  appender.write<uint32_t>(static_cast<uint32_t>(bindMounts.size()));
   for (const auto& path : bindMounts) {
     serializeString(appender, path);
   }
@@ -530,7 +531,7 @@ UnixSocket::Message PrivHelperConn::serializeSetUseEdenFsRequest(
     bool useEdenFs) {
   auto msg = serializeRequestPacket(xid, REQ_SET_USE_EDENFS);
   Appender appender(&msg.data, kDefaultBufferSize);
-  appender.write<uint64_t>(((useEdenFs) ? 1 : 0));
+  appender.write<uint64_t>(static_cast<uint64_t>(((useEdenFs) ? 1 : 0)));
 
   return msg;
 }
@@ -544,6 +545,75 @@ UnixSocket::Message PrivHelperConn::serializeGetPidRequest(uint32_t xid) {
   return serializeRequestPacket(xid, REQ_GET_PID);
 }
 
+UnixSocket::Message PrivHelperConn::serializeGetNamespaceInfoRequest(
+    uint32_t xid,
+    pid_t daemonPid) {
+  auto msg = serializeRequestPacket(xid, REQ_GET_NAMESPACE_INFO);
+  Appender appender(&msg.data, kDefaultBufferSize);
+  appender.writeBE<pid_t>(daemonPid);
+  return msg;
+}
+
+NamespaceInfo PrivHelperConn::parseGetNamespaceInfoResponse(
+    const UnixSocket::Message& msg) {
+  Cursor cursor(&msg.data);
+  PrivHelperPacket packet = parsePacket(cursor);
+  if (packet.metadata.msg_type == RESP_ERROR) {
+    rethrowErrorResponse(cursor);
+  } else if (packet.metadata.msg_type != REQ_GET_NAMESPACE_INFO) {
+    throwf<std::runtime_error>(
+        "unexpected response type {} for request {} of type {} for version v{}",
+        packet.metadata.msg_type,
+        packet.metadata.transaction_id,
+        REQ_GET_NAMESPACE_INFO,
+        packet.header.version);
+  }
+  NamespaceInfo info{};
+  bool valid = cursor.tryReadBE<pid_t>(info.privhelperPid);
+  if (!valid) {
+    throwf<std::runtime_error>(
+        "Failed to read privhelper pid from privhelper server for request {} for version v{}",
+        packet.metadata.transaction_id,
+        packet.header.version);
+  }
+  valid = cursor.tryReadBE<uint64_t>(info.rootMountNsInode);
+  if (!valid) {
+    throwf<std::runtime_error>(
+        "Failed to read root mount ns inode from privhelper server for request {} for version v{}",
+        packet.metadata.transaction_id,
+        packet.header.version);
+  }
+  valid = cursor.tryReadBE<uint64_t>(info.privhelperMountNsInode);
+  if (!valid) {
+    throwf<std::runtime_error>(
+        "Failed to read privhelper mount ns inode from privhelper server for request {} for version v{}",
+        packet.metadata.transaction_id,
+        packet.header.version);
+  }
+  valid = cursor.tryReadBE<uint64_t>(info.privhelperPidNsInode);
+  if (!valid) {
+    throwf<std::runtime_error>(
+        "Failed to read privhelper pid ns inode from privhelper server for request {} for version v{}",
+        packet.metadata.transaction_id,
+        packet.header.version);
+  }
+  valid = cursor.tryReadBE<uint64_t>(info.daemonMountNsInode);
+  if (!valid) {
+    throwf<std::runtime_error>(
+        "Failed to read daemon mount ns inode from privhelper server for request {} for version v{}",
+        packet.metadata.transaction_id,
+        packet.header.version);
+  }
+  valid = cursor.tryReadBE<uint64_t>(info.daemonPidNsInode);
+  if (!valid) {
+    throwf<std::runtime_error>(
+        "Failed to read daemon pid ns inode from privhelper server for request {} for version v{}",
+        packet.metadata.transaction_id,
+        packet.header.version);
+  }
+  return info;
+}
+
 UnixSocket::Message PrivHelperConn::serializeStartFamRequest(
     uint32_t xid,
     const std::vector<std::string>& paths,
@@ -553,7 +623,7 @@ UnixSocket::Message PrivHelperConn::serializeStartFamRequest(
   auto msg = serializeRequestPacket(xid, REQ_START_FAM);
   Appender appender(&msg.data, kDefaultBufferSize);
 
-  appender.write<uint32_t>(paths.size());
+  appender.write<uint32_t>(static_cast<uint32_t>(paths.size()));
   for (const auto& path : paths) {
     serializeString(appender, path);
   }
@@ -694,6 +764,48 @@ void PrivHelperConn::parseSetMemoryPriorityForProcessRequest(
   checkAtEnd(cursor, "set memory priority for process request");
 }
 
+UnixSocket::Message PrivHelperConn::serializeSetFuseReadAheadRequest(
+    uint32_t xid,
+    StringPiece mountPath,
+    uint32_t readAheadKb) {
+  auto msg = serializeRequestPacket(xid, REQ_SET_FUSE_READ_AHEAD);
+  Appender appender(&msg.data, kDefaultBufferSize);
+  serializeString(appender, mountPath);
+  appender.write<uint32_t>(readAheadKb);
+  return msg;
+}
+
+void PrivHelperConn::parseSetFuseReadAheadRequest(
+    Cursor& cursor,
+    string& mountPath,
+    uint32_t& readAheadKb) {
+  mountPath = deserializeString(cursor);
+  readAheadKb = cursor.read<uint32_t>();
+  checkAtEnd(cursor, "set fuse read-ahead request");
+}
+
+void PrivHelperConn::serializeSanityCheckResult(
+    Appender& appender,
+    const SanityCheckResult& result) {
+  appender.write<uint32_t>(result.staleRedirectionMountsFound);
+  appender.write<uint32_t>(result.staleRedirectionMountsSucceeded);
+  appender.write<uint32_t>(result.staleRedirectionMountsFailed);
+  appender.write<uint8_t>(result.staleCheckoutMountUnmounted ? 1 : 0);
+}
+
+SanityCheckResult PrivHelperConn::parseSanityCheckResult(Cursor& cursor) {
+  SanityCheckResult result{};
+  if (cursor.isAtEnd()) {
+    // Old server that doesn't send cleanup data
+    return result;
+  }
+  result.staleRedirectionMountsFound = cursor.read<uint32_t>();
+  result.staleRedirectionMountsSucceeded = cursor.read<uint32_t>();
+  result.staleRedirectionMountsFailed = cursor.read<uint32_t>();
+  result.staleCheckoutMountUnmounted = cursor.read<uint8_t>() != 0;
+  return result;
+}
+
 void PrivHelperConn::serializeErrorResponse(
     Appender& appender,
     const std::exception& ex) {
@@ -712,7 +824,7 @@ void PrivHelperConn::serializeErrorResponse(
     folly::StringPiece message,
     int errnum,
     folly::StringPiece excType) {
-  appender.write<uint32_t>(errnum);
+  appender.write<uint32_t>(static_cast<uint32_t>(errnum));
   serializeString(appender, message);
   serializeString(appender, excType);
 }

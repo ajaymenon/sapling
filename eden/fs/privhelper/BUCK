@@ -28,6 +28,16 @@ cpp_library(
 )
 
 cpp_library(
+    name = "rollback",
+    srcs = ["PrivHelperRollback.cpp"],
+    headers = ["PrivHelperRollback.h"],
+    deps = [
+        "//folly:string",
+        "//folly/logging:logging",
+    ],
+)
+
+cpp_library(
     name = "conn",
     srcs = ["PrivHelperConn.cpp"],
     headers = ["PrivHelperConn.h"],
@@ -60,19 +70,22 @@ cpp_library(
         "PrivHelperServer.cpp",
         "PrivHelperServerSanityCheck.cpp",
     ],
-    headers = ["PrivHelperServer.h"],
+    headers = [
+        "PrivHelperServer.h",
+    ],
     deps = [
         ":nfs_rpc",
+        ":rollback",
         "//eden/common/utils:errno_utils",
         "//eden/common/utils:fsdetect",
         "//eden/common/utils:path",
         "//eden/common/utils:sysctl_util",
         "//eden/common/utils:throw",
         "//eden/fs/privhelper/priority:process_priority",
+        "//eden/fs/utils:mount_info_table",
         "//folly:conv",
         "//folly:exception",
         "//folly:expected",
-        "//folly:file",
         "//folly:file_util",
         "//folly:network_address",
         "//folly:string",
@@ -96,6 +109,7 @@ cpp_library(
         ":conn",
         "//eden/common/utils:io",
         "//eden/common/utils:process",
+        "//folly:file",
     ],
     external_deps = [
         ("boost", None, "boost_algorithm"),
@@ -118,6 +132,8 @@ cpp_library(
         "//eden/common/utils:io",
         "//eden/common/utils:process",
         "//eden/common/utils:user_info",
+        "//eden/fs/telemetry:log_info",
+        "//eden/fs/telemetry:structured_logger",
         "//eden/fs/utils:eden_error",
         "//folly:exception",
         "//folly:expected",

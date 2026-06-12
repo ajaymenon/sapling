@@ -24,10 +24,13 @@
 #include <folly/SocketAddress.h>
 #include <folly/Synchronized.h>
 #include <folly/ThreadLocal.h>
+#include <folly/coro/safe/NowTask.h>
 #include <folly/futures/SharedPromise.h>
+#include <folly/synchronization/LifoSem.h>
 
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/PathMap.h"
+#include "eden/fs/eden-config.h"
 #include "eden/fs/inodes/EdenMountHandle.h"
 #include "eden/fs/inodes/InodePtr.h"
 #include "eden/fs/inodes/overlay/OverlayChecker.h"
@@ -65,8 +68,10 @@ class BlobCache;
 class CheckoutConfig;
 class Dirstate;
 class EdenConfig;
+class EdenFsEventsLogger;
 class EdenMount;
 class EdenServiceHandler;
+class ErrorLogger;
 class HeartbeatManager;
 class SaplingBackingStore;
 class IScribeLogger;
@@ -81,6 +86,9 @@ class StartupStatusChannel;
 class StructuredLogger;
 class TreeCache;
 class UserInfo;
+#ifdef EDEN_HAVE_LOGGER
+class XplatLogger;
+#endif
 struct CheckoutResult;
 struct INodePopulationReport;
 struct SessionInfo;
@@ -327,6 +335,14 @@ class EdenServer : private TakeoverHandler {
       folly::StringPiece callerName,
       CheckoutMode checkoutMode);
 
+  folly::coro::now_task<CheckoutResult> co_checkOutRevision(
+      AbsolutePathPiece mountPath,
+      std::string& rootId,
+      std::optional<folly::StringPiece> rootHgManifest,
+      const ObjectFetchContextPtr& fetchContext,
+      folly::StringPiece callerName,
+      CheckoutMode checkoutMode);
+
   /**
    * Garbage collect the working copy of the passed in mount.
    */
@@ -334,7 +350,8 @@ class EdenServer : private TakeoverHandler {
       EdenMount& mount,
       TreeInodePtr rootInode,
       std::chrono::system_clock::time_point cutoff,
-      const ObjectFetchContextPtr& context);
+      const ObjectFetchContextPtr& context,
+      bool pressureBased = false);
 
   /**
    * Stop all garbage collection tasks and wait for any running GC to finish.
@@ -578,6 +595,8 @@ class EdenServer : private TakeoverHandler {
   // Forbidden copy constructor and assignment operator
   EdenServer(EdenServer const&) = delete;
   EdenServer& operator=(EdenServer const&) = delete;
+  EdenServer(EdenServer&&) = delete;
+  EdenServer& operator=(EdenServer&&) = delete;
 
   void startPeriodicTasks();
   void updatePeriodicTaskIntervals(const EdenConfig& config);
@@ -662,6 +681,12 @@ class EdenServer : private TakeoverHandler {
   // hold an owning reference to the mount to safely sample stats.
   void registerStats(std::shared_ptr<EdenMount> edenMount);
   void unregisterStats(EdenMount* edenMount);
+
+#ifdef EDEN_HAVE_LOGGER
+  // Central place to register all XplatLogger table transforms.
+  // Must be called before any logging call sites fire.
+  void registerXplatTransforms();
+#endif
 
   // Registers inode population reports callback with the notifier.
   void registerInodePopulationReportsCallback();
@@ -785,7 +810,7 @@ class EdenServer : private TakeoverHandler {
   /**
    * The EventBase driving the main thread loop.
    *
-   * This is used to drive the the thrift server and can also be used for
+   * This is used to drive the thrift server and can also be used for
    * scheduling other asynchronous operations.
    *
    * This is set when the EdenServer is started and is never updated after
@@ -804,14 +829,37 @@ class EdenServer : private TakeoverHandler {
   std::shared_ptr<StructuredLogger> notificationsStructuredLogger_;
 
   /**
-   * HeartbeatManager to handle all heartbeat-related operations
+   * Structured logger for error telemetry. When scribe binary and
+   * error category are configured, this is an ErrorLogger instance;
+   * Always created; no-ops internally when scribe is not configured.
    */
-  std::shared_ptr<HeartbeatManager> heartbeatManager_;
+  std::shared_ptr<ErrorLogger> errorLogger_;
+
+#ifdef EDEN_HAVE_LOGGER
+  /**
+   * Cross-platform structured logger for file access events.
+   * Owns the EdenTelemetryIdentity used for all log entries.
+   * Must be declared before serverState_ so it outlives InodeAccessLogger.
+   */
+  std::unique_ptr<XplatLogger> xplatLogger_;
+#endif
+
+  /**
+   * Events logger for telemetry, shared with WindowsNotifier.
+   * Declared before serverState_ so it can be passed to getPlatformNotifier.
+   */
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
 
   /**
    * Common state shared by all of the EdenMount objects.
    */
   const std::shared_ptr<ServerState> serverState_;
+
+  /**
+   * HeartbeatManager to handle all heartbeat-related operations.
+   * Declared after serverState_ so it can receive the EdenFsEventsLogger.
+   */
+  std::shared_ptr<HeartbeatManager> heartbeatManager_;
 
   // TODO: We should not be sharing in-memory BlobCache and TreeCache across
   // multiple BackingStores. The IDs inhabit different spaces.
@@ -906,7 +954,7 @@ class EdenServer : private TakeoverHandler {
      * status updates.
      */
     void printProgresses(
-        std::shared_ptr<StartupLogger>,
+        const std::shared_ptr<StartupLogger>&,
         std::optional<std::string_view> errorMessage = std::nullopt);
 
     /**
@@ -915,7 +963,7 @@ class EdenServer : private TakeoverHandler {
      * OverlayChecker calls back
      */
     void manageProgress(
-        std::shared_ptr<StartupLogger> logger,
+        const std::shared_ptr<StartupLogger>& logger,
         size_t processIndex,
         uint16_t percent);
 
@@ -958,9 +1006,21 @@ class EdenServer : private TakeoverHandler {
 #endif
 
   /**
+   * Semaphore limiting concurrent fsck operations during startup.
+   * Prevents OOM when many mounts need fsck after ungraceful shutdown.
+   */
+  std::unique_ptr<folly::LifoSem> fsckSemaphore_;
+
+  /**
+   * Last scheduled pressure-based GC time by mount path.
+   */
+  PathMap<std::chrono::steady_clock::time_point, AbsolutePath>
+      lastPressureBasedGcTimes_;
+
+  /**
    * Cancellation source for garbage collection operations.
    * This allows cancelling any in-progress GC operations.
    */
-  folly::CancellationSource gcCancelSource_;
+  folly::Synchronized<folly::CancellationSource> gcCancelSource_;
 };
 } // namespace facebook::eden

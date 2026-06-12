@@ -7,7 +7,7 @@
   $ setconfig progress.delay=0 progress.assume-tty=true progress.lockstep=True progress.renderer=simple
 
 simple test
-  $ hg progresstest 4 4
+  $ sl progresstest 4 4
    (clear) (no-eol)
      Progress test  [>              ]  0/4 cycles  loop 0\x1b[55D (clear) (no-eol) (esc)
      Progress test  [===>           ]  1/4 cycles  loop 1\x1b[55D (clear) (no-eol) (esc)
@@ -16,7 +16,7 @@ simple test
      Progress test  [===============]  4/4 cycles  loop 4\x1b[55D (clear) (no-eol) (esc)
 
 test nested topics
-  $ hg progresstest --nested 2 2
+  $ sl progresstest --nested 2 2
    (clear) (no-eol)
      Progress test  [>              ]  0/2 cycles  loop 0\x1b[55D (clear) (no-eol) (esc)
      Progress test  [>              ]  0/2 cycles  loop 0\r (esc)
@@ -42,7 +42,7 @@ test nested topics
 
 
 test count over total
-  $ hg progresstest 4 2
+  $ sl progresstest 4 2
    (clear) (no-eol)
      Progress test  [>              ]  0/2 cycles  loop 0\x1b[55D (clear) (no-eol) (esc)
      Progress test  [=======>       ]  1/2 cycles  loop 1\x1b[55D (clear) (no-eol) (esc)
@@ -51,7 +51,7 @@ test count over total
      Progress test  [<=>            ]  4/2 cycles  loop 4\x1b[55D (clear) (no-eol) (esc)
 
 test rendering with bytes
-  $ hg bytesprogresstest
+  $ sl bytesprogresstest
    (clear) (no-eol)
     Bytes progress  [>              ]  0B/1111MB  0 bytes\x1b[55D (clear) (no-eol) (esc)
     Bytes progress  [>              ]  10B/1111MB  10 bytes\x1b[57D (clear) (no-eol) (esc)
@@ -68,7 +68,7 @@ test rendering with bytes
     Bytes progress  [===============]  1111MB/1111MB  1111111111 bytes\x1b[68D (clear) (no-eol) (esc)
 
 test unicode topic
-  $ hg --encoding utf-8 progresstest 4 4 --unicode
+  $ sl --encoding utf-8 progresstest 4 4 --unicode
    (clear) (no-eol)
               あいうえ  [>              ]  0/4 cycles  あい\x1b[57D (clear) (no-eol) (esc)
               あいうえ  [===>           ]  1/4 cycles  あいう\x1b[59D (clear) (no-eol) (esc)
@@ -77,7 +77,7 @@ test unicode topic
               あいうえ  [===============]  4/4 cycles  あいう\x1b[59D (clear) (no-eol) (esc)
 
 test iter adapter
-  $ hg iterprogresstest
+  $ sl iterprogresstest
    (clear) (no-eol)
            Numbers  [===>           ]  1/4\x1b[40D (clear) (no-eol) (esc)
            Numbers  [=======>       ]  2/4\x1b[40D (clear) (no-eol) (esc)

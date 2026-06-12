@@ -18,7 +18,7 @@ use blobstore::OverwriteStatus;
 use blobstore::PutBehaviour;
 use context::CoreContext;
 use mononoke_types::BlobstoreBytes;
-use rand::Rng;
+use rand::RngExt as _;
 use rand_distr::Distribution;
 
 pub type Normal = rand_distr::Normal<f64>;
@@ -136,7 +136,7 @@ where
     D: Distribution<f64>,
 {
     if let Some(distribution) = distribution {
-        let seconds = rand::thread_rng().sample(distribution).abs();
+        let seconds = rand::rng().sample(distribution).abs();
         tokio::time::sleep(Duration::new(
             seconds.trunc() as u64,
             (seconds.fract() * 1e+9) as u32,
@@ -223,7 +223,7 @@ impl<B: Blobstore> KeyedBlobstore for DelayedKeyedBlobstore<B> {
             .inner
             .get(ctx, old_key)
             .await?
-            .with_context(|| format!("key {} not present", old_key))?;
+            .with_context(|| format!("key {old_key} not present"))?;
         self.inner.put(ctx, new_key, value.into_bytes()).await
     }
 }

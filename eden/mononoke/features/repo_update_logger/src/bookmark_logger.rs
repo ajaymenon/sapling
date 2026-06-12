@@ -19,14 +19,11 @@ use context::CoreContext;
 use futures::join;
 #[cfg(fbcode_build)]
 use git_ref_rust_logger::GitRefLogger;
-use git_source_of_truth::GitSourceOfTruth;
-use git_source_of_truth::GitSourceOfTruthConfigRef;
-use git_source_of_truth::RepositoryName;
-use git_source_of_truth::Staleness;
 use gix_hash::Kind;
 use gix_hash::ObjectId;
 use hostname::get_hostname;
 use logger_ext::Loggable;
+use metaconfig_types::CommitIdentityScheme;
 use metaconfig_types::RepoConfigRef;
 #[cfg(fbcode_build)]
 use mononoke_bookmark_rust_logger::MononokeBookmarkLogger;
@@ -71,7 +68,7 @@ impl std::fmt::Display for BookmarkOperation {
             Delete(_) => "delete",
         };
 
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -109,6 +106,7 @@ struct GitBookmarkInfo {
     bookmark_name: String,
     old_bookmark_value: String,
     new_bookmark_value: String,
+    pusher_identities: Vec<String>,
     server_hostname: String,
     timestamp: u128,
 }
@@ -132,12 +130,19 @@ impl GitBookmarkInfo {
         let new_bookmark_value = get_git_hash(ctx, repo, info.operation.new_bookmark_value())
             .await
             .unwrap_or_else(|| ObjectId::null(Kind::Sha1).to_hex().to_string());
+        let pusher_identities = ctx
+            .metadata()
+            .identities()
+            .iter()
+            .map(|i| i.to_typed_string())
+            .collect();
         let server_hostname = get_hostname().unwrap_or("error".to_string());
         Self {
             repo_name,
             bookmark_name,
             old_bookmark_value,
             new_bookmark_value,
+            pusher_identities,
             server_hostname,
             timestamp,
         }
@@ -160,9 +165,12 @@ impl Loggable for GitBookmarkInfo {
         ref_logger.set_ref_name(self.bookmark_name.clone());
         ref_logger.set_old_ref_value(self.old_bookmark_value.clone());
         ref_logger.set_new_ref_value(self.new_bookmark_value.clone());
-        ref_logger.set_pusher_identities(vec![]); // Maintaining parity with current Git logger
+        ref_logger.set_pusher_identities(self.pusher_identities.clone());
         ref_logger.set_server_hostname(self.server_hostname.clone());
         ref_logger.set_received_timestamp(self.timestamp as i64);
+        if let Some(cri) = ctx.client_request_info() {
+            ref_logger.set_client_correlator(cri.correlator.clone());
+        }
         ref_logger.log_async()?;
         Ok(())
     }
@@ -236,11 +244,11 @@ impl PlainBookmarkInfo {
             old_bookmark_value: info
                 .operation
                 .old_bookmark_value()
-                .map(|cs| format!("{}", cs)),
+                .map(|cs| format!("{cs}")),
             new_bookmark_value: info
                 .operation
                 .new_bookmark_value()
-                .map(|cs| format!("{}", cs)),
+                .map(|cs| format!("{cs}")),
             operation: format!("{}", info.operation),
             update_reason: format!("{}", info.reason),
         }
@@ -290,7 +298,7 @@ impl Loggable for PlainBookmarkInfo {
 
 pub async fn log_bookmark_operation(
     ctx: &CoreContext,
-    repo: &(impl RepoIdentityRef + RepoConfigRef + BonsaiGitMappingRef + GitSourceOfTruthConfigRef),
+    repo: &(impl RepoIdentityRef + RepoConfigRef + BonsaiGitMappingRef),
     info: &BookmarkInfo,
 ) {
     if let Some(bookmark_logging_destination) = &repo
@@ -304,20 +312,10 @@ pub async fn log_bookmark_operation(
                 .await;
         };
         let git_logger_future = async move {
-            let mononoke_source_of_truth = repo
-                .git_source_of_truth_config()
-                .get_by_repo_name(
-                    ctx,
-                    &RepositoryName(repo.repo_identity().name().to_string()),
-                    Staleness::MaybeStale,
-                )
-                .await
-                .map(|entry| {
-                    entry.is_some_and(|entry| entry.source_of_truth == GitSourceOfTruth::Mononoke)
-                })
-                .unwrap_or(false);
-            // Only log Git bookmarks if the Git repo is SoT'd in Mononoke
-            if mononoke_source_of_truth {
+            let is_git_repo =
+                repo.repo_config().default_commit_identity_scheme == CommitIdentityScheme::GIT;
+            // Only log Git bookmarks if the repo uses Git as its commit identity scheme
+            if is_git_repo {
                 GitBookmarkInfo::new(ctx, repo, info)
                     .await
                     .log(ctx, bookmark_logging_destination)

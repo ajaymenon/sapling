@@ -28,7 +28,6 @@ use mononoke_types::Timestamp;
 use sql::mysql;
 use sql::mysql_async::FromValueError;
 use sql::mysql_async::Value;
-use sql::mysql_async::prelude::ConvIr;
 use sql::mysql_async::prelude::FromValue;
 
 /// An id in the BookmarkUpdateLog
@@ -188,6 +187,9 @@ pub enum BookmarkUpdateReason {
 
     /// Bookmark was moved by an API request.
     ApiRequest,
+
+    /// Bookmark was moved by the multi-repo land service.
+    MultiRepoLand,
 }
 
 impl std::fmt::Display for BookmarkUpdateReason {
@@ -203,13 +205,15 @@ impl std::fmt::Display for BookmarkUpdateReason {
             Backsyncer => "backsyncer",
             XRepoSync => "xreposync",
             ApiRequest => "apirequest",
+            MultiRepoLand => "multirepoland",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
-impl ConvIr<BookmarkUpdateReason> for BookmarkUpdateReason {
-    fn new(v: Value) -> Result<Self, FromValueError> {
+impl TryFrom<Value> for BookmarkUpdateReason {
+    type Error = FromValueError;
+    fn try_from(v: Value) -> Result<Self, FromValueError> {
         use BookmarkUpdateReason::*;
 
         match v {
@@ -221,16 +225,9 @@ impl ConvIr<BookmarkUpdateReason> for BookmarkUpdateReason {
             Value::Bytes(ref b) if b == b"backsyncer" => Ok(Backsyncer),
             Value::Bytes(ref b) if b == b"xreposync" => Ok(XRepoSync),
             Value::Bytes(ref b) if b == b"apirequest" => Ok(ApiRequest),
+            Value::Bytes(ref b) if b == b"multirepoland" => Ok(MultiRepoLand),
             v => Err(FromValueError(v)),
         }
-    }
-
-    fn commit(self) -> BookmarkUpdateReason {
-        self
-    }
-
-    fn rollback(self) -> Value {
-        self.into()
     }
 }
 
@@ -251,6 +248,7 @@ impl From<BookmarkUpdateReason> for Value {
             Backsyncer => Value::Bytes(b"backsyncer".to_vec()),
             XRepoSync => Value::Bytes(b"xreposync".to_vec()),
             ApiRequest => Value::Bytes(b"apirequest".to_vec()),
+            MultiRepoLand => Value::Bytes(b"multirepoland".to_vec()),
         }
     }
 }

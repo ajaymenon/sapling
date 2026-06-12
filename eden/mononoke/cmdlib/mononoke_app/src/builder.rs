@@ -46,6 +46,7 @@ use permission_checker::AclProvider;
 use permission_checker::DefaultAclProvider;
 use permission_checker::InternalAclProvider;
 use rendezvous::RendezVousArgs;
+use repo_derivation_queues::DerivationQueueArgs;
 use sql_ext::facebook::MysqlOptions;
 use sql_ext::facebook::PoolConfig;
 use sql_ext::facebook::ReadConnectionType;
@@ -129,6 +130,14 @@ pub struct EnvironmentArgs {
 
     #[clap(flatten, next_help_heading = "COMMIT GRAPH OPTIONS")]
     commit_graph_args: CommitGraphArgs,
+
+    #[clap(flatten, next_help_heading = "DERIVATION QUEUE OPTIONS")]
+    derivation_queue_args: DerivationQueueArgs,
+
+    /// Disable content redaction. Intended for Cogwheel tests where the
+    /// redaction keylist blobs are not available in the ephemeral blobstore.
+    #[clap(long)]
+    disable_redaction: bool,
 }
 
 impl MononokeAppBuilder {
@@ -318,6 +327,8 @@ impl MononokeAppBuilder {
             just_knobs_args,
             gflags_args,
             commit_graph_args,
+            derivation_queue_args,
+            disable_redaction,
         } = env_args;
 
         gflags_args.propagate(self.fb)?;
@@ -376,8 +387,8 @@ impl MononokeAppBuilder {
 
         let remote_diff_options = remote_diff_args.into();
 
-        let acl_provider =
-            create_acl_provider(self.fb, &acl_args).context("Failed to create ACL provider")?;
+        let acl_provider = create_acl_provider(self.fb, &acl_args, runtime)
+            .context("Failed to create ACL provider")?;
 
         let commit_graph_options = commit_graph_args.into();
 
@@ -409,6 +420,9 @@ impl MononokeAppBuilder {
             filter_repos: None,
             commit_graph_options,
             client_entry_point_for_service: self.client_entry_point_for_service,
+            derivation_queue_namespace: derivation_queue_args.derivation_queue_namespace,
+            use_pipeline_zelos_config: derivation_queue_args.use_pipeline_zelos_config,
+            redaction_disabled: disable_redaction,
         })
     }
 }
@@ -530,12 +544,60 @@ fn init_just_knobs_worker(
     }
 }
 
-fn create_acl_provider(fb: FacebookInit, acl_args: &AclArgs) -> Result<Arc<dyn AclProvider>> {
-    let acl_provider = match &acl_args.acl_file {
-        Some(acl_file) => InternalAclProvider::from_file(acl_file).with_context(|| {
-            format!("Failed to load ACLs from '{}'", acl_file.to_string_lossy())
-        })?,
-        None => DefaultAclProvider::new(fb)?,
-    };
-    Ok(acl_provider)
+#[cfg(fbcode_build)]
+fn create_acl_provider(
+    fb: FacebookInit,
+    acl_args: &AclArgs,
+    runtime: &Runtime,
+) -> Result<Arc<dyn AclProvider>> {
+    if let Some(acl_file) = &acl_args.acl_file {
+        return InternalAclProvider::from_file(acl_file)
+            .with_context(|| format!("Failed to load ACLs from '{}'", acl_file.to_string_lossy()));
+    }
+    if acl_args.access_checker_shadow_enabled {
+        let verifier = parse_access_checker_verifier(acl_args)?;
+        let primary = DefaultAclProvider::new(fb).context("Failed to create DefaultAclProvider")?;
+        let shadow = runtime
+            .block_on(permission_checker::AccessCheckerProvider::new(fb, verifier))
+            .context("Failed to create AccessCheckerProvider for shadow mode")?;
+        return Ok(permission_checker::ShadowAclProvider::new(
+            fb,
+            primary,
+            shadow,
+            acl_args.access_checker_shadow_sample_rate,
+        ));
+    }
+    if acl_args.access_checker_enabled {
+        let verifier = parse_access_checker_verifier(acl_args)?;
+        return runtime
+            .block_on(permission_checker::AccessCheckerProvider::new(fb, verifier))
+            .context("Failed to create AccessCheckerProvider");
+    }
+    DefaultAclProvider::new(fb).context("Failed to create DefaultAclProvider")
+}
+
+#[cfg(fbcode_build)]
+fn parse_access_checker_verifier(acl_args: &AclArgs) -> Result<infrasec_authorization::Identity> {
+    let raw = acl_args.access_checker_verifier.as_str();
+    let (id_type, id_data) = raw.split_once(':').with_context(|| {
+        format!("Invalid --access-checker-verifier value '{raw}': expected '<type>:<data>'")
+    })?;
+    Ok(infrasec_authorization::Identity {
+        id_type: id_type.to_string(),
+        id_data: id_data.to_string(),
+        ..Default::default()
+    })
+}
+
+#[cfg(not(fbcode_build))]
+fn create_acl_provider(
+    fb: FacebookInit,
+    acl_args: &AclArgs,
+    _runtime: &Runtime,
+) -> Result<Arc<dyn AclProvider>> {
+    if let Some(acl_file) = &acl_args.acl_file {
+        return InternalAclProvider::from_file(acl_file)
+            .with_context(|| format!("Failed to load ACLs from '{}'", acl_file.to_string_lossy()));
+    }
+    DefaultAclProvider::new(fb).context("Failed to create DefaultAclProvider")
 }

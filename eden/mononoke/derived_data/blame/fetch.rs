@@ -15,6 +15,7 @@ use bytes::Bytes;
 use context::CoreContext;
 use filestore::FetchKey;
 use futures::TryStreamExt;
+use mononoke_types::ContentId;
 use mononoke_types::FileUnodeId;
 use mononoke_types::blame_v2::BlameRejected;
 use repo_blobstore::RepoBlobstoreArc;
@@ -66,7 +67,31 @@ pub async fn fetch_content_for_blame_with_limit(
     let (mut stream, size) =
         filestore::fetch_with_size(blobstore.clone(), ctx, &FetchKey::Canonical(content_id))
             .await?
-            .ok_or_else(|| anyhow!("Missing content: {}", content_id))?;
+            .ok_or_else(|| anyhow!("Missing content: {content_id}"))?;
+    if size > filesize_limit {
+        return Ok(FetchOutcome::Rejected(BlameRejected::TooBig));
+    }
+    let mut buffer = Vec::with_capacity(size as usize);
+    while let Some(bytes) = stream.try_next().await? {
+        if bytes.contains(&0u8) {
+            return Ok(FetchOutcome::Rejected(BlameRejected::Binary));
+        }
+        buffer.extend(bytes);
+    }
+    Ok(FetchOutcome::Fetched(Bytes::from(buffer)))
+}
+
+/// Fetch file content by ContentId, checking size limit and binary content.
+pub async fn fetch_content_for_blame_by_content_id(
+    ctx: &CoreContext,
+    blobstore: &Arc<dyn KeyedBlobstore>,
+    content_id: ContentId,
+    filesize_limit: u64,
+) -> Result<FetchOutcome> {
+    let (mut stream, size) =
+        filestore::fetch_with_size(blobstore.clone(), ctx, &FetchKey::Canonical(content_id))
+            .await?
+            .ok_or_else(|| anyhow!("Missing content: {content_id}"))?;
     if size > filesize_limit {
         return Ok(FetchOutcome::Rejected(BlameRejected::TooBig));
     }

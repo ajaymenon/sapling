@@ -20,7 +20,7 @@
 
 Read from the repo
 
-  $ hg log -pr $E
+  $ sl log -pr $E
   commit:      9bc730a19041
   bookmark:    master
   user:        test
@@ -34,28 +34,28 @@ Read from the repo
   +E
   \ No newline at end of file
 
-  $ hg bookmarks
+  $ sl bookmarks
      master                    9bc730a19041
      stable                    26805aba1e60
 
 Bookmarks
 
-  $ hg book -d stable
-  $ hg book stable -r $B
-  $ hg bookmarks
+  $ sl book -d stable
+  $ sl book stable -r $B
+  $ sl bookmarks
      master                    9bc730a19041
      stable                    112478962961
 
 Rename
 
-  $ hg up -q $E
-  $ hg mv E E1
-  $ hg st
+  $ sl up -q $E
+  $ sl mv E E1
+  $ sl st
   A E1
   R E
-  $ hg ci -m E1
+  $ sl ci -m E1
 
-  $ hg log -p -r . --config diff.git=true
+  $ sl log -p -r . --config diff.git=true
   commit:      bb41b36a84b5
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
@@ -64,6 +64,3 @@ Rename
   diff --git a/E b/E1
   rename from E
   rename to E1
-
-Export to revlog repo:
-  $ hg debugexportrevlog "$TESTTMP/export-revlog"

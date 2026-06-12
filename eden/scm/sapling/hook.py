@@ -11,6 +11,7 @@
 # GNU General Public License version 2 or any later version.
 
 
+import base64
 import os
 import sys
 
@@ -113,7 +114,8 @@ def _pythonhook_via_pyhook(ui, repo, htype, hname, funcname, args, throw):
     starttime = util.timer()
     try:
         with util.traced("pythonhook", hookname=hname, cat="blocked"):
-            r = bindings.hook.run_python_hook(repo._rsrepo, funcname, hname, args)
+            rsrepo = repo and repo._rsrepo
+            r = bindings.hook.run_python_hook(rsrepo, funcname, hname, args)
     except Exception as exc:
         if isinstance(exc, error.Abort):
             ui.warn(_("error: %s hook failed: %s\n") % (hname, exc.args[0]))
@@ -137,6 +139,13 @@ def _pythonhook_via_pyhook(ui, repo, htype, hname, funcname, args, throw):
             raise error.HookAbort(_("%s hook failed") % hname)
         ui.warn(_("warning: %s hook failed\n") % hname)
     return r, False
+
+
+def _maybe_decode_base64(cmd):
+    if cmd.startswith("base64:"):
+        s = cmd[7:]
+        return base64.b64decode(s).decode("utf-8")
+    return cmd
 
 
 def _exthook(ui, repo, htype, name, cmd, args, throw, background=False):
@@ -252,10 +261,7 @@ def runhooks(ui, repo, htype, hooks, throw: bool = False, **args):
         if callable(cmd):
             r, raised = _pythonhook(ui, repo, htype, hname, cmd, args, throw)
         elif cmd.startswith("python:"):
-            if (
-                ui.configbool("experimental", "run-python-hooks-via-pyhook")
-                and repo is not None
-            ):
+            if ui.configbool("experimental", "run-python-hooks-via-pyhook"):
                 funcname = cmd.split(":", 1)[1]
                 r, raised = _pythonhook_via_pyhook(
                     ui, repo, htype, hname, funcname, args, throw
@@ -266,11 +272,13 @@ def runhooks(ui, repo, htype, hooks, throw: bool = False, **args):
         elif cmd.startswith("background:"):
             # Run a shell command in background. Do not throw.
             cmd = cmd.split(":", 1)[1]
+            cmd = _maybe_decode_base64(cmd)
             r = _exthook(
                 ui, repo, htype, hname, cmd, args, throw=False, background=True
             )
             raised = False
         else:
+            cmd = _maybe_decode_base64(cmd)
             r = _exthook(ui, repo, htype, hname, cmd, args, throw)
             raised = False
 

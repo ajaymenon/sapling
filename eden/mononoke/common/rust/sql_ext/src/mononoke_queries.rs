@@ -24,8 +24,6 @@ use maplit::hashset;
 use memcache::KeyGen;
 use mononoke_types::RepositoryId;
 use mononoke_types::Timestamp;
-#[cfg(fbcode_build)]
-use mysql_client::MysqlError;
 use sql::QueryTelemetry;
 use sql_query_config::CachingConfig;
 use sql_query_telemetry::SqlQueryTelemetry;
@@ -68,6 +66,301 @@ macro_rules! mononoke_queries {
             $( $rest )*
         }
     };
+
+    // >tuple_list read query with single expression. Redirect to full form.
+    (
+        $vi:vis read $name:ident (
+            $( $pname:ident: $ptype:ty ),* $(,)*
+            >tuple_list $tlname:ident: ($( $col:ident: $col_type:ty ),+)
+        ) -> ($( $rtype:ty ),* $(,)*) { $q:expr }
+        $( $rest:tt )*
+    ) => {
+        $crate::mononoke_queries! {
+            $vi read $name (
+                $( $pname: $ptype, )*
+                >tuple_list $tlname: ($( $col: $col_type ),+)
+            ) -> ($( $rtype ),*) { mysql($q) sqlite($q) }
+            $( $rest )*
+        }
+    };
+
+    // >tuple_list full read query. Bypasses sql::queries! to directly match
+    // on Connection variants, enabling WHERE (col1, col2) IN ((v1, v2), ...)
+    // queries that sql::queries! does not support.
+    (
+        $vi:vis read $name:ident (
+            $( $pname:ident: $ptype:ty ),* $(,)*
+            >tuple_list $tlname:ident: ($( $col:ident: $col_type:ty ),+)
+        ) -> ($( $rtype:ty ),* $(,)*) { mysql($mysql_q:expr) sqlite($sqlite_q:expr) }
+        $( $rest:tt )*
+    ) => {
+        #[allow(non_snake_case)]
+        $vi mod $name {
+            #[allow(unused_imports)]
+            use super::*;
+
+            #[allow(unused_imports)]
+            use $crate::_macro_internal::*;
+
+            #[allow(dead_code)]
+            pub async fn query(
+                connection: &Connection,
+                sql_query_tel: SqlQueryTelemetry,
+                $( $pname: &$ptype, )*
+                $tlname: &[( $( $col_type, )+ )],
+            ) -> Result<Vec<($( $rtype, )*)>> {
+                if $tlname.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let res = _query_impl(
+                    connection,
+                    sql_query_tel,
+                    $( $pname, )*
+                    $tlname,
+                )
+                .await?;
+                Ok(res.0)
+            }
+
+            async fn _query_impl(
+                connection: &Connection,
+                sql_query_tel: SqlQueryTelemetry,
+                $( $pname: &$ptype, )*
+                $tlname: &[( $( $col_type, )+ )],
+            ) -> Result<(Vec<($( $rtype, )*)>, Option<QueryTelemetry>)> {
+                let query_name = stringify!($name);
+                let shard_name = connection.shard_name();
+                let repo_ids = $crate::extract_repo_ids_from_queries!($($pname: $ptype; )*);
+
+                let client_request_info = sql_query_tel.client_request_info()
+                    .map(|cri| serde_json::to_string(cri)).transpose()?;
+
+                let ((res, opt_tel, fut_stats), attempt) = query_with_retry_no_cache(
+                    |_attempt| {
+                        borrowed!(client_request_info);
+                        async move {
+                            let (fut_stats, (res, opt_tel)) = _execute_query(
+                                connection.sql_connection(),
+                                client_request_info.as_deref(),
+                                $( $pname, )*
+                                $tlname,
+                            )
+                            .try_timed()
+                            .await?;
+                            Ok((res, opt_tel, fut_stats))
+                        }
+                    },
+                    shard_name,
+                    query_name,
+                    &sql_query_tel,
+                    TelemetryGranularity::Query,
+                    &repo_ids,
+                ).await?;
+
+                log_query_telemetry(
+                    opt_tel.clone(),
+                    &sql_query_tel,
+                    TelemetryGranularity::Query,
+                    &repo_ids,
+                    query_name,
+                    shard_name.as_ref(),
+                    fut_stats,
+                    Some(attempt),
+                )?;
+
+                Ok((res, opt_tel))
+            }
+
+            async fn _execute_query(
+                connection: &_tl::InnerSqlConnection,
+                comment: Option<&str>,
+                $( $pname: &$ptype, )*
+                $tlname: &[( $( $col_type, )+ )],
+            ) -> Result<(Vec<($( $rtype, )*)>, Option<QueryTelemetry>)> {
+                match connection {
+                    _tl::InnerSqlConnection::Mysql(conn) => {
+                        let mut query = _build_mysql_query($( $pname, )* $tlname)?;
+                        if let Some(comment) = comment {
+                            query.insert_str(0, &format!("/* {} */", comment));
+                        }
+                        let (res, tel) = conn.read_query(query).await
+                            .map_err(_tl::anyhow::Error::from)?;
+
+                        #[cfg(fbcode_build)]
+                        { Ok((res, tel.map(_tl::InnerQueryTelemetry::MySQL))) }
+                        #[cfg(not(fbcode_build))]
+                        { Ok((res, tel)) }
+                    }
+                    _tl::InnerSqlConnection::OssMysql(conn) => {
+                        let query = _build_mysql_query($( $pname, )* $tlname)?;
+                        let mut con = _tl::OssConnection::get_conn_counted(
+                            conn.pool.clone(), &conn.stats,
+                        ).await?;
+                        let (mut res, _tel) = conn.read_query(&mut con, &query).await
+                            .map_err(_tl::anyhow::Error::from)?;
+                        let result = res
+                            .map(|row| _row_to_tuple(row))
+                            .await?
+                            .into_iter()
+                            .collect::<std::result::Result<Vec<($( $rtype, )*)>, _tl::anyhow::Error>>()?;
+                        Ok((result, None))
+                    }
+                    _tl::InnerSqlConnection::Sqlite(multithread_con) => {
+                        let res = _sqlite_query(multithread_con, $( $pname, )* $tlname).await?;
+                        let sqlite_tel = multithread_con
+                            .hlc_ts_lower_bound()
+                            .map(_tl::SqliteQueryTelemetry::new)
+                            .map(_tl::InnerQueryTelemetry::Sqlite);
+                        Ok((res, sqlite_tel))
+                    }
+                }
+            }
+
+            fn _build_mysql_query(
+                $( $pname: &$ptype, )*
+                $tlname: &[( $( $col_type, )+ )],
+            ) -> std::result::Result<String, _tl::anyhow::Error> {
+                use std::fmt::Write as _;
+                use _tl::mysql_async::prelude::ToValue;
+
+                // Pre-allocate: estimate ~30 bytes per tuple element.
+                let mut tuple_str = String::with_capacity($tlname.len() * 30 + 2);
+                write!(&mut tuple_str, "(")?;
+                let mut _first_tuple = true;
+                for ($( $col, )+) in $tlname {
+                    if _first_tuple { _first_tuple = false; } else { write!(&mut tuple_str, ", ")?; }
+                    write!(&mut tuple_str, "(")?;
+                    let mut _first_col = true;
+                    $(
+                        if _first_col { _first_col = false; } else { write!(&mut tuple_str, ", ")?; }
+                        write!(&mut tuple_str, "{}", ToValue::to_value($col).as_sql(false))?;
+                    )+
+                    write!(&mut tuple_str, ")")?;
+                }
+                write!(&mut tuple_str, ")")?;
+
+                Ok(format!(
+                    $mysql_q,
+                    $( $pname = ToValue::to_value(&$pname).as_sql(false), )*
+                    $tlname = tuple_str,
+                ))
+            }
+
+            fn _row_to_tuple(row: _tl::mysql_async::Row) -> std::result::Result<($( $rtype, )*), _tl::anyhow::Error> {
+                use _tl::mysql_async::prelude::FromValue;
+                #[allow(clippy::mixed_read_write_in_expression)]
+                let mut idx = 0;
+                let res = (
+                    $({
+                        let res: _tl::mysql_async::Value = row.get(idx)
+                            .ok_or_else(|| _tl::anyhow::anyhow!("Failed to get column at index {}", idx))?;
+                        idx += 1;
+                        <$rtype as FromValue>::from_value_opt(res)
+                            .map_err(|err| _tl::anyhow::anyhow!(
+                                "Failed to parse column {} as `{}`: {}", idx - 1, stringify!($rtype), err
+                            ))?
+                    },)*
+                );
+                let _ = idx;
+                Ok(res)
+            }
+
+            async fn _sqlite_query(
+                multithread_con: &_tl::SqliteMultithreaded,
+                $( $pname: &$ptype, )*
+                $tlname: &[( $( $col_type, )+ )],
+            ) -> std::result::Result<Vec<($( $rtype, )*)>, _tl::anyhow::Error> {
+                use std::fmt::Write as _;
+                use _tl::mysql_async::prelude::ToValue;
+                use _tl::mysql_async::prelude::FromValue;
+
+                // Build named params for scalar params and tuple list elements.
+                // Count: scalar params + (tuple_count * columns_per_tuple).
+                let _num_cols = {
+                    let mut _n = 0u32;
+                    $( let _ = stringify!($col); _n += 1; )+
+                    _n as usize
+                };
+                let mut params: Vec<(String, _tl::ValueWrapper)> =
+                    Vec::with_capacity($tlname.len() * _num_cols);
+                $(
+                    params.push((
+                        format!(":{}", stringify!($pname)),
+                        _tl::ValueWrapper(ToValue::to_value($pname)),
+                    ));
+                )*
+                for (i, ($( $col, )+)) in $tlname.iter().enumerate() {
+                    $(
+                        params.push((
+                            format!(":{}_{}_{}",  stringify!($tlname), i, stringify!($col)),
+                            _tl::ValueWrapper(ToValue::to_value($col)),
+                        ));
+                    )+
+                }
+
+                // Build the tuple list placeholder for SQLite.
+                // SQLite supports row values: WHERE (a, b) IN (VALUES (:p0, :p1), (:p2, :p3))
+                let mut tl_str = String::new();
+                write!(&mut tl_str, "(VALUES ")?;
+                for i in 0..$tlname.len() {
+                    if i > 0 { write!(&mut tl_str, ", ")?; }
+                    write!(&mut tl_str, "(")?;
+                    let mut _first = true;
+                    $(
+                        if _first { _first = false; } else { write!(&mut tl_str, ", ")?; }
+                        write!(&mut tl_str, ":{}_{}_{}",  stringify!($tlname), i, stringify!($col))?;
+                    )+
+                    write!(&mut tl_str, ")")?;
+                }
+                write!(&mut tl_str, ")")?;
+
+                let query = format!(
+                    $sqlite_q,
+                    $( $pname = format!(":{}", stringify!($pname)), )*
+                    $tlname = tl_str,
+                );
+
+                let con = multithread_con.acquire_sqlite_connection(
+                    _tl::SqliteQueryType::Read,
+                ).await?;
+
+                let mut ref_params: Vec<(&str, &dyn _tl::rusqlite::types::ToSql)> = Vec::new();
+                for idx in 0..params.len() {
+                    ref_params.push((&params[idx].0, &params[idx].1));
+                }
+
+                let mut stmt = con.prepare(&query)?;
+                let rows = stmt.query_map(
+                    &ref_params[..],
+                    |row| {
+                        #[allow(clippy::mixed_read_write_in_expression)]
+                        {
+                            let mut idx = 0;
+                            let res = (
+                                $({
+                                    let res: _tl::ValueWrapper = row.get(idx)?;
+                                    idx += 1;
+                                    <$rtype as FromValue>::from_value_opt(res.0)
+                                        .map_err(|err| _tl::rusqlite::Error::FromSqlConversionFailure(
+                                            idx - 1,
+                                            _tl::rusqlite::types::Type::Blob,
+                                            Box::new(err),
+                                        ))?
+                                },)*
+                            );
+                            let _ = idx;
+                            Ok(res)
+                        }
+                    }
+                )?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+                Ok(rows)
+            }
+        }
+
+        $crate::mononoke_queries! { $( $rest )* }
+    };
+
     // Read query with a single expression and cache. Redirect to read query with same expression for mysql and sqlite.
     (
         $vi:vis cacheable read $name:ident (
@@ -140,36 +433,23 @@ macro_rules! mononoke_queries {
                     // Check if any parameter is a RepositoryId and pass it to telemetry
                     let repo_ids = $crate::extract_repo_ids_from_queries!($($pname: $ptype; )*);
 
-                    query_with_retry_no_cache(
-                        || {
-                            borrowed!(sql_query_tel);
-                            cloned!(repo_ids);
-                            async move {
-                                let cri = sql_query_tel.client_request_info();
-                                // Convert ClientRequestInfo to string if present
-                                let cri_str = cri.map(|cri| serde_json::to_string(cri)).transpose()?;
+                    let client_request_info = sql_query_tel.client_request_info()
+                        .map(|cri| serde_json::to_string(cri)).transpose()?;
 
+                    let ((res, opt_tel, fut_stats), attempt) = query_with_retry_no_cache(
+                        |_attempt| {
+                            borrowed!(client_request_info);
+                            async move {
                                 let (fut_stats, (res, opt_tel)) = [<$name Impl>]::commented_query(
                                     connection.sql_connection(),
-                                    cri_str.as_deref(),
+                                    client_request_info.as_deref(),
                                     $( $pname, )*
                                     $( $lname, )*
                                 )
                                 .try_timed()
                                 .await?;
 
-                                log_query_telemetry(
-                                    opt_tel.clone(),
-                                    &sql_query_tel,
-                                    granularity,
-                                    &repo_ids,
-                                    query_name,
-                                    shard_name.as_ref(),
-                                    fut_stats,
-                                )?;
-
-
-                                Ok((res, opt_tel))
+                                Ok((res, opt_tel, fut_stats))
                             }
                         },
                         shard_name,
@@ -177,7 +457,20 @@ macro_rules! mononoke_queries {
                         &sql_query_tel,
                         granularity,
                         &repo_ids,
-                    ).await
+                    ).await?;
+
+                    log_query_telemetry(
+                        opt_tel.clone(),
+                        &sql_query_tel,
+                        granularity,
+                        &repo_ids,
+                        query_name,
+                        shard_name.as_ref(),
+                        fut_stats,
+                        Some(attempt),
+                    )?;
+
+                    Ok((res, opt_tel))
                 }
 
                 #[allow(dead_code)]
@@ -244,11 +537,11 @@ macro_rules! mononoke_queries {
                     // Check if any parameter is a RepositoryId and pass it to telemetry
                     let repo_ids = $crate::extract_repo_ids_from_queries!($($pname: $ptype; )*);
 
-                    let (fut_stats, (final_res, opt_tel)) = {
+                    let (fut_stats, (final_res, opt_tel, attempt)) = {
                         cloned!(sql_query_tel);
                         async {
-                            let res = query_with_consistency_no_cache(
-                                || {
+                            let (res, cons_read_attempt) = query_with_consistency_no_cache(
+                                |_attempt| {
 
                                     cloned!(sql_query_tel);
                                     async move {
@@ -274,16 +567,18 @@ macro_rules! mononoke_queries {
                             if let Err(ConsistentReadError::MissingHLC) = res {
                                 // If the query failed because the HLC was missing,
                                 // fallback to the primary connection
-                                return query_impl(
+                                let (res, opt_tel) = query_impl(
                                     &connections.read_master_connection,
                                     sql_query_tel,
                                     granularity,
                                     $( $pname, )*
                                     $( $lname, )*
-                                ).await;
+                                ).await?;
+                                return anyhow::Ok((res, opt_tel, cons_read_attempt + 1));
                             };
 
-                            Ok(res?)
+                            let (res, opt_tel) = res?;
+                            anyhow::Ok((res, opt_tel, cons_read_attempt))
                         }
                     }
                     .try_timed()
@@ -297,6 +592,7 @@ macro_rules! mononoke_queries {
                         query_name,
                         shard_name.as_ref(),
                         fut_stats,
+                        Some(attempt),
                     )?;
 
                     Ok(final_res)
@@ -364,9 +660,11 @@ macro_rules! mononoke_queries {
                     let repo_ids = $crate::extract_repo_ids_from_queries!($($pname: $ptype; )*);
 
                     // Execute query with caching
-                    let res = query_with_retry(
+                    // Note: For cache hits, no DB-level telemetry is logged since the query doesn't run.
+                    // Telemetry is logged inside the closure only when there's a cache miss.
+                    let (cached_res, _attempt) = query_with_retry(
                         data,
-                        || {
+                        |_attempt| {
                             borrowed!(sql_query_tel);
                             cloned!(repo_ids);
                             let cri = sql_query_tel.client_request_info();
@@ -393,7 +691,9 @@ macro_rules! mononoke_queries {
                                     query_name,
                                     shard_name.as_ref(),
                                     fut_stats,
+                                    None,
                                 )?;
+
                                 Ok(CachedQueryResult(res))
                             }
                         },
@@ -402,9 +702,9 @@ macro_rules! mononoke_queries {
                         &sql_query_tel,
                         granularity,
                         &repo_ids,
-                    ).await?.0;
+                    ).await?;
 
-                    Ok(res)
+                    Ok(cached_res.0)
                 }
 
                 #[allow(dead_code)]
@@ -498,8 +798,8 @@ macro_rules! mononoke_queries {
                         .collect();
 
 
-                    let (fut_stats, write_res) = query_with_retry_no_cache(
-                        || [<$name Impl>]::commented_query(
+                    let (fut_stats, (write_res, attempt)) = query_with_retry_no_cache(
+                        |_attempt| [<$name Impl>]::commented_query(
                             connection.sql_connection(),
                             cri_str.as_deref(),
                             values
@@ -524,6 +824,7 @@ macro_rules! mononoke_queries {
                         &query_name,
                         shard_name.as_ref(),
                         fut_stats,
+                        Some(attempt),
                     )?;
 
                     Ok(write_res)
@@ -595,6 +896,7 @@ macro_rules! mononoke_queries {
                         query_name,
                         shard_name,
                         fut_stats,
+                        1, // attempt number
                     )?;
 
                     Ok((txn, write_res))
@@ -665,8 +967,8 @@ macro_rules! mononoke_queries {
                     // Check if any parameter is a RepositoryId and pass it to telemetry
                     let repo_ids = $crate::extract_repo_ids_from_queries!($($pname: $ptype; )*);
 
-                    let (fut_stats, write_res) = query_with_retry_no_cache(
-                        || [<$name Impl>]::commented_query(
+                    let (fut_stats, (write_res, attempt)) = query_with_retry_no_cache(
+                        |_attempt| [<$name Impl>]::commented_query(
                             connection.sql_connection(),
                             cri_str.as_deref(),
                             $( $pname, )*
@@ -690,6 +992,7 @@ macro_rules! mononoke_queries {
                         &query_name,
                         shard_name.as_ref(),
                         fut_stats,
+                        Some(attempt),
                     )?;
 
                     Ok(write_res)
@@ -756,6 +1059,7 @@ macro_rules! mononoke_queries {
                         &query_name,
                         shard_name,
                         fut_stats,
+                        1, // attempt number
                     )?;
 
                     Ok((txn, write_res))
@@ -824,6 +1128,7 @@ macro_rules! read_query_with_transaction {
             $query_name,
             shard_name,
             fut_stats,
+            1, // attempt number
         )?;
 
         Ok((txn, res))
@@ -945,7 +1250,7 @@ where
         keys: HashSet<Key>,
     ) -> Result<HashMap<Key, CachedQueryResult<Vec<T>>>> {
         let key = keys.into_iter().exactly_one()?;
-        anyhow::ensure!(key == self.key, "Fetched invalid key {}", key);
+        anyhow::ensure!(key == self.key, "Fetched invalid key {key}");
         let val = (self.fetcher)().await?;
         Ok(hashmap! { key => val })
     }
@@ -974,21 +1279,21 @@ where
 }
 
 pub async fn query_with_retry_no_cache<T, Fut>(
-    do_query: impl Fn() -> Fut + Send + Sync,
+    do_query: impl Fn(usize) -> Fut + Send + Sync,
     shard_name: &str,
     query_name: &str,
     sql_query_tel: &SqlQueryTelemetry,
     granularity: TelemetryGranularity,
     repo_ids: &[RepositoryId],
-) -> Result<T>
+) -> Result<(T, usize)>
 where
     T: Send + 'static,
     Fut: Future<Output = Result<T>>,
 {
-    if let Ok(true) = justknobs::eval("scm/mononoke:sql_disable_auto_retries", None, None) {
-        return do_query().await;
+    if justknobs::eval("scm/mononoke:sql_disable_auto_retries", None, None) {
+        return Ok((do_query(0).await?, 0));
     }
-    Ok(retry(|_| do_query(), Duration::from_secs(10))
+    let (res, attempt) = retry(do_query, Duration::from_secs(10))
         .exponential_backoff(1.2)
         .jitter(Duration::from_secs(5))
         .max_attempts(RETRY_ATTEMPTS)
@@ -1004,25 +1309,25 @@ where
                 attempt < RETRY_ATTEMPTS,
             )
         })
-        .await?
-        .0)
+        .await?;
+    Ok((res, attempt))
 }
 
 pub async fn query_with_retry<T, Fut>(
     cache_data: CacheData<'_>,
-    do_query: impl Fn() -> Fut + Send + Sync,
+    do_query: impl Fn(usize) -> Fut + Send + Sync,
     shard_name: &str,
     query_name: &str,
     sql_query_tel: &SqlQueryTelemetry,
     granularity: TelemetryGranularity,
     repo_ids: &[RepositoryId],
-) -> Result<CachedQueryResult<Vec<T>>>
+) -> Result<(CachedQueryResult<Vec<T>>, usize)>
 where
     T: Send + bincode::Encode + bincode::Decode<()> + Clone + 'static,
     CachedQueryResult<Vec<T>>: MemcacheEntity,
     Fut: Future<Output = Result<CachedQueryResult<Vec<T>>>> + Send,
 {
-    if let Ok(true) = justknobs::eval("scm/mononoke:sql_disable_auto_cache", None, None) {
+    if justknobs::eval("scm/mononoke:sql_disable_auto_cache", None, None) {
         return query_with_retry_no_cache(
             &do_query,
             shard_name,
@@ -1033,18 +1338,20 @@ where
         )
         .await;
     }
-    let fetch = || {
-        query_with_retry_no_cache(
-            &do_query,
-            shard_name,
-            query_name,
-            sql_query_tel,
-            granularity,
-            repo_ids,
-        )
-    };
     let key = cache_data.key;
     if let Some(config) = cache_data.config.as_ref() {
+        let fetch = || async {
+            let (result, _attempt) = query_with_retry_no_cache(
+                &do_query,
+                shard_name,
+                query_name,
+                sql_query_tel,
+                granularity,
+                repo_ids,
+            )
+            .await?;
+            Ok(result)
+        };
         let store = QueryCacheStore {
             key: cache_data.key,
             cachelib: config.cache_handler_factory.cachelib(),
@@ -1053,21 +1360,32 @@ where
             fetcher: fetch,
             cache_ttl: cache_data.cache_ttl,
         };
-        Ok(get_or_fill(&store, hashset! {key})
+        let res = get_or_fill(&store, hashset! {key})
             .await?
             .into_iter()
             .exactly_one()
             .map_err(|_| anyhow!("Multiple values for a single key"))?
-            .1)
+            .1;
+        // When result came from cache or fetched through cache infrastructure,
+        // we report attempt as 1 since the cache layer doesn't track retry attempts
+        Ok((res, 1))
     } else {
-        fetch().await
+        query_with_retry_no_cache(
+            &do_query,
+            shard_name,
+            query_name,
+            sql_query_tel,
+            granularity,
+            repo_ids,
+        )
+        .await
     }
 }
 
 /// Use the HLC from Read Your Own Writes feature (https://fburl.com/wiki/bvaobxgp)
 /// to determine if the replica was up to date when it served the query.
 pub async fn query_with_consistency_no_cache<T, Fut>(
-    do_query: impl Fn() -> Fut + Send + Sync,
+    do_query: impl Fn(usize) -> Fut + Send + Sync,
     target_lower_bound_hlc: Option<Timestamp>,
     return_early_if: Option<Arc<Box<dyn Fn(&T) -> bool + Send + Sync>>>,
     cons_read_opts: ConsistentReadOptions,
@@ -1076,7 +1394,10 @@ pub async fn query_with_consistency_no_cache<T, Fut>(
     sql_query_tel: &SqlQueryTelemetry,
     granularity: TelemetryGranularity,
     repo_ids: &[RepositoryId],
-) -> Result<(T, Option<QueryTelemetry>), ConsistentReadError>
+) -> (
+    Result<(T, Option<QueryTelemetry>), ConsistentReadError>,
+    usize,
+)
 where
     T: Send + 'static,
     Fut: Future<Output = Result<(T, Option<QueryTelemetry>)>>,
@@ -1087,31 +1408,46 @@ where
 
     let hlc_drift_tolerance_ns = cons_read_opts.hlc_drift_tolerance_ns;
 
-    let result = retry(
-        |_| async {
-            let (res, opt_tel) = do_query().await?;
+    // Wrap in Arc so it can be cloned into the retry closure
+    let do_query = Arc::new(do_query);
 
-            if let Some(ref early_check) = return_early_if {
-                if early_check(&res) {
-                    return Ok((res, opt_tel));
+    let last_attempt = std::sync::atomic::AtomicUsize::new(0);
+
+    let retry_result = retry(
+        |attempt| {
+            last_attempt.store(attempt, std::sync::atomic::Ordering::Relaxed);
+            let do_query = Arc::clone(&do_query);
+            let return_early_if = return_early_if.clone();
+            async move {
+                let (res, opt_tel) = do_query(attempt).await?;
+
+                if let Some(ref early_check) = return_early_if {
+                    if early_check(&res) {
+                        return Ok((res, opt_tel));
+                    };
                 };
-            };
-            let response_hlc = match opt_tel {
-                #[cfg(fbcode_build)]
-                Some(QueryTelemetry::MySQL(ref mysql_tel)) => mysql_tel
-                    .hlc_ts_lower_bound
-                    .ok_or(ConsistentReadError::MissingHLC),
-                Some(QueryTelemetry::Sqlite(ref sqlite_tel)) => Ok(sqlite_tel.hlc_ts_lower_bound),
-                // HLC is needed to use query_with_consistency, otherwise the
-                // result can't be trusted be up-to-date.
-                _ => Err(ConsistentReadError::MissingHLC),
-            }?;
+                let response_hlc = match opt_tel {
+                    #[cfg(fbcode_build)]
+                    Some(QueryTelemetry::MySQL(ref mysql_tel)) => mysql_tel
+                        .hlc_ts_lower_bound
+                        .ok_or(ConsistentReadError::MissingHLC),
+                    Some(QueryTelemetry::Sqlite(ref sqlite_tel)) => {
+                        Ok(sqlite_tel.hlc_ts_lower_bound)
+                    }
+                    // HLC is needed to use query_with_consistency, otherwise the
+                    // result can't be trusted be up-to-date.
+                    _ => Err(ConsistentReadError::MissingHLC),
+                }?;
 
-            if replica_was_up_to_date(target_lower_bound_hlc, response_hlc, hlc_drift_tolerance_ns)?
-            {
-                Ok((res, opt_tel))
-            } else {
-                Err(ConsistentReadError::ReplicaLagging)
+                if replica_was_up_to_date(
+                    target_lower_bound_hlc,
+                    response_hlc,
+                    hlc_drift_tolerance_ns,
+                )? {
+                    Ok((res, opt_tel))
+                } else {
+                    Err(ConsistentReadError::ReplicaLagging)
+                }
             }
         },
         cons_read_opts.interval,
@@ -1141,10 +1477,14 @@ where
             attempt < cons_read_opts.max_attempts,
         );
     })
-    .await?
-    .0;
+    .await;
 
-    Ok(result)
+    let attempt = last_attempt.load(std::sync::atomic::Ordering::Relaxed);
+
+    match retry_result {
+        Ok((result, _)) => (Ok(result), attempt),
+        Err(e) => (Err(e), attempt),
+    }
 }
 
 fn replica_was_up_to_date(

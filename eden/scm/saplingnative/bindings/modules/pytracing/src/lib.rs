@@ -160,8 +160,10 @@ py_class!(class tracingdata |py| {
     /// `minduration` specifies the minimal duration threshold in micro seconds.
     /// The default value is 10000 (10 milliseconds).
     def ascii(&self, minduration: u64 = 10000) -> PyResult<String> {
-        let mut opts = tracing_collector::model::AsciiOptions::default();
-        opts.min_duration_to_hide = minduration;
+        let opts = tracing_collector::model::AsciiOptions {
+            min_duration_to_hide: minduration,
+            ..Default::default()
+        };
         Ok(self.data(py).lock().ascii(&opts))
     }
 
@@ -374,7 +376,7 @@ impl wrapfunc {
 
         // If the callsite provides a class name, use it.
         if let Some(class_name) = class_name {
-            name = format!("{}.{}", class_name, name);
+            name = format!("{class_name}.{name}");
         }
 
         // Function wrapping is used a lot in hg extensions (via mercurial.
@@ -389,7 +391,7 @@ impl wrapfunc {
             // in a span, and common prefix like `sapling` is not
             // very interesting.
             if module_last_name != "<missing>" {
-                name = format!("{}.{}", module_last_name, name);
+                name = format!("{module_last_name}.{name}");
             }
         }
 
@@ -1035,6 +1037,8 @@ const LEVEL_WARN: usize = 3;
 const LEVEL_ERROR: usize = 4;
 
 fn updateenvfilter(py: Python, dirs: &str) -> PyResult<PyNone> {
-    tracing_reload::update_env_filter_directives(dirs).map_pyerr(py)?;
+    tracing_reload_states::LOG_FILTER
+        .update_directives(dirs)
+        .map_pyerr(py)?;
     Ok(PyNone)
 }

@@ -242,6 +242,10 @@ impl IndexedLogHgIdHistoryStore {
         let log = self.log.read();
         log.contains(0, index_key)
     }
+
+    pub fn is_dirty(&self) -> bool {
+        self.log.is_dirty()
+    }
 }
 
 impl LocalStore for IndexedLogHgIdHistoryStore {
@@ -269,7 +273,7 @@ impl HgIdHistoryStore for IndexedLogHgIdHistoryStore {
         Ok(Some(entry.node_info()))
     }
 
-    fn refresh(&self) -> Result<()> {
+    fn sync(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -304,8 +308,8 @@ mod tests {
     use std::collections::HashMap;
 
     use fs_err::remove_file;
-    use rand::SeedableRng;
-    use rand_chacha::ChaChaRng;
+    use rand_chacha::ChaCha20Rng;
+    use rand_chacha::rand_core::SeedableRng;
     use tempfile::TempDir;
     use types::testutil::*;
 
@@ -357,7 +361,7 @@ mod tests {
     fn test_corrupted() -> Result<()> {
         let tempdir = TempDir::new()?;
         let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
-        let mut rng = ChaChaRng::from_seed([0u8; 32]);
+        let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
 
         let nodes = get_nodes(&mut rng);
         for (key, info) in nodes.iter() {
@@ -397,7 +401,7 @@ mod tests {
         Ok(())
     }
 
-    fn get_nodes(mut rng: &mut ChaChaRng) -> HashMap<Key, NodeInfo> {
+    fn get_nodes(mut rng: &mut ChaCha20Rng) -> HashMap<Key, NodeInfo> {
         let file1 = RepoPath::from_str("path").unwrap();
         let file2 = RepoPath::from_str("path/file").unwrap();
         let null = HgId::null_id();

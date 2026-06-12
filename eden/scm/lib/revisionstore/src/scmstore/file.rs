@@ -11,7 +11,6 @@ mod types;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use ::metrics::Counter;
@@ -27,9 +26,6 @@ use anyhow::ensure;
 use blob::Blob;
 use flume::bounded;
 use flume::unbounded;
-use indexedlog::log::AUTO_SYNC_COUNT;
-use indexedlog::log::SYNC_COUNT;
-use indexedlog::rotate::ROTATE_COUNT;
 use metrics::FILE_STORE_FETCH_METRICS;
 use minibytes::Bytes;
 use parking_lot::Mutex;
@@ -37,7 +33,6 @@ use parking_lot::RwLock;
 use progress_model::AggregatingProgressBar;
 use progress_model::ProgressBar;
 use progress_model::Registry;
-use rand::Rng;
 use storemodel::SerializationFormat;
 use tracing::debug;
 
@@ -65,6 +60,7 @@ use crate::lfs::LfsClient;
 use crate::lfs::LfsPointersEntry;
 use crate::scmstore::activitylogger::ActivityLogger;
 use crate::scmstore::fetch::FetchResults;
+use crate::scmstore::fetch::MaxFetchCount;
 use crate::scmstore::metrics::StoreLocation;
 use crate::scmstore::util::try_local_content;
 
@@ -115,6 +111,12 @@ pub struct FileStore {
 
     // Temporary escape hatch to disable streaming of LFS data to caches.
     pub(crate) lfs_buffer_in_memory: bool,
+
+    // Bounds the number of items this store can deliver across the lifetime of
+    // the process. When exceeded, every subsequent item becomes an error,
+    // catching all callers and code paths (including serial fetches). Set via
+    // `FileStoreBuilder::max_fetch_count`; absent means the guard is disabled.
+    pub(crate) max_fetch_count: MaxFetchCount,
 }
 
 impl Drop for FileStore {
@@ -126,9 +128,6 @@ impl Drop for FileStore {
 }
 
 static FILESTORE_FLUSH_COUNT: Counter = Counter::new_counter("scmstore.file.flush");
-static INDEXEDLOG_SYNC_COUNT: Counter = Counter::new_counter("scmstore.indexedlog.sync");
-static INDEXEDLOG_AUTO_SYNC_COUNT: Counter = Counter::new_counter("scmstore.indexedlog.auto_sync");
-static INDEXEDLOG_ROTATE_COUNT: Counter = Counter::new_counter("scmstore.indexedlog.rotate");
 
 impl FileStore {
     /// Get the "local content" without going through the heavyweight "fetch" API.
@@ -259,6 +258,7 @@ impl FileStore {
 
         let fetch_local = fctx.mode().contains(FetchMode::LOCAL);
         let fetch_remote = fctx.mode().contains(FetchMode::REMOTE);
+        let sync_mode = fctx.sync_mode();
 
         let lfs_buffer_in_memory = self.lfs_buffer_in_memory;
 
@@ -279,7 +279,7 @@ impl FileStore {
             let span = tracing::span!(
                 tracing::Level::DEBUG,
                 "file fetch",
-                id = rand::thread_rng().r#gen::<u16>()
+                id = rand::random::<u16>()
             );
             let _enter = span.enter();
 
@@ -307,20 +307,22 @@ impl FileStore {
 
                 fctx.inc_local(fetched_since_last_time(&state));
 
-                if let Some(lfs_cache) = lfs_client.as_ref().map(|c| c.shared.as_ref()) {
-                    assert!(
-                        format == SerializationFormat::Hg,
-                        "LFS cannot be used with non-Hg serialization format"
-                    );
-                    state.fetch_lfs(lfs_cache, StoreLocation::Cache);
-                }
+                if !fctx.skip_lfs() {
+                    if let Some(lfs_cache) = lfs_client.as_ref().map(|c| c.shared.as_ref()) {
+                        assert!(
+                            format == SerializationFormat::Hg,
+                            "LFS cannot be used with non-Hg serialization format"
+                        );
+                        state.fetch_lfs(lfs_cache, StoreLocation::Cache);
+                    }
 
-                if let Some(lfs_local) = lfs_client.as_ref().and_then(|c| c.local.as_ref()) {
-                    assert!(
-                        format == SerializationFormat::Hg,
-                        "LFS cannot be used with non-Hg serialization format"
-                    );
-                    state.fetch_lfs(lfs_local, StoreLocation::Local);
+                    if let Some(lfs_local) = lfs_client.as_ref().and_then(|c| c.local.as_ref()) {
+                        assert!(
+                            format == SerializationFormat::Hg,
+                            "LFS cannot be used with non-Hg serialization format"
+                        );
+                        state.fetch_lfs(lfs_local, StoreLocation::Local);
+                    }
                 }
 
                 fctx.inc_local(fetched_since_last_time(&state));
@@ -336,12 +338,14 @@ impl FileStore {
                     );
                 }
 
-                if let Some(ref lfs_client) = lfs_client {
-                    assert!(
-                        format == SerializationFormat::Hg,
-                        "LFS cannot be used with non-Hg serialization format"
-                    );
-                    state.fetch_lfs_remote(lfs_client, lfs_buffer_in_memory);
+                if !fctx.skip_lfs() {
+                    if let Some(ref lfs_client) = lfs_client {
+                        assert!(
+                            format == SerializationFormat::Hg,
+                            "LFS cannot be used with non-Hg serialization format"
+                        );
+                        state.fetch_lfs_remote(lfs_client, lfs_buffer_in_memory);
+                    }
                 }
 
                 fctx.inc_remote(fetched_since_last_time(&state));
@@ -350,11 +354,6 @@ impl FileStore {
             state.derive_computable(aux_cache.as_ref().map(|s| s.as_ref()));
 
             state.finish();
-
-            // These aren't technically filestore specific, but this will keep them updated.
-            INDEXEDLOG_SYNC_COUNT.add(SYNC_COUNT.swap(0, Ordering::Relaxed) as usize);
-            INDEXEDLOG_AUTO_SYNC_COUNT.add(AUTO_SYNC_COUNT.swap(0, Ordering::Relaxed) as usize);
-            INDEXEDLOG_ROTATE_COUNT.add(ROTATE_COUNT.swap(0, Ordering::Relaxed) as usize);
 
             if let Some(activity_logger) = activity_logger {
                 if let Err(err) = activity_logger.lock().log_file_fetch(
@@ -372,7 +371,7 @@ impl FileStore {
         // NB: callers such as backingstore::prefetch assume asynchronous behavior when fetching
         // more than 1k keys. If you change how this works, consider callers' expectations
         // carefully.
-        if keys_len > 1000 {
+        if sync_mode.should_spawn(keys_len) {
             let active_bar = Registry::main().get_active_progress_bar();
             std::thread::spawn(move || {
                 // Propagate parent progress bar into the thread so things nest well.
@@ -386,7 +385,7 @@ impl FileStore {
         FetchResults::new(Box::new(found_rx.into_iter()))
     }
 
-    fn write_lfsptr(&self, key: Key, bytes: Bytes) -> Result<()> {
+    pub(crate) fn write_lfsptr(&self, key: Key, bytes: Bytes) -> Result<()> {
         if !self.allow_write_lfs_ptrs {
             ensure!(
                 std::env::var("TESTTMP").is_ok(),
@@ -409,7 +408,7 @@ impl FileStore {
         lfs_local.add_pointer(lfs_pointer)
     }
 
-    fn write_lfs(&self, key: Key, bytes: Bytes) -> Result<()> {
+    pub(crate) fn write_lfs(&self, key: Key, bytes: Bytes) -> Result<()> {
         let lfs_local = self
             .lfs_client
             .as_ref()
@@ -477,6 +476,15 @@ impl FileStore {
     #[allow(unused_must_use)]
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn flush(&self) -> Result<()> {
+        self.flush_inner(true)
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.metrics.write().api.hg_refresh.call(0);
+        self.flush_inner(false)
+    }
+
+    fn flush_inner(&self, skip_clean: bool) -> Result<()> {
         let mut result = Ok(());
         let mut handle_error = |error| {
             tracing::error!(%error);
@@ -484,19 +492,27 @@ impl FileStore {
         };
 
         if let Some(ref indexedlog_local) = self.indexedlog_local {
-            indexedlog_local.flush_log().map_err(&mut handle_error);
+            if !skip_clean || indexedlog_local.is_dirty() {
+                indexedlog_local.flush_log().map_err(&mut handle_error).ok();
+            }
         }
 
         if let Some(ref indexedlog_cache) = self.indexedlog_cache {
-            indexedlog_cache.flush_log().map_err(&mut handle_error);
+            if !skip_clean || indexedlog_cache.is_dirty() {
+                indexedlog_cache.flush_log().map_err(&mut handle_error).ok();
+            }
         }
 
         if let Some(lfs_client) = &self.lfs_client {
-            lfs_client.flush().map_err(&mut handle_error);
+            if !skip_clean || lfs_client.is_dirty() {
+                lfs_client.flush().map_err(&mut handle_error).ok();
+            }
         }
 
         if let Some(ref aux_cache) = self.aux_cache {
-            aux_cache.flush().map_err(&mut handle_error);
+            if !skip_clean || aux_cache.is_dirty() {
+                aux_cache.flush().map_err(&mut handle_error).ok();
+            }
         }
 
         let metrics = std::mem::take(&mut *self.metrics.write());
@@ -507,11 +523,6 @@ impl FileStore {
         FILESTORE_FLUSH_COUNT.increment();
 
         result
-    }
-
-    pub fn refresh(&self) -> Result<()> {
-        self.metrics.write().api.hg_refresh.call(0);
-        self.flush()
     }
 
     pub fn metrics(&self) -> Vec<(String, usize)> {
@@ -547,6 +558,8 @@ impl FileStore {
             unbounded_queue: false,
 
             lfs_buffer_in_memory: false,
+
+            max_fetch_count: Default::default(),
         }
     }
 
@@ -596,6 +609,8 @@ impl FileStore {
             unbounded_queue: self.unbounded_queue,
 
             lfs_buffer_in_memory: self.lfs_buffer_in_memory,
+
+            max_fetch_count: self.max_fetch_count.clone(),
         }
     }
 
@@ -617,7 +632,7 @@ impl FileStore {
         self.metrics.write().api.hg_prefetch.call(keys.len());
 
         self.fetch(
-            FetchContext::new_with_cause(
+            FetchContext::new_with_mode_and_cause(
                 FetchMode::AllowRemote | FetchMode::IGNORE_RESULT,
                 FetchCause::SaplingPrefetch,
             ),
@@ -666,8 +681,8 @@ impl HgIdDataStore for FileStore {
         )
     }
 
-    fn refresh(&self) -> Result<()> {
-        self.refresh()
+    fn sync(&self) -> Result<()> {
+        self.sync()
     }
 }
 
@@ -706,5 +721,107 @@ impl HgIdMutableDeltaStore for FileStore {
         self.metrics.write().api.hg_flush.call(0);
         self.flush()?;
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ::types::RepoPathBuf;
+    use ::types::fetch_cause::FetchCause;
+    use ::types::fetch_mode::FetchMode;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::StoreType;
+    use crate::indexedlogdatastore::IndexedLogHgIdDataStoreConfig;
+
+    fn make_indexedlog(tempdir: &TempDir) -> Arc<IndexedLogHgIdDataStore> {
+        let config = IndexedLogHgIdDataStoreConfig {
+            max_log_count: None,
+            max_bytes_per_log: None,
+            max_bytes: None,
+            btrfs_compression: false,
+        };
+        Arc::new(
+            IndexedLogHgIdDataStore::new(
+                &BTreeMap::<&str, &str>::new(),
+                tempdir,
+                &config,
+                StoreType::Rotated,
+                SerializationFormat::Hg,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_skip_lfs_skips_lfs_fetch() {
+        let il_dir = TempDir::new().unwrap();
+        let indexedlog = make_indexedlog(&il_dir);
+
+        let lfs_key = Key::new(
+            RepoPathBuf::from_string("large.bin".to_string()).unwrap(),
+            HgId::from_hex(b"2222222222222222222222222222222222222222").unwrap(),
+        );
+        let content = Bytes::from_static(b"large file content here");
+
+        // Write file content to indexedlog with LFS flag set.
+        let lfs_meta = Metadata {
+            flags: Some(Metadata::LFS_FLAG),
+            size: None,
+        };
+        indexedlog
+            .put_entry(Entry::new(lfs_key.hgid, content.clone(), lfs_meta))
+            .unwrap();
+
+        // Set up LFS store with the actual blob.
+        let lfs_dir = TempDir::new().unwrap();
+        let server = mockito::Server::new();
+        let lfs_config = crate::testutil::make_lfs_config(&server, &lfs_dir, "skip_lfs");
+        let lfs_store = Arc::new(crate::lfs::LfsStore::rotated(&lfs_dir, &lfs_config).unwrap());
+        lfs_store
+            .add_blob_and_pointer(lfs_key.clone(), content)
+            .unwrap();
+        lfs_store.flush().unwrap();
+        let lfs_client = crate::lfs::LfsClient::new(lfs_store, None, &lfs_config).unwrap();
+
+        let make_store = || {
+            let mut store = FileStore::empty();
+            store.indexedlog_local = Some(indexedlog.clone());
+            store.lfs_client = Some(lfs_client.clone());
+            store.lfs_threshold_bytes = Some(1);
+            store
+        };
+
+        // Without skip_lfs, the LFS key resolves successfully.
+        let fctx = FetchContext::new_with_mode_and_cause(
+            FetchMode::LocalOnly,
+            FetchCause::EdenWalkPrefetch,
+        );
+        let results: Vec<_> = make_store()
+            .fetch(fctx, vec![lfs_key.clone()], FileAttributes::CONTENT)
+            .into_iter()
+            .collect();
+        assert!(
+            results[0].is_ok(),
+            "LFS key should resolve without skip_lfs"
+        );
+
+        // With skip_lfs, the LFS fetch is skipped so the key is not found.
+        let fctx = FetchContext::new_with_mode_and_cause(
+            FetchMode::LocalOnly,
+            FetchCause::EdenWalkPrefetch,
+        )
+        .with_skip_lfs(true);
+        let results: Vec<_> = make_store()
+            .fetch(fctx, vec![lfs_key.clone()], FileAttributes::CONTENT)
+            .into_iter()
+            .collect();
+        assert!(
+            results[0].is_err(),
+            "LFS key should not be found when skip_lfs=true"
+        );
     }
 }

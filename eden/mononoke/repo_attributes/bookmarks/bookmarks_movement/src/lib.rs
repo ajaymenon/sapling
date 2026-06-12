@@ -21,6 +21,8 @@ use bookmarks_types::BookmarkKey;
 use commit_graph::CommitGraphRef;
 use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
+use dbbookmarks::SqlBookmarksRef;
+use filestore::FilestoreConfigRef;
 use itertools::Itertools;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::ChangesetId;
@@ -53,7 +55,6 @@ mod restrictions;
 mod update;
 
 pub use bookmarks_types::BookmarkKind;
-use git_source_of_truth::GitSourceOfTruthConfigRef;
 pub use hooks::CrossRepoPushSource;
 pub use hooks::HookRejection;
 pub use pushrebase::PushrebaseOutcome;
@@ -66,6 +67,8 @@ pub use crate::hook_running::AdminBypassError;
 pub use crate::hook_running::run_bookmark_hooks;
 pub use crate::hook_running::run_changeset_hooks;
 pub use crate::pushrebase_onto::PushrebaseOntoBookmarkOp;
+pub use crate::pushrebase_onto::postprocess_pushrebase_outcome;
+pub use crate::pushrebase_onto::prepare_pushrebase_hooks;
 pub use crate::restrictions::BookmarkKindRestrictions;
 pub use crate::restrictions::check_bookmark_sync_config;
 pub use crate::update::BookmarkUpdatePolicy;
@@ -84,6 +87,8 @@ pub trait Repo = BonsaiHgMappingRef
     + BonsaiGitMappingArc
     + BonsaiGlobalrevMappingArc
     + BookmarksRef
+    + SqlBookmarksRef
+    + FilestoreConfigRef
     + PhasesRef
     + PushrebaseMutationMappingRef
     + RepoBookmarkAttrsRef
@@ -97,7 +102,6 @@ pub trait Repo = BonsaiHgMappingRef
     + RepoLockRef
     + CommitGraphRef
     + CommitGraphWriterRef
-    + GitSourceOfTruthConfigRef
     + Send
     + Sync;
 
@@ -221,7 +225,6 @@ impl BookmarkInfoData {
              + RepoConfigRef
              + BonsaiGlobalrevMappingRef
              + BonsaiGitMappingRef
-             + GitSourceOfTruthConfigRef
          ),
     ) {
         if self.log_new_public_commits_to_scribe {

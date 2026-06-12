@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {LazyExoticComponent} from 'react';
+import type {JSX, LazyExoticComponent} from 'react';
 import type {Comparison} from 'shared/Comparison';
 import type {Json} from 'shared/typeUtils';
 import type {MessageBus} from './MessageBus';
@@ -34,6 +34,8 @@ export interface Platform {
   openFiles(paths: ReadonlyArray<RepoRelativePath>, options?: {line?: OneIndexedLineNumber}): void;
   canCustomizeFileOpener: boolean;
   openContainingFolder?(path: RepoRelativePath): void;
+  revealInFileExplorer?(path: RepoRelativePath): void;
+  revealInExplorerView?(path: RepoRelativePath): void;
   openDiff?(path: RepoRelativePath, comparison: Comparison): void;
   openExternalLink(url: string): void;
   clipboardCopy(text: string, html?: string): void;

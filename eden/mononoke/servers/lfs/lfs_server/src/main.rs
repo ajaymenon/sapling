@@ -42,7 +42,7 @@ use gotham_ext::middleware::ServerIdentityMiddleware;
 use gotham_ext::middleware::TimerMiddleware;
 use gotham_ext::middleware::TlsSessionDataMiddleware;
 use gotham_ext::serve;
-use hyper::header::HeaderValue;
+use http::header::HeaderValue;
 use metaconfig_types::RepoConfig;
 use metaconfig_types::ShardedService;
 use mononoke_app::MononokeApp;
@@ -71,6 +71,7 @@ use crate::scuba::LfsScubaHandler;
 use crate::service::build_router;
 
 mod batch;
+mod compression_sniff;
 mod config;
 mod download;
 mod errors;
@@ -160,6 +161,21 @@ struct LfsServerArgs {
     /// Whether to require the client-info header or not.
     #[clap(long, default_value = "false")]
     dont_require_client_info: bool,
+    /// Hosts for which to force http scheme in generated hrefs (comma-separated)
+    #[clap(long, value_delimiter = ',')]
+    force_http_for_host: Vec<String>,
+    /// Headers whose presence (with value "1") forces http scheme in generated hrefs (comma-separated)
+    #[clap(long, value_delimiter = ',')]
+    force_http_for_header: Vec<String>,
+    /// Enable per-blob magic-byte sniffing on the download path. When on, the
+    /// server pulls the first chunk of each blob, checks for a known
+    /// already-compressed container format (zip/apk/zstd/png/jpeg/mp4/...),
+    /// and bypasses gzip/zstd response compression for matches. Per-request
+    /// behavior is additionally gated by the
+    /// `scm/mononoke:lfs_server_compression_sniff_enabled` JustKnob, so a
+    /// deployment can be built with this flag but kept off in production.
+    #[clap(long)]
+    enable_compression_sniff: bool,
 }
 
 #[derive(Clone)]
@@ -208,7 +224,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     let git_blob_upload_allowed = args.git_blob_upload_allowed;
 
-    let addr = format!("{}:{}", listen_host, listen_port);
+    let addr = format!("{listen_host}:{listen_port}");
 
     let tls_acceptor = args
         .tls_params
@@ -242,6 +258,8 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     let self_urls = args.self_urls;
     let upstream_url = args.upstream_url;
     let always_wait_for_upstream = args.always_wait_for_upstream;
+    let force_http_for_host = args.force_http_for_host;
+    let force_http_for_header = args.force_http_for_header;
     let log_middleware = if args.test_friendly_logging {
         LogMiddleware::test_friendly()
     } else {
@@ -294,7 +312,12 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                 vec![protocol.to_owned() + &bound_addr]
             };
 
-            let server_uris = ServerUris::new(self_urls, upstream_url)?;
+            let server_uris = ServerUris::new(
+                self_urls,
+                upstream_url,
+                force_http_for_host,
+                force_http_for_header,
+            )?;
 
             let repos_config = repos.config.clone();
 
@@ -309,6 +332,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                 config_handle.clone(),
                 &args.tls_params,
                 bandwidth,
+                args.enable_compression_sniff,
             )?;
             let enforce_authentication = ctx.get_config().enforce_authentication();
 
@@ -372,7 +396,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             pin_mut!(serve);
             try_select(
                 serve,
-                shutdown_rx.map_err(|err| anyhow!("Cancelled channel: {}", err)),
+                shutdown_rx.map_err(|err| anyhow!("Cancelled channel: {err}")),
             )
             .await
             .map_err(|e| futures::future::Either::factor_first(e).0)?;

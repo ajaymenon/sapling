@@ -12,7 +12,7 @@
 //! Refer to tests for some examples.
 
 mod ascii_options;
-pub(crate) mod row;
+pub mod row;
 mod tree;
 mod tree_span;
 
@@ -57,15 +57,17 @@ mod tests {
         }
 
         let render = |min_duration_to_hide, merge| -> String {
-            let mut opts = AsciiOptions::default();
-            opts.min_duration_to_hide = min_duration_to_hide;
+            let opts = AsciiOptions {
+                min_duration_to_hide,
+                ..Default::default()
+            };
             let mut tree = tree.clone();
             if merge {
                 tree.merge_children(&opts, &|n| n.extra);
             }
             let desc = Desc;
             let out = tree.render_ascii_rows(&opts, &desc);
-            format!("\n{}", out)
+            format!("\n{out}")
         };
 
         assert_eq!(

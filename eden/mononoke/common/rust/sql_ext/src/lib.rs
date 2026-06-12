@@ -86,6 +86,22 @@ pub mod _macro_internal {
     pub use crate::telemetry::log_query_error;
     pub use crate::telemetry::log_query_telemetry;
     pub use crate::telemetry::log_transaction_telemetry;
+
+    /// Re-exports for `>tuple_list` support in `mononoke_queries!`.
+    /// These types are needed to directly match on `sql::Connection`
+    /// variants without going through `sql::queries!`.
+    pub mod _tl {
+        pub use anyhow;
+        pub use sql::Connection as InnerSqlConnection;
+        pub use sql::ValueWrapper;
+        pub use sql::mysql_async;
+        pub use sql::rusqlite;
+        pub use sql::sql_common::QueryTelemetry as InnerQueryTelemetry;
+        pub use sql::sql_common::mysql::OssConnection;
+        pub use sql::sqlite::SqliteMultithreaded;
+        pub use sql::sqlite::SqliteQueryTelemetry;
+        pub use sql::sqlite::SqliteQueryType;
+    }
 }
 
 /// Wrapper over the SQL transaction that will keep track of telemetry from the
@@ -151,6 +167,7 @@ impl Transaction {
         query_name: &str,
         shard_name: String,
         fut_stats: FutureStats,
+        attempt: usize,
     ) -> Result<Self> {
         if let Some(tel) = opt_tel.as_ref() {
             txn_telemetry.add_query_telemetry(tel.clone())
@@ -167,6 +184,7 @@ impl Transaction {
             query_name,
             shard_name.as_ref(),
             fut_stats,
+            Some(attempt),
         )?;
 
         Ok(Transaction::new(
@@ -469,43 +487,38 @@ pub enum ConsistentReadError {
 pub fn consistent_read_options(
     client_correlator: Option<&str>,
     callsite: Option<&str>,
-) -> Option<ConsistentReadOptions> {
+) -> Result<Option<ConsistentReadOptions>> {
     // Callsites that don't require the most recent bookmark value should
     // read from a replica. More context on D81212709.
     let should_query_with_consistency = justknobs::eval(
         "scm/mononoke:retry_query_from_replica_with_consistency_check",
         client_correlator,
         callsite,
-    )
-    .unwrap_or(false);
+    );
 
     if !should_query_with_consistency {
-        return None;
+        return Ok(None);
     }
 
     let max_attempts = justknobs::get_as::<usize>(
         "scm/mononoke:retry_query_from_replica_with_consistency_check_max_attempts",
         callsite,
-    )
-    .unwrap_or(10);
+    );
 
-    let interval = justknobs::get_as::<u64>(
+    let interval = Duration::from_millis(justknobs::get_as::<u64>(
         "scm/mononoke:retry_query_from_replica_with_consistency_check_interval_ms",
         callsite,
-    )
-    .map_or(Duration::from_millis(50), Duration::from_millis);
+    ));
 
-    let jitter = justknobs::get_as::<u64>(
+    let jitter = Duration::from_millis(justknobs::get_as::<u64>(
         "scm/mononoke:retry_query_from_replica_with_consistency_check_jitter",
         callsite,
-    )
-    .map_or(Duration::from_millis(10), Duration::from_millis);
+    ));
 
     let hlc_drift_tolerance_ns = justknobs::get_as::<i64>(
         "scm/mononoke:retry_query_from_replica_with_consistency_check_hlc_drift_tolerance_ns",
         callsite,
-    )
-    .unwrap_or(0);
+    );
 
     let cons_read_opts = ConsistentReadOptions {
         interval,
@@ -515,5 +528,5 @@ pub fn consistent_read_options(
         ..ConsistentReadOptions::default()
     };
 
-    Some(cons_read_opts)
+    Ok(Some(cons_read_opts))
 }

@@ -178,7 +178,7 @@ impl Display for RepoUrl {
 
 impl FromConfig for RepoUrl {
     fn try_from_str_with_config(c: &dyn Config, s: &str) -> configmodel::Result<Self> {
-        Self::from_str(c, s).map_err(|err| configmodel::Error::Convert(format!("{:?}", err)))
+        Self::from_str(c, s).map_err(|err| configmodel::Error::Convert(format!("{err:?}")))
     }
 }
 
@@ -220,6 +220,17 @@ fn repo_name_from_resolved_url(config: &dyn Config, url: &Url) -> Option<String>
             if let Some(repo_prefix) = config.get("remotefilelog", "reponame-path-prefixes") {
                 if let Some((_, reponame)) = url.path().split_once(repo_prefix.to_string().as_str())
                 {
+                    if !reponame.is_empty() {
+                        return Some(reponame.to_string());
+                    }
+                }
+            }
+            // For URLs with specific host (like git.*), the repo name is the full path.
+            if let Some(prefix) = config.get("remotefilelog", "reponame-host-prefixes") {
+                if let Some(host) = url.host_str()
+                    && host.starts_with(prefix.to_string().as_str())
+                {
+                    let reponame = url.path().trim_matches('/');
                     if !reponame.is_empty() {
                         return Some(reponame.to_string());
                     }

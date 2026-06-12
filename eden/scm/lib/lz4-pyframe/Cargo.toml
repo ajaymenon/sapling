@@ -18,9 +18,9 @@ harness = false
 
 [dependencies]
 byteorder = "1.5"
-libc = "0.2.139"
+libc = "0.2.186"
 lz4-sys = "1.9.4"
 thiserror = "2.0.18"
 
 [dev-dependencies]
-quickcheck = "1.0"
+quickcheck = "1.1"

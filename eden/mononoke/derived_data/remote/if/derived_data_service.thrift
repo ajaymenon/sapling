@@ -97,6 +97,10 @@ union DerivedData {
   22: DerivedDataContentManifest content_manifest;
   23: DerivedDataInferredCopyFrom inferred_copy_from;
   24: DerivedDataGitDeltaManifestV3 git_delta_manifest_v3;
+  25: DerivedDataDirectoryBranchClusterManifest directory_branch_cluster_manifest;
+  26: DerivedDataAclManifest acl_manifest;
+  27: DerivedDataHistoryManifest history_manifest;
+  28: DerivedDataBlame blame_v3;
 }
 
 union DerivedDataFsnode {
@@ -124,12 +128,19 @@ union DerivedDataFastlog {
 union DerivedDataBlame {
   // 1: DerivedDataRootBlameV1 was deleted
   2: DerivedDataRootBlameV2 root_blame_v2;
+  3: DerivedDataRootBlameV3 root_blame_v3;
 }
 
 @rust.Exhaustive
 struct DerivedDataRootBlameV2 {
   1: id.ChangesetId changeset_id;
   2: DerivedDataUnode unode;
+}
+
+@rust.Exhaustive
+struct DerivedDataRootBlameV3 {
+  1: id.ChangesetId changeset_id;
+  2: DerivedDataHistoryManifest history_manifest;
 }
 
 union DerivedDataHgChangeset {
@@ -190,6 +201,18 @@ union DerivedDataContentManifest {
 
 union DerivedDataInferredCopyFrom {
   1: id.InferredCopyFromId root_inferred_copy_from_id;
+}
+
+union DerivedDataDirectoryBranchClusterManifest {
+  1: id.DirectoryBranchClusterManifestId root_directory_branch_cluster_manifest_id;
+}
+
+union DerivedDataAclManifest {
+  1: id.AclManifestId root_acl_manifest_id;
+}
+
+union DerivedDataHistoryManifest {
+  1: id.HistoryManifestDirectoryId root_history_manifest_directory_id;
 }
 
 @rust.Exhaustive

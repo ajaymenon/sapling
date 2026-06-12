@@ -9,10 +9,10 @@ Prepare tests:
 
   $ setconfig alias.ndiff='diff --nodates'
 
-  $ hg init repo
+  $ sl init repo
   $ cd repo
   $ printf 'hello world\ngoodbye world\n' >foo
-  $ hg ci -Amfoo -ufoo
+  $ sl ci -Amfoo -ufoo
   adding foo
 
 
@@ -22,7 +22,7 @@ Test added blank lines:
 
 >>> two diffs showing three added lines <<<
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -32,7 +32,7 @@ Test added blank lines:
   +
    goodbye world
   +
-  $ hg ndiff -b
+  $ sl ndiff -b
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -45,8 +45,8 @@ Test added blank lines:
 
 >>> no diffs <<<
 
-  $ hg ndiff -B
-  $ hg ndiff -Bb
+  $ sl ndiff -B
+  $ sl ndiff -Bb
 
 
 Test added horizontal space first on a line():
@@ -55,7 +55,7 @@ Test added horizontal space first on a line():
 
 >>> four diffs showing added space first on the first line <<<
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -64,7 +64,7 @@ Test added horizontal space first on a line():
   +	 hello world
    goodbye world
 
-  $ hg ndiff -b
+  $ sl ndiff -b
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -73,7 +73,7 @@ Test added horizontal space first on a line():
   +	 hello world
    goodbye world
 
-  $ hg ndiff -B
+  $ sl ndiff -B
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -82,7 +82,7 @@ Test added horizontal space first on a line():
   +	 hello world
    goodbye world
 
-  $ hg ndiff -Bb
+  $ sl ndiff -Bb
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -98,7 +98,7 @@ Test added horizontal space last on a line:
 
 >>> two diffs showing space appended to the first line <<<
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -107,7 +107,7 @@ Test added horizontal space last on a line:
   +hello world	 
    goodbye world
 
-  $ hg ndiff -B
+  $ sl ndiff -B
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -118,8 +118,8 @@ Test added horizontal space last on a line:
 
 >>> no diffs <<<
 
-  $ hg ndiff -b
-  $ hg ndiff -Bb
+  $ sl ndiff -b
+  $ sl ndiff -Bb
 
 
 Test added horizontal space in the middle of a word:
@@ -128,7 +128,7 @@ Test added horizontal space in the middle of a word:
 
 >>> four diffs showing space inserted into "goodbye" <<<
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -137,7 +137,7 @@ Test added horizontal space in the middle of a word:
   -goodbye world
   +good bye world
 
-  $ hg ndiff -B
+  $ sl ndiff -B
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -146,7 +146,7 @@ Test added horizontal space in the middle of a word:
   -goodbye world
   +good bye world
 
-  $ hg ndiff -b
+  $ sl ndiff -b
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -155,7 +155,7 @@ Test added horizontal space in the middle of a word:
   -goodbye world
   +good bye world
 
-  $ hg ndiff -Bb
+  $ sl ndiff -Bb
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -171,7 +171,7 @@ Test increased horizontal whitespace amount:
 
 >>> two diffs showing changed whitespace amount in the last line <<<
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -180,7 +180,7 @@ Test increased horizontal whitespace amount:
   -goodbye world
   +goodbye		  	world
 
-  $ hg ndiff -B
+  $ sl ndiff -B
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -191,8 +191,8 @@ Test increased horizontal whitespace amount:
 
 >>> no diffs <<<
 
-  $ hg ndiff -b
-  $ hg ndiff -Bb
+  $ sl ndiff -b
+  $ sl ndiff -Bb
 
 
 Test added blank line with horizontal whitespace:
@@ -201,7 +201,7 @@ Test added blank line with horizontal whitespace:
 
 >>> three diffs showing added blank line with horizontal space <<<
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -210,7 +210,7 @@ Test added blank line with horizontal whitespace:
   + 	
    goodbye world
 
-  $ hg ndiff -B
+  $ sl ndiff -B
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -219,7 +219,7 @@ Test added blank line with horizontal whitespace:
   + 	
    goodbye world
 
-  $ hg ndiff -b
+  $ sl ndiff -b
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -230,7 +230,7 @@ Test added blank line with horizontal whitespace:
 
 >>> no diffs <<<
 
-  $ hg ndiff -Bb
+  $ sl ndiff -Bb
 
 
 Test added blank line with other whitespace:
@@ -239,7 +239,7 @@ Test added blank line with other whitespace:
 
 >>> three diffs showing added blank line with other space <<<
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -250,7 +250,7 @@ Test added blank line with other whitespace:
   + 	
   +goodbye world 
 
-  $ hg ndiff -B
+  $ sl ndiff -B
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -261,7 +261,7 @@ Test added blank line with other whitespace:
   + 	
   +goodbye world 
 
-  $ hg ndiff -b
+  $ sl ndiff -b
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -272,7 +272,7 @@ Test added blank line with other whitespace:
 
 >>> no diffs <<<
 
-  $ hg ndiff -Bb
+  $ sl ndiff -Bb
 
 
 Test whitespace changes:
@@ -281,7 +281,7 @@ Test whitespace changes:
 
 >>> four diffs showing changed whitespace <<<
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -291,7 +291,7 @@ Test whitespace changes:
   +helloworld
   +goodbye	world 
 
-  $ hg ndiff -B
+  $ sl ndiff -B
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -301,7 +301,7 @@ Test whitespace changes:
   +helloworld
   +goodbye	world 
 
-  $ hg ndiff -b
+  $ sl ndiff -b
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -310,7 +310,7 @@ Test whitespace changes:
   +helloworld
    goodbye world
 
-  $ hg ndiff -Bb
+  $ sl ndiff -Bb
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -321,7 +321,7 @@ Test whitespace changes:
 
 >>> no diffs <<<
 
-  $ hg ndiff -w
+  $ sl ndiff -w
 
 
 Test whitespace changes and blank lines:
@@ -330,7 +330,7 @@ Test whitespace changes and blank lines:
 
 >>> five diffs showing changed whitespace <<<
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -343,7 +343,7 @@ Test whitespace changes and blank lines:
   +
   +goodbye	world 
 
-  $ hg ndiff -B
+  $ sl ndiff -B
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -356,7 +356,7 @@ Test whitespace changes and blank lines:
   +
   +goodbye	world 
 
-  $ hg ndiff -b
+  $ sl ndiff -b
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -368,7 +368,7 @@ Test whitespace changes and blank lines:
   +
    goodbye world
 
-  $ hg ndiff -Bb
+  $ sl ndiff -Bb
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -380,7 +380,7 @@ Test whitespace changes and blank lines:
   +
    goodbye world
 
-  $ hg ndiff -w
+  $ sl ndiff -w
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -393,14 +393,14 @@ Test whitespace changes and blank lines:
 
 >>> no diffs <<<
 
-  $ hg ndiff -wB
+  $ sl ndiff -wB
 
 
 Test \r (carriage return) as used in "DOS" line endings:
 
   $ printf 'hello world\r\n\r\ngoodbye\rworld\n' >foo
 
-  $ hg ndiff
+  $ sl ndiff
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -416,7 +416,7 @@ Test \r (carriage return) as used in "DOS" line endings:
 
   $ printf 'hello world    \r\n\t\ngoodbye world\n' >foo
 
-  $ hg ndiff --ignore-space-at-eol
+  $ sl ndiff --ignore-space-at-eol
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -429,7 +429,7 @@ No completely blank lines to ignore:
 
   $ printf 'hello world\r\n\r\ngoodbye\rworld\n' >foo
 
-  $ hg ndiff --ignore-blank-lines
+  $ sl ndiff --ignore-blank-lines
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -443,7 +443,7 @@ No completely blank lines to ignore:
 
 Only new line noticed:
 
-  $ hg ndiff --ignore-space-change
+  $ sl ndiff --ignore-space-change
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -452,7 +452,7 @@ Only new line noticed:
   +\r (esc)
    goodbye world
 
-  $ hg ndiff --ignore-all-space
+  $ sl ndiff --ignore-all-space
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -463,12 +463,12 @@ Only new line noticed:
 
 New line not noticed when space change ignored:
 
-  $ hg ndiff --ignore-blank-lines --ignore-all-space
+  $ sl ndiff --ignore-blank-lines --ignore-all-space
 
 Do not ignore all newlines, only blank lines
 
   $ printf 'hello \nworld\ngoodbye world\n' > foo
-  $ hg ndiff --ignore-blank-lines
+  $ sl ndiff --ignore-blank-lines
   diff -r 540c40a65b78 foo
   --- a/foo
   +++ b/foo
@@ -480,15 +480,15 @@ Do not ignore all newlines, only blank lines
 
 Test hunk offsets adjustments with --ignore-blank-lines
 
-  $ hg revert -aC
+  $ sl revert -aC
   reverting foo
   $ printf '\nb\nx\nd\n' > a
   $ printf 'b\ny\nd\n' > b
-  $ hg add a b
-  $ hg ci -m add
-  $ hg cat -r . a > b
-  $ hg cat -r . b > a
-  $ hg diff -B --nodates a > ../diffa
+  $ sl add a b
+  $ sl ci -m add
+  $ sl cat -r . a > b
+  $ sl cat -r . b > a
+  $ sl diff -B --nodates a > ../diffa
   $ cat ../diffa
   diff -r 0e66aa54f318 a
   --- a/a
@@ -499,7 +499,7 @@ Test hunk offsets adjustments with --ignore-blank-lines
   -x
   +y
    d
-  $ hg diff -B --nodates b > ../diffb
+  $ sl diff -B --nodates b > ../diffb
   $ cat ../diffb
   diff -r 0e66aa54f318 b
   --- a/b
@@ -509,14 +509,14 @@ Test hunk offsets adjustments with --ignore-blank-lines
   -y
   +x
    d
-  $ hg revert -aC
+  $ sl revert -aC
   reverting a
   reverting b
-  $ hg import --no-commit ../diffa
+  $ sl import --no-commit ../diffa
   applying ../diffa
-  $ hg revert -aC
+  $ sl revert -aC
   reverting a
-  $ hg import --no-commit ../diffb
+  $ sl import --no-commit ../diffb
   applying ../diffb
-  $ hg revert -aC
+  $ sl revert -aC
   reverting b

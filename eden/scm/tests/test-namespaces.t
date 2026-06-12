@@ -20,7 +20,7 @@ Test namespace registration using registrar
   >     return namespaces.namespace()
   > EOF
 
-  $ hg debugshell -c "ui.write('%s\n' % str(list(repo.names)))"
+  $ sl debugshell -c "ui.write('%s\n' % str(list(repo.names)))"
   ['bookmarks', 'c', 'remotebookmarks', 'a', 'hoistednames', 'titles', 'commitscheme']
 
   $ newext << EOF
@@ -33,7 +33,7 @@ Test namespace registration using registrar
   > def d(_repo):
   >     return namespaces.namespace()
   > EOF
-  $ hg debugshell -c "ui.write('%s\n' % str(list(repo.names)))"
+  $ sl debugshell -c "ui.write('%s\n' % str(list(repo.names)))"
   ['bookmarks', 'd', 'c', 'remotebookmarks', 'a', 'hoistednames', 'titles', 'z', 'commitscheme']
 
 Test that not specifying the priority will result in failure to load the
@@ -50,5 +50,5 @@ extension.
 
 - Run any command to test that the extension loading failed.
 
-  $ hg files || true
+  $ sl files || true
   warning: extension ext3 is disabled because it cannot be imported from $TESTTMP/ext3.py: namespace priority must be specified

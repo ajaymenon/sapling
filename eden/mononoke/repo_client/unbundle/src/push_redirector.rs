@@ -501,8 +501,7 @@ impl<R: Repo> PushRedirector<R> {
         log_id: BookmarkUpdateLogId,
     ) -> Result<(), Error> {
         let defer_to_backsyncer_for_backsync =
-            justknobs::eval("scm/mononoke:defer_to_backsyncer_for_backsync", None, None)
-                .unwrap_or(false);
+            justknobs::eval("scm/mononoke:defer_to_backsyncer_for_backsync", None, None);
         if defer_to_backsyncer_for_backsync {
             ensure_backsynced(
                 ctx.clone(),
@@ -519,22 +518,21 @@ impl<R: Repo> PushRedirector<R> {
     async fn backsync_latest(&self, ctx: &CoreContext) -> Result<(), Error> {
         // backsync_latest returns a tokio-spawned future which contains the
         // non-blocking extra syncing done. We don't need to wait for it.
-        std::mem::drop(
-            backsync_latest(
-                ctx.clone(),
-                self.large_to_small_commit_syncer.clone(),
-                self.target_repo_dbs.clone(),
-                BacksyncLimit::NoLimit,
-                Arc::new(AtomicBool::new(false)),
-                CommitSyncContext::PushRedirector,
-                // Disable leases because this is the push path and we want
-                // it as fast as possible
-                true,
-                // We don't chain successive backsyncs here.
-                Box::new(future::ready(())),
-            )
-            .await?,
-        );
+        let (_delay_info, future) = backsync_latest(
+            ctx.clone(),
+            self.large_to_small_commit_syncer.clone(),
+            self.target_repo_dbs.clone(),
+            BacksyncLimit::NoLimit,
+            Arc::new(AtomicBool::new(false)),
+            CommitSyncContext::PushRedirector,
+            // Disable leases because this is the push path and we want
+            // it as fast as possible
+            true,
+            // We don't chain successive backsyncs here.
+            Box::new(future::ready(())),
+        )
+        .await?;
+        std::mem::drop(future);
         Ok(())
     }
 
@@ -706,18 +704,13 @@ impl<R: Repo> PushRedirector<R> {
         maybe_commit_sync_outcome
             .ok_or_else(|| {
                 format_err!(
-                    "Changeset: unexpected absence of CommitSyncOutcome for {} in {:?}",
-                    cs_id,
-                    syncer
+                    "Changeset: unexpected absence of CommitSyncOutcome for {cs_id} in {syncer:?}"
                 )
             })
             .and_then(|commit_sync_outcome| match commit_sync_outcome {
                 CommitSyncOutcome::RewrittenAs(rewritten, _) => Ok(rewritten),
                 cso => Err(format_err!(
-                    "Changeset: unexpected CommitSyncOutcome for {} in {:?}: {:?}",
-                    cs_id,
-                    syncer,
-                    cso
+                    "Changeset: unexpected CommitSyncOutcome for {cs_id} in {syncer:?}: {cso:?}"
                 )),
             })
     }
@@ -771,8 +764,7 @@ impl<R: Repo> PushRedirector<R> {
             .contains(&name)
         {
             return Err(format_err!(
-                "cannot force pushrebase to shared bookmark {}",
-                name
+                "cannot force pushrebase to shared bookmark {name}"
             ));
         }
 
@@ -916,8 +908,7 @@ impl<R: Repo> PushRedirector<R> {
             .await?
             .ok_or_else(|| {
                 format_err!(
-                    "{} was rewritten into nothingness during uploaded changesets sync",
-                    bcs_id
+                    "{bcs_id} was rewritten into nothingness during uploaded changesets sync"
                 )
             })?;
             synced_ids.push((bcs_id, synced_bcs_id));

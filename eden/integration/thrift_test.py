@@ -4,7 +4,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
 
 import binascii
 import hashlib
@@ -55,10 +55,6 @@ class ThriftTest(testcase.EdenRepoTest):
     expected_hello_blake3: bytes = b""
     expected_adir_file_blake3: bytes = b""
     _blake3_computed: bool = False
-
-    def setup_eden_test(self) -> None:
-        self.enable_windows_symlinks = True
-        super().setup_eden_test()
 
     def edenfs_extra_config(self) -> Optional[Dict[str, List[str]]]:
         result = super().edenfs_extra_config() or {}

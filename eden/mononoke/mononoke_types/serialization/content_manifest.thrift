@@ -24,6 +24,8 @@ include "thrift/annotation/thrift.thrift"
 @thrift.AllowLegacyMissingUris
 package;
 
+namespace py3 eden.mononoke.mononoke_types.serialization
+
 @rust.Exhaustive
 struct ContentManifestFile {
   1: id.ContentId content_id;
@@ -34,6 +36,24 @@ struct ContentManifestFile {
 @rust.Exhaustive
 struct ContentManifestDirectory {
   1: id.ContentManifestId id;
+  2: ContentManifestRollupData rollup_data;
+}
+
+@rust.Exhaustive
+struct ContentManifestCounts {
+  1: i64 files_count;
+  2: i64 dirs_count;
+  3: i64 files_total_size;
+}
+
+// Composite rollup data stored in ShardedMapV2 shard nodes.
+// Contains both "child" (flat/immediate) and "descendant" (recursive) counts
+// so that both can be extracted in O(1) from the sharded map's rollup data
+// without iterating all entries.
+@rust.Exhaustive
+struct ContentManifestRollupData {
+  1: ContentManifestCounts child_counts;
+  2: ContentManifestCounts descendant_counts;
 }
 
 union ContentManifestEntry {

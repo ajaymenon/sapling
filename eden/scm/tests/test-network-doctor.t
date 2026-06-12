@@ -9,9 +9,9 @@
 Set up fake cert paths so we don't hit "missing certs" error.
   $ setconfig auth.test.cert=$TESTTMP/stub auth.test.key=$TESTTMP/stub auth.test.priority=1 auth.test.prefix=mononoke://*
 
-  $ hg init repo && cd repo
+  $ sl init repo && cd repo
 
-  $ hg pull --config edenapi.url=https://test_fail/foo --config doctor.external-host-check-url=https://test_succeed
+  $ sl pull --config edenapi.url=https://test_fail/foo --config doctor.external-host-check-url=https://test_succeed
   pulling from mononoke://169.254.1.2/foo
   abort: command failed due to network error (see * for details) (glob)
   
@@ -19,7 +19,7 @@ Set up fake cert paths so we don't hit "missing certs" error.
   [1]
 
 
-  $ hg pull --config edenapi.url=https://test_fail/foo --config doctor.external-host-check-url=https://test_succeed --verbose
+  $ sl pull --config edenapi.url=https://test_fail/foo --config doctor.external-host-check-url=https://test_succeed --verbose
   pulling from mononoke://169.254.1.2/foo
   abort: command failed due to network error (see * for details) (glob)
   
@@ -28,7 +28,7 @@ Set up fake cert paths so we don't hit "missing certs" error.
   [1]
 
 
-  $ hg pull --config edenapi.url=https://test_fail/foo --config doctor.external-host-check-url=https://test_succeed --debug
+  $ sl pull --config edenapi.url=https://test_fail/foo --config doctor.external-host-check-url=https://test_succeed --debug
   pulling from mononoke://169.254.1.2/foo
   abort: command failed due to network error (see * for details) (glob)
   
@@ -41,7 +41,7 @@ Set up fake cert paths so we don't hit "missing certs" error.
 
 
 Works for native rust commands as well.
-  $ hg clone mononoke://169.254.1.2/banana --config commands.force-rust=clone --config edenapi.url=https://test_fail/foo --config doctor.external-host-check-url=https://test_succeed 2>&1 | sed '/Stack backtrace/q'
+  $ sl clone mononoke://169.254.1.2/banana --config commands.force-rust=clone --config edenapi.url=https://test_fail/foo --config doctor.external-host-check-url=https://test_succeed
   Cloning banana into $TESTTMP/repo/banana
   abort: command failed due to network error
   
@@ -58,4 +58,4 @@ Works for native rust commands as well.
   Caused by:
       \[6\] (Could not|Couldn't) resolve (hostname|host name) \(Could not resolve host: test_fail\) (re)
   
-  Stack backtrace:
+  [255]

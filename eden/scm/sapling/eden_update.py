@@ -62,6 +62,7 @@ def update(
             if updatecheck == "noconflict":
                 with progress.spinner(repo.ui, _("conflict check")):
                     conflicts = repo.dirstate.eden_client.checkout(
+                        repo.ui._rcfg,
                         destctx.node(),
                         "DRY_RUN",
                         manifest=destctx.manifestnode(),
@@ -93,6 +94,7 @@ def update(
             # those conflict types.
             with progress.spinner(repo.ui, _("updating")):
                 conflicts = repo.dirstate.eden_client.checkout(
+                    repo.ui._rcfg,
                     destctx.node(),
                     "FORCE",
                     manifest=destctx.manifestnode(),
@@ -110,6 +112,7 @@ def update(
         else:
             with progress.spinner(repo.ui, _("updating")):
                 conflicts = repo.dirstate.eden_client.checkout(
+                    repo.ui._rcfg,
                     destctx.node(),
                     "NORMAL",
                     manifest=destctx.manifestnode(),
@@ -169,13 +172,13 @@ def _abort_on_eden_conflict_error(repo, conflicts):
     for conflict in conflicts:
         if conflict["conflict_type"] == "ERROR":
             if propagate_error:
-                repo.ui.metrics.gauge("abort_on_eden_conflict_error", 1)
+                repo.ui.metrics.inc("abort_on_eden_conflict_error", 1)
                 path = conflict["path"]
                 raise error.Abort(
                     _("error updating %s: %s") % (path, conflict["message"])
                 )
             else:
-                repo.ui.metrics.gauge("ignore_eden_conflict_error", 1)
+                repo.ui.metrics.inc("ignore_eden_conflict_error", 1)
 
 
 def _is_abort_on_eden_conflict_error_enabled(repo) -> bool:
@@ -215,7 +218,7 @@ def _determine_actions_for_conflicts(repo, src, conflicts, wctx, destctx):
         conflict_type = conflict["conflict_type"]
         if conflict_type == "ERROR":
             if _is_abort_on_eden_conflict_error_enabled(repo):
-                repo.ui.metrics.gauge("abort_on_eden_conflict_error", 1)
+                repo.ui.metrics.inc("abort_on_eden_conflict_error", 1)
                 raise error.Abort(
                     _("error updating %s: %s") % (path, conflict["message"])
                 )
@@ -232,7 +235,25 @@ def _determine_actions_for_conflicts(repo, src, conflicts, wctx, destctx):
             action = (path, None, path, False, src.node())
             prompt = "prompt changed/deleted"
         elif conflict_type == "UNTRACKED_ADDED":
-            if repo.dirstate[path] == "?" and (
+            if destctx.hasdir(path):
+                # The conflict path is a directory in the destination (e.g.
+                # an untracked file/symlink being replaced by a tracked
+                # directory). EdenFS handles directory creation itself.
+                if repo.dirstate[path] == "?" and repo.dirstate._ignore(path):
+                    # Remove the ignored file so EdenFS can create the
+                    # directory during the NORMAL checkout.
+                    util.unlink(repo.wjoin(path))
+                    continue
+                else:
+                    # Non-ignored untracked file conflicts with a directory.
+                    raise error.Abort(
+                        _(
+                            "%s: local file conflicts with a directory "
+                            "in the destination commit"
+                        )
+                        % path
+                    )
+            elif repo.dirstate[path] == "?" and (
                 repo.dirstate._ignore(path)
                 or not mergemod._checkunknownfile(repo, wctx, destctx, path)
             ):

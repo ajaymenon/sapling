@@ -17,6 +17,7 @@ use blobstore::Blobstore;
 use blobstore::BlobstoreGetData;
 use blobstore_sync_queue::BlobstoreWal;
 use blobstore_sync_queue::BlobstoreWalEntry;
+use blobstore_sync_queue::ReadInfo;
 use chrono::Duration as ChronoDuration;
 use cloned::cloned;
 use context::CoreContext;
@@ -32,8 +33,6 @@ use metaconfig_types::MultiplexId;
 use mononoke_types::BlobstoreBytes;
 use mononoke_types::DateTime;
 use mononoke_types::Timestamp;
-use rand::Rng;
-use rand::rng;
 use tracing::info;
 use tracing::warn;
 
@@ -132,7 +131,7 @@ impl WalHealer {
 
                     fetch_size = new_fetch_size;
                     let delay =
-                        rng().random_range(MIN_FETCH_FAILURE_DELAY..MAX_FETCH_FAILURE_DELAY);
+                        rand::random_range(MIN_FETCH_FAILURE_DELAY..MAX_FETCH_FAILURE_DELAY);
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -422,15 +421,13 @@ async fn enqueue_entries(
     );
     let new_entries = entries
         .into_iter()
-        .map(|entry| {
-            let BlobstoreWalEntry {
-                blobstore_key,
-                multiplex_id,
-                blob_size,
-                ..
-            } = entry;
-
-            BlobstoreWalEntry::new(blobstore_key, multiplex_id, Timestamp::now(), blob_size)
+        .map(|entry| BlobstoreWalEntry {
+            timestamp: Timestamp::now(),
+            read_info: ReadInfo {
+                id: None,
+                shard_id: None,
+            },
+            ..entry
         })
         .collect();
 

@@ -59,6 +59,7 @@ from sapling.bookmarks import (
     selectivepullbookmarknames,
     splitremotename,
 )
+from sapling.eagerpeer import unwrap
 from sapling.ext.commitcloud import util as ccutil
 from sapling.i18n import _
 from sapling.node import bin, hex, short
@@ -96,7 +97,7 @@ def expush(orig, repo, remote, *args, **kwargs):
 
         remotename = repo.ui.paths.getname(remote.url())
         remotebookmarkskeys = selectivepullbookmarknames(repo, remotename)
-        remotebookmarks = _listremotebookmarks(remote, remotebookmarkskeys)
+        remotebookmarks = _listremotebookmarks(repo, remote, remotebookmarkskeys)
 
         # ATTENTION: This might get commits that are unknown to the local repo!
         # The correct approach is to get the remote names within "orig". But
@@ -135,8 +136,23 @@ def expushop(
         setattr(pushop, flag, kwargs.pop(flag, None))
 
 
-def _listremotebookmarks(remote, bookmarks):
-    remotebookmarks = remote.listkeyspatterns("bookmarks", bookmarks)
+def _listremotebookmarks(repo, remote, bookmarks):
+    """Fetch remote bookmarks via SaplingRemoteAPI."""
+    if repo.nullableedenapi is not None:
+        # Use SaplingRemoteAPI for bookmark lookup.
+        # remotenames.httplistbookmarksfreshness controls the freshness level
+        # for bookmark requests. "MostRecent" bypasses Mononoke's warm bookmark
+        # cache, which is useful in integration tests where the cache may be
+        # stale immediately after a push. Default is "MaybeStale".
+        freshness = repo.ui.config(
+            "remotenames", "httplistbookmarksfreshness", "MaybeStale"
+        )
+        fetchedbookmarks = repo.edenapi.bookmarks(list(bookmarks), freshness)
+        remotebookmarks = {
+            bm: n for (bm, n) in fetchedbookmarks.items() if n is not None
+        }
+    else:
+        remotebookmarks = remote.listkeyspatterns("bookmarks", bookmarks)
     result = {}
     for book in bookmarks:
         if book in remotebookmarks:
@@ -171,9 +187,9 @@ def _expull(orig, repo, remote, heads=None, force=False, **kwargs):
 
     if kwargs.get("bookmarks"):
         remotebookmarkslist.extend(kwargs["bookmarks"])
-        bookmarks = _listremotebookmarks(remote, remotebookmarkslist)
+        bookmarks = _listremotebookmarks(repo, remote, remotebookmarkslist)
     else:
-        bookmarks = _listremotebookmarks(remote, remotebookmarkslist)
+        bookmarks = _listremotebookmarks(repo, remote, remotebookmarkslist)
         if not heads:
             heads = []
         for node in bookmarks.values():
@@ -256,7 +272,7 @@ def exclone(orig, ui, *args, **opts):
 
     with repo.wlock(), repo.lock(), repo.transaction("exclone") as tr:
         remotebookmarkskeys = selectivepullbookmarknames(repo)
-        remotebookmarks = _listremotebookmarks(srcpeer, remotebookmarkskeys)
+        remotebookmarks = _listremotebookmarks(repo, srcpeer, remotebookmarkskeys)
         # Clone pulled with selectivepull disabled.  Hide all the commits
         # so we only get the ones we want.
         visibility.setvisibleheads(repo, [])
@@ -554,7 +570,7 @@ def expushdiscoverybookmarks(pushop):
     repo = pushop.repo
 
     if pushop.delete:
-        remotemarks = pushop.remote.listkeyspatterns("bookmarks", [pushop.delete])
+        remotemarks = _listremotebookmarks(repo, pushop.remote, [pushop.delete])
         if pushop.delete not in remotemarks:
             raise error.Abort(_("remote bookmark %s does not exist") % pushop.delete)
         pushop.outbookmarks.append((pushop.delete, remotemarks[pushop.delete], ""))
@@ -584,7 +600,15 @@ def expushdiscoverybookmarks(pushop):
             # aborting error causing the connection to close
             anonheads = []
             revs = sorted(revs)
-            knownlist = pushop.remote.known(revs)
+            edenapi = repo.nullableedenapi
+            if edenapi is not None:
+                knownresponse = edenapi.commitknown(revs)
+                knownnodes = {
+                    res["hgid"] for res in knownresponse if unwrap(res["known"])
+                }
+                knownlist = [n in knownnodes for n in revs]
+            else:
+                knownlist = pushop.remote.known(revs)
             for node, known in zip(revs, knownlist):
                 ctx = repo[node]
                 if (
@@ -612,7 +636,7 @@ def expushdiscoverybookmarks(pushop):
 
     # allow new bookmark only if --create is specified
     old = ""
-    remotemarks = pushop.remote.listkeyspatterns("bookmarks", [bookmark])
+    remotemarks = _listremotebookmarks(repo, pushop.remote, [bookmark])
     if bookmark in remotemarks:
         old = remotemarks[bookmark]
     elif not pushop.create:
@@ -660,6 +684,15 @@ def _pushrevs(repo, ui, rev):
     return []
 
 
+def _marklanded(ui, repo):
+    """Call debugmarklanded to mark landed commits before rebase."""
+    try:
+        fbcodereview = extensions.find("fbcodereview")
+        fbcodereview._cleanuplanded(repo)
+    except KeyError:
+        pass
+
+
 def expullcmd(orig, ui, repo, source="default", **opts):
     revrenames = dict((v, k) for k, v in _getrenames(ui).items())
     source = revrenames.get(source, source)
@@ -690,6 +723,8 @@ def expullcmd(orig, ui, repo, source="default", **opts):
         del opts["rebase"]
         tool = opts.pop("tool", "")
         ret = orig(ui, repo, source, **opts)
+        # Mark landed commits before rebase so it can skip them.
+        _marklanded(ui, repo)
         return ret or rebasemodule.rebase(ui, repo, dest=dest, tool=tool)
     else:
         return orig(ui, repo, source, **opts)

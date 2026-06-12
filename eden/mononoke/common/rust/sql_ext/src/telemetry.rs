@@ -73,6 +73,7 @@ pub fn log_query_telemetry(
     query_name: &str,
     shard_name: &str,
     fut_stats: FutureStats,
+    attempt: Option<usize>,
 ) -> Result<()> {
     match opt_tel {
         Some(query_tel) => log_query_telemetry_impl(
@@ -83,6 +84,7 @@ pub fn log_query_telemetry(
             query_name,
             shard_name,
             fut_stats,
+            attempt,
         ),
         // TODO(T223577767): handle case when there's no telemetry
         None => Ok(()),
@@ -116,8 +118,7 @@ fn setup_error_logging(
     let jk_sample_rate = justknobs::get_as::<u64>(
         "scm/mononoke:sql_telemetry_error_sample_rate",
         Some(shard_name),
-    )
-    .unwrap_or(10);
+    );
 
     let mut scuba = setup_scuba_sample(
         sql_query_tel,
@@ -177,7 +178,7 @@ pub fn log_query_error(
         }
     };
 
-    scuba.add("error", format!("{:?}", err));
+    scuba.add("error", format!("{err:?}"));
     scuba.add("success", 0);
 
     #[cfg(fbcode_build)]
@@ -264,6 +265,7 @@ fn log_query_telemetry_impl(
     query_name: &str,
     shard_name: &str,
     fut_stats: FutureStats,
+    attempt: Option<usize>,
 ) -> Result<()> {
     #[cfg(not(fbcode_build))]
     {
@@ -275,6 +277,7 @@ fn log_query_telemetry_impl(
             query_name,
             shard_name,
             fut_stats,
+            attempt,
         );
     }
     match query_tel {
@@ -292,6 +295,7 @@ fn log_query_telemetry_impl(
                 query_name,
                 shard_name,
                 fut_stats,
+                attempt,
             )
         }
         QueryTelemetry::Sqlite(_) => Ok(()),
@@ -321,7 +325,7 @@ fn setup_scuba_sample(
 
     scuba.add_common_server_data();
 
-    scuba.add("granularity", format!("{:?}", granularity));
+    scuba.add("granularity", format!("{granularity:?}"));
     scuba.add("query_name", query_name);
     scuba.add("shard_name", shard_name);
 
@@ -401,6 +405,7 @@ mod facebook {
         query_name: &str,
         shard_name: &str,
         fut_stats: FutureStats,
+        attempt: Option<usize>,
     ) -> Result<()> {
         // Also log to the new MononokeXDBTelemetry logger
         if let Err(e) = log_to_mononoke_xdb_telemetry_logger(
@@ -412,13 +417,13 @@ mod facebook {
             query_name,
             shard_name,
             fut_stats.clone(),
+            attempt,
         ) {
             tracing::error!("Failed to log to MononokeXDBTelemetry logger: {e:?}");
         }
 
         let jk_sample_rate =
-            justknobs::get_as::<u64>("scm/mononoke:sql_telemetry_sample_rate", Some(shard_name))
-                .unwrap_or(10);
+            justknobs::get_as::<u64>("scm/mononoke:sql_telemetry_sample_rate", Some(shard_name));
 
         let mut scuba = setup_scuba_sample(
             sql_query_tel,
@@ -430,6 +435,7 @@ mod facebook {
         )?;
 
         scuba.add("success", 1);
+        scuba.add("attempt", attempt);
         STATS::success.add_value(1, (shard_name.to_string(),));
         STATS::success_query.add_value(1, (shard_name.to_string(), query_name.to_string()));
 
@@ -440,7 +446,7 @@ mod facebook {
             (
                 shard_name.to_string(),
                 query_name.to_string(),
-                format!("{:?}", granularity),
+                format!("{granularity:?}"),
             ),
         );
 
@@ -468,7 +474,7 @@ mod facebook {
                 (
                     shard_name.to_string(),
                     query_name.to_string(),
-                    format!("{:?}", granularity),
+                    format!("{granularity:?}"),
                     instance_type.clone(),
                     read_or_write.to_string(),
                 ),
@@ -602,7 +608,7 @@ mod facebook {
         let mut log_entry = MononokeXdbTelemetryLogger::new(fb);
 
         // Set required fields
-        log_entry.set_granularity(format!("{:?}", granularity));
+        log_entry.set_granularity(format!("{granularity:?}"));
         log_entry.set_shard_name(shard_name.to_string());
 
         // Set optional fields if available
@@ -632,6 +638,7 @@ mod facebook {
         query_name: &str,
         shard_name: &str,
         fut_stats: FutureStats,
+        attempt: Option<usize>,
     ) -> Result<()> {
         let mut log_entry = setup_logger_entry(
             fb,
@@ -643,6 +650,9 @@ mod facebook {
         );
 
         log_entry.set_success(1); // This function is only called for successful queries
+        if let Some(attempt) = attempt {
+            log_entry.set_attempt(attempt as i64);
+        }
 
         if let Some(instance_type) = query_tel.instance_type() {
             log_entry.set_instance_type(instance_type.clone());
@@ -762,7 +772,7 @@ mod facebook {
 
         log_entry.set_success(0); // 0 indicates failed query
         // Set error message
-        log_entry.set_error(format!("{:?}", err));
+        log_entry.set_error(format!("{err:?}"));
         mysql_errno(err).map(|errno| log_entry.set_mysql_errno(errno));
         mysql_error_type(err).map(|etype| log_entry.set_mysql_error_type(etype));
         // Set retry fields
@@ -795,6 +805,7 @@ mod facebook {
 
         // Set transaction-specific fields
         log_entry.set_success(1); // Transactions that reach this function are successful
+        log_entry.set_attempt(1); // Transactions don't retry, so always attempt 1
 
         // Set table access information
         let read_tables: Vec<String> = txn_tel.read_tables.iter().cloned().collect();
@@ -835,8 +846,7 @@ mod facebook {
         }
 
         let jk_sample_rate =
-            justknobs::get_as::<u64>("scm/mononoke:sql_telemetry_sample_rate", Some(shard_name))
-                .unwrap_or(10);
+            justknobs::get_as::<u64>("scm/mononoke:sql_telemetry_sample_rate", Some(shard_name));
 
         let mut scuba = setup_scuba_sample(
             sql_query_tel,
@@ -848,6 +858,7 @@ mod facebook {
         )?;
 
         scuba.add("success", 1);
+        scuba.add("attempt", 1); // Transactions don't retry, so always attempt 1
 
         scuba.add(
             "read_tables",
@@ -965,9 +976,6 @@ mod facebook {
         logger.set_session_uuid(data.session_uuid.clone());
         logger.set_client_identities(data.client_identities.clone());
 
-        if let Some(ref variant) = data.client_identity_variant {
-            logger.set_client_identity_variant(variant.clone());
-        }
         if let Some(ref hostname) = data.source_hostname {
             logger.set_source_hostname(hostname.clone());
         }

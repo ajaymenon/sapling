@@ -10,6 +10,8 @@
 
 
 import os
+import re
+import subprocess
 from typing import Optional
 
 from sapling import encoding, error, json, util
@@ -54,36 +56,103 @@ class Client:
                 # original order
                 self._mocked_responses.reverse()
 
+        self._ui = ui
+        self._repodir = repodir
+        self._app_id = None
         self._host = None
         self._user = None
         self._oauth = None
         self._catslocation = None
         self._cats = None
-        self._applyarcconfig(
-            arcconfig.loadforpath(repodir), ui.config("phabricator", "arcrc_host")
+
+        # phabricator.use-unix-socket is escape hatch in case something breaks.
+        self._unix_socket_path = ui.configbool(
+            "phabricator", "use-unix-socket", default=True
+        ) and ui.config("auth_proxy", "unix_socket_path")
+
+        # TODO: remove this force_arcrc safety check when sl release has soaked
+        # for a while.
+        self._force_arcrc = ui.configbool("phabricator", "force_arcrc", False)
+        self._phabricator_auth_command = ui.configlist(
+            "phabricator", "auth-command", ["jf", "auth"]
+        )
+        self._auth_token_regex = ui.config(
+            "phabricator",
+            "auth-expired-regex",
+            r"invalid auth token|the provided crypto auth token\(s\) are expired",
         )
         if not self._mock:
-            app_id = ui.config("phabricator", "graphql_app_id")
+            self._app_id = ui.config("phabricator", "graphql_app_id")
             self._host = ui.config("phabricator", "graphql_host")
-            if app_id is None or self._host is None:
-                raise GraphQLConfigError(
-                    "GraphQL unavailable because of missing configuration"
-                )
 
-            # phabricator.use-unix-socket is escape hatch in case something breaks.
-            unix_socket_path = ui.configbool(
-                "phabricator", "use-unix-socket", default=True
-            ) and ui.config("auth_proxy", "unix_socket_path")
+            self._client = self._get_phab_client()
 
-            self._client = phabricator_graphql_client.PhabricatorGraphQLClient(
-                phabricator_graphql_client_urllib.PhabricatorGraphQLClientRequests(
-                    unix_socket_proxy=unix_socket_path, ui=ui
-                ),
-                app_id if unix_socket_path else None,
-                self._oauth,
-                self._cats,
-                self._host,
+    def _get_phab_client(self):
+        if not self._unix_socket_path or self._force_arcrc:
+            self._applyarcconfig(
+                arcconfig.loadforpath(self._repodir),
+                self._ui.config("phabricator", "arcrc_host"),
             )
+
+        if self._app_id is None or self._host is None:
+            raise GraphQLConfigError(
+                "GraphQL unavailable because of missing configuration"
+            )
+
+        return phabricator_graphql_client.PhabricatorGraphQLClient(
+            phabricator_graphql_client_urllib.PhabricatorGraphQLClientRequests(
+                unix_socket_proxy=self._unix_socket_path, ui=self._ui
+            ),
+            self._app_id if self._unix_socket_path else None,
+            self._oauth,
+            self._cats,
+            self._host,
+        )
+
+    def _is_token_expired(self, response):
+        if not self._auth_token_regex:
+            return False
+        pattern = re.compile(self._auth_token_regex, re.IGNORECASE)
+        possible_errors = [response.get(key) for key in ("error", "errors")]
+        possible_errors = [e if isinstance(e, list) else [e] for e in possible_errors]
+        possible_messages = [str(m) for e in possible_errors for m in e]
+        return any(pattern.search(m) for m in possible_messages)
+
+    # _query wraps self._client.query and provides transparent re-auth
+    # if the response looks like it failed due to expired tokens.
+    def _query(self, timeout, request, params=None):
+        ret = self._client.query(timeout, request, params)
+        if not self._phabricator_auth_command or not self._is_token_expired(ret):
+            return ret
+
+        try:
+            subprocess.run(
+                self._phabricator_auth_command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=60,
+            )
+        except Exception as ex:
+            cmd_str = " ".join(self._phabricator_auth_command)
+            self._ui.warn(_("warning: `%s` failed: %s\n") % (cmd_str, ex))
+            stderr = getattr(ex, "stderr", None) or b""
+            stdout = getattr(ex, "stdout", None) or b""
+            if stderr:
+                self._ui.warn(
+                    _("  stderr: %s\n")
+                    % stderr.decode("utf-8", errors="replace").strip()
+                )
+            if stdout:
+                self._ui.warn(
+                    _("  stdout: %s\n")
+                    % stdout.decode("utf-8", errors="replace").strip()
+                )
+            return ret
+
+        self._client = self._get_phab_client()
+        return self._client.query(timeout, request, params)
 
     def _applyarcconfig(self, config, defaultarcrchost):
         arcrchost = config.get("graphql_uri", None)
@@ -207,7 +276,7 @@ class Client:
         query = query % extra_query
 
         params = {"diffid": diffid}
-        ret = self._client.query(timeout, query, params)
+        ret = self._query(timeout, query, params)
 
         try:
             latest: Optional[dict] = ret["data"]["phabricator_diff_query"][0][
@@ -291,7 +360,7 @@ class Client:
                 }
                 """
             params = {"diffids": diffids}
-            ret = self._client.query(timeout, query, params)
+            ret = self._query(timeout, query, params)
             # Example result:
             # { "data": {
             #     "phabricator_diff_query": [
@@ -411,13 +480,13 @@ class Client:
             ret = self._mocked_responses.pop()
         else:
             params = {"params": {"numbers": rev_numbers}}
-            ret = self._client.query(timeout, self._getquery(signalstatus), params)
+            ret = self._query(timeout, self._getquery(signalstatus), params)
         return self._processrevisioninfo(ret)
 
     def graphqlquery(self, query, variables, timeout=60_000):
         if self._mock:
             return self._mocked_responses.pop()
-        return self._client.query(timeout, query, variables)
+        return self._query(timeout, query, variables)
 
     def _getquery(self, signalstatus):
         signalquery = ""
@@ -449,6 +518,13 @@ class Client:
                 is_landing
                 land_job_status
                 needs_final_review_status
+                required_reviewers_info {
+                  overall_status
+                  type
+                }
+                automated_review_info {
+                  deferred_review_badge_label
+                }
                 unpublished_phabricator_versions {
                   phabricator_version_migration {
                     ordinal_label {
@@ -506,6 +582,15 @@ class Client:
                 info["is_landing"] = node["is_landing"]
                 info["land_job_status"] = node["land_job_status"]
                 info["needs_final_review_status"] = node["needs_final_review_status"]
+                info["required_reviewers_info"] = node.get("required_reviewers_info")
+
+                automated_review_info = node.get("automated_review_info")
+                if automated_review_info:
+                    info["automated_review_badge_label"] = automated_review_info.get(
+                        "deferred_review_badge_label"
+                    )
+                else:
+                    info["automated_review_badge_label"] = None
 
                 info["signal_status"] = None
                 if (
@@ -562,7 +647,7 @@ class Client:
                 "revs": [rev],
             }
         }
-        ret = self._client.query(timeout, query, json.dumps(params))
+        ret = self._query(timeout, query, json.dumps(params))
         self._raise_errors(ret)
         for pair in ret["data"]["query"]["rev_map"]:
             if pair["from_rev"] == rev:
@@ -595,7 +680,7 @@ class Client:
                 "revs": list(map(fromenc, nodes)),
             }
         }
-        ret = self._client.query(timeout, query, json.dumps(params))
+        ret = self._query(timeout, query, json.dumps(params))
         self._raise_errors(ret)
         result = {}
         for pair in ret["data"]["query"]["rev_map"]:
@@ -658,7 +743,7 @@ class Client:
                 "follow_mutable_file_history": use_mutable_history,
             }
         }
-        ret = self._client.query(timeout, query, json.dumps(params))
+        ret = self._query(timeout, query, json.dumps(params))
         self._raise_errors(ret)
         return ret["data"]["query"]
 
@@ -671,7 +756,7 @@ class Client:
         query = "query($u: String!) { intern_user_for_unixname(unixname: $u) { access_name email } }"
         params = {"u": unixname}
         # {'data': {'intern_user_for_unixname': {'access_name': 'Name', 'email': 'foo@example.com'}}}
-        ret = self._client.query(timeout, query, json.dumps(params))
+        ret = self._query(timeout, query, json.dumps(params))
         self._raise_errors(ret)
         data = ret["data"]["intern_user_for_unixname"]
         if not data:

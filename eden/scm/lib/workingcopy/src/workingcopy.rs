@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -63,9 +64,13 @@ use crate::filesystem::DotGitFileSystem;
 use crate::filesystem::EdenFileSystem;
 use crate::filesystem::FileSystem;
 use crate::filesystem::FileSystemType;
+use crate::filesystem::GrepoFileSystem;
 use crate::filesystem::PendingChange;
 use crate::filesystem::PhysicalFileSystem;
 use crate::filesystem::WatchmanFileSystem;
+use crate::filesystem::grepo::grepo_manifest_path;
+use crate::filesystem::grepo::parse_grepo_manifest;
+use crate::manifest::apply_status;
 use crate::status::compute_status;
 use crate::util::added_files;
 use crate::util::fast_path_wdir_parents;
@@ -150,6 +155,8 @@ impl WorkingCopy {
             FileSystemType::Eden
         } else if has_requirement("dotgit") {
             FileSystemType::DotGit
+        } else if has_requirement("grepo") {
+            FileSystemType::Grepo
         } else {
             let fsmonitor_ext = config.get("extensions", "fsmonitor");
             let fsmonitor_mode = config.get_nonempty("fsmonitor", "mode");
@@ -344,12 +351,27 @@ impl WorkingCopy {
                     )?)
                 }
             }
-            FileSystemType::DotGit => Box::new(DotGitFileSystem::new(
-                vfs.clone(),
-                dot_dir,
-                store.clone(),
-                &config,
-            )?),
+            FileSystemType::DotGit => {
+                let git_dir = vfs.root().join(".git");
+                Box::new(DotGitFileSystem::new(
+                    vfs.clone(),
+                    dot_dir,
+                    &git_dir,
+                    store.clone(),
+                    &config,
+                )?)
+            }
+            FileSystemType::Grepo => {
+                let git_dir = vfs.root().join(".repo/manifests/.git");
+                let inner =
+                    DotGitFileSystem::new(vfs.clone(), dot_dir, &git_dir, store.clone(), &config)?;
+                Box::new(GrepoFileSystem::new(
+                    inner,
+                    vfs.clone(),
+                    tree_resolver.clone(),
+                    &config,
+                )?)
+            }
         })
     }
 
@@ -401,6 +423,53 @@ impl WorkingCopy {
             .lock()
             .sparse_matcher(&manifests, self.ident.dot_dir())?;
         Ok(sparse_matcher)
+    }
+
+    /// Returns a manifest representing the current working copy state.
+    ///
+    /// This combines the p1 manifest with uncommitted changes from status to produce
+    /// a manifest that reflects the current working directory contents.
+    ///
+    /// # Arguments
+    /// * `ctx` - The core context for the operation
+    /// * `matcher` - Matcher for filtering which files to include in status
+    /// * `include_unknown` - If true, untracked files are included in the manifest
+    pub fn working_manifest(
+        &self,
+        ctx: &CoreContext,
+        matcher: DynMatcher,
+        include_unknown: bool,
+    ) -> Result<TreeManifest> {
+        // Get the current parent manifests.
+        let manifests =
+            WorkingCopy::current_manifests(&self.treestate.lock(), &self.tree_resolver)?;
+
+        // Clone the p1 manifest as our base.
+        let mut manifest = (*manifests[0]).clone();
+
+        // Get the status of uncommitted changes.
+        let status = self.status(ctx, matcher.clone(), false)?;
+
+        // Get the copymap and convert to HashMap.
+        let copymap: HashMap<RepoPathBuf, RepoPathBuf> =
+            self.copymap(matcher)?.into_iter().collect();
+
+        // Build the list of parent manifest references for apply_status.
+        let parent_refs: Vec<&TreeManifest> = manifests.iter().map(|m| m.as_ref()).collect();
+
+        // Apply the status changes to the manifest.
+        apply_status(
+            ctx,
+            &mut manifest,
+            &status,
+            &self.vfs,
+            &self.filestore,
+            &parent_refs,
+            copymap,
+            include_unknown,
+        )?;
+
+        Ok(manifest)
     }
 
     pub fn status_internal(
@@ -640,6 +709,29 @@ impl WorkingCopy {
         Ok(parsed)
     }
 
+    /// Synthesize `Submodule` entries from the grepo projects in the workingcopy.
+    pub fn parse_grepo_submodules(&self) -> Result<Vec<Submodule>> {
+        let manifest_path = grepo_manifest_path(&self.vfs, &self.config)?;
+        let manifest = parse_grepo_manifest(&manifest_path)?;
+
+        manifest
+            .projects
+            .iter()
+            .map(|(path, project)| {
+                Ok(Submodule {
+                    name: project.name.clone(),
+                    url: "".to_string(), // Can probably be inferred but not useful for now
+                    path: path.to_string_lossy().into_owned(),
+                    r#ref: project
+                        .upstream
+                        .clone()
+                        .or_else(|| project.revision.clone()),
+                    active: true,
+                })
+            })
+            .collect()
+    }
+
     pub fn copymap(&self, matcher: DynMatcher) -> Result<Vec<(RepoPathBuf, RepoPathBuf)>> {
         let mut copied: Vec<(RepoPathBuf, RepoPathBuf)> = Vec::new();
 
@@ -653,7 +745,7 @@ impl WorkingCopy {
                 let copied_path = state
                     .copied
                     .clone()
-                    .ok_or_else(|| anyhow!("Invalid treestate entry for {}: missing copied from path on file with COPIED flag", path))
+                    .ok_or_else(|| anyhow!("Invalid treestate entry for {path}: missing copied from path on file with COPIED flag"))
                     .map(|p| p.into_vec())
                     .and_then(|p| RepoPathBuf::from_utf8(p).map_err(|e| anyhow!(e)))?;
 

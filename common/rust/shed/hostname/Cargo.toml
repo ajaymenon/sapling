@@ -11,8 +11,8 @@ repository = "https://github.com/facebookexperimental/rust-shed"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-anyhow = "1.0.98"
-real_hostname = { package = "hostname", version = "0.3" }
+anyhow = "1.0.102"
+real_hostname = { package = "hostname", version = "0.4.2" }
 
 [lints]
 rust = { unexpected_cfgs = { check-cfg = ["cfg(conda_build)", "cfg(fbcode_build)"], level = "warn" } }

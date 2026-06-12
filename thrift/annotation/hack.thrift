@@ -119,6 +119,32 @@ struct Name {
   2: string reason;
 }
 
+@scope.Program
+@scope.Structured
+@scope.Typedef
+@scope.Enum
+@scope.Const
+@scope.Service
+struct NamePrefix {
+  /// Prepends a prefix to generated Hack type names.
+  /// When both program-level and definition-level NamePrefix are present,
+  /// the definition-level prefix wins instead of stacking with the
+  /// program-level prefix.
+  1: string prefix;
+  /// Set to false when you want getName() to keep returning the IDL name.
+  2: bool apply_on_getName = true;
+  /// When true, types generated from services (interfaces, clients,
+  /// processors, helper structs like args/result) are not prefixed.
+  /// When false (default), all types including service-generated types
+  /// are prefixed.
+  3: bool skip_services = false;
+}
+
+@scope.Program
+struct ConstantsClass {
+  1: string name;
+}
+
 /// This annotation is for adding Hack attributes to union enums.
 @scope.Union
 struct UnionEnumAttributes {
@@ -237,3 +263,39 @@ struct MigrationBlockingAllowInheritance {}
  */
 @scope.Union
 struct MigrationBlockingLegacyJSONSerialization {}
+
+/**
+ * Wraps the field type with \HH_FIXME\WRONG_TYPE<Type> in generated Hack code
+ * to suppress type-checking errors.
+ *
+ * When applied to a struct, wraps all field types in the struct.
+ *
+ * Example:
+ *   struct MyStruct {
+ *     @hack.FixmeWrongType
+ *     1: i64 my_field;
+ *   }
+ *
+ * Generates: public \HH_FIXME\WRONG_TYPE<int> $my_field;
+ */
+@scope.Field
+@scope.Struct
+@scope.Union
+@scope.Exception
+struct FixmeWrongType {}
+
+/**
+ * Replaces array/collection types with unsafe semi-statically-typed equivalents:
+ *   - vec<T> becomes varrayish_UNSAFE<T>
+ *   - dict<K, V> becomes darrayish_UNSAFE<K, V>
+ *
+ * Example:
+ *   struct MyStruct {
+ *     @hack.UnsafeArray
+ *     1: list<i64> my_list;
+ *   }
+ *
+ * Generates: public varrayish_UNSAFE<int> $my_list;
+ */
+@scope.Field
+struct UnsafeArray {}

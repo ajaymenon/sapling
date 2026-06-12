@@ -1,5 +1,6 @@
-#require mononoke
-#require eden
+#require mononoke eden
+
+  $ export SL_REPO_IDENTITY=hg
 
   $ setconfig checkout.use-rust=true
   $ setconfig clone.use-rust=true
@@ -10,7 +11,7 @@
   > A   # A/foo = foo
   >     # A/bar = bar
   > EOS
-  $ hg push -r $A --to master --create -q
+  $ sl push -r $A --to master --create -q
   $ newclientrepo repo2 repo1
   $ cd "$TESTTMP/repo2"
   $ eden list
@@ -25,13 +26,13 @@ Quick check for making sure this test is capable of using EdenFS
 
   $ ls -a
   .eden
-  .hg
+  .?? (glob)
   A
   bar
   foo
 
-  $ hg st
+  $ sl st
 
 Check that pulling is using the correct url
-  $ hg pull
+  $ sl pull
   pulling from test:repo1

@@ -9,6 +9,7 @@
 
 #include <folly/Range.h>
 #include <folly/coro/Task.h>
+#include <folly/coro/safe/NowTask.h>
 #include <folly/futures/Future.h>
 #include <folly/memory/not_null.h>
 #include <memory>
@@ -238,6 +239,13 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
       const RootId& rootId,
       const ObjectFetchContextPtr& context) = 0;
 
+  /**
+   * Coroutine version of getRootTree.
+   */
+  virtual folly::coro::now_task<GetRootTreeResult> co_getRootTree(
+      const RootId& rootId,
+      const ObjectFetchContextPtr& context) = 0;
+
   virtual ImmediateFuture<std::shared_ptr<TreeEntry>> getTreeEntryForObjectId(
       const ObjectId& objectId,
       TreeEntryType treeEntryType,
@@ -252,12 +260,20 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
       const ObjectId& id,
       const ObjectFetchContextPtr& context) = 0;
 
+  virtual folly::coro::now_task<GetTreeResult> co_getTree(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) = 0;
+
   /**
    * Fetch the tree aux data from the backing store.
    *
    * Return the tree aux data and where it was found.
    */
   virtual folly::SemiFuture<GetTreeAuxResult> getTreeAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) = 0;
+
+  virtual folly::coro::now_task<GetTreeAuxResult> co_getTreeAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) = 0;
 
@@ -270,11 +286,6 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
       const ObjectId& id,
       const ObjectFetchContextPtr& context) = 0;
 
-  /**
-   * Fetch a blob from the backing store.
-   *
-   * Return the blob and where it was found.
-   */
   virtual folly::coro::Task<GetBlobResult> co_getBlob(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) = 0;
@@ -285,6 +296,10 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
    * Return the blob aux data and where it was found.
    */
   virtual folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) = 0;
+
+  virtual folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) = 0;
 
@@ -302,6 +317,25 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
       const std::vector<std::string>& prefixes) = 0;
 
   /**
+   * Coroutine version of getGlobFiles.
+   */
+  virtual folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const std::vector<std::string>& prefixes) = 0;
+
+  /**
+   * Check whether the caller has access to the given manifest ID.
+   * Returns true if access is allowed, false if denied.
+   * Throws on error (e.g. permission service unreachable).
+   * Default implementation returns true (no restrictions for non-SLAPI stores).
+   */
+  virtual ImmediateFuture<bool> checkPermission(const ObjectId& manifestId) {
+    (void)manifestId;
+    return true;
+  }
+
+  /**
    * Prefetch all the blobs represented by the HashRange.
    *
    * The caller is responsible for making sure that the HashRange stays valid
@@ -311,6 +345,18 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
       ObjectIdRange /*ids*/,
       const ObjectFetchContextPtr& /*context*/) {
     return folly::unit;
+  }
+
+  /**
+   * Coroutine version of prefetchBlobs.
+   *
+   * Default implementation is a no-op. Subclasses may override
+   * with native coroutine implementations.
+   */
+  virtual folly::coro::now_task<folly::Unit> co_prefetchBlobs(
+      ObjectIdRange /*ids*/,
+      const ObjectFetchContextPtr& /*context*/) {
+    co_return folly::unit;
   }
 
   virtual void workingCopyParentHint(const RootId&) {}

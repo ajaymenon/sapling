@@ -8,7 +8,8 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
-cxx = "1.0.119"
+anyhow = "1.0.102"
+cxx = "1.0.194"
+cxxerror = { version = "0.1.0", path = "../../../scm/lib/edenfs_ffi/cxxerror" }
 edenfs-client = { version = "0.1.0", path = "../../cli_rs/edenfs-client" }
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }

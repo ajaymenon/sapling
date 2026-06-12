@@ -9,6 +9,7 @@
 
 #include "eden/fs/privhelper/PrivHelperServer.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
+#include "eden/fs/privhelper/PrivHelperRollback.h"
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <fcntl.h>
@@ -28,18 +29,24 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/Unistd.h>
 #include <folly/system/ThreadName.h>
+#ifndef __APPLE__
+#include <linux/openat2.h>
+#endif
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#ifndef __APPLE__
+#include <sys/syscall.h>
+#endif
 #include <sys/types.h>
 #include <chrono>
 #include <csignal>
-#include <set>
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/SysctlUtil.h"
 #include "eden/common/utils/Throw.h"
 #include "eden/fs/privhelper/NfsMountRpc.h"
 #include "eden/fs/privhelper/priority/ProcessPriority.h"
+#include "eden/fs/utils/MountInfoTable.h"
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h> // @manual
@@ -67,6 +74,272 @@ namespace facebook::eden {
 static constexpr folly::StringPiece kFamBinaryPath{
     "/usr/local/libexec/eden/edenfs_fam/SCMFileAccessMonitor.app/Contents/MacOS/SCMFileAccessMonitor"};
 
+namespace {
+
+#ifndef __APPLE__
+constexpr int kRegisteredMountRootOpenFlags = O_PATH | O_DIRECTORY | O_CLOEXEC;
+#endif
+
+#ifndef __APPLE__
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 1
+#endif
+#ifndef OPEN_TREE_CLOEXEC
+#define OPEN_TREE_CLOEXEC O_CLOEXEC
+#endif
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#endif
+#ifndef MOVE_MOUNT_T_EMPTY_PATH
+#define MOVE_MOUNT_T_EMPTY_PATH 0x00000040
+#endif
+#ifndef FSOPEN_CLOEXEC
+#define FSOPEN_CLOEXEC 0x00000001
+#endif
+#ifndef FSCONFIG_SET_FLAG
+#define FSCONFIG_SET_FLAG 0
+#endif
+#ifndef FSCONFIG_SET_STRING
+#define FSCONFIG_SET_STRING 1
+#endif
+#ifndef FSCONFIG_CMD_CREATE
+#define FSCONFIG_CMD_CREATE 6
+#endif
+#ifndef FSMOUNT_CLOEXEC
+#define FSMOUNT_CLOEXEC 0x00000001
+#endif
+#ifndef MOUNT_ATTR_RDONLY
+#define MOUNT_ATTR_RDONLY 0x00000001
+#endif
+#ifndef MOUNT_ATTR_NOSUID
+#define MOUNT_ATTR_NOSUID 0x00000002
+#endif
+
+std::string bindMountTargetSuffix(
+    folly::StringPiece mountRoot,
+    folly::StringPiece mountPath) {
+  auto suffix = mountPath.subpiece(mountRoot.size());
+  if (suffix.empty()) {
+    return ".";
+  }
+  XCHECK_EQ('/', suffix.front());
+  suffix.advance(1);
+  return suffix.empty() ? "." : suffix.str();
+}
+
+void fsConfigSet(
+    int fsFd,
+    unsigned int command,
+    const char* key,
+    const char* value,
+    int aux = 0) {
+  const auto rc =
+      static_cast<int>(syscall(SYS_fsconfig, fsFd, command, key, value, aux));
+  checkUnixError(
+      rc,
+      "failed to configure filesystem context option `",
+      key ? key : "<create>",
+      "`");
+}
+
+void fsConfigFlag(int fsFd, folly::StringPiece key) {
+  const auto keyStr = key.str();
+  fsConfigSet(fsFd, FSCONFIG_SET_FLAG, keyStr.c_str(), nullptr);
+}
+
+void fsConfigString(
+    int fsFd,
+    folly::StringPiece key,
+    folly::StringPiece value) {
+  const auto keyStr = key.str();
+  const auto valueStr = value.str();
+  fsConfigSet(fsFd, FSCONFIG_SET_STRING, keyStr.c_str(), valueStr.c_str());
+}
+
+void fsConfigCommaSeparatedOptions(int fsFd, folly::StringPiece mountOptions) {
+  std::vector<folly::StringPiece> options;
+  folly::split(',', mountOptions, options, /*ignoreEmpty=*/true);
+  for (const auto& option : options) {
+    const auto separator = option.find('=');
+    if (separator == folly::StringPiece::npos) {
+      fsConfigFlag(fsFd, option);
+      continue;
+    }
+    fsConfigString(
+        fsFd, option.subpiece(0, separator), option.subpiece(separator + 1));
+  }
+}
+
+folly::File fsOpen(folly::StringPiece fsType) {
+  const auto fsTypeStr = fsType.str();
+  const auto fsFd =
+      static_cast<int>(syscall(SYS_fsopen, fsTypeStr.c_str(), FSOPEN_CLOEXEC));
+  checkUnixError(fsFd, "failed to open filesystem context for `", fsType, "`");
+  return folly::File{fsFd, /*ownsFd=*/true};
+}
+
+folly::File fsMount(int fsFd, bool readOnly) {
+  unsigned int mountAttrs = MOUNT_ATTR_NOSUID;
+  if (readOnly) {
+    mountAttrs |= MOUNT_ATTR_RDONLY;
+  }
+
+  const auto mountFd =
+      static_cast<int>(syscall(SYS_fsmount, fsFd, FSMOUNT_CLOEXEC, mountAttrs));
+  checkUnixError(mountFd, "failed to create detached mount");
+  return folly::File{mountFd, /*ownsFd=*/true};
+}
+
+void moveDetachedMount(
+    const folly::File& detachedMount,
+    const folly::File& targetFd,
+    const char* mountPath) {
+  const auto rc = static_cast<int>(syscall(
+      SYS_move_mount,
+      detachedMount.fd(),
+      "",
+      targetFd.fd(),
+      "",
+      MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH));
+  checkUnixError(rc, "failed to attach detached mount over `", mountPath, "`");
+}
+
+int linuxUnmountFlags(UnmountOptions options, bool noFollow) {
+  int umountFlags = (noFollow ? UMOUNT_NOFOLLOW : 0) | MNT_DETACH;
+
+  // Only "force" is checked because as this is implemented, we only plan to
+  // add "--no-force" as an option. The other options are not checked until
+  // we need to support valid use cases for them.
+  if (!options.detach || options.expire) {
+    XLOGF(
+        DFATAL,
+        "Unsupported unmount option provided: 'detach'{}",
+        options.detach);
+  }
+  if (options.expire) {
+    XLOGF(
+        DFATAL,
+        "Unsupported unmount option provided: 'expire'{}",
+        options.expire);
+  }
+  if (options.force) {
+    umountFlags |= MNT_FORCE;
+  }
+  return umountFlags;
+}
+
+#endif
+
+void logUnmountError(const char* mountPath, int errnum) {
+  // EINVAL simply means the path is no longer mounted. This can happen if it
+  // was already manually unmounted by a separate process.
+  if (errnum != EINVAL) {
+    XLOGF(
+        WARNING, "error unmounting {}: {}", mountPath, folly::errnoStr(errnum));
+  }
+}
+
+} // namespace
+
+PrivHelperServer::RegisteredMount PrivHelperServer::openRegisteredMount(
+    const std::string& mountPath) {
+#ifdef __APPLE__
+  (void)mountPath;
+  return RegisteredMount{};
+#else
+  const auto rootFd = open(mountPath.c_str(), kRegisteredMountRootOpenFlags);
+  checkUnixError(
+      rootFd, "failed to open registered mount root `", mountPath, "`");
+  XLOGF(DBG2, "Opened registered mount root `{}` by fd", mountPath);
+  return RegisteredMount{folly::File{rootFd, /*ownsFd=*/true}};
+#endif
+}
+
+void PrivHelperServer::registerMountPoint(const std::string& mountPath) {
+  mountPoints_.erase(mountPath);
+  mountPoints_.emplace(mountPath, openRegisteredMount(mountPath));
+}
+
+void PrivHelperServer::registerMountPoint(
+    const std::string& mountPath,
+    RegisteredMount registeredMount) {
+  XLOGF(DBG2, "Registered mount root `{}` from existing mount fd", mountPath);
+  mountPoints_.erase(mountPath);
+  mountPoints_.emplace(mountPath, std::move(registeredMount));
+}
+
+void PrivHelperServer::unmountRegisteredMount(
+    const std::string& mountPath,
+    const RegisteredMount& registeredMount,
+    UnmountOptions options) {
+#ifdef __APPLE__
+  (void)registeredMount;
+#else
+  if (useModernMountApi()) {
+    const auto procFdPath =
+        fmt::format("/proc/self/fd/{}", registeredMount.rootFd.fd());
+    struct stat st{};
+    // This probes procfs support for an already-open fd before using that fd
+    // path for umount2().
+    //
+    // @lint-ignore CLANGTIDY facebook-hte-BadCall-stat
+    if (stat(procFdPath.c_str(), &st) == 0) {
+      XLOGF(
+          DBG2,
+          "Unmounting registered mount `{}` through `{}`",
+          mountPath,
+          procFdPath);
+      const auto rc =
+          umount2(procFdPath.c_str(), linuxUnmountFlags(options, false));
+      if (rc != 0) {
+        logUnmountError(mountPath.c_str(), errno);
+      }
+      return;
+    }
+
+    XLOGF(
+        DBG2,
+        "failed to stat {}; falling back to path-based unmount for {}: {}",
+        procFdPath,
+        mountPath,
+        folly::errnoStr(errno));
+  }
+#endif
+  unmount(mountPath.c_str(), options);
+}
+
+folly::File PrivHelperServer::openBindMountTarget(
+    folly::StringPiece mountRoot,
+    folly::StringPiece mountPath) {
+#ifdef __APPLE__
+  (void)mountRoot;
+  (void)mountPath;
+  throw std::runtime_error("this system does not support bind mounts");
+#else
+  const auto mountPoint = mountPoints_.find(mountRoot.str());
+  if (mountPoint == mountPoints_.end()) {
+    throwf<std::domain_error>("No FUSE mount found for {}", mountRoot);
+  }
+
+  const auto suffix = bindMountTargetSuffix(mountRoot, mountPath);
+  struct open_how targetHow{};
+  targetHow.flags = O_PATH | O_DIRECTORY | O_CLOEXEC;
+  // Resolve the target relative to the registered mount root in the same
+  // kernel operation that returns the fd. This rejects ".." escapes and
+  // symlink components without a separate check-then-open window.
+  targetHow.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS;
+  auto targetFdNum = static_cast<int>(syscall(
+      SYS_openat2,
+      mountPoint->second.rootFd.fd(),
+      suffix.c_str(),
+      &targetHow,
+      sizeof(targetHow)));
+  checkUnixError(
+      targetFdNum, "failed to open bind mount target `", mountPath, "`");
+  return folly::File{targetFdNum, /*ownsFd=*/true};
+#endif
+}
+
 PrivHelperServer::PrivHelperServer() = default;
 
 PrivHelperServer::~PrivHelperServer() = default;
@@ -80,7 +353,7 @@ void PrivHelperServer::initPartial(folly::File socket, uid_t uid, gid_t gid) {
   XCHECK_EQ(uid_, std::numeric_limits<uid_t>::max());
   XCHECK_EQ(gid_, std::numeric_limits<gid_t>::max());
 
-  // Set our thread name to to make it easier to distinguish
+  // Set our thread name to make it easier to distinguish
   // the privhelper process from the main EdenFS process.  Setting the thread
   // name for the main thread also changes the process name reported
   // /proc/PID/comm (and therefore by ps).
@@ -299,7 +572,7 @@ folly::File mountOSXFuse(
       ioctl(fuseDev.fd(), FUSEDEVIOCGETRANDOM, &args.random),
       "failed negotiation with ioctl FUSEDEVIOCGETRANDOM");
 
-  // We get to set some metadata for for mounted volume
+  // We get to set some metadata for the mounted volume
   checkThenPlaceInBuffer(
       args.fsname,
       fmt::format(
@@ -507,6 +780,94 @@ folly::File mountMacFuse(
 } // namespace
 #endif
 
+#ifndef __APPLE__
+namespace {
+folly::File openLinuxFuseDevice() {
+  // We manually call open() here rather than using the folly::File()
+  // constructor just so we can emit a slightly more helpful message on error.
+  const char* devName = "/dev/fuse";
+  const int fd = folly::openNoInt(devName, O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno == ENODEV || errno == ENOENT) {
+      throwSystemError(
+          "failed to open ",
+          devName,
+          ": make sure the fuse kernel module is loaded");
+    } else {
+      throwSystemError("failed to open ", devName);
+    }
+  }
+  return folly::File{fd, /*ownsFd=*/true};
+}
+
+std::string makeLinuxNfsMountOptions(const NFSMountOptions& options) {
+  // Since each mount point will have its own NFS server, we need to manually
+  // specify it.
+  folly::StringPiece noReaddirplusStr = ",nordirplus,";
+  if (options.useReaddirplus) {
+    noReaddirplusStr = ",";
+  }
+
+  // Check if we should use a soft or hard mount.
+  // https://linux.die.net/man/5/nfs
+  folly::StringPiece softOptionStr = "hard";
+  if (options.useSoftMount) {
+    softOptionStr = "soft";
+  }
+
+  return fmt::format(
+      "addr={},vers=3,proto=tcp,port={},mountvers=3,mountproto=tcp,mountport={},"
+      "noresvport,nolock{}{},retrans={},timeo={},rsize={},wsize={}",
+      options.nfsdAddr.getAddressStr(),
+      options.nfsdAddr.getPort(),
+      options.mountdAddr.getPort(),
+      noReaddirplusStr,
+      softOptionStr,
+      options.retransmitAttempts,
+      options.retransmitTimeoutTenthSeconds,
+      options.readIOSize,
+      options.writeIOSize);
+}
+
+/**
+ * Configure FUSE read-ahead by writing to
+ * /sys/class/bdi/{major}:{minor}/read_ahead_kb
+ */
+void configureFuseReadAhead(const char* mountPath, uint32_t readAheadKb) {
+  auto result = getMountInfoForPath(mountPath);
+  if (result.hasError()) {
+    XLOGF(
+        WARN,
+        "Cannot determine device for {}: {}; skipping BDI config",
+        mountPath,
+        folly::errnoStr(result.error()));
+    return;
+  }
+  if (!result.value().has_value()) {
+    XLOGF(WARN, "No mount found for {}, skipping BDI config", mountPath);
+    return;
+  }
+  const auto& info = result.value().value();
+
+  auto bdiPath = fmt::format(
+      "/sys/class/bdi/{}:{}/read_ahead_kb", info.devMajor, info.devMinor);
+
+  auto valueStr = fmt::format("{}", readAheadKb);
+  if (!folly::writeFile(valueStr, bdiPath.c_str())) {
+    throwSystemError(
+        fmt::format("Failed to write {} to {}", valueStr, bdiPath));
+  }
+
+  XLOGF(
+      DBG2,
+      "Configured FUSE read-ahead to {} KB for {}:{}",
+      readAheadKb,
+      info.devMajor,
+      info.devMinor);
+}
+} // namespace
+#endif
+
 folly::File PrivHelperServer::fuseMount(
     const char* mountPath,
     bool readOnly,
@@ -526,21 +887,7 @@ folly::File PrivHelperServer::fuseMount(
     return mountOSXFuse(mountPath, readOnly, fuseTimeout_, useDevEdenFs_);
   }
 #else
-  // We manually call open() here rather than using the folly::File()
-  // constructor just so we can emit a slightly more helpful message on error.
-  const char* devName = "/dev/fuse";
-  const int fd = folly::openNoInt(devName, O_RDWR | O_CLOEXEC);
-  if (fd < 0) {
-    if (errno == ENODEV || errno == ENOENT) {
-      throwSystemError(
-          "failed to open ",
-          devName,
-          ": make sure the fuse kernel module is loaded");
-    } else {
-      throwSystemError("failed to open ", devName);
-    }
-  }
-  folly::File fuseDev(fd, true);
+  auto fuseDev = openLinuxFuseDevice();
 
   // Prepare the flags and options to pass to mount(2).
   // We currently don't allow these to be customized by the unprivileged
@@ -570,6 +917,46 @@ folly::File PrivHelperServer::fuseMount(
   return fuseDev;
 #endif
 }
+
+#ifndef __APPLE__
+PrivHelperServer::FuseMountResult PrivHelperServer::fuseMountByFd(
+    folly::File targetFd,
+    const char* mountPath,
+    bool readOnly,
+    const char* vfsType) {
+  XLOGF(
+      DBG1,
+      "Mounting `{}` via fd-native FUSE with type `{}`; readOnly={}",
+      mountPath,
+      vfsType,
+      readOnly);
+  auto fuseDev = openLinuxFuseDevice();
+
+  const int rootMode = S_IFDIR;
+  auto mountOpts = fmt::format(
+      "allow_other,default_permissions,"
+      "rootmode={:o},user_id={},group_id={},fd={}",
+      rootMode,
+      uid_,
+      gid_,
+      fuseDev.fd());
+
+  auto fsFd = fsOpen(vfsType);
+  // The colon preserves the old "remote" source name used by mount(2).
+  fsConfigString(fsFd.fd(), "source", "edenfs:");
+  fsConfigCommaSeparatedOptions(fsFd.fd(), mountOpts);
+  fsConfigSet(fsFd.fd(), FSCONFIG_CMD_CREATE, nullptr, nullptr);
+
+  auto mountFd = fsMount(fsFd.fd(), readOnly);
+  // Attach the detached mount to the already-open target fd, then keep that
+  // mount fd as the registered root for future bind redirects.
+  moveDetachedMount(mountFd, targetFd, mountPath);
+  return FuseMountResult{
+      std::move(fuseDev),
+      RegisteredMount{std::move(mountFd)},
+  };
+}
+#endif
 
 void PrivHelperServer::nfsMount(
     std::string mountPath,
@@ -636,6 +1023,8 @@ void PrivHelperServer::nfsMount(
    *   short for files to be fetched, thus make it configurable.
    * Possibly specifies dumbtimer behavior, iff an EdenConfig value is
    *   explicitly set.
+   * Suppresses macOS kernel JUKEBOX retry logging (NFS_MFLAG_MUTEJUKEBOX),
+   *   since EdenFS uses NFS3ERR_JUKEBOX intentionally for backpressure.
    *
    * See `man mount_nfs` for more options.
    */
@@ -643,9 +1032,10 @@ void PrivHelperServer::nfsMount(
   nfs_mattr_flags flags{
       NFS_MATTR_BITMAP_LEN,
       NFS_MFLAG_RESVPORT | NFS_MFLAG_RDIRPLUS | NFS_MFLAG_SOFT |
-          NFS_MFLAG_INTR | unmask_dumbtimer,
+          NFS_MFLAG_INTR | NFS_MFLAG_MUTEJUKEBOX | unmask_dumbtimer,
       NFS_MATTR_BITMAP_LEN,
-      NFS_MFLAG_INTR | readdirplus_flag | soft_flag | dumbtimer_flag};
+      NFS_MFLAG_INTR | NFS_MFLAG_MUTEJUKEBOX | readdirplus_flag | soft_flag |
+          dumbtimer_flag};
   XdrTrait<nfs_mattr_flags>::serialize(attrSer, flags);
 
   mattrFlags |= NFS_MATTR_NFS_VERSION;
@@ -850,33 +1240,7 @@ void PrivHelperServer::nfsMount(
             options.mountdAddr.describe(),
             options.nfsdAddr.describe()));
   }
-  // Prepare the flags and options to pass to mount(2).
-  // Since each mount point will have its own NFS server, we need to manually
-  // specify it.
-  folly::StringPiece noReaddirplusStr = ",nordirplus,";
-  if (options.useReaddirplus) {
-    noReaddirplusStr = ",";
-  }
-
-  // Check if we should use a soft or hard mount.
-  // https://linux.die.net/man/5/nfs
-  folly::StringPiece softOptionStr = "hard";
-  if (options.useSoftMount) {
-    softOptionStr = "soft";
-  }
-
-  auto mountOpts = fmt::format(
-      "addr={},vers=3,proto=tcp,port={},mountvers=3,mountproto=tcp,mountport={},"
-      "noresvport,nolock{}{},retrans={},timeo={},rsize={},wsize={}",
-      options.nfsdAddr.getAddressStr(),
-      options.nfsdAddr.getPort(),
-      options.mountdAddr.getPort(),
-      noReaddirplusStr,
-      softOptionStr,
-      options.retransmitAttempts,
-      options.retransmitTimeoutTenthSeconds,
-      options.readIOSize,
-      options.writeIOSize);
+  auto mountOpts = makeLinuxNfsMountOptions(options);
 
   // The mount flags.
   // We do not use MS_NODEV.  MS_NODEV prevents mount points from being created
@@ -895,7 +1259,41 @@ void PrivHelperServer::nfsMount(
 #endif
 }
 
-void PrivHelperServer::bindMount(
+#ifndef __APPLE__
+PrivHelperServer::RegisteredMount PrivHelperServer::nfsMountByFd(
+    folly::File targetFd,
+    const std::string& mountPath,
+    const NFSMountOptions& options) {
+  if (!options.mountdAddr.isFamilyInet() || !options.nfsdAddr.isFamilyInet()) {
+    folly::throwSystemErrorExplicit(
+        EINVAL,
+        fmt::format(
+            "only inet addresses are supported: mountdAddr=\"{}\", nfsdAddr=\"{}\"",
+            options.mountdAddr.describe(),
+            options.nfsdAddr.describe()));
+  }
+
+  auto mountOpts = makeLinuxNfsMountOptions(options);
+  auto source = fmt::format("edenfs:{}", mountPath);
+  XLOGF(
+      DBG1,
+      "Mounting {} via fd-native NFS with opts: {}; readOnly={}",
+      source,
+      mountOpts,
+      options.readOnly);
+
+  auto fsFd = fsOpen("nfs");
+  fsConfigString(fsFd.fd(), "source", source);
+  fsConfigCommaSeparatedOptions(fsFd.fd(), mountOpts);
+  fsConfigSet(fsFd.fd(), FSCONFIG_CMD_CREATE, nullptr, nullptr);
+
+  auto mountFd = fsMount(fsFd.fd(), options.readOnly);
+  moveDetachedMount(mountFd, targetFd, mountPath.c_str());
+  return RegisteredMount{std::move(mountFd)};
+}
+#endif
+
+void PrivHelperServer::insecureBindMount(
     const char* clientPath,
     const char* mountPath) {
 #ifdef __APPLE__
@@ -903,10 +1301,65 @@ void PrivHelperServer::bindMount(
   (void)mountPath;
   throw std::runtime_error("this system does not support bind mounts");
 #else
+  // This path is kept only for the root-controlled rollback marker. mount(2)
+  // resolves mountPath by string, so it cannot close the target-path race.
   const int rc =
       mount(clientPath, mountPath, /*type*/ nullptr, MS_BIND, /*data*/ nullptr);
   checkUnixError(
       rc, "failed to bind mount `", clientPath, "` over `", mountPath, "`");
+#endif
+}
+
+void PrivHelperServer::bindMount(
+    const char* clientPath,
+    const char* mountPath,
+    folly::StringPiece mountRoot) {
+#ifdef __APPLE__
+  (void)clientPath;
+  (void)mountPath;
+  (void)mountRoot;
+  throw std::runtime_error("this system does not support bind mounts");
+#else
+  auto targetFd = openBindMountTarget(mountRoot, mountPath);
+  XLOGF(
+      DBG2,
+      "Moving detached bind mount from `{}` to `{}` by fd",
+      clientPath,
+      mountPath);
+
+  // Clone the source mount into a detached tree, then attach it to the target
+  // fd. The target path is not re-resolved by string during the attach.
+  auto treeFdNum = static_cast<int>(syscall(
+      SYS_open_tree,
+      AT_FDCWD,
+      clientPath,
+      OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC));
+  checkUnixError(
+      treeFdNum, "failed to clone bind mount source `", clientPath, "`");
+  folly::File treeFd{treeFdNum, /*ownsFd=*/true};
+
+  const auto rc = static_cast<int>(syscall(
+      SYS_move_mount,
+      treeFd.fd(),
+      "",
+      targetFd.fd(),
+      "",
+      MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH));
+  checkUnixError(
+      rc,
+      "failed to move detached bind mount `",
+      clientPath,
+      "` over `",
+      mountPath,
+      "`");
+#endif
+}
+
+bool PrivHelperServer::useModernMountApi() const {
+#ifdef __APPLE__
+  return false;
+#else
+  return !disablePrivHelperHardening();
 #endif
 }
 
@@ -939,40 +1392,11 @@ void PrivHelperServer::unmount(
   // a more flexible behavior if needed.
   //
   // In the future it might be nice to provide more smarter unmount options.
-  int umountFlags = UMOUNT_NOFOLLOW | MNT_DETACH;
-
-  // Only "force" is checked because as this is implemented, we only plan to
-  // add "--no-force" as an option. The other options are not checked until
-  // we need to support valid use cases for them.
-  if (!options.detach || options.expire) {
-    XLOGF(
-        DFATAL,
-        "Unsupported unmount option provided: 'detach'{}",
-        options.detach);
-  }
-  if (options.expire) {
-    XLOGF(
-        DFATAL,
-        "Unsupported unmount option provided: 'expire'{}",
-        options.expire);
-  }
-  if (options.force) {
-    umountFlags |= MNT_FORCE;
-  }
+  const auto umountFlags = linuxUnmountFlags(options, true);
   const auto rc = umount2(mountPath, umountFlags);
 #endif
   if (rc != 0) {
-    const int errnum = errno;
-    // EINVAL simply means the path is no longer mounted.
-    // This can happen if it was already manually unmounted by a
-    // separate process.
-    if (errnum != EINVAL) {
-      XLOGF(
-          WARNING,
-          "error unmounting {}: {}",
-          mountPath,
-          folly::errnoStr(errnum));
-    }
+    logUnmountError(mountPath, errno);
   }
 }
 
@@ -987,10 +1411,21 @@ UnixSocket::Message PrivHelperServer::processTakeoverStartupMsg(
       mountPath,
       bindMounts.size());
 
-  sanityCheckMountPoint(mountPath);
+  // Skip stale bind mount cleanup on takeover: the kernel preserves live
+  // redirections (e.g. buck-out) across a graceful restart, so unmounting
+  // them here would destroy legitimate user state.
+  auto sanityResult = sanityCheckMountPoint(
+      mountPath,
+      /*isNFS=*/false,
+      /*isHardMount=*/false,
+      /*performBindMountCleanup=*/false);
 
-  mountPoints_.insert(mountPath);
-  return makeResponse();
+  registerMountPoint(mountPath);
+  auto response = makeResponse();
+  response.data.unshare();
+  folly::io::Appender appender(&response.data, 0);
+  PrivHelperConn::serializeSanityCheckResult(appender, sanityResult);
+  return response;
 }
 
 UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
@@ -1000,12 +1435,41 @@ UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
   PrivHelperConn::parseMountRequest(cursor, mountPath, readOnly, vfsType);
   XLOGF(DBG3, "mount \"{}\"", mountPath);
 
-  sanityCheckMountPoint(mountPath);
+#ifndef __APPLE__
+  if (useModernMountApi()) {
+    auto checkedMount = openAndSanityCheckMountPoint(mountPath);
+    auto mountResult = fuseMountByFd(
+        std::move(checkedMount.targetFd),
+        mountPath.c_str(),
+        readOnly,
+        vfsType.c_str());
+    registerMountPoint(mountPath, std::move(mountResult.registeredMount));
 
+    auto response = makeResponse(std::move(mountResult.fuseDev));
+    response.data.unshare();
+    folly::io::Appender appender(&response.data, 0);
+    PrivHelperConn::serializeSanityCheckResult(
+        appender, checkedMount.sanityResult);
+    return response;
+  }
+  if (disablePrivHelperHardening()) {
+    XLOGF(
+        WARNING,
+        "Using legacy path-based FUSE mount for `{}` because `{}` is present",
+        mountPath,
+        kDisablePrivHelperHardeningPath);
+  }
+#endif
+
+  auto sanityResult = sanityCheckMountPoint(mountPath);
   auto fuseDev = fuseMount(mountPath.c_str(), readOnly, vfsType.c_str());
-  mountPoints_.insert(mountPath);
+  registerMountPoint(mountPath);
 
-  return makeResponse(std::move(fuseDev));
+  auto response = makeResponse(std::move(fuseDev));
+  response.data.unshare();
+  folly::io::Appender appender(&response.data, 0);
+  PrivHelperConn::serializeSanityCheckResult(appender, sanityResult);
+  return response;
 }
 
 UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
@@ -1014,12 +1478,40 @@ UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
   PrivHelperConn::parseMountNfsRequest(cursor, mountPath, options);
   XLOGF(DBG3, "mount.nfs \"{}\"", mountPath);
 
-  sanityCheckMountPoint(mountPath, /*isNFS=*/true, !options.useSoftMount);
+#ifndef __APPLE__
+  if (useModernMountApi()) {
+    auto checkedMount = openAndSanityCheckMountPoint(
+        mountPath, /*isNFS=*/true, !options.useSoftMount);
+    registerMountPoint(
+        mountPath,
+        nfsMountByFd(std::move(checkedMount.targetFd), mountPath, options));
 
+    auto response = makeResponse();
+    response.data.unshare();
+    folly::io::Appender appender(&response.data, 0);
+    PrivHelperConn::serializeSanityCheckResult(
+        appender, checkedMount.sanityResult);
+    return response;
+  }
+  if (disablePrivHelperHardening()) {
+    XLOGF(
+        WARNING,
+        "Using legacy path-based NFS mount for `{}` because `{}` is present",
+        mountPath,
+        kDisablePrivHelperHardeningPath);
+  }
+#endif
+
+  auto sanityResult =
+      sanityCheckMountPoint(mountPath, /*isNFS=*/true, !options.useSoftMount);
   nfsMount(mountPath, std::move(options));
-  mountPoints_.insert(mountPath);
+  registerMountPoint(mountPath);
 
-  return makeResponse();
+  auto response = makeResponse();
+  response.data.unshare();
+  folly::io::Appender appender(&response.data, 0);
+  PrivHelperConn::serializeSanityCheckResult(appender, sanityResult);
+  return response;
 }
 
 UnixSocket::Message PrivHelperServer::processUnmountMsg(Cursor& cursor) {
@@ -1033,8 +1525,8 @@ UnixSocket::Message PrivHelperServer::processUnmountMsg(Cursor& cursor) {
     throwf<std::domain_error>("No FUSE mount found for {}", mountPath);
   }
 
-  unmount(mountPath.c_str(), options);
-  mountPoints_.erase(mountPath);
+  unmountRegisteredMount(mountPath, it->second, options);
+  mountPoints_.erase(it);
   return makeResponse();
 }
 
@@ -1048,8 +1540,8 @@ UnixSocket::Message PrivHelperServer::processNfsUnmountMsg(Cursor& cursor) {
     throwf<std::domain_error>("No NFS mount found for {}", mountPath);
   }
 
-  unmount(mountPath.c_str(), {});
-  mountPoints_.erase(mountPath);
+  unmountRegisteredMount(mountPath, it->second, {});
+  mountPoints_.erase(it);
   return makeResponse();
 }
 
@@ -1064,12 +1556,13 @@ UnixSocket::Message PrivHelperServer::processTakeoverShutdownMsg(
     throwf<std::domain_error>("No mount found for {}", mountPath);
   }
 
-  mountPoints_.erase(mountPath);
+  mountPoints_.erase(it);
   return makeResponse();
 }
 
 std::string PrivHelperServer::findMatchingMountPrefix(folly::StringPiece path) {
-  for (const auto& mountPoint : mountPoints_) {
+  for (const auto& entry : mountPoints_) {
+    const auto& mountPoint = entry.first;
     if (boost::starts_with(path, mountPoint + "/")) {
       return mountPoint;
     }
@@ -1086,9 +1579,22 @@ UnixSocket::Message PrivHelperServer::processBindMountMsg(Cursor& cursor) {
   // findMatchingMountPrefix will throw if mountPath doesn't match
   // any known mount.  We perform this check so that we're not a
   // vector for mounting things in arbitrary places.
-  auto key = findMatchingMountPrefix(mountPath);
+  auto mountRoot = findMatchingMountPrefix(mountPath);
 
-  bindMount(clientPath.c_str(), mountPath.c_str());
+#ifndef __APPLE__
+  if (disablePrivHelperHardening()) {
+    XLOGF(
+        WARNING,
+        "Using legacy path-based bind mount for `{}` because `{}` is present",
+        mountPath,
+        kDisablePrivHelperHardeningPath);
+    // The rollback marker intentionally restores the old path-based behavior.
+    insecureBindMount(clientPath.c_str(), mountPath.c_str());
+    return makeResponse();
+  }
+#endif
+
+  bindMount(clientPath.c_str(), mountPath.c_str(), mountRoot);
   return makeResponse();
 }
 
@@ -1100,9 +1606,24 @@ UnixSocket::Message PrivHelperServer::processBindUnMountMsg(Cursor& cursor) {
   // findMatchingMountPrefix will throw if mountPath doesn't match
   // any known mount.  We perform this check so that we're not a
   // vector for arbitrarily unmounting things.
-  findMatchingMountPrefix(mountPath);
+  auto mountRoot = findMatchingMountPrefix(mountPath);
 
-  bindUnmount(mountPath.c_str());
+#ifndef __APPLE__
+  if (!disablePrivHelperHardening()) {
+    bindUnmount(mountPath.c_str(), mountRoot);
+    return makeResponse();
+  }
+#endif
+
+#ifndef __APPLE__
+  XLOGF(
+      WARNING,
+      "Using legacy path-based bind unmount for `{}` because `{}` is present",
+      mountPath,
+      kDisablePrivHelperHardeningPath);
+#endif
+  // The rollback marker intentionally restores the old path-based behavior.
+  insecureBindUnmount(mountPath.c_str());
 
   return makeResponse();
 }
@@ -1163,6 +1684,43 @@ UnixSocket::Message PrivHelperServer::processGetPid() {
   response.data.unshare();
   folly::io::Appender cursor{&response.data, 0};
   cursor.writeBE<pid_t>(pid);
+  return response;
+}
+
+UnixSocket::Message PrivHelperServer::processGetNamespaceInfo(
+    folly::io::Cursor& cursor) {
+  XLOG(DBG3, "get namespace info");
+
+  pid_t daemonPid = cursor.readBE<pid_t>();
+
+  auto statIno = [](const char* path) -> ino_t {
+    struct stat st = {};
+    if (::stat(path, &st) != 0) {
+      throwf<std::runtime_error>(
+          "failed to stat {}: {}", path, folly::errnoStr(errno));
+    }
+    return st.st_ino;
+  };
+
+  auto rootIno = statIno("/proc/1/ns/mnt");
+  auto selfMountIno = statIno("/proc/self/ns/mnt");
+  auto selfPidIno = statIno("/proc/self/ns/pid");
+
+  auto daemonMountNsPath = fmt::format("/proc/{}/ns/mnt", daemonPid);
+  auto daemonMountIno = statIno(daemonMountNsPath.c_str());
+
+  auto daemonPidNsPath = fmt::format("/proc/{}/ns/pid", daemonPid);
+  auto daemonPidIno = statIno(daemonPidNsPath.c_str());
+
+  auto response = makeResponse();
+  response.data.unshare();
+  folly::io::Appender appender{&response.data, 0};
+  appender.writeBE<pid_t>(getpid());
+  appender.writeBE<uint64_t>(rootIno);
+  appender.writeBE<uint64_t>(selfMountIno);
+  appender.writeBE<uint64_t>(selfPidIno);
+  appender.writeBE<uint64_t>(daemonMountIno);
+  appender.writeBE<uint64_t>(daemonPidIno);
   return response;
 }
 
@@ -1270,6 +1828,21 @@ UnixSocket::Message PrivHelperServer::processSetMemoryPriorityForProcess(
   return makeResponse();
 }
 
+UnixSocket::Message PrivHelperServer::processSetFuseReadAhead(
+    folly::io::Cursor& cursor) {
+  std::string mountPath;
+  uint32_t readAheadKb;
+  PrivHelperConn::parseSetFuseReadAheadRequest(cursor, mountPath, readAheadKb);
+#ifndef __APPLE__
+  configureFuseReadAhead(mountPath.c_str(), readAheadKb);
+#else
+  (void)mountPath;
+  (void)readAheadKb;
+  XLOG(WARN, "FUSE BDI read-ahead configuration is not supported on macOS");
+#endif
+  return makeResponse();
+}
+
 void PrivHelperServer::setMemoryPriorityForProcess(pid_t pid, int priority) {
   auto processPriority = ProcessPriority{priority};
 
@@ -1288,15 +1861,20 @@ folly::Expected<unsigned long, int> getFSID(const char* path) {
   }
   return folly::makeExpected<int>(data.f_fsid);
 }
-} // namespace
 
-void PrivHelperServer::bindUnmount(const char* mountPath) {
-  // Check the current filesystem information for this path,
-  // so we can confirm that it has been unmounted afterwards.
-  const auto origFSID = getFSID(mountPath);
+#ifndef __APPLE__
+folly::Expected<unsigned long, int> getFSID(int fd) {
+  struct statvfs data{};
+  if (fstatvfs(fd, &data) != 0) {
+    return folly::makeUnexpected(errno);
+  }
+  return folly::makeExpected<int>(data.f_fsid);
+}
+#endif
 
-  unmount(mountPath, {});
-
+void waitForUnmount(
+    const char* mountPath,
+    folly::Expected<unsigned long, int> origFSID) {
   // Empirically, the unmount may not be complete when umount2() returns.
   // To work around this, we repeatedly invoke statvfs() on the bind mount
   // until it fails or returns a different filesystem ID.
@@ -1324,6 +1902,69 @@ void PrivHelperServer::bindUnmount(const char* mountPath) {
     }
     sched_yield();
   }
+}
+
+#ifndef __APPLE__
+bool bindUnmountByFd(const folly::File& targetFd, const char* mountPath) {
+  const auto procFdPath = fmt::format("/proc/self/fd/{}", targetFd.fd());
+  // umount2() still takes a path, but this procfs path refers to the already
+  // open target fd. Do not pass UMOUNT_NOFOLLOW here: the procfd magic link is
+  // the mechanism that converts the fd back to a kernel path for umount2().
+  struct stat st{};
+  // This probes procfs support for an already-open fd before deciding whether
+  // to use the explicit legacy fallback.
+  //
+  // @lint-ignore CLANGTIDY facebook-hte-BadCall-stat
+  if (stat(procFdPath.c_str(), &st) != 0) {
+    XLOGF(
+        DBG2,
+        "failed to stat {}; falling back to path-based unmount for {}: {}",
+        procFdPath,
+        mountPath,
+        folly::errnoStr(errno));
+    return false;
+  }
+
+  XLOGF(DBG2, "Unmounting bind mount `{}` through `{}`", mountPath, procFdPath);
+  const auto rc = umount2(procFdPath.c_str(), MNT_DETACH);
+  checkUnixError(
+      rc,
+      "failed to unmount bind mount `",
+      mountPath,
+      "` through `",
+      procFdPath,
+      "`");
+  return true;
+}
+#endif
+} // namespace
+
+void PrivHelperServer::insecureBindUnmount(const char* mountPath) {
+  // Check the current filesystem information for this path,
+  // so we can confirm that it has been unmounted afterwards.
+  const auto origFSID = getFSID(mountPath);
+
+  unmount(mountPath, {});
+  waitForUnmount(mountPath, origFSID);
+}
+
+void PrivHelperServer::bindUnmount(
+    const char* mountPath,
+    folly::StringPiece mountRoot) {
+#ifndef __APPLE__
+  auto targetFd = openBindMountTarget(mountRoot, mountPath);
+  const auto origFSID = getFSID(targetFd.fd());
+  if (bindUnmountByFd(targetFd, mountPath)) {
+    // The privileged unmount already used targetFd. This best-effort
+    // completion check still stats mountPath because targetFd keeps reporting
+    // the detached filesystem until the fd is closed.
+    waitForUnmount(mountPath, origFSID);
+    return;
+  }
+#else
+  (void)mountRoot;
+#endif
+  insecureBindUnmount(mountPath);
 }
 
 void PrivHelperServer::run() {
@@ -1472,12 +2113,16 @@ UnixSocket::Message PrivHelperServer::processMessage(
       return processSetUseEdenFs(cursor, request);
     case PrivHelperConn::REQ_GET_PID:
       return processGetPid();
+    case PrivHelperConn::REQ_GET_NAMESPACE_INFO:
+      return processGetNamespaceInfo(cursor);
     case PrivHelperConn::REQ_START_FAM:
       return processStartFam(cursor);
     case PrivHelperConn::REQ_STOP_FAM:
       return processStopFam();
     case PrivHelperConn::REQ_SET_MEMORY_PRIORITY_FOR_PROCESS:
       return processSetMemoryPriorityForProcess(cursor);
+    case PrivHelperConn::REQ_SET_FUSE_READ_AHEAD:
+      return processSetFuseReadAhead(cursor);
     case PrivHelperConn::MSG_TYPE_NONE:
     case PrivHelperConn::RESP_ERROR:
       break;
@@ -1502,9 +2147,10 @@ void PrivHelperServer::receiveError(
 }
 
 void PrivHelperServer::cleanupMountPoints() {
-  for (const auto& mountPoint : mountPoints_) {
+  for (const auto& entry : mountPoints_) {
+    const auto& mountPoint = entry.first;
     try {
-      unmount(mountPoint.c_str(), {});
+      unmountRegisteredMount(mountPoint, entry.second, {});
     } catch (const std::exception& ex) {
       XLOGF(
           ERR,

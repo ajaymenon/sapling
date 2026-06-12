@@ -61,6 +61,7 @@ cpp_library(
         "//eden/fs/model:model-fwd",
         "//folly:range",
         "//folly/coro:task",
+        "//folly/coro/safe:now_task",
         "//folly/futures:core",
         "//folly/memory:not_null",
     ],
@@ -81,6 +82,8 @@ cpp_library(
         "//eden/fs/store/sl:sapling_backing_store",
         "//eden/fs/utils:filter_utils",
         "//folly:varint",
+        "//folly/coro:collect",
+        "//folly/coro:invoke",
     ],
     exported_deps = [
         "fbsource//third-party/googletest:gtest",
@@ -90,6 +93,7 @@ cpp_library(
         "//eden/fs/store/filter:filtered_object_id",
         "//eden/fs/store/filter:filters",
         "//folly/coro:task",
+        "//folly/coro/safe:now_task",
     ],
 )
 
@@ -104,16 +108,17 @@ cpp_library(
         exclude = CONTEXT_HEADERS + BACKING_STORE_INF + FILTERED_BACKING_STORE_HEADERS + BACKING_STORE_TYPE_INF,
     ),
     deps = [
-        "//eden/common/telemetry:structured_logger",
         "//eden/common/utils:bug",
         "//eden/common/utils:process_info_cache",
         "//eden/common/utils:throw",
         "//eden/fs/model/git:gitignore",
         "//eden/fs/telemetry:log_info",
+        "//eden/fs/telemetry:structured_logger",
         "//eden/fs/telemetry:task_trace",
         "//eden/fs/utils:eden_error",
         "//folly:conv",
         "//folly:portability",
+        "//folly/coro:invoke",
         "//folly/io:iobuf",
     ],
     exported_deps = [
@@ -142,6 +147,7 @@ cpp_library(
         "//folly/container:evicting_cache_map",
         "//folly/container:f14_hash",
         "//folly/coro:task",
+        "//folly/coro/safe:now_task",
         "//folly/futures:core",
         "//folly/futures:shared_promise",
         "//folly/logging:logging",

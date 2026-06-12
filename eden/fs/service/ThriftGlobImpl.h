@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <folly/Range.h>
+#include <folly/coro/safe/NowTask.h>
 
 #include "eden/common/utils/ImmediateFuture.h"
 #include "eden/common/utils/RefPtr.h"
@@ -45,6 +46,12 @@ class ThriftGlobImpl {
       std::vector<std::string> globs,
       const ObjectFetchContextPtr& fetchContext);
 
+  folly::coro::now_task<std::unique_ptr<Glob>> co_glob(
+      std::shared_ptr<EdenMount> edenMount,
+      std::shared_ptr<ServerState> serverState,
+      std::vector<std::string> globs,
+      const ObjectFetchContextPtr& fetchContext);
+
   std::string logString();
   std::string logString(const std::vector<std::string>& globs) const;
 
@@ -63,6 +70,16 @@ class ThriftGlobImpl {
 // .ensure() the lifetime of EdenMountHandle outlives the call.
 ImmediateFuture<std::vector<BackingStore::GetGlobFilesResult>>
 getLocalGlobResults(
+    const std::shared_ptr<EdenMount>& edenMount,
+    const std::shared_ptr<ServerState>& serverState,
+    bool includeDotfiles,
+    const std::vector<std::string>& suffixGlobs,
+    const std::vector<std::string>& prefixes,
+    const TreeInodePtr& rootInode,
+    const ObjectFetchContextPtr& context);
+
+folly::coro::now_task<std::vector<BackingStore::GetGlobFilesResult>>
+co_getLocalGlobResults(
     const std::shared_ptr<EdenMount>& edenMount,
     const std::shared_ptr<ServerState>& serverState,
     bool includeDotfiles,

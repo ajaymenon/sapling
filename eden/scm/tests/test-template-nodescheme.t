@@ -3,11 +3,11 @@
 
 
   $ newclientrepo
-  $ hg log -r . -T '{nodescheme}\n'
+  $ sl log -r . -T '{nodescheme}\n'
   hg
 
   $ cd
-  $ hg init --git git
+  $ sl init --git git
   $ cd git
-  $ hg log -r . -T '{nodescheme}\n'
+  $ sl log -r . -T '{nodescheme}\n'
   git

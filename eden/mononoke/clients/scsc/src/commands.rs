@@ -12,14 +12,18 @@ base_app::subcommands! {
     mod async_requests_ping if "SCSC_ADMIN_ENABLED";
     mod cat;
     mod blame;
+    mod commit_fingerprint;
+    mod commit_rate_limit_check;
     mod common_base;
     mod create_git_bundle;
     mod create_repos if "SCSC_ADMIN_ENABLED";
     mod create_bookmark if "SCSC_WRITES_ENABLED";
     mod delete_bookmark if "SCSC_WRITES_ENABLED";
     mod diff;
+    mod directory_branch_clusters;
     mod file_diff;
     mod export;
+    mod filter_ancestors;
     mod find_files;
     mod info;
     mod is_ancestor;
@@ -32,6 +36,7 @@ base_app::subcommands! {
     mod prepare_commits if "SCSC_WRITES_ENABLED";
     mod pushrebase_history;
     mod restricted_paths if "SCSC_ADMIN_ENABLED";
+    mod git_mutation_history;
     mod hg_mutation_history;
     mod repo_info;
     mod repos;

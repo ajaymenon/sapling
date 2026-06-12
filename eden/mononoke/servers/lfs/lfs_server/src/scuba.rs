@@ -66,10 +66,17 @@ pub enum LfsScubaKey {
     ClientTwTask,
     ClientAtlas,
     ClientAtlasEnvId,
+    ClientAtlasRl,
     /// Fetch cause
     FetchCause,
     /// Whether or not the client attempted to fetch from CAS.
     FetchFromCASAttempted,
+    /// Set by the magic-byte sniffer (see `compression_sniff`) when it bypasses
+    /// HTTP-layer compression on a download. Value is the detected container
+    /// format name (e.g., "zip", "gzip", "png", "jpeg", "iso_base_media", ...)
+    /// so Scuba can break savings down by blob type. Absent when no bypass
+    /// happened (sniff disabled, no match, or first chunk too short).
+    CompressionBypassReason,
 }
 
 impl AsRef<str> for LfsScubaKey {
@@ -101,8 +108,10 @@ impl AsRef<str> for LfsScubaKey {
             ClientTwTask => "client_tw_task",
             ClientAtlas => "client_atlas",
             ClientAtlasEnvId => "client_atlas_env_id",
+            ClientAtlasRl => "client_atlas_rl",
             FetchCause => "fetch_cause",
             FetchFromCASAttempted => "fetch_from_cas_attempted",
+            CompressionBypassReason => "compression_bypass_reason",
         }
     }
 }
@@ -171,7 +180,7 @@ impl ScubaHandler for LfsScubaHandler {
             }
 
             if let Some(err) = info.first_error() {
-                scuba.add(LfsScubaKey::ErrorMessage, format!("{:?}", err));
+                scuba.add(LfsScubaKey::ErrorMessage, format!("{err:?}"));
             }
 
             scuba.add(LfsScubaKey::ErrorCount, info.error_count());
@@ -204,6 +213,8 @@ impl ScubaHandler for LfsScubaHandler {
             scuba.add_opt(LfsScubaKey::ClientAtlas, client_info.fb.is_atlas());
 
             scuba.add_opt(LfsScubaKey::ClientAtlasEnvId, client_info.fb.atlas_env_id());
+
+            scuba.add_opt(LfsScubaKey::ClientAtlasRl, client_info.fb.is_atlas_rl());
         }
 
         scuba.add_opt(LfsScubaKey::FetchCause, self.fetch_cause);

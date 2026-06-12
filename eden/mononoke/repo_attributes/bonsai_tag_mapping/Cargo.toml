@@ -12,13 +12,13 @@ name = "bonsai_tag_mapping_test"
 path = "test/main.rs"
 
 [dependencies]
-anyhow = "1.0.98"
-arc-swap = { version = "1.5", features = ["weak"] }
+anyhow = "1.0.102"
+arc-swap = { version = "1.9.0", features = ["weak"] }
 async-trait = "0.1.86"
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
-facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
+justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
@@ -27,7 +27,7 @@ repo_update_logger = { version = "0.1.0", path = "../../features/repo_update_log
 sql_construct = { version = "0.1.0", path = "../../common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

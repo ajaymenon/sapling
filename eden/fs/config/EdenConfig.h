@@ -289,6 +289,15 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * If true, EdenFS refuses to start when running in a non-root mount
+   * namespace.
+   */
+  ConfigSetting<bool> requireRootMountNamespace{
+      "core:require-root-mount-namespace",
+      false,
+      this};
+
+  /**
    * Timeout value for a clean shutdown on SIGTERM. If the timeout elapses, we
    * exit immediately. Set to zero to revert to the old behavior where we
    * unregister the signal handler unconditionally, causing the next signal to
@@ -399,7 +408,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> thriftUseCheckoutExecutor{
       "thrift:use-checkout-executor",
-      false,
+      true,
       this};
 
   /**
@@ -514,6 +523,33 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Minimum interval between pressure-based GC runs for a mount, used when
+   * inode count is at/above gc-pressure-max-inodes.
+   */
+  ConfigSetting<std::chrono::nanoseconds> pressureBasedGcPeriodMin{
+      "mount:pressure-gc-period-min",
+      std::chrono::seconds{30},
+      this};
+
+  /**
+   * Maximum interval between pressure-based GC runs for a mount, used when
+   * inode count is below gc-pressure-min-inodes.
+   */
+  ConfigSetting<std::chrono::nanoseconds> pressureBasedGcPeriodMax{
+      "mount:pressure-gc-period-max",
+      std::chrono::minutes{5},
+      this};
+
+  /**
+   * How often the pressure-based GC scheduler wakes up to check whether each
+   * mount is due for a pressure-derived GC run.
+   */
+  ConfigSetting<std::chrono::nanoseconds> pressureBasedGcTickPeriod{
+      "mount:pressure-gc-tick-period",
+      std::chrono::seconds{5},
+      this};
+
+  /**
    * If the number of inodes is greater than this threshold, the garbage
    * collection cutoff will be more aggressive.
    *
@@ -550,6 +586,78 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<OneHourMinDuration> gcCutoff{
       "mount:garbage-collection-cutoff",
       OneHourMinDuration(std::chrono::hours(24)),
+      this};
+
+  /**
+   * Inode count below which no GC pressure is applied.
+   * Below this count, max TTL and max GC cutoff are used.
+   */
+  ConfigSetting<uint64_t> gcPressureMinInodes{
+      "mount:gc-pressure-min-inodes",
+      10000,
+      this};
+
+  /**
+   * Inode count at/above which maximum GC pressure is applied.
+   * At or above this count, min TTL and min GC cutoff are used.
+   */
+  ConfigSetting<uint64_t> gcPressureMaxInodes{
+      "mount:gc-pressure-max-inodes",
+      2000000,
+      this};
+
+  /**
+   * Maximum FUSE entry/attribute cache TTL (seconds), used when inode
+   * count is below gc-pressure-min-inodes.
+   */
+  ConfigSetting<uint64_t> fuseTtlMaxSeconds{
+      "mount:fuse-ttl-max-seconds",
+      3600,
+      this};
+
+  /**
+   * Minimum FUSE entry/attribute cache TTL (seconds), used when inode
+   * count is at/above gc-pressure-max-inodes.
+   */
+  ConfigSetting<uint64_t> fuseTtlMinSeconds{
+      "mount:fuse-ttl-min-seconds",
+      1,
+      this};
+
+  /**
+   * FUSE negative dentry cache TTL (seconds) for ENOENT lookups.
+   * Defaults to the legacy "effectively infinite" cache duration.
+   */
+  ConfigSetting<uint64_t> fuseNegativeDcacheTtlSeconds{
+      "fuse:negative-dcache-ttl-seconds",
+      2147483647,
+      this};
+
+  /**
+   * Maximum GC cutoff duration (seconds), used at lowest pressure.
+   * Inodes not accessed within this duration are candidates for GC.
+   */
+  ConfigSetting<uint64_t> gcCutoffMaxSeconds{
+      "mount:gc-cutoff-max-seconds",
+      21600,
+      this};
+
+  /**
+   * Minimum GC cutoff duration (seconds), used at highest pressure.
+   */
+  ConfigSetting<uint64_t> gcCutoffMinSeconds{
+      "mount:gc-cutoff-min-seconds",
+      60,
+      this};
+
+  /**
+   * When pressure-based inode GC evaluates whether a directory subtree can be
+   * collapsed into a single FUSE invalidation, entries newer than the normal GC
+   * cutoff by less than this grace period do not block collapse.
+   */
+  ConfigSetting<std::chrono::nanoseconds> pressureBasedGcCollapseGrace{
+      "mount:pressure-gc-collapse-grace",
+      std::chrono::seconds{5},
       this};
 
   /**
@@ -701,10 +809,67 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<std::string> fuseVfsType{"fuse:vfs-type", "fuse", this};
 
+  /**
+   * The read-ahead size in KB for FUSE mounts. This is written to
+   * /sys/class/bdi/{major}:{minor}/read_ahead_kb after mounting.
+   * If nullopt, the kernel default is used.
+   * This setting only applies to Linux FUSE mounts.
+   */
+  ConfigSetting<std::optional<uint32_t>> fuseBdiReadAheadKb{
+      "fuse:bdi-read-ahead-kb",
+      std::nullopt,
+      this};
+
+  /**
+   * The maximum number of pages per FUSE read request. Default kernel value
+   * is 32 pages (128KB with 4KB pages). Setting FUSE_MAX_PAGES flag in
+   * FUSE_INIT allows configuring this up to 256 pages (1MB with 4KB pages).
+   * Set to 0 to use the kernel default (32).
+   */
+  ConfigSetting<uint32_t> fuseMaxPages{"fuse:max-pages", 0, this};
+
+  /**
+   * Whether to use io_uring for FUSE request/reply transport instead of
+   * traditional /dev/fuse read/write. Requires Linux 6.11+ with
+   * CONFIG_FUSE_IO_URING=y. Falls back to /dev/fuse automatically if
+   * the kernel doesn't support it.
+   */
+  ConfigSetting<bool> fuseUseIoUring{"fuse:use-io-uring", false, this};
+
+  /**
+   * RE2 regex pattern matched against the Linux kernel release string
+   * (`uname -r`) where Eden may negotiate FUSE io_uring when
+   * fuse:use-io-uring is enabled. Defaults to fbk 6.13 kernels, where Eden's
+   * graceful restart flow has been validated.
+   */
+  ConfigSetting<std::string> fuseIoUringKernelReleaseRegex{
+      "fuse:io-uring-kernel-release-regex",
+      "^6\\.13\\.",
+      this};
+
+  /**
+   * Whether `eden restart --graceful` should fall back to a full restart when
+   * the current FUSE transport config differs from the transport negotiated by
+   * the running mounts.
+   */
+  ConfigSetting<bool> fuseRestartOnTransportMismatch{
+      "fuse:restart-on-transport-mismatch",
+      false,
+      this};
+
+  /**
+   * The io_uring queue depth to use when the FUSE io_uring transport is
+   * enabled. Match libfuse's current default.
+   */
+  ConfigSetting<uint32_t> fuseIoUringQueueDepth{
+      "fuse:io-uring-queue-depth",
+      8,
+      this};
+
   // [nfs]
 
   /**
-   * Controls whether Eden will run it's own rpcbind/portmapper server. On
+   * Controls whether Eden will run its own rpcbind/portmapper server. On
    * Linux there is one built into the kernel that is always running, and on
    * mac there is one built into the kernel you just have to poke into running.
    * There is not one built into Windows and no good (and discoverable by
@@ -929,6 +1094,13 @@ class EdenConfig : private ConfigSettingManager {
       folly::kIsLinux ? true : false,
       this};
 
+  /**
+   * Whether to fast-path null and unimplemented NFS RPCs directly on the
+   * EventBase thread, bypassing the thread pool. Prevents liveness probes
+   * from blocking behind slow operations.
+   */
+  ConfigSetting<bool> nfsFastPathRPCs{"nfs:fast-path-rpcs", true, this};
+
   // [prjfs]
 
   /**
@@ -970,7 +1142,7 @@ class EdenConfig : private ConfigSettingManager {
    * directory...
    *
    * This is bad for EdenFS for a number of reason. The main one being that
-   * EdenFS will attempt to recursively add all the childrens of that
+   * EdenFS will attempt to recursively add all the children of that
    * directory to the inode hierarchy. If the symlinks points to a very
    * large directory, this can be extremely slow, leading to a very poor
    * user experience.
@@ -1037,16 +1209,17 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Maximum number of pending FSChannel requests. This is currently only
-   * enforced in the FUSE FSChannel implementation. This value is also used as
-   * the threshold when determining when to log high number of pending requests.
-   * Logging is currently is only enabled in FUSE and NFS FSChannel
-   * implementations. When set to 0, no limit is enforced and no logging will
-   * occur.
+   * Maximum number of pending FSChannel requests. When enforced, requests
+   * beyond this limit receive backpressure: FUSE blocks until capacity is
+   * available, NFS returns NFS3ERR_JUKEBOX causing the client to retry.
+   * This value is also used as the threshold for logging high request counts.
+   * When set to 0, no limit is enforced and no logging will occur.
+   * Defaults to 10× CPU count on macOS (~100 on typical Macs), 0 (disabled)
+   * on other platforms.
    */
   ConfigSetting<uint64_t> maxFsChannelInflightRequests{
       "fschannel:max-inflight-requests",
-      0,
+      folly::kIsApple ? folly::available_concurrency() * 10 : 0,
       this};
 
   ConfigSetting<std::chrono::nanoseconds> highFsRequestsLogInterval{
@@ -1139,7 +1312,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> hgEnableCachedResultForStatusRequest{
       "hg:enable-scm-status-cache",
-      false,
+      folly::kIsWindows ? false : true,
       this};
 
   /**
@@ -1224,6 +1397,31 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::string> notificationsScribeCategory{
       "telemetry:notifications-scribe-category",
       "",
+      this};
+
+  /**
+   * Scribe category is the first argument passed to the scribe_cat binary. This
+   * is used by the ErrorStructuredLogger
+   */
+  ConfigSetting<std::string> errorScribeCategory{
+      "telemetry:error-scribe-category",
+      "",
+      this};
+
+  /**
+   * Kill switch for the entire structured error logging feature.
+   */
+  ConfigSetting<bool> enableErrorLogging{
+      "telemetry:enable-error-logging",
+      false,
+      this};
+
+  /**
+   * Whether to upload stack traces to Manifold when logging errors.
+   */
+  ConfigSetting<bool> enableStackTraceUpload{
+      "telemetry:enable-stack-trace-upload",
+      false,
       this};
 
   /**
@@ -1319,11 +1517,11 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Controls whether, after a silent daemon exit, the "log show" command is run
-   * to determine if the exit was caused by memory pressure. Running "log show"
-   * is time-consuming, so it is executed asynchronously and does not block
+   * Controls whether, after a silent daemon exit, system logs are checked
+   * to determine if the exit was caused by memory pressure. On macOS, this
+   * runs "log show"; on Linux, this runs "dmesg". The check is
+   * time-consuming, so it is executed asynchronously and does not block
    * EdenFS startup.
-   * Note: Only works on macOS.
    */
   ConfigSetting<bool> silentDaemonExitLogShow{
       "telemetry:silent-daemon-exit-log-show",
@@ -1388,6 +1586,22 @@ class EdenConfig : private ConfigSettingManager {
       "telemetry:long-running-fs-request-threshold",
       folly::kIsWindows ? std::chrono::nanoseconds(0)
                         : std::chrono::seconds{45},
+      this};
+
+  /**
+   * Whether to enable XplatLogger for edenfs_file_accesses telemetry
+   */
+  ConfigSetting<bool> enableXplatLoggerFileAccess{
+      "telemetry:enable-xplatlogger-fileaccess",
+      false,
+      this};
+
+  /**
+   * Whether to enable XplatLogger for edenfs_events telemetry.
+   */
+  ConfigSetting<bool> enableXplatLoggerEvents{
+      "telemetry:enable-xplatlogger-events",
+      false,
       this};
 
   // [experimental]
@@ -1482,8 +1696,8 @@ class EdenConfig : private ConfigSettingManager {
    * 0 means periodic unloading is disabled.
    *
    * Note 1: Periodic inode unloading and Garbage Collection (GC) are mutually
-   * exclusive. If GC is enabled, periodic unloading should be disabled or
-   * vice versa.
+   * exclusive. EdenFS skips periodic unloading when pressure-based GC is
+   * enabled.
    * Note 2: Periodic inode unloading is no-op on Windows.
    */
   ConfigSetting<uint32_t> periodicUnloadIntervalMinutes{
@@ -1523,14 +1737,10 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Controls whether EdenFS symlinks are enabled on Windows.
-   *
-   * Currently this is disabled because of a Windows bug. Directories with
-   * long symlinks become un-list-able.
-   * https://fb.workplace.com/groups/edenfswindows/permalink/1427359391513268/
    */
   ConfigSetting<bool> windowsSymlinksEnabled{
       "experimental:windows-symlinks",
-      false,
+      folly::kIsWindows,
       this};
 
   /**
@@ -1595,6 +1805,16 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * When true, skip populating originHashes in glob results when there are
+   * 0 or 1 revisions. In that case every entry has the same origin, so the
+   * per-file origin hash carries no information and is wasted work.
+   */
+  ConfigSetting<bool> globSkipRedundantOriginHashes{
+      "experimental:glob-skip-redundant-origin-hashes",
+      true,
+      this};
+
+  /**
    * When true, EdenFS will convert the backing store to a FilteredBackingStore
    * with the "null" filter when it restarts. The real filter info will be
    * written to a special file under .hg folder and will be applied next time
@@ -1602,6 +1822,154 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> attemptEdensparseMigration{
       "experimental:attempt-edensparse-migration",
+      false,
+      this};
+
+  /**
+   * When true, checkout avoids O(n^2) overlay writes by skipping per-child
+   * overlay writes during childMaterialized/childDematerialized, instead
+   * writing each directory's overlay once in its own saveOverlayPostCheckout()
+   * call. Set to false to revert to the old behavior of writing overlay data
+   * on every child state change.
+   */
+  ConfigSetting<bool> skipCheckoutChildOverlayWrites{
+      "experimental:skip-checkout-child-overlay-writes",
+      true,
+      this};
+
+  /**
+   * When true, checkout removes stale overlay directory data in the background
+   * GC thread instead of synchronously on the checkout thread.
+   */
+  ConfigSetting<bool> backgroundOverlayCleanupDuringCheckout{
+      "experimental:background-overlay-cleanup-during-checkout",
+      true,
+      this};
+
+  /**
+   * When true, checkout uses PathMapMutator to batch directory entry
+   * mutations, reducing O(n*k) cost to O(n + k log k) for large directories.
+   */
+  ConfigSetting<bool> batchCheckoutDirMutations{
+      "experimental:batch-checkout-dir-mutations",
+      true,
+      this};
+
+  /**
+   * Master gate for pressure-based inode GC on FUSE.
+   * When enabled, FUSE TTLs and GC cutoffs are dynamically computed based
+   * on total inode count.
+   */
+  ConfigSetting<bool> enablePressureBasedGc{
+      "experimental:enable-pressure-based-gc",
+      false,
+      this};
+
+  /**
+   * Whether to use systemd for EdenFS lifecycle management
+   * (start/stop/restart). Only used in the CLI, including here to get rid of
+   * warnings.
+   */
+  ConfigSetting<bool> systemdManagedLifecycle{
+      "experimental:systemd-managed-lifecycle",
+      false,
+      this};
+
+  /**
+   * Whether to place EdenFS in a dedicated systemd cgroup via systemd-run.
+   * Only used in the CLI, including here to get rid of warnings.
+   */
+  ConfigSetting<bool> systemdCgroupIsolation{
+      "experimental:systemd-cgroup-isolation",
+      false,
+      this};
+
+  // [coroutines]
+
+  /**
+   * Master switch to enable/disable all coroutine-based implementations.
+   * When false, all coroutine implementations are disabled regardless of
+   * individual feature flags. When true, individual feature flags control
+   * each endpoint.
+   * Default is true to allow individual feature flags to work.
+   */
+  ConfigSetting<bool> enableCoroutines{"coroutines:enabled", true, this};
+
+  /**
+   * Controls whether EdenFS uses phase 2 coroutine implementations
+   * (prefetchFilesV2, glob, getRootTree, and related code paths).
+   */
+  ConfigSetting<bool> enableCoroutinesPhase2{
+      "coroutines:enable-phase2",
+      false,
+      this};
+
+  /**
+   * Controls whether EdenFS uses getBlake3 coroutine implementations
+   */
+  ConfigSetting<bool> enableCoroutinesPhase5{
+      "coroutines:enable-phase5",
+      false,
+      this};
+
+  /**
+   * Controls whether EdenFS uses getSHA1 coroutine implementations
+   */
+  ConfigSetting<bool> enableCoroutinesPhase6{
+      "coroutines:enable-phase6",
+      false,
+      this};
+
+  /**
+   * Controls whether EdenFS uses phase 8 coroutine implementations
+   * (getEntryInformation).
+   */
+  ConfigSetting<bool> enableCoroutinesPhase8{
+      "coroutines:enable-phase8",
+      false,
+      this};
+
+  /**
+   * Controls whether EdenFS uses phase 9 coroutine implementations
+   * (getFileInformation).
+   */
+  ConfigSetting<bool> enableCoroutinesPhase9{
+      "coroutines:enable-phase9",
+      false,
+      this};
+
+  /**
+   * Controls whether EdenFS uses phase 3 coroutine implementations
+   * (glob, predictiveGlob, and related code paths).
+   */
+  ConfigSetting<bool> enableCoroutinesPhase3{
+      "coroutines:enable-phase3",
+      false,
+      this};
+
+  /**
+   * Controls whether EdenFS uses phase 4 coroutine implementations
+   * (readdir and VirtualInode attribute fetching coroutine paths).
+   */
+  ConfigSetting<bool> enableCoroutinesPhase4{
+      "coroutines:enable-phase4",
+      false,
+      this};
+
+  /**
+   * Controls whether EdenFS uses phase 7 coroutine implementations
+   * (the checkOutRevision thrift endpoint).
+   */
+  ConfigSetting<bool> enableCoroutinesPhase7{
+      "coroutines:enable-phase7",
+      false,
+      this};
+
+  /**
+   * Controls whether EdenFS uses getDigestHash coroutine implementations
+   */
+  ConfigSetting<bool> enableCoroutinesPhase11{
+      "coroutines:enable-phase11",
       false,
       this};
 
@@ -1761,7 +2129,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> enablePredictivePrefetchProfiles{
       "prefetch-profiles:predictive-prefetching-enabled",
-      false,
+      true,
       this};
 
   /**
@@ -1871,6 +2239,52 @@ class EdenConfig : private ConfigSettingManager {
       100,
       this};
 
+  /**
+   * When true, write non-materialized directories directly to their overlay
+   * file instead of creating a temporary file and renaming. This avoids
+   * filesystem metadata overhead (rename) at the cost of leaving a
+   * partially-written file on crash, which might be okay for non-materialized
+   * directories.
+   */
+  ConfigSetting<bool> overlayDirectFileWrites{
+      "overlay:direct-file-writes",
+      false,
+      this};
+
+  /**
+   * Determines if EdenFS should use Write-Ahead Logging (WAL) for overlay
+   * directory writes. Only applies to Legacy and LegacyDev catalog types.
+   */
+  ConfigSetting<bool> overlayUseWal{"overlay:use-wal", false, this};
+
+  /**
+   * Multiplier applied to a directory's base size when computing the
+   * inline-compaction threshold. A compaction is triggered when the WAL
+   * entry count for a parent exceeds `multiplier * max(baseSize, 10)`,
+   * capped by `overlay:wal-compaction-cap`. Larger values let the WAL
+   * absorb more appends before paying the rewrite cost; smaller values
+   * keep load-time replay shorter at the cost of more frequent
+   * compactions. Snapshot at Overlay construction.
+   */
+  ConfigSetting<size_t> overlayWalCompactionMultiplier{
+      "overlay:wal-compaction-multiplier",
+      3,
+      this};
+
+  /**
+   * Hard upper bound on the inline-compaction WAL byte size, regardless
+   * of directory size. Caps the worst-case work the inline compaction
+   * has to do under the parent `TreeInode::contents_` lock. Snapshot at
+   * Overlay construction.
+   *
+   * Default 5 MB ≈ 100k typical WAL entries (each entry is ~50 bytes),
+   * which benchmarks at ~225 ms total replay + compact time inline.
+   */
+  ConfigSetting<uint64_t> overlayWalCompactionByteCap{
+      "overlay:wal-compaction-byte-cap",
+      5'000'000,
+      this};
+
   // [clone]
 
   /**
@@ -1892,6 +2306,13 @@ class EdenConfig : private ConfigSettingManager {
    * endpoint from the CLI during clone. A value of 0 means no timeout.
    */
   ConfigSetting<size_t> cloneMountTimeout{"clone:mount-timeout", 20, this};
+
+  /**
+   * Maximum number of Eden checkouts allowed on this host. When the count of
+   * existing checkouts reaches this limit, `eden clone` will fail with a clear
+   * error message. A value of 0 (the default) means unlimited.
+   */
+  ConfigSetting<uint32_t> maxClones{"clone:max-clones", 0, this};
 
   // [fsck]
 
@@ -1915,6 +2336,16 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint64_t> fsckNumErrorDiscoveryThreads{
       "fsck:num-error-discovery-threads",
       4,
+      this};
+
+  /**
+   * Maximum number of mounts that can run fsck concurrently during startup.
+   * Limits peak memory usage after ungraceful shutdown to N times a single
+   * mount's fsck. Set to 0 for unlimited concurrency (no semaphore).
+   */
+  ConfigSetting<uint32_t> fsckMaxConcurrentMounts{
+      "fsck:max-concurrent-mounts",
+      5,
       this};
 
   // [glob]
@@ -1989,7 +2420,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<std::string> doctorMinimumKernelVersion{
       "doctor:minimum-kernel-version",
-      "4.11.3-67",
+      "5.12",
       this};
 
   /**
@@ -2092,6 +2523,62 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<RelativePath> notificationsStateDirectory{
       "notify:state-directory",
       RelativePath{".edenfs-notifications-state"},
+      this};
+
+  // [xplat-logger]
+
+  ConfigSetting<size_t> xplatLoggerQueueLimitBytes{
+      "xplat-logger:queue-limit-bytes",
+      128 * 1024,
+      this};
+
+  ConfigSetting<size_t> xplatLoggerMaxBatchSize{
+      "xplat-logger:max-batch-size",
+      100,
+      this};
+
+  ConfigSetting<size_t> xplatLoggerMaxConsecutiveFailures{
+      "xplat-logger:max-consecutive-failures",
+      10,
+      this};
+
+  ConfigSetting<std::chrono::nanoseconds> xplatLoggerInitialBackoff{
+      "xplat-logger:initial-backoff",
+      std::chrono::milliseconds(100),
+      this};
+
+  ConfigSetting<std::chrono::nanoseconds> xplatLoggerMaxBackoff{
+      "xplat-logger:max-backoff",
+      std::chrono::seconds(5),
+      this};
+
+  ConfigSetting<std::chrono::nanoseconds> xplatLoggerFlushTimeout{
+      "xplat-logger:flush-timeout",
+      std::chrono::seconds(1),
+      this};
+
+  ConfigSetting<std::chrono::nanoseconds> xplatLoggerConnectTimeout{
+      "xplat-logger:connect-timeout",
+      std::chrono::seconds(1),
+      this};
+
+  ConfigSetting<std::chrono::nanoseconds> xplatLoggerRpcTimeout{
+      "xplat-logger:rpc-timeout",
+      std::chrono::seconds(1),
+      this};
+
+  // [acl]
+  // Path-based ACL settings
+
+  /**
+   * TTL in seconds for restricted tree permission rechecks. When a restricted
+   * tree's TTL expires, EdenFS calls check_permission to see if the user has
+   * been granted access. Set to 0 to disable TTL-based rechecks (immediate
+   * recheck on every access).
+   */
+  ConfigSetting<uint64_t> restrictedTreeTtlSeconds{
+      "acl:restricted-tree-ttl-seconds",
+      300,
       this};
 
 // [facebook]

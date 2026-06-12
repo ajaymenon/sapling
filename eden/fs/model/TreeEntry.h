@@ -9,9 +9,10 @@
 
 #include <iosfwd>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include <folly/Try.h>
-#include <folly/io/Cursor.h>
 
 #include "eden/common/utils/DirType.h"
 #include "eden/common/utils/PathFuncs.h"
@@ -33,6 +34,29 @@ enum class TreeEntryType : uint8_t {
   SYMLINK,
 };
 
+/**
+ * A single ACL entry for a path. Each entry represents one restriction root
+ * with its associated repo-region ACL and optional request ACL.
+ */
+struct EntryAcl {
+  std::string restrictionRoot;
+  std::string repoRegionAcl;
+  std::optional<std::string> requestAcl;
+
+  bool operator==(const EntryAcl&) const = default;
+};
+
+/**
+ * Access control metadata for a path. Mirrors the thrift AclInfo struct
+ * but lives in the model layer without thrift dependencies.
+ */
+struct EntryAclInfo {
+  bool underAcl{false};
+  std::vector<EntryAcl> acls;
+
+  bool operator==(const EntryAclInfo&) const = default;
+};
+
 struct EntryAttributes {
   // for each requested attribute the member here should be set. If the
   // attribute was not requested, then the member will be nullopt.
@@ -50,6 +74,8 @@ struct EntryAttributes {
   std::optional<folly::Try<Hash32>> digestHash;
   std::optional<folly::Try<timespec>> mtime;
   std::optional<folly::Try<mode_t>> mode;
+  std::optional<folly::Try<bool>> underAcl;
+  std::optional<folly::Try<EntryAclInfo>> aclInfo;
 };
 
 /**
@@ -74,17 +100,6 @@ mode_t modeFromTreeEntryType(TreeEntryType ft);
 std::optional<TreeEntryType> treeEntryTypeFromMode(mode_t mode);
 
 /**
- * Returns a filtered TreeEntryType based on platform and options.
- *
- * On Windows:
- *   - If windowsSymlinksEnabled is true and ft is SYMLINK, returns SYMLINK
- *   - Otherwise, returns the input type (ft)
- * On non-Windows platforms:
- *   - Returns the input type (ft) unchanged
- */
-TreeEntryType filteredEntryType(TreeEntryType ft, bool windowsSymlinksEnabled);
-
-/**
  * Compares two optional TreeEntryType values for equality, with special
  * handling for Windows:
  * - On Windows, EXECUTABLE_FILE and REGULAR_FILE are considered equivalent for
@@ -98,8 +113,6 @@ bool compareTreeEntryType(
     std::optional<TreeEntryType> lhs,
     std::optional<TreeEntryType> rhs);
 
-dtype_t filteredEntryDtype(dtype_t mode, bool windowsSymlinksEnabled);
-
 class TreeEntry {
  public:
   explicit TreeEntry(ObjectId&& id, TreeEntryType type)
@@ -110,12 +123,14 @@ class TreeEntry {
       TreeEntryType type,
       std::optional<uint64_t> size,
       std::optional<Hash20> contentSha1,
-      std::optional<Hash32> contentBlake3)
+      std::optional<Hash32> contentBlake3,
+      bool isRestricted = false)
       : type_(type),
         id_(std::move(id)),
         size_(size),
         contentSha1_(contentSha1),
-        contentBlake3_(contentBlake3) {}
+        contentBlake3_(contentBlake3),
+        isRestricted_(isRestricted) {}
 
   const ObjectId& getObjectId() const {
     return id_;
@@ -160,21 +175,9 @@ class TreeEntry {
     return contentBlake3_;
   }
 
-  /**
-   * Computes exact serialized size of this entry.
-   */
-  size_t serializedSize(PathComponentPiece name) const;
-
-  /**
-   * Serializes entry into appender, consuming exactly serializedSize() bytes.
-   */
-  void serialize(PathComponentPiece name, folly::io::Appender& appender) const;
-
-  /**
-   * Deserialize tree entry.
-   */
-  static std::optional<std::pair<PathComponent, TreeEntry>> deserialize(
-      folly::StringPiece& data);
+  bool isRestricted() const {
+    return isRestricted_;
+  }
 
  private:
   TreeEntryType type_;
@@ -182,8 +185,7 @@ class TreeEntry {
   std::optional<uint64_t> size_;
   std::optional<Hash20> contentSha1_;
   std::optional<Hash32> contentBlake3_;
-
-  static constexpr uint64_t NO_SIZE = std::numeric_limits<uint64_t>::max();
+  bool isRestricted_ = false;
 };
 
 } // namespace facebook::eden

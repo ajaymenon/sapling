@@ -63,7 +63,7 @@ pub struct DiskUsageCmd {
     #[clap(
         long,
         help = "Performs automated cleanup",
-        conflicts_with = "deep-clean",
+        conflicts_with = "deep_clean",
         conflicts_with = "json"
     )]
     clean: bool,
@@ -82,7 +82,7 @@ pub struct DiskUsageCmd {
         help = "Performs automated cleanup of the orphaned redirections. \
         This is a subset of --clean that is safe to run without affecting \
         running tools relying on redirections.",
-        conflicts_with = "deep-clean",
+        conflicts_with = "deep_clean",
         conflicts_with = "clean",
         conflicts_with = "json"
     )]
@@ -94,20 +94,20 @@ pub struct DiskUsageCmd {
         gives the user the option to purge it. Requires elevated permissions, \
         user will be prompted. Do not run with sudo as this will cause filepath issues. \
         Has no effect on non-APFS filesystems.",
-        conflicts_with = "deep-clean",
+        conflicts_with = "deep_clean",
         conflicts_with = "clean",
         conflicts_with = "json",
-        conflicts_with = "clean-orphaned"
+        conflicts_with = "clean_orphaned"
     )]
     purgeable: bool,
 
     #[clap(
         long,
         help = "Prints only the disk usage summary",
-        conflicts_with = "deep-clean",
+        conflicts_with = "deep_clean",
         conflicts_with = "clean",
         conflicts_with = "json",
-        conflicts_with = "clean-orphaned",
+        conflicts_with = "clean_orphaned",
         conflicts_with = "purgeable"
     )]
     fast: bool,
@@ -205,7 +205,7 @@ fn format_size(size: u64) -> String {
     } else if size > 1000 {
         format!("{:.1} KB", size as f64 / 1000.0)
     } else if size > 0 {
-        format!("{} B", size)
+        format!("{size} B")
     } else {
         "0".to_string()
     }
@@ -317,7 +317,7 @@ impl fmt::Display for AggregatedUsageCounts {
             table.add_row(row);
         }
 
-        write!(f, "{}", table)
+        write!(f, "{table}")
     }
 }
 
@@ -389,7 +389,7 @@ fn get_hg_cache_path() -> Result<PathBuf> {
 }
 
 fn write_title(title: &str) {
-    println!("\n{}", title);
+    println!("\n{title}");
     println!("{}", "-".repeat(title.len()));
 }
 
@@ -969,7 +969,7 @@ impl crate::Subcommand for DiskUsageCmd {
             } else {
                 DisplayMode::Default
             };
-            println!("{}", aggregated_usage_counts);
+            println!("{aggregated_usage_counts}");
 
             // PRINT DETAILS
             if !redirect_usage_count.path_usage.is_empty() {
@@ -1157,7 +1157,7 @@ mod tests {
     #[test]
     fn test_display_default_mode_shows_no_status() {
         let counts = create_usage_counts(1000, 2000, 0, 0, 0, 0, 0, DisplayMode::Default);
-        let output = format!("{}", counts);
+        let output = format!("{counts}");
 
         // Should contain the labels and sizes
         assert!(output.contains("Materialized files:"));
@@ -1170,7 +1170,7 @@ mod tests {
     #[test]
     fn test_display_clean_mode_shows_status() {
         let counts = create_usage_counts(1000, 2000, 3000, 4000, 5000, 6000, 0, DisplayMode::Clean);
-        let output = format!("{}", counts);
+        let output = format!("{counts}");
 
         // Should contain cleanup status
         assert!(output.contains("Cleaned"));
@@ -1184,7 +1184,7 @@ mod tests {
     #[test]
     fn test_display_deep_clean_mode_fsck_cleaned() {
         let counts = create_usage_counts(0, 0, 0, 0, 0, 0, 1000, DisplayMode::DeepClean);
-        let output = format!("{}", counts);
+        let output = format!("{counts}");
 
         // In DeepClean mode, fsck should show "Cleaned"
         assert!(output.contains("Filesystem Check recovered files:"));
@@ -1196,7 +1196,7 @@ mod tests {
     #[test]
     fn test_display_clean_mode_fsck_not_cleaned() {
         let counts = create_usage_counts(0, 0, 0, 0, 0, 0, 1000, DisplayMode::Clean);
-        let output = format!("{}", counts);
+        let output = format!("{counts}");
 
         // In Clean mode (not DeepClean), fsck should show "Not cleaned"
         assert!(output.contains("Filesystem Check recovered files:"));
@@ -1208,7 +1208,7 @@ mod tests {
     #[test]
     fn test_display_clean_orphaned_mode() {
         let counts = create_usage_counts(0, 0, 5000, 0, 0, 0, 0, DisplayMode::CleanOrphaned);
-        let output = format!("{}", counts);
+        let output = format!("{counts}");
 
         // Orphaned redirections should show "Cleaned" in CleanOrphaned mode
         assert!(output.contains("Orphaned redirections:"));
@@ -1218,7 +1218,7 @@ mod tests {
     #[test]
     fn test_display_shows_only_nonzero_values() {
         let counts = create_usage_counts(1000, 0, 0, 2000, 0, 0, 0, DisplayMode::Default);
-        let output = format!("{}", counts);
+        let output = format!("{counts}");
 
         // Should only show materialized and ignored
         assert!(output.contains("Materialized files:"));

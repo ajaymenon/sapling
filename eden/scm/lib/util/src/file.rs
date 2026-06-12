@@ -22,17 +22,17 @@ use crate::errors::IOContext;
 
 static MAX_IO_RETRIES: Lazy<u32> = Lazy::new(|| {
     std::env::var("SL_IO_RETRIES")
-        .unwrap_or("3".to_string())
-        .parse::<u32>()
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(3)
 });
 
 static FILE_UTIL_RETRY_SUCCESS: Counter = Counter::new_counter("util.file_retry_success");
 static FILE_UTIL_RETRY_FAILURE: Counter = Counter::new_counter("util.file_retry_failure");
 
-pub(crate) static UMASK: Lazy<u32> = Lazy::new(|| unsafe {
+pub(crate) static UMASK: Lazy<u32> = Lazy::new(|| {
     #[cfg(unix)]
-    {
+    unsafe {
         let umask = libc::umask(0);
         libc::umask(umask);
         #[allow(clippy::useless_conversion)] // mode_t is u16 on mac and u32 on linux
@@ -82,7 +82,7 @@ pub fn open(path: impl AsRef<Path>, mode: &str) -> io::Result<File> {
             't' => opts.truncate(true),
             'x' => opts.create_new(true),
             _ => {
-                return Err(io::Error::other(format!("invalid open() mode {}", opt)))
+                return Err(io::Error::other(format!("invalid open() mode {opt}")))
                     .path_context("error opening file", path);
             }
         };
@@ -102,13 +102,13 @@ fn is_retryable(err: &io::Error) -> bool {
             || err.kind() == io::ErrorKind::StaleNetworkFileHandle)
 }
 
-fn with_retry<'a, F, T>(io_operation: &mut F, path: &'a Path) -> io::Result<T>
+pub(crate) fn retry_io<F, T>(mut io_operation: F) -> io::Result<T>
 where
-    F: FnMut(&'a Path) -> io::Result<T>,
+    F: FnMut() -> io::Result<T>,
 {
     let mut attempts: u32 = 0;
     loop {
-        match io_operation(path) {
+        match io_operation() {
             Ok(v) => {
                 if attempts > 0 {
                     FILE_UTIL_RETRY_SUCCESS.increment();
@@ -127,6 +127,13 @@ where
             Err(err) => return Err(err),
         }
     }
+}
+
+fn with_retry<'a, F, T>(io_operation: &mut F, path: &'a Path) -> io::Result<T>
+where
+    F: FnMut(&'a Path) -> io::Result<T>,
+{
+    retry_io(|| io_operation(path))
 }
 
 pub fn exists(path: impl AsRef<Path>) -> io::Result<Option<std::fs::Metadata>> {

@@ -25,23 +25,26 @@ use futures::future;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
+use gotham::handler::IntoBody as _;
+use gotham::helpers::http::Body;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham_derive::StateData;
-use gotham_ext::body_ext::BodyExt;
+use gotham_ext::body_ext::BodyExt as _;
 use hostname::get_hostname;
+use http::Request;
+use http::header;
 use http::header::HeaderMap;
 use http::uri::Authority;
 use http::uri::Parts;
 use http::uri::PathAndQuery;
 use http::uri::Scheme;
 use http::uri::Uri;
-use hyper::Body;
-use hyper::Client;
-use hyper::Request;
-use hyper::client::HttpConnector;
-use hyper::header;
-use hyper_openssl::HttpsConnector;
+use http_body_util::BodyExt as _;
+use hyper_openssl::client::legacy::HttpsConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use lfs_protocol::RequestBatch;
 use lfs_protocol::RequestObject;
 use lfs_protocol::ResponseBatch;
@@ -69,7 +72,7 @@ use crate::errors::LfsServerContextErrorKind;
 use crate::middleware::LfsMethod;
 use crate::middleware::RequestContext;
 
-pub type HttpsHyperClient = Client<HttpsConnector<HttpConnector>>;
+pub type HttpsHyperClient = Client<HttpsConnector<HttpConnector>, Body>;
 
 // The user agent string presented to upstream
 const CLIENT_USER_AGENT: &str = "mononoke-lfs-server/0.1.0 git/2.15.1";
@@ -83,6 +86,7 @@ struct LfsServerContextInner {
     config_handle: ConfigHandle<ServerConfig>,
     server_hostname: Arc<String>,
     bandwidth: Option<i64>,
+    compression_sniff_enabled: bool,
 }
 
 #[derive(Clone, StateData)]
@@ -101,6 +105,7 @@ impl LfsServerContext {
         config_handle: ConfigHandle<ServerConfig>,
         tls_args: &Option<TLSArgs>,
         bandwidth: Option<i64>,
+        compression_sniff_enabled: bool,
     ) -> Result<Self, Error> {
         let connector = match tls_args {
             Some(tls_args) => {
@@ -117,7 +122,7 @@ impl LfsServerContext {
         .map_err(Error::from)
         .context(ErrorKind::HttpClientInitializationFailed)?;
 
-        let client = Client::builder().build(connector);
+        let client = Client::builder(TokioExecutor::new()).build(connector);
         let server_hostname =
             Arc::new(get_hostname().unwrap_or_else(|_| "UNKNOWN_HOSTNAME".to_string()));
 
@@ -130,6 +135,7 @@ impl LfsServerContext {
             config_handle,
             server_hostname,
             bandwidth,
+            compression_sniff_enabled,
         };
 
         Ok(LfsServerContext {
@@ -143,6 +149,7 @@ impl LfsServerContext {
         ctx: CoreContext,
         repository: String,
         host: String,
+        headers: &Option<&HeaderMap>,
         method: LfsMethod,
     ) -> Result<RepositoryRequestContext, LfsServerContextErrorKind> {
         let (
@@ -154,6 +161,7 @@ impl LfsServerContext {
             config,
             server_hostname,
             bandwidth,
+            compression_sniff_enabled,
         ) = {
             let inner = self.inner.lock().expect("poisoned lock");
 
@@ -167,6 +175,7 @@ impl LfsServerContext {
                     inner.config_handle.get(),
                     inner.server_hostname.clone(),
                     inner.bandwidth,
+                    inner.compression_sniff_enabled,
                 ),
                 None => {
                     return Err(LfsServerContextErrorKind::RepositoryDoesNotExist(
@@ -181,6 +190,8 @@ impl LfsServerContext {
 
         acl_check(&ctx, &repo, enforce_acl_check, method).await?;
 
+        let force_http = should_force_http_scheme(&host, headers, &server);
+
         Ok(RepositoryRequestContext {
             ctx,
             repo,
@@ -189,12 +200,14 @@ impl LfsServerContext {
                 server,
                 host,
                 server_hostname,
+                force_http,
             },
             client: HttpClient::Enabled(client),
             config,
             always_wait_for_upstream,
             max_upload_size,
             bandwidth,
+            compression_sniff_enabled,
         })
     }
 
@@ -271,6 +284,7 @@ pub struct RepositoryRequestContext {
     max_upload_size: Option<u64>,
     client: HttpClient,
     bandwidth: Option<i64>,
+    compression_sniff_enabled: bool,
 }
 
 pub struct HttpClientResponse<S: Stream<Item = Result<Bytes, Error>> + Send + 'static> {
@@ -319,6 +333,22 @@ fn host_maybe_port_to_host(host_maybe_port: &str) -> Result<String, LfsServerCon
         .to_string())
 }
 
+fn should_force_http_scheme(host: &str, headers: &Option<&HeaderMap>, server: &ServerUris) -> bool {
+    if server.force_http_hosts.iter().any(|h| h == host) {
+        return true;
+    }
+    if let Some(headers) = headers {
+        for header_name in &server.force_http_headers {
+            if let Some(val) = headers.get(header_name.as_str()) {
+                if val.as_bytes() == b"1" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn get_host_header(headers: &Option<&HeaderMap>) -> Result<String, LfsServerContextErrorKind> {
     let host_maybe_port = headers
         .ok_or(LfsServerContextErrorKind::MissingHostHeader)?
@@ -345,7 +375,9 @@ impl RepositoryRequestContext {
         let host = get_host_header(&headers)?;
 
         let lfs_ctx = LfsServerContext::borrow_from(state);
-        lfs_ctx.request(ctx, repository, host, method).await
+        lfs_ctx
+            .request(ctx, repository, host, &headers, method)
+            .await
     }
 
     pub fn always_wait_for_upstream(&self) -> bool {
@@ -358,6 +390,13 @@ impl RepositoryRequestContext {
 
     pub fn bandwidth(&self) -> Option<i64> {
         self.bandwidth
+    }
+
+    /// Whether the deployment was started with compression sniffing enabled
+    /// (the `--enable-compression-sniff` CLI flag). Per-request behavior is
+    /// additionally gated by a JustKnob.
+    pub fn compression_sniff_enabled(&self) -> bool {
+        self.compression_sniff_enabled
     }
 
     pub async fn dispatch(
@@ -396,7 +435,10 @@ impl RepositoryRequestContext {
             let (head, body) = res.into_parts();
 
             if !head.status.is_success() {
-                let body = body.try_concat_body(&head.headers)?.await?;
+                let body = body
+                    .into_data_stream()
+                    .try_concat_body(&head.headers)?
+                    .await?;
                 return Err(ErrorKind::UpstreamError(
                     head.status,
                     String::from_utf8_lossy(&body).to_string(),
@@ -409,7 +451,7 @@ impl RepositoryRequestContext {
             // our own wrapper type that wraps the response and the headers.
             Ok(HttpClientResponse {
                 headers: head.headers,
-                body: Some(body.map_err(Error::from)),
+                body: Some(body.into_data_stream().map_err(Error::from)),
                 handle: Handle::current(),
             })
         };
@@ -437,7 +479,7 @@ impl RepositoryRequestContext {
             .into();
 
         let req = Request::post(uri)
-            .body(body.into())
+            .body(body.into_body())
             .map_err(|e| ErrorKind::Error(e.into()))?;
 
         let res = self
@@ -461,6 +503,7 @@ pub struct UriBuilder {
     pub server: Arc<ServerUris>,
     pub host: String,
     pub server_hostname: Arc<String>,
+    pub force_http: bool,
 }
 
 impl UriBuilder {
@@ -472,26 +515,40 @@ impl UriBuilder {
             .ok_or_else(|| ErrorKind::HostNotAllowlisted(self.host.clone()))
     }
 
+    fn scheme_override(&self) -> Option<Scheme> {
+        if self.force_http {
+            Some(Scheme::HTTP)
+        } else {
+            None
+        }
+    }
+
     pub fn upload_uri(&self, object: &RequestObject) -> Result<Uri, ErrorKind> {
         self.pick_uri()?
-            .build(format_args!(
-                "{}/upload/{}/{}?server_hostname={}",
-                encode_repo_name(&self.repository),
-                object.oid,
-                object.size,
-                self.server_hostname,
-            ))
+            .build(
+                format_args!(
+                    "{}/upload/{}/{}?server_hostname={}",
+                    encode_repo_name(&self.repository),
+                    object.oid,
+                    object.size,
+                    self.server_hostname,
+                ),
+                self.scheme_override(),
+            )
             .map_err(|e| ErrorKind::UriBuilderFailed("upload_uri", e))
     }
 
     pub fn download_uri(&self, content_id: &ContentId) -> Result<Uri, ErrorKind> {
         self.pick_uri()?
-            .build(format_args!(
-                "{}/download/{}?server_hostname={}",
-                encode_repo_name(&self.repository),
-                content_id,
-                self.server_hostname
-            ))
+            .build(
+                format_args!(
+                    "{}/download/{}?server_hostname={}",
+                    encode_repo_name(&self.repository),
+                    content_id,
+                    self.server_hostname
+                ),
+                self.scheme_override(),
+            )
             .map_err(|e| ErrorKind::UriBuilderFailed("download_uri", e))
     }
 
@@ -502,14 +559,17 @@ impl UriBuilder {
         tasks_per_content: NonZeroU16,
     ) -> Result<Uri, ErrorKind> {
         self.pick_uri()?
-            .build(format_args!(
-                "{}/download/{}?routing={}&server_hostname={}&tpc={}",
-                encode_repo_name(&self.repository),
-                content_id,
-                routing_key,
-                self.server_hostname,
-                tasks_per_content.get(),
-            ))
+            .build(
+                format_args!(
+                    "{}/download/{}?routing={}&server_hostname={}&tpc={}",
+                    encode_repo_name(&self.repository),
+                    content_id,
+                    routing_key,
+                    self.server_hostname,
+                    tasks_per_content.get(),
+                ),
+                self.scheme_override(),
+            )
             .map_err(|e| ErrorKind::UriBuilderFailed("consistent_download_uri", e))
     }
 
@@ -518,7 +578,7 @@ impl UriBuilder {
             .upstream_uri
             .as_ref()
             .map(|uri| {
-                uri.build(format_args!("objects/batch"))
+                uri.build(format_args!("objects/batch"), None)
                     .map_err(|e| ErrorKind::UriBuilderFailed("upstream_batch_uri", e))
             })
             .transpose()
@@ -551,16 +611,27 @@ pub struct ServerUris {
     self_uris: Vec<BaseUri>,
     /// The URL for an upstream LFS server
     upstream_uri: Option<BaseUri>,
+    /// Hosts for which to force http scheme in generated hrefs
+    force_http_hosts: Vec<String>,
+    /// Headers whose presence (with value "1") forces http scheme in generated hrefs
+    force_http_headers: Vec<String>,
 }
 
 impl ServerUris {
-    pub fn new(self_uris: Vec<String>, upstream_uri: Option<String>) -> Result<Self, Error> {
+    pub fn new(
+        self_uris: Vec<String>,
+        upstream_uri: Option<String>,
+        force_http_hosts: Vec<String>,
+        force_http_headers: Vec<String>,
+    ) -> Result<Self, Error> {
         Ok(Self {
             self_uris: self_uris
                 .into_iter()
                 .map(|v| parse_and_check_uri(&v))
                 .collect::<Result<Vec<_>, _>>()?,
             upstream_uri: upstream_uri.map(|v| parse_and_check_uri(&v)).transpose()?,
+            force_http_hosts,
+            force_http_headers,
         })
     }
 }
@@ -573,10 +644,10 @@ struct BaseUri {
 }
 
 impl BaseUri {
-    pub fn build(&self, args: Arguments) -> Result<Uri, Error> {
+    pub fn build(&self, args: Arguments, scheme_override: Option<Scheme>) -> Result<Uri, Error> {
         let mut p = String::new();
         if let Some(ref path_and_query) = self.path_and_query {
-            write!(&mut p, "{}", path_and_query)?;
+            write!(&mut p, "{path_and_query}")?;
             if !path_and_query.path().ends_with('/') {
                 write!(&mut p, "/")?;
             }
@@ -584,7 +655,7 @@ impl BaseUri {
         p.write_fmt(args)?;
 
         Uri::builder()
-            .scheme(self.scheme.clone())
+            .scheme(scheme_override.unwrap_or_else(|| self.scheme.clone()))
             .authority(self.authority.clone())
             .path_and_query(&p[..])
             .build()
@@ -620,12 +691,15 @@ mod test {
         let server = ServerUris::new(
             self_uris.into_iter().map(|v| v.to_string()).collect(),
             upstream_uri.map(|v| v.to_string()),
+            vec![],
+            vec![],
         )?;
         Ok(UriBuilder {
             repository: "repo123/blah".to_string(),
             server: Arc::new(server),
             host,
             server_hostname: Arc::new(SERVER_HOSTNAME.to_string()),
+            force_http: false,
         })
     }
 
@@ -675,6 +749,7 @@ mod test {
                 max_upload_size: None,
                 client: HttpClient::Disabled,
                 bandwidth: None,
+                compression_sniff_enabled: false,
             })
         }
     }
@@ -876,8 +951,7 @@ mod test {
             )?
             .to_string(),
             format!(
-                "http://foo.com/repo123%2Fblah/download/{}?routing={}&server_hostname={}&tpc=1",
-                ONES_HASH, TWOS_HASH, SERVER_HOSTNAME
+                "http://foo.com/repo123%2Fblah/download/{ONES_HASH}?routing={TWOS_HASH}&server_hostname={SERVER_HOSTNAME}&tpc=1"
             ),
         );
         Ok(())
@@ -985,6 +1059,167 @@ mod test {
         assert_eq!(host_maybe_port_to_host("[::1]")?, "[::1]");
         assert_eq!(host_maybe_port_to_host("[::1]:80")?, "[::1]");
         assert_eq!(host_maybe_port_to_host("127.0.0.1:80")?, "127.0.0.1");
+        Ok(())
+    }
+
+    fn make_server_uris(force_http_hosts: Vec<&str>, force_http_headers: Vec<&str>) -> ServerUris {
+        ServerUris::new(
+            vec!["https://foo.com".to_string()],
+            None,
+            force_http_hosts
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+            force_http_headers
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[mononoke::test]
+    fn test_should_force_http_matching_host() {
+        let server = make_server_uris(vec!["proxy.example.com"], vec![]);
+        let headers: Option<&HeaderMap> = None;
+        assert!(should_force_http_scheme(
+            "proxy.example.com",
+            &headers,
+            &server
+        ));
+    }
+
+    #[mononoke::test]
+    fn test_should_force_http_non_matching_host() {
+        let server = make_server_uris(vec!["proxy.example.com"], vec![]);
+        let headers: Option<&HeaderMap> = None;
+        assert!(!should_force_http_scheme(
+            "other.example.com",
+            &headers,
+            &server
+        ));
+    }
+
+    #[mononoke::test]
+    fn test_should_force_http_matching_header() {
+        let server = make_server_uris(vec![], vec!["corpx2pagent"]);
+        let mut hm = HeaderMap::new();
+        hm.insert("corpx2pagent", "1".parse().unwrap());
+        let headers = Some(&hm);
+        assert!(should_force_http_scheme("any.host.com", &headers, &server));
+    }
+
+    #[mononoke::test]
+    fn test_should_force_http_header_wrong_value() {
+        let server = make_server_uris(vec![], vec!["corpx2pagent"]);
+        let mut hm = HeaderMap::new();
+        hm.insert("corpx2pagent", "0".parse().unwrap());
+        let headers = Some(&hm);
+        assert!(!should_force_http_scheme("any.host.com", &headers, &server));
+    }
+
+    #[mononoke::test]
+    fn test_should_force_http_header_missing() {
+        let server = make_server_uris(vec![], vec!["corpx2pagent"]);
+        let hm = HeaderMap::new();
+        let headers = Some(&hm);
+        assert!(!should_force_http_scheme("any.host.com", &headers, &server));
+    }
+
+    #[mononoke::test]
+    fn test_should_force_http_no_config() {
+        let server = make_server_uris(vec![], vec![]);
+        let headers: Option<&HeaderMap> = None;
+        assert!(!should_force_http_scheme("any.host.com", &headers, &server));
+    }
+
+    #[mononoke::test]
+    fn test_force_http_overrides_https_upload_uri() -> Result<(), Error> {
+        let server = ServerUris::new(
+            vec!["https://foo.com".to_string()],
+            Some("https://bar.com".to_string()),
+            vec![],
+            vec![],
+        )?;
+        let b = UriBuilder {
+            repository: "repo123/blah".to_string(),
+            server: Arc::new(server),
+            host: "foo.com".to_string(),
+            server_hostname: Arc::new(SERVER_HOSTNAME.to_string()),
+            force_http: true,
+        };
+        let uri = b.upload_uri(&obj()?)?.to_string();
+        assert!(uri.starts_with("http://"), "expected http:// but got {uri}");
+        assert!(
+            !uri.starts_with("https://"),
+            "expected no https:// but got {uri}"
+        );
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_force_http_overrides_https_download_uri() -> Result<(), Error> {
+        let server = ServerUris::new(
+            vec!["https://foo.com".to_string()],
+            Some("https://bar.com".to_string()),
+            vec![],
+            vec![],
+        )?;
+        let b = UriBuilder {
+            repository: "repo123/blah".to_string(),
+            server: Arc::new(server),
+            host: "foo.com".to_string(),
+            server_hostname: Arc::new(SERVER_HOSTNAME.to_string()),
+            force_http: true,
+        };
+        let uri = b.download_uri(&content_id()?)?.to_string();
+        assert!(uri.starts_with("http://"), "expected http:// but got {uri}");
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_force_http_does_not_affect_upstream() -> Result<(), Error> {
+        let server = ServerUris::new(
+            vec!["https://foo.com".to_string()],
+            Some("https://bar.com".to_string()),
+            vec![],
+            vec![],
+        )?;
+        let b = UriBuilder {
+            repository: "repo123/blah".to_string(),
+            server: Arc::new(server),
+            host: "foo.com".to_string(),
+            server_hostname: Arc::new(SERVER_HOSTNAME.to_string()),
+            force_http: true,
+        };
+        let uri = b.upstream_batch_uri()?.unwrap().to_string();
+        assert!(
+            uri.starts_with("https://"),
+            "upstream should stay https:// but got {uri}"
+        );
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_no_force_http_preserves_https() -> Result<(), Error> {
+        let server = ServerUris::new(
+            vec!["https://foo.com".to_string()],
+            Some("https://bar.com".to_string()),
+            vec![],
+            vec![],
+        )?;
+        let b = UriBuilder {
+            repository: "repo123/blah".to_string(),
+            server: Arc::new(server),
+            host: "foo.com".to_string(),
+            server_hostname: Arc::new(SERVER_HOSTNAME.to_string()),
+            force_http: false,
+        };
+        let uri = b.upload_uri(&obj()?)?.to_string();
+        assert!(
+            uri.starts_with("https://"),
+            "expected https:// but got {uri}"
+        );
         Ok(())
     }
 }

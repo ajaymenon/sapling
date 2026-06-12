@@ -23,6 +23,7 @@ use bookmarks::BookmarksRef;
 use clap::ArgGroup;
 use clap::Args;
 use commit_id::parse_commit_id;
+use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
 use fsnodes::RootFsnodeId;
@@ -35,6 +36,7 @@ use mononoke_app::args::RepoBlobstoreArgs;
 use mononoke_types::BlobstoreKey;
 use mononoke_types::ChangesetId;
 use mononoke_types::NonRootMPath;
+use mononoke_types::content_manifest::compat;
 use mononoke_types::typed_hash::RedactionKeyListId;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_derived_data::RepoDerivedDataRef;
@@ -69,6 +71,10 @@ pub struct RedactionCreateKeyListArgs {
     #[clap(long)]
     output_file: Option<PathBuf>,
 
+    /// Skip syncing the keylist to the AWS Mononoke instance.
+    #[clap(long)]
+    skip_aws_sync: bool,
+
     /// Files to redact
     #[clap(value_name = "FILE")]
     files: Vec<String>,
@@ -86,6 +92,12 @@ pub struct RedactionCreateKeyListFromIdsArgs {
     /// Name of a file to write the new key to.
     #[clap(long)]
     output_file: Option<PathBuf>,
+
+    /// Skip syncing the keylist to the AWS Mononoke instance.
+    /// This flag is accepted for CLI uniformity but has no effect
+    /// (this command never triggers AWS sync).
+    #[clap(long)]
+    _skip_aws_sync: bool,
 }
 
 #[derive(Args)]
@@ -118,13 +130,17 @@ pub async fn fetch_key_list(
         })?;
         for key in key_list.keys {
             output
-                .write(format!("{}\n", key).as_bytes())
+                .write(format!("{key}\n").as_bytes())
                 .with_context(|| {
                     format!(
                         "Failed to write to output file '{}'",
                         output_file.to_string_lossy()
                     )
                 })?;
+        }
+    } else {
+        for key in key_list.keys {
+            println!("{key}");
         }
     }
     Ok(())
@@ -135,7 +151,7 @@ async fn create_key_list(
     app: &MononokeApp,
     keys: Vec<String>,
     output_file: Option<&Path>,
-) -> Result<()> {
+) -> Result<RedactionKeyListId> {
     let redaction_blobstore = app.redaction_config_blobstore().await?;
     let key_list_id = redaction::create_key_list(ctx, &redaction_blobstore, keys).await?;
     if let Some(output_file) = output_file {
@@ -154,7 +170,7 @@ async fn create_key_list(
                 )
             })?;
     }
-    Ok(())
+    Ok(key_list_id)
 }
 
 /// Returns the content keys for the given paths.
@@ -164,17 +180,33 @@ async fn content_keys_for_paths(
     cs_id: ChangesetId,
     paths: Vec<NonRootMPath>,
 ) -> Result<HashSet<String>> {
-    let root_fsnode_id = repo
-        .repo_derived_data()
-        .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
-        .await?;
-    let path_content_keys = root_fsnode_id
-        .fsnode_id()
+    let use_content_manifests = justknobs::eval(
+        "scm/mononoke:derived_data_use_content_manifests",
+        None,
+        Some(repo.repo_identity.name()),
+    );
+
+    let root_manifest_id: compat::ContentManifestId = if use_content_manifests {
+        repo.repo_derived_data()
+            .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
+            .await?
+            .into_content_manifest_id()
+            .into()
+    } else {
+        repo.repo_derived_data()
+            .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
+            .await?
+            .into_fsnode_id()
+            .into()
+    };
+
+    let path_content_keys = root_manifest_id
         .find_entries(ctx.clone(), repo.repo_blobstore_arc(), paths.clone())
         .try_filter_map(|(path, entry)| async move {
             match (path.into_optional_non_root_path(), entry) {
-                (Some(path), Entry::Leaf(fsnode_file)) => {
-                    Ok(Some((path, fsnode_file.content_id().blobstore_key())))
+                (Some(path), Entry::Leaf(leaf)) => {
+                    let file: compat::ContentManifestFile = leaf.into();
+                    Ok(Some((path, file.content_id().blobstore_key())))
                 }
                 _ => Ok(None),
             }
@@ -185,12 +217,12 @@ async fn content_keys_for_paths(
     let mut missing_paths = 0;
     for path in paths.iter() {
         if !path_content_keys.contains_key(path) {
-            eprintln!("Missing file: {}", path);
+            eprintln!("Missing file: {path}");
             missing_paths += 1;
         }
     }
     if missing_paths > 0 {
-        bail!("Failed to find {} files in this commit", missing_paths);
+        bail!("Failed to find {missing_paths} files in this commit");
     }
 
     Ok(path_content_keys.into_values().collect())
@@ -273,13 +305,17 @@ pub async fn create_key_list_from_commit_files(
         }
     }
 
-    create_key_list(
-        ctx,
-        app,
-        keys.into_iter().collect(),
-        create_args.output_file.as_deref(),
-    )
-    .await
+    let keys_vec: Vec<String> = keys.into_iter().collect();
+    let keys_for_sync = keys_vec.clone();
+
+    let key_list_id =
+        create_key_list(ctx, app, keys_vec, create_args.output_file.as_deref()).await?;
+
+    if !create_args.skip_aws_sync {
+        super::aws_sync::sync_to_aws(&keys_for_sync, key_list_id, repo.repo_identity.name()).await;
+    }
+
+    Ok(())
 }
 
 pub async fn create_key_list_from_blobstore_keys(
@@ -287,11 +323,13 @@ pub async fn create_key_list_from_blobstore_keys(
     app: &MononokeApp,
     create_args: RedactionCreateKeyListFromIdsArgs,
 ) -> Result<()> {
-    create_key_list(
+    let _key_list_id = create_key_list(
         ctx,
         app,
         create_args.keys,
         create_args.output_file.as_deref(),
     )
-    .await
+    .await?;
+
+    Ok(())
 }

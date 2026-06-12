@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/Synchronized.h>
+#include <folly/coro/safe/NowTask.h>
 #include <folly/futures/Future.h>
 #include <atomic>
 #include <memory>
@@ -160,6 +161,9 @@ class InodeBase {
 
   // See EdenDispatcher::getattr
   virtual ImmediateFuture<struct stat> stat(
+      const ObjectFetchContextPtr& context) = 0;
+
+  virtual folly::coro::now_task<struct stat> co_stat(
       const ObjectFetchContextPtr& context) = 0;
 
   // See Dispatcher::setattr
@@ -324,7 +328,7 @@ class InodeBase {
    * Get the channel reference count.
    *
    * This is intended only to be checked when an Inode is being unloaded,
-   * while holding both it's parent TreeInode's contents_ lock and the InodeMap
+   * while holding both its parent TreeInode's contents_ lock and the InodeMap
    * lock.
    *
    * The channel reference count is only incremented or decremented while
@@ -399,11 +403,11 @@ class InodeBase {
   }
 
   /**
-   * This is used only by NFS Garbage Collection (GC) to determine if an inode
-   * is unused for the cutoff time and can be deleted
+   * Used by Garbage Collection (GC) to determine if an inode
+   * is unused for the cutoff time and can be collected.
    */
-  EdenTimestamp getNfsLastUsedTime() const {
-    return nfsLastUsedTime_.load(std::memory_order_relaxed);
+  EdenTimestamp getLastFsRequestTime() const {
+    return lastFsRequestTime_.load(std::memory_order_relaxed);
   }
 
   struct LocationInfo {
@@ -458,7 +462,7 @@ class InodeBase {
 
   /**
    * Acquire the content lock and update the inode metadata. This method is used
-   * to make the kernel refresh it's caches on NFS.
+   * to make the kernel refresh its caches on NFS.
    */
   virtual void forceMetadataUpdate() = 0;
 
@@ -549,7 +553,7 @@ class InodeBase {
    * This method should not be called on the root inode.  The caller is
    * responsible for checking that before calling getPathHelper().
    *
-   * Returns true if the the file exists at the given path, or false if the file
+   * Returns true if the file exists at the given path, or false if the file
    * has been unlinked.
    *
    * If stopOnUnlinked is true, it breaks immediately when it finds that the
@@ -605,10 +609,10 @@ class InodeBase {
   }
 
   /**
-   * Updates the NFS last time used for this inode. The value is only updated
+   * Updates the last fs request time for this inode. The value is only updated
    * for this inode, it is not propagated to its parents.
    */
-  void updateNfsLastUsedTime();
+  void updateLastFsRequestTime();
 
  private:
   ParentInodeInfo getParentInfo() const;
@@ -740,9 +744,9 @@ class InodeBase {
   folly::Synchronized<LocationInfo> location_;
 
   /**
-   * The last time this inode was used with any NFS command.
-   * This is used only by NFS Garbage Collection (GC) to determine if an inode
-   * is unused for the cutoff time and can be deleted.
+   * The last time the kernel made a request involving this inode.
+   * Used by Garbage Collection (GC) to determine if an inode
+   * is unused for the cutoff time and can be collected.
    *
    * Note1: This field is distinct from atime and is not persisted to disk via
    * InodeTable.
@@ -750,7 +754,7 @@ class InodeBase {
    * Note2: This field get updated for the inode itself and not propagate to its
    * parent.
    */
-  std::atomic<EdenTimestamp> nfsLastUsedTime_{getNow()};
+  std::atomic<EdenTimestamp> lastFsRequestTime_{getNow()};
 
   template <typename InodeState>
   friend class InodeBaseMetadata;

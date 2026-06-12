@@ -288,14 +288,18 @@ class HgRepository(repobase.Repository):
 
         # Eagerepo allows us to fake remote fetches from the server
         eagerepo = self.temp_mgr.make_temp_dir(prefix="eagerepo")
+        self.eagerepo = eagerepo
 
         hgrc.setdefault("remotefilelog", {})
         hgrc["remotefilelog"]["server"] = "false"
         hgrc["remotefilelog"]["reponame"] = "test"
         hgrc["remotefilelog"]["cachepath"] = cachepath
 
-        # We should allow fetching tree aux data along with trees
-        hgrc.add_section("scmstore")
+        # We should allow fetching tree aux data along with trees.
+        # Use has_section() so callers that set other scmstore keys via
+        # apply_hg_config_variant() don't trip DuplicateSectionError here.
+        if not hgrc.has_section("scmstore"):
+            hgrc.add_section("scmstore")
         hgrc["scmstore"]["fetch-tree-aux-data"] = "true"
 
         # Some tests set these configs on their own. We shouldn't overwrite them.
@@ -310,6 +314,9 @@ class HgRepository(repobase.Repository):
         # Use (native) Rust checkout whenever possible
         hgrc.setdefault("checkout", {})
         hgrc["checkout"]["use-rust"] = "true"
+
+        hgrc.setdefault("grep", {})
+        hgrc["grep"]["use-rust"] = "true"
 
         # It's safe to use EdenAPI push for testing purposes
         hgrc.add_section("push")
@@ -408,6 +415,8 @@ class HgRepository(repobase.Repository):
                 "commit",
                 "--config",
                 user_config,
+                "--config",
+                "ui.allowmerge=True",
                 "--date",
                 date_str,
                 "--logfile",

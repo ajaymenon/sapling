@@ -23,6 +23,7 @@ import type {
   ServerToClientMessage,
   StableLocationData,
   SubmodulesByRoot,
+  WorktreeInfo,
 } from 'isl/src/types';
 import type {EjecaError, EjecaReturn} from 'shared/ejeca';
 import type {ExportStack, ImportedStack} from 'shared/types/stack';
@@ -77,6 +78,8 @@ export default class ServerToClientAPI {
 
   /** Disposables that must be disposed whenever the current repo is changed */
   private repoDisposables: Array<Disposable> = [];
+  /** Disposables that persist across repo changes, disposed only when the connection closes */
+  private connectionDisposables: Array<Disposable> = [];
   private subscriptions = new Map<string, Disposable>();
   private activeRepoRef: RepositoryReference | undefined;
 
@@ -146,6 +149,20 @@ export default class ServerToClientAPI {
       this.postMessage({type: 'fetchedRecommendedBookmarks', bookmarks});
     });
 
+    repo.pullFetchedDiffs().catch((err: unknown) => {
+      this.logger.error('error pulling authored diff commit hashes:', err);
+    });
+
+    repo.fetchAndSetHiddenMasterConfig(async (config, odType) => {
+      await this.connection.readySignal?.promise;
+      this.postMessage({
+        type: 'fetchedHiddenMasterBranchConfig',
+        config,
+        odType,
+        cwd: ctx.cwd,
+      });
+    });
+
     this.processQueuedMessages();
   }
 
@@ -159,6 +176,7 @@ export default class ServerToClientAPI {
       this.activeRepoRef.unref();
     }
     this.logger.info(`Setting active repo cwd to ${newCwd}`);
+    this.connection.onChangeCwd?.(newCwd);
     // Set as loading right away while we determine the new cwd's repo
     // This ensures new messages coming in will be queued and handled only with the new repository
     this.currentState = {type: 'loading'};
@@ -182,6 +200,9 @@ export default class ServerToClientAPI {
   dispose() {
     this.incomingListener.dispose();
     this.disposeRepoDisposables();
+
+    this.connectionDisposables.forEach(d => d.dispose());
+    this.connectionDisposables = [];
 
     if (this.activeRepoRef !== undefined) {
       this.activeRepoRef.unref();
@@ -235,6 +256,9 @@ export default class ServerToClientAPI {
             message => this.postMessage(message),
             (dispose: () => unknown) => {
               this.repoDisposables.push({dispose});
+            },
+            (dispose: () => unknown) => {
+              this.connectionDisposables.push({dispose});
             },
           );
           this.notifyListeners(data);
@@ -451,6 +475,29 @@ export default class ServerToClientAPI {
             });
             break;
           }
+          case 'worktreeInfo': {
+            const postWorktreeInfo = (worktreeInfo: WorktreeInfo | undefined) => {
+              this.postMessage({
+                type: 'subscriptionResult',
+                kind: 'worktreeInfo',
+                subscriptionID,
+                data: worktreeInfo,
+              });
+            };
+            const worktreeInfo = repo.getWorktreeInfo();
+            if (worktreeInfo !== undefined) {
+              postWorktreeInfo(worktreeInfo);
+            }
+            repo.refreshWorktreeInfo();
+
+            const disposable = repo.subscribeToWorktreeInfoChanges(postWorktreeInfo);
+            this.subscriptions.set(subscriptionID, {
+              dispose: () => {
+                disposable.dispose();
+              },
+            });
+            break;
+          }
           case 'subscribedFullRepoBranches': {
             const fullRepoBranchModule = repo.fullRepoBranchModule;
             if (fullRepoBranchModule == null) {
@@ -545,9 +592,9 @@ export default class ServerToClientAPI {
         break;
       }
       case 'requestComparison': {
-        const {comparison} = data;
+        const {comparison, ignoreWhitespace} = data;
         const diff: Promise<Result<string>> = repo
-          .runDiff(ctx, comparison)
+          .runDiff(ctx, comparison, undefined, ignoreWhitespace)
           .then(value => ({value}))
           .catch(error => {
             logger?.error('error running diff', error.toString());
@@ -558,6 +605,7 @@ export default class ServerToClientAPI {
             type: 'comparison',
             comparison,
             data: {diff: data},
+            ignoreWhitespace,
           }),
         );
         break;
@@ -612,6 +660,9 @@ export default class ServerToClientAPI {
         logger?.log('refresh requested');
         repo.fetchAndSetRecommendedBookmarks(bookmarks => {
           this.postMessage({type: 'fetchedRecommendedBookmarks', bookmarks});
+        });
+        repo.pullFetchedDiffs().catch((err: unknown) => {
+          this.logger.error('error pulling authored diff commit hashes:', err);
         });
         repo.fetchSmartlogCommits();
         repo.fetchUncommittedChanges();
@@ -1272,6 +1323,44 @@ export default class ServerToClientAPI {
         Internal.unsubscribeToFullRepoBranch?.(ctx, repo, data.fullRepoBranch);
         break;
       }
+      case 'createFullRepoBranch': {
+        Internal.createFullRepoBranch?.(ctx, repo, data.input)
+          .then((result: InternalTypes['CreateFullRepoBranchResult']) => {
+            this.postMessage({
+              type: 'createdFullRepoBranch',
+              id: data.id,
+              result: {value: result},
+            });
+          })
+          .catch((error: Error) => {
+            logger?.error('Failed to create full repo branch', error);
+            this.postMessage({
+              type: 'createdFullRepoBranch',
+              id: data.id,
+              result: {error},
+            });
+          });
+        break;
+      }
+      case 'checkBranchNameExists': {
+        Internal.checkBranchNameExists?.(ctx, repo, data.branchName)
+          .then((result: {exists: boolean}) => {
+            this.postMessage({
+              type: 'checkedBranchNameExists',
+              id: data.id,
+              result: {value: result},
+            });
+          })
+          .catch((error: Error) => {
+            logger?.error('Failed to check branch name existence', error);
+            this.postMessage({
+              type: 'checkedBranchNameExists',
+              id: data.id,
+              result: {error},
+            });
+          });
+        break;
+      }
       default: {
         if (
           repo.codeReviewProvider?.handleClientToServerMessage?.(data, message =>
@@ -1287,6 +1376,9 @@ export default class ServerToClientAPI {
           message => this.postMessage(message),
           (dispose: () => unknown) => {
             this.repoDisposables.push({dispose});
+          },
+          (dispose: () => unknown) => {
+            this.connectionDisposables.push({dispose});
           },
         );
         break;

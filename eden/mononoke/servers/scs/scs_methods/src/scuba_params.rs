@@ -330,9 +330,22 @@ impl AddScubaParams for thrift::CommitInfoParams {
 
 impl AddScubaParams for thrift::CommitGenerationParams {}
 
+impl AddScubaParams for thrift::CommitFingerprintParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("fingerprint_version", format!("{:?}", self.version));
+    }
+}
+
 impl AddScubaParams for thrift::CommitIsAncestorOfParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add("other_commit", self.descendant_commit_id.to_string());
+    }
+}
+
+impl AddScubaParams for thrift::CommitFilterAncestorsParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("param_num_candidates", self.candidate_ancestor_ids.len());
+        self.identity_schemes.add_scuba_params(scuba);
     }
 }
 
@@ -418,6 +431,12 @@ impl AddScubaParams for thrift::CommitRunHooksParams {
     }
 }
 
+impl AddScubaParams for thrift::CommitRateLimitCheckParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("bookmark_name", self.bookmark.as_str());
+    }
+}
+
 impl AddScubaParams for thrift::CommitSubtreeChangesParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
         self.identity_schemes.add_scuba_params(scuba);
@@ -437,7 +456,7 @@ impl AddScubaParams for thrift::CommitPathBlameParams {
         if let Some(param_blame_format_option) = &self.format_options {
             let repr = param_blame_format_option
                 .iter()
-                .map(|x| format!("{}", x))
+                .map(|x| format!("{x}"))
                 .join("|");
             scuba.add("param_format_options", repr);
         }
@@ -474,6 +493,8 @@ impl AddScubaParams for thrift::CommitPathHistoryParams {
 }
 
 impl AddScubaParams for thrift::CommitHgMutationHistoryParams {}
+
+impl AddScubaParams for thrift::CommitGitMutationHistoryParams {}
 
 impl AddScubaParams for thrift::CommitDirectoryBranchClustersParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
@@ -533,7 +554,7 @@ impl AddScubaParams for thrift::CommitSparseProfileDeltaParamsV2 {
                     profiles.iter().collect::<ScubaValue>()
                 }
                 thrift::SparseProfiles::UnknownField(t) => {
-                    ScubaValue::from(format!("unknown SparseProfiles type {}", t))
+                    ScubaValue::from(format!("unknown SparseProfiles type {t}"))
                 }
             },
         );
@@ -560,7 +581,7 @@ impl AddScubaParams for thrift::CommitSparseProfileSizeParamsV2 {
                     profiles.iter().collect::<ScubaValue>()
                 }
                 thrift::SparseProfiles::UnknownField(t) => {
-                    ScubaValue::from(format!("unknown SparseProfiles type {}", t))
+                    ScubaValue::from(format!("unknown SparseProfiles type {t}"))
                 }
             },
         );

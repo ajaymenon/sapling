@@ -54,6 +54,8 @@ class PrivHelperConn {
     REQ_START_FAM = 14,
     REQ_STOP_FAM = 15,
     REQ_SET_MEMORY_PRIORITY_FOR_PROCESS = 16,
+    REQ_GET_NAMESPACE_INFO = 17,
+    REQ_SET_FUSE_READ_AHEAD = 18,
   };
 
   // This structure should never change. If fields need to be added to the
@@ -184,6 +186,12 @@ class PrivHelperConn {
   static UnixSocket::Message serializeGetPidRequest(uint32_t xid);
   static pid_t parseGetPidResponse(const UnixSocket::Message& msg);
 
+  static UnixSocket::Message serializeGetNamespaceInfoRequest(
+      uint32_t xid,
+      pid_t daemonPid);
+  static NamespaceInfo parseGetNamespaceInfoResponse(
+      const UnixSocket::Message& msg);
+
   static UnixSocket::Message serializeStartFamRequest(
       uint32_t xid,
       const std::vector<std::string>& paths,
@@ -221,6 +229,21 @@ class PrivHelperConn {
       folly::io::Cursor& cursor,
       pid_t& pid,
       int& targetPriority);
+
+  static UnixSocket::Message serializeSetFuseReadAheadRequest(
+      uint32_t xid,
+      folly::StringPiece mountPath,
+      uint32_t readAheadKb);
+  static void parseSetFuseReadAheadRequest(
+      folly::io::Cursor& cursor,
+      std::string& mountPath,
+      uint32_t& readAheadKb);
+
+  static void serializeSanityCheckResult(
+      folly::io::Appender& appender,
+      const SanityCheckResult& result);
+
+  static SanityCheckResult parseSanityCheckResult(folly::io::Cursor& cursor);
 
   /**
    * Parse a response that is expected to be empty.
@@ -326,6 +349,15 @@ struct formatter<facebook::eden::PrivHelperConn::MsgType>
         break;
       case facebook::eden::PrivHelperConn::REQ_STOP_FAM:
         name = "REQ_STOP_FAM";
+        break;
+      case facebook::eden::PrivHelperConn::REQ_SET_MEMORY_PRIORITY_FOR_PROCESS:
+        name = "REQ_SET_MEMORY_PRIORITY_FOR_PROCESS";
+        break;
+      case facebook::eden::PrivHelperConn::REQ_GET_NAMESPACE_INFO:
+        name = "REQ_GET_NAMESPACE_INFO";
+        break;
+      case facebook::eden::PrivHelperConn::REQ_SET_FUSE_READ_AHEAD:
+        name = "REQ_SET_FUSE_READ_AHEAD";
         break;
       default:
         name = "Unknown PrivHelperConn::MsgType";

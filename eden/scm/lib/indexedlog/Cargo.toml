@@ -31,38 +31,40 @@ harness = false
 
 [dependencies]
 byteorder = "1.5"
-memmap2 = "0.9.5"
-once_cell = "1.21"
-rand = { version = "0.9", features = ["small_rng"] }
+memmap2 = "0.9.10"
+once_cell = "1.21.4"
+rand = "0.10.1"
 sapling-atomicfile = { version = "0.1.0", path = "../atomicfile" }
 sapling-configmodel = { version = "0.1.0", path = "../config/model", optional = true }
+sapling-metrics = { version = "0.1.0", path = "../metrics", optional = true }
 sapling-minibytes = { version = "0.1.0", path = "../minibytes" }
 sapling-vlqencoding = { version = "0.1.0", path = "../vlqencoding" }
-tempfile = "3.22"
+tempfile = "3.27.0"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 twox-hash = "1.6.1"
 
 [dev-dependencies]
-quickcheck = "1.0"
-rand_chacha = "0.3"
+ctor = "1.0.7"
+quickcheck = "1.1"
+rand_chacha = "0.10"
 sapling-dev-logger = { version = "0.1.0", path = "../dev-logger" }
-sapling-fsinfo = { version = "0.1.0", path = "../fsinfo" }
 sapling-minibench = { version = "0.1.0", path = "../minibench" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hex = { version = "0.4.3", features = ["alloc"] }
-libc = "0.2.139"
-sapling-btrfs = { path = "../util/btrfs", optional = true }
+libc = "0.2.186"
+sapling-btrfs = { version = "0.1.0", path = "../util/btrfs", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-tempfile = "3.22"
+sapling-fsinfo = { version = "0.1.0", path = "../fsinfo" }
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hex = { version = "0.4.3", features = ["alloc"] }
-libc = "0.2.139"
+libc = "0.2.186"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-tempfile = "3.22"
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = ["everything", "std"] }
@@ -70,4 +72,5 @@ winapi = { version = "0.3", features = ["everything", "std"] }
 [features]
 btrfs = ["sapling-btrfs"]
 configurable = ["sapling-configmodel"]
+metrics = ["sapling-metrics"]
 sigbus-handler = []

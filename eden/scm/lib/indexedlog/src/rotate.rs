@@ -22,6 +22,7 @@ use minibytes::Bytes;
 use once_cell::sync::OnceCell;
 use tracing::debug;
 use tracing::debug_span;
+use tracing::info;
 use tracing::trace;
 
 use crate::change_detect::SharedChangeDetector;
@@ -30,18 +31,20 @@ use crate::errors::ResultExt;
 use crate::lock::READER_LOCK_OPTS;
 use crate::lock::ScopedDirLock;
 use crate::log;
+use crate::log::Appendable;
 use crate::log::ExtendWrite;
 use crate::log::FlushFilterContext;
 use crate::log::FlushFilterFunc;
 use crate::log::FlushFilterOutput;
 use crate::log::IndexDef;
 use crate::log::Log;
+use crate::metrics::Counter;
 use crate::repair::OpenOptionsOutput;
 use crate::repair::OpenOptionsRepair;
 use crate::repair::RepairMessage;
 use crate::utils;
 
-pub static ROTATE_COUNT: AtomicU64 = AtomicU64::new(0);
+static ROTATE_COUNT: Counter = Counter::new_counter("indexedlog.rotate");
 
 /// A collection of [`Log`]s that get rotated or deleted automatically when they
 /// exceed size or count limits.
@@ -282,7 +285,7 @@ impl OpenOptions {
             Ok(rotate_log)
         })();
 
-        result.context(|| format!("in rotate::OpenOptions::open({:?})", dir))
+        result.context(|| format!("in rotate::OpenOptions::open({dir:?})"))
     }
 
     /// Open an-empty [`RotateLog`] in memory. The [`RotateLog`] cannot [`RotateLog::sync`].
@@ -319,7 +322,7 @@ impl OpenOptions {
             let _lock = ScopedDirLock::new(dir)?;
 
             let mut message = RepairMessage::new(dir);
-            message += &format!("Processing RotateLog: {:?}\n", dir);
+            message += &format!("Processing RotateLog: {dir:?}\n");
             let read_dir = dir.read_dir().context(dir, "cannot readdir")?;
             let mut ids = Vec::new();
 
@@ -336,25 +339,25 @@ impl OpenOptions {
             ids.sort_unstable();
             for &id in ids.iter() {
                 let name = id.to_string();
-                message += &format!("Attempt to repair log {:?}\n", name);
+                message += &format!("Attempt to repair log {name:?}\n");
                 match self.log_open_options.repair(dir.join(name)) {
                     Ok(log) => message += &log,
-                    Err(err) => message += &format!("Failed: {}\n", err),
+                    Err(err) => message += &format!("Failed: {err}\n"),
                 }
             }
 
             let latest_path = dir.join(LATEST_FILE);
             match read_latest_raw(dir) {
-                Ok(latest) => message += &format!("Latest = {}\n", latest),
+                Ok(latest) => message += &format!("Latest = {latest}\n"),
                 Err(err) => match err.kind() {
                     io::ErrorKind::NotFound
                     | io::ErrorKind::InvalidData
                     | io::ErrorKind::UnexpectedEof => {
                         let latest = guess_latest(ids);
-                        let content = format!("{}", latest);
+                        let content = format!("{latest}");
                         let fsync = false;
                         utils::atomic_write(&latest_path, content, fsync)?;
-                        message += &format!("Reset latest to {}\n", latest);
+                        message += &format!("Reset latest to {latest}\n");
                     }
                     _ => return Err(err).context(&latest_path, "cannot read or parse"),
                 },
@@ -362,7 +365,7 @@ impl OpenOptions {
 
             Ok(message.into_string())
         })()
-        .context(|| format!("in rotate::OpenOptions::repair({:?})", dir))
+        .context(|| format!("in rotate::OpenOptions::repair({dir:?})"))
     }
 }
 
@@ -393,25 +396,9 @@ impl fmt::Debug for OpenOptions {
 
 impl RotateLog {
     /// Append data to the writable [`Log`].
-    pub fn append(&mut self, data: impl AsRef<[u8]>) -> crate::Result<()> {
-        self.append_internal(
-            |buf| {
-                buf.extend_from_slice(data.as_ref());
-                crate::Result::Ok(())
-            },
-            Some(data.as_ref().len()),
-        )
-    }
-
-    /// Append data directly to the writable [`Log`]'s in-memory buffer.
-    pub fn append_direct<E>(
-        &mut self,
-        cb: impl Fn(&mut dyn ExtendWrite) -> Result<(), E>,
-    ) -> crate::Result<()>
-    where
-        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
-    {
-        self.append_internal(cb, None)
+    pub fn append(&mut self, data: impl Appendable) -> crate::Result<()> {
+        let data_len = data.data_len();
+        self.append_internal(|buf| data.write_to(buf), data_len)
     }
 
     fn append_internal<E>(
@@ -507,7 +494,7 @@ impl RotateLog {
             .get()
             .unwrap()
             .lookup(index_id, key)
-            .context(|| format!("in RotateLog::lookup_latest({}, {:?})", index_id, key))
+            .context(|| format!("in RotateLog::lookup_latest({index_id}, {key:?})"))
             .context(|| format!("  RotateLog.dir = {:?}", self.dir))
     }
 
@@ -684,6 +671,12 @@ impl RotateLog {
     /// is in-memory.
     pub fn remove_old_logs(&mut self) -> crate::Result<()> {
         if let Some(dir) = &self.dir {
+            // Optimistic lock-free check: skip the exclusive lock if there
+            // are no old logs to clean up, which is the common case.
+            let latest = read_latest(dir)?;
+            if latest != self.latest || !self.maybe_has_old_logs() {
+                return Ok(());
+            }
             let lock = ScopedDirLock::new(dir)?;
             let latest = read_latest(dir)?;
             if latest == self.latest {
@@ -691,6 +684,35 @@ impl RotateLog {
             }
         }
         Ok(())
+    }
+
+    /// Check if there are log directories outside the valid range.
+    /// We don't take any locks, so this is a racey "best effort" check.
+    fn maybe_has_old_logs(&self) -> bool {
+        let dir = match &self.dir {
+            Some(dir) => dir,
+            None => return false,
+        };
+        let read_dir = match dir.read_dir() {
+            Ok(read_dir) => read_dir,
+            Err(_) => return false,
+        };
+        let latest = self.latest;
+        let earliest = latest.wrapping_sub(self.open_options.max_log_count - 1);
+        for entry in read_dir {
+            if let Ok(entry) = entry {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Ok(id) = name.parse::<u8>() {
+                        if (latest >= earliest && (id > latest || id < earliest))
+                            || (latest < earliest && (id > latest && id < earliest))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Returns `true` if `sync` will load more data on disk.
@@ -713,15 +735,21 @@ impl RotateLog {
     /// callsite makes sure that [`Log`]s are consistent (ex. up-to-date,
     /// and do not have dirty entries in non-writable logs).
     fn rotate_internal(&mut self, lock: &ScopedDirLock) -> crate::Result<()> {
-        ROTATE_COUNT.fetch_add(1, Ordering::Relaxed);
+        ROTATE_COUNT.add(1);
+
+        let dir_name = match &self.dir {
+            Some(dir) => dir.to_string_lossy(),
+            None => "<none>".into(),
+        };
 
         // This is relative to the primary log, so clear it out when rotating.
         self.next_btrfs_size_check.take();
 
-        let span = debug_span!("RotateLog::rotate", latest = self.latest as u32);
-        if let Some(dir) = &self.dir {
-            span.record("dir", dir.to_string_lossy().as_ref());
-        }
+        let span = debug_span!(
+            "RotateLog::rotate",
+            dir = %dir_name,
+            latest = self.latest as u32
+        );
         let _guard = span.enter();
 
         // Create a new Log. Bump latest.
@@ -734,6 +762,12 @@ impl RotateLog {
         )?;
         if self.logs.len() >= self.open_options.max_log_count as usize {
             if let Some(log) = self.logs.pop().and_then(|mut l| l.take()) {
+                info!(
+                    %dir_name,
+                    len = log.meta.primary_len,
+                    "RotateLog dropping log"
+                );
+
                 if self.is_consistent_reads() {
                     self.pinned_logs.push(log);
                 }
@@ -887,6 +921,14 @@ impl RotateLog {
         logs.into_iter().rev().flat_map(|log| log.iter())
     }
 
+    /// Returns `true` if there are in-memory changes that haven't been flushed to disk.
+    pub fn is_dirty(&self) -> bool {
+        match self.logs[0].get() {
+            Some(log) => log.is_dirty(),
+            None => false,
+        }
+    }
+
     /// Iterate over all dirty entries.
     pub fn iter_dirty(&self) -> impl Iterator<Item = crate::Result<&[u8]>> {
         self.logs[0].get().unwrap().iter_dirty()
@@ -940,7 +982,7 @@ fn create_log_cell(log: Log) -> OnceCell<Log> {
 
 /// Load a single log at the given location.
 fn load_log(dir: &Path, id: u8, open_options: log::OpenOptions) -> crate::Result<Log> {
-    let name = format!("{}", id);
+    let name = format!("{id}");
     let log_path = dir.join(name);
     open_options.create(false).open(log_path)
 }
@@ -1073,7 +1115,7 @@ fn create_empty_log(
     Ok(match dir {
         Some(dir) => {
             let latest_path = dir.join(LATEST_FILE);
-            let latest_str = format!("{}", latest);
+            let latest_str = format!("{latest}");
             let log_path = dir.join(&latest_str);
             let opts = open_options.log_open_options.clone().create(true);
             opts.delete_content(&log_path)?;
@@ -1096,16 +1138,13 @@ fn read_latest_raw(dir: &Path) -> io::Result<u8> {
     let content: String = String::from_utf8(data).map_err(|_e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{:?}: failed to read as utf8 string", latest_path),
+            format!("{latest_path:?}: failed to read as utf8 string"),
         )
     })?;
     let id: u8 = content.parse().map_err(|_e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "{:?}: failed to parse {:?} as u8 integer",
-                latest_path, content
-            ),
+            format!("{latest_path:?}: failed to parse {content:?} as u8 integer"),
         )
     })?;
     Ok(id)
@@ -1127,7 +1166,7 @@ fn read_logs(
         let id = latest.wrapping_sub(index);
         // Do a quick check about whether the log exists or not so we
         // can avoid unnecessary `Log::open`.
-        let name = format!("{}", id);
+        let name = format!("{id}");
         let log_path = dir.join(&name);
         if !log_path.is_dir() {
             break;
@@ -1342,6 +1381,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_remove_old_logs_skips_exclusive_lock() {
+        let dir = tempdir().unwrap();
+        let dir = &dir;
+
+        // Create a RotateLog with no old logs to clean up.
+        let mut rotate = OpenOptions::new()
+            .create(true)
+            .max_bytes_per_log(100)
+            .max_log_count(3)
+            .open(dir)
+            .unwrap();
+        rotate.append(b"data").unwrap();
+        rotate.sync().unwrap();
+
+        // Hold the exclusive write lock. If remove_old_logs tries to
+        // take it, the test will deadlock (caught as a test timeout).
+        let _write_lock = ScopedDirLock::new(dir.as_ref()).unwrap();
+
+        // Should succeed without needing the exclusive lock since
+        // there are no old logs to remove.
+        rotate.remove_old_logs().unwrap();
+    }
+
     fn test_wrapping_rotate(max_log_count: u8) {
         let dir = tempdir().unwrap();
         let mut rotate = OpenOptions::new()
@@ -1515,7 +1578,7 @@ mod tests {
 
         let size = |log_index: u64| {
             dir.path()
-                .join(format!("{}", log_index))
+                .join(format!("{log_index}"))
                 .join(log::PRIMARY_FILE)
                 .metadata()
                 .unwrap()
@@ -2092,6 +2155,8 @@ Reset latest to 2"#
         assert_eq!(count, THREAD_COUNT as u64 * WRITE_COUNT_PER_THREAD as u64);
     }
 
+    // see lib.rs - dummy_btrfs won't run this test
+    #[cfg(all(target_os = "linux", feature = "btrfs"))]
     #[test]
     fn test_btrfs_rotate() {
         let dir = tempdir().unwrap();
@@ -2102,11 +2167,11 @@ Reset latest to 2"#
 
         #[cfg(target_os = "linux")]
         {
-            use rand::RngCore;
+            use rand::Rng as _;
 
             let mut rotate = OpenOptions::new()
                 .create(true)
-                .max_bytes_per_log(50)
+                .max_bytes_per_log(500)
                 .max_log_count(2)
                 .index("first-byte", |_| vec![IndexOutput::Reference(0..1)])
                 .btrfs_compression(true)
@@ -2114,7 +2179,7 @@ Reset latest to 2"#
                 .unwrap();
 
             // No rotation - log is compressed well.
-            let aaa = vec![b'a'; 100];
+            let aaa = vec![b'a'; 1000];
             rotate.append(&aaa).unwrap();
             assert_eq!(rotate.sync().unwrap(), 0);
             assert_eq!(lookup(&rotate, b"a"), vec![&aaa]);
@@ -2122,10 +2187,10 @@ Reset latest to 2"#
             // Sanity check we compressed well.
             let btrfs_size = rotate.writable_log().btrfs_size().unwrap();
             assert!(btrfs_size > 0);
-            assert!(btrfs_size < 50);
+            assert!(btrfs_size < 500);
 
             // Rotate triggered.
-            let mut random_bytes = vec![0u8; 100];
+            let mut random_bytes = vec![0u8; 1000];
             rand::rng().fill_bytes(&mut random_bytes);
             random_bytes[0] = b'b';
             rotate.append(&random_bytes).unwrap();
@@ -2134,7 +2199,7 @@ Reset latest to 2"#
             assert_eq!(lookup(&rotate, b"b"), vec![&random_bytes]);
 
             let rotated_btrfs_size = rotate.logs[1].get_mut().unwrap().btrfs_size().unwrap();
-            assert!(rotated_btrfs_size >= 50);
+            assert!(rotated_btrfs_size >= 500);
         }
     }
 

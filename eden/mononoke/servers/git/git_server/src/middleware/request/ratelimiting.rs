@@ -5,14 +5,17 @@
  * GNU General Public License version 2.
  */
 
+use gotham::handler::IntoBody as _;
+use gotham::helpers::http::Body;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham_ext::middleware::MetadataState;
 use gotham_ext::middleware::Middleware;
+use http::HeaderMap;
 use http::Response;
+use http::StatusCode;
 use http::Uri;
-use hyper::Body;
-use hyper::StatusCode;
+use http::header::USER_AGENT;
 use metadata::Metadata;
 use rate_limiting::LoadShedResult;
 use rate_limiting::RateLimitEnvironment;
@@ -20,6 +23,7 @@ use scuba_ext::MononokeScubaSampleBuilder;
 use tracing::error;
 
 use crate::scuba::MononokeGitScubaHandler;
+use crate::scuba::MononokeGitScubaKey;
 
 const GIT_UPLOAD_PACK: &str = "/git-upload-pack";
 const SERVER_PATH_PREFIX: &str = "/repos/git/";
@@ -70,21 +74,45 @@ impl Middleware for UploadPackRateLimitingMiddleware {
                 .and_then(|request_info| request_info.main_id);
             let atlas = metadata.clientinfo_atlas();
             let mut scuba = self.scuba.clone();
+            // Enrich scuba before check_load_shed() so that Tracked (shadow)
+            // mode logs include per-request context when logging via scuba.
+            scuba.add(MononokeGitScubaKey::Repo, repo_name.to_string());
+            scuba.add_opt(MononokeGitScubaKey::ClientMainId, main_client_id.clone());
+            scuba.unsampled();
             if let LoadShedResult::Fail(err) = rate_limiter.check_load_shed(
                 metadata.identities(),
                 main_client_id.as_deref(),
                 &mut scuba,
                 atlas,
             ) {
+                let status = if err.no_target() {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    // Targeted rate limiting — still 429 for now
+                    StatusCode::TOO_MANY_REQUESTS
+                };
+                let user_agent = HeaderMap::try_borrow_from(state)
+                    .and_then(|headers| headers.get(USER_AGENT))
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                let client_correlator = metadata
+                    .client_request_info()
+                    .map(|cri| cri.correlator.clone());
+                let client_entrypoint = metadata
+                    .client_request_info()
+                    .map(|cri| cri.entry_point.to_string());
                 MononokeGitScubaHandler::log_rejected(
                     scuba,
                     repo_name,
                     main_client_id,
                     metadata.identities(),
                     format!(
-                        "Upload pack request rejected due to load shedding / rate limiting: {:?}",
-                        err
+                        "Upload pack request rejected due to load shedding / rate limiting: {err:?}"
                     ),
+                    status,
+                    user_agent,
+                    client_correlator,
+                    client_entrypoint,
                 );
                 error!(
                     "Upload pack request rejected due to load shedding / rate limiting: {:?}",
@@ -92,13 +120,12 @@ impl Middleware for UploadPackRateLimitingMiddleware {
                 );
                 return Some(
                     Response::builder()
-                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .status(status)
                         .body(
                             format!(
-                                "Upload pack request rejected due to load shedding / rate limiting: {:?}",
-                                err
+                                "Upload pack request rejected due to load shedding / rate limiting: {err:?}"
                             )
-                            .into(),
+                            .into_body(),
                         )
                         .expect("Failed to build a response"),
                 );

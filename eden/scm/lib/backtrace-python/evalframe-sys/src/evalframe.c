@@ -30,12 +30,13 @@ To learn examples about the APIs, check  cpython/Modules/_testinternalcapi.c.
 
 #if defined(_WIN32)
 #define EXPORT __declspec(dllexport)
+#if defined(_MSC_VER)
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#endif
 #else
 #define EXPORT
 #endif
-
-// _PyInterpreterState_SetEvalFrameFunc is new in CPython 3.9.
-#define HAS_SET_EVAL_FRAME_FUNC (PY_VERSION_HEX >= 0x03090000)
 
 #if PY_VERSION_HEX >= 0x030b0000
 // CPython 3.11 changed PyFrameObject* to _PyInterpreterFrame*.
@@ -44,81 +45,6 @@ To learn examples about the APIs, check  cpython/Modules/_testinternalcapi.c.
 #include <frameobject.h> // @manual=fbsource//third-party/python:python
 #define PyFrame PyFrameObject
 #endif
-
-#if HAS_SET_EVAL_FRAME_FUNC
-
-// Disable optimization like tail recursion, dead code elimination,
-// so function args are pushed to stack.
-#if defined(__clang__)
-#define NO_OPT __attribute__((optnone))
-#elif defined(__GNUC__) || defined(__GNUG__)
-#define NO_OPT __attribute__((optimize("O0")))
-#else
-#define NO_OPT
-#endif
-
-#if defined(_MSC_VER)
-#pragma optimize("", off)
-#endif
-
-// Only used by codegen (offset-probe, D92185212) in a controlled way.
-// Not used by regular runs.
-static size_t last_frame = 0;
-
-// Runtime evalframe: minimal overhead, does not track last_frame.
-EXPORT PyObject* NO_OPT
-
-Sapling_PyEvalFrame(PyThreadState* tstate, PyFrame* f, int exc) {
-  return _PyEval_EvalFrameDefault(tstate, f, exc);
-}
-
-// Probe evalframe: tracks last_frame for offset detection at build time.
-// Calls Sapling_PyEvalFrame so offsets computed during probing are valid
-// for runtime use.
-EXPORT PyObject* NO_OPT
-
-Sapling_PyEvalFrameProbe(PyThreadState* tstate, PyFrame* f, int exc) {
-  last_frame = (size_t)f;
-  return Sapling_PyEvalFrame(tstate, f, exc);
-}
-
-#if defined(_MSC_VER)
-#pragma optimize("", on)
-#endif
-
-#endif // HAS_SET_EVAL_FRAME_FUNC
-
-/**
- * Update the "EvalFrame" function to go through a custom eval frame function.
- * Intended to be called by cpython bindings in Rust.
- *
- * mode:
- *   0 = disabled (use default Python eval)
- *   1 = enabled (use Sapling_PyEvalFrame - minimal overhead, no tracking)
- *   2 = probe (use Sapling_PyEvalFrameProbe - tracks last_frame for offset
- * detection)
- *
- * Note: calling this function when the Python interpreter is not initialized
- * is a no-op.
- */
-void sapling_cext_evalframe_set_mode(int mode) {
-#if HAS_SET_EVAL_FRAME_FUNC
-  if (Py_IsInitialized()) {
-    PyInterpreterState* interp = PyInterpreterState_Get();
-    switch (mode) {
-      case 1:
-        _PyInterpreterState_SetEvalFrameFunc(interp, Sapling_PyEvalFrame);
-        break;
-      case 2:
-        _PyInterpreterState_SetEvalFrameFunc(interp, Sapling_PyEvalFrameProbe);
-        break;
-      default:
-        _PyInterpreterState_SetEvalFrameFunc(interp, _PyEval_EvalFrameDefault);
-        break;
-    }
-  }
-#endif
-}
 
 /**
  * Extract the code object and line number from a PyFrame.
@@ -144,7 +70,7 @@ void sapling_cext_evalframe_set_mode(int mode) {
  */
 EXPORT PyCodeObject* sapling_cext_evalframe_extract_code_lineno_from_frame(
     PyFrame* f,
-    int* pline_no) {
+    volatile ssize_t* pline_no) {
   if (!f) {
     return NULL;
   }
@@ -161,16 +87,110 @@ EXPORT PyCodeObject* sapling_cext_evalframe_extract_code_lineno_from_frame(
   if (code == NULL) {
     return NULL;
   }
-  *pline_no = PyFrame_GetLineNumber(f);
+  *pline_no = (ssize_t)PyFrame_GetLineNumber(f);
 #elif PY_VERSION_HEX >= 0x030c0000
   // >=3.12: f is _PyInterpreterFrame. Can be accessed via PyUnstable APIs.
   code = (PyCodeObject*)PyUnstable_InterpreterFrame_GetCode(f);
   if (code == NULL) {
     return NULL;
   }
-  *pline_no = PyUnstable_InterpreterFrame_GetLine(f);
+  *pline_no = (ssize_t)PyUnstable_InterpreterFrame_GetLine(f);
 #endif
   return code;
+}
+
+// _PyInterpreterState_SetEvalFrameFunc is new in CPython 3.9.
+#define HAS_SET_EVAL_FRAME_FUNC (PY_VERSION_HEX >= 0x03090000)
+
+#if HAS_SET_EVAL_FRAME_FUNC
+
+// Disable optimization like tail recursion, dead code elimination,
+// so function args are pushed to stack.
+#if defined(__clang__)
+#define NO_OPT __attribute__((optnone))
+#elif defined(__GNUC__) || defined(__GNUG__)
+#define NO_OPT __attribute__((optimize("O0")))
+#else
+#define NO_OPT
+#endif
+
+#if defined(_MSC_VER)
+#pragma optimize("", off)
+#endif
+
+// Only used by codegen (offset-probe) in a controlled way.
+// Not used by regular runs. Set by Sapling_PyEvalFrameProbe.
+static size_t last_frame = 0;
+static size_t last_code = 0;
+static volatile ssize_t last_line_no = 0;
+
+// Runtime evalframe: minimal overhead, does not track last_frame.
+EXPORT PyObject* NO_OPT
+
+Sapling_PyEvalFrame(PyThreadState* tstate, PyFrame* f, int exc) {
+  // `f` might be de-allocated by `_PyEval_EvalFrameDefault`.
+  // Extract the `code` and `line_no` out here so stack scanners
+  // (e.g. sampling-profiler) can read them.
+  volatile ssize_t line_no = 0;
+  volatile PyCodeObject* code =
+      sapling_cext_evalframe_extract_code_lineno_from_frame(f, &line_no);
+  // Mark variables as used, and keep them on stack explicitly.
+  // NO_OPT can still be useful to keep the frame pointer.
+#if !defined(_MSC_VER)
+  __asm__ __volatile__("" : : "m"(code));
+  __asm__ __volatile__("" : : "m"(line_no));
+#endif
+  return _PyEval_EvalFrameDefault(tstate, f, exc);
+}
+
+// Probe evalframe: write values to last* for offset detection at build time.
+// Calls Sapling_PyEvalFrame so offsets computed during probing are valid
+// for runtime use.
+EXPORT PyObject* NO_OPT
+
+Sapling_PyEvalFrameProbe(PyThreadState* tstate, PyFrame* f, int exc) {
+  last_frame = (size_t)f;
+  last_code = (size_t)sapling_cext_evalframe_extract_code_lineno_from_frame(
+      f, &last_line_no);
+  return Sapling_PyEvalFrame(tstate, f, exc);
+}
+
+#if defined(_MSC_VER)
+#pragma optimize("", on)
+#endif
+
+#endif // HAS_SET_EVAL_FRAME_FUNC
+
+/**
+ * Update the "EvalFrame" function to go through a custom eval frame function.
+ * Intended to be called by cpython bindings in Rust.
+ *
+ * mode:
+ *   0 = disabled (use default Python eval)
+ *   1 = enabled (use Sapling_PyEvalFrame - minimal overhead, no tracking)
+ *   2 = probe (use Sapling_PyEvalFrameProbe - tracks last* for offset
+ * detection)
+ *
+ * Note: calling this function when the Python interpreter is not initialized
+ * is a no-op.
+ */
+void sapling_cext_evalframe_set_mode(int mode) {
+#if HAS_SET_EVAL_FRAME_FUNC
+  if (Py_IsInitialized()) {
+    PyInterpreterState* interp = PyInterpreterState_Get();
+    switch (mode) {
+      case 1:
+        _PyInterpreterState_SetEvalFrameFunc(interp, Sapling_PyEvalFrame);
+        break;
+      case 2:
+        _PyInterpreterState_SetEvalFrameFunc(interp, Sapling_PyEvalFrameProbe);
+        break;
+      default:
+        _PyInterpreterState_SetEvalFrameFunc(interp, _PyEval_EvalFrameDefault);
+        break;
+    }
+  }
+#endif
 }
 
 /**
@@ -215,7 +235,7 @@ out:
  */
 EXPORT const char* sapling_cext_evalframe_stringify_code_lineno(
     PyCodeObject* code,
-    int line_no) {
+    ssize_t line_no) {
   static char buf[4096] = {0};
   memset(buf, 0, sizeof buf);
   const char* filename = NULL;
@@ -224,7 +244,7 @@ EXPORT const char* sapling_cext_evalframe_stringify_code_lineno(
   if (!filename || !name) {
     goto out;
   }
-  snprintf(buf, (sizeof buf) - 1, "%s at %s:%d", name, filename, line_no);
+  snprintf(buf, (sizeof buf) - 1, "%s at %s:%d", name, filename, (int)line_no);
 out:
   // Intentionally leak the reference. We don't have GIL and DECREF is risky.
   // Py_XDECREF(code);
@@ -258,7 +278,7 @@ out:
  */
 EXPORT const char* sapling_cext_evalframe_resolve_frame(size_t address) {
   PyFrame* f = (PyFrame*)address;
-  int line_no = 0;
+  ssize_t line_no = 0;
   PyCodeObject* code =
       (PyCodeObject*)sapling_cext_evalframe_extract_code_lineno_from_frame(
           f, &line_no);
@@ -276,8 +296,17 @@ EXPORT int sapling_cext_evalframe_resolve_frame_is_supported() {
 
 /**
  * Report the last `PyFrame` value.
- * Useful to probe the `PyFrame` variable on the `Sapling_PyEvalFrame` stack.
+ * Useful to probe the `PyFrame` variable on the `Sapling_PyEvalFrameInner`
+ * stack.
  */
 EXPORT size_t sapling_cext_evalframe_get_last_frame() {
   return last_frame;
+}
+
+EXPORT size_t sapling_cext_evalframe_get_last_code() {
+  return last_code;
+}
+
+EXPORT ssize_t sapling_cext_evalframe_get_last_line_no() {
+  return last_line_no;
 }

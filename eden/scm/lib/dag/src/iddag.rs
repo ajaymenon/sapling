@@ -628,12 +628,12 @@ pub trait IdDagAlgorithm: IdDagStore {
                 // If `id` is in `result`, then `ancestors(id)` are all in `result`.
                 continue;
             }
-            trace(&|| format!(" lookup {:?}", id));
+            trace(&|| format!(" lookup {id:?}"));
             let flat_seg = self.find_flat_segment_including_id(id)?;
             if let Some(ref s) = flat_seg {
                 if s.only_head()? {
                     // Fast path.
-                    trace(&|| format!(" push ..={:?} (only head fast path)", id));
+                    trace(&|| format!(" push ..={id:?} (only head fast path)"));
                     result.push_span((Id::MIN..=id).into());
                     break 'outer;
                 }
@@ -665,8 +665,7 @@ pub trait IdDagAlgorithm: IdDagStore {
                 // The current design requires flat segments to cover all Ids.
                 // Potentially they can be made lazy. But that would be a large change.
                 return bug(format!(
-                    "flat segments should cover all Ids but {:?} is not covered",
-                    id
+                    "flat segments should cover all Ids but {id:?} is not covered"
                 ));
             }
         }
@@ -781,7 +780,7 @@ pub trait IdDagAlgorithm: IdDagStore {
         let max_level = self.max_level()?;
 
         'outer: while let Some(head) = set.max() {
-            trace(&|| format!("check head {:?}", head));
+            trace(&|| format!("check head {head:?}"));
             // For high-level segments. If the set covers the entire segment, then
             // the parents is (the segment - its head + its parents).
             for level in (1..=max_level).rev() {
@@ -975,7 +974,7 @@ pub trait IdDagAlgorithm: IdDagStore {
             if !intersected.is_empty() {
                 let head = intersected.min().unwrap();
                 n += head.0 - id.0;
-                trace(&|| format!("  contains head ({:?})", head));
+                trace(&|| format!("  contains head ({head:?})"));
                 break 'outer (head, n);
             }
             // Does this segment contain any `x` that is an ancestor of a merge,
@@ -1038,7 +1037,7 @@ pub trait IdDagAlgorithm: IdDagStore {
                 debug_assert!(ancestors.contains(child_low));
                 let next_id = child_low;
                 let next_n = n + 1 + parent_id.0 - id.0;
-                trace(&|| format!("  follow {:?}~{}", next_id, next_n));
+                trace(&|| format!("  follow {next_id:?}~{next_n}"));
                 next_id_n = Some((next_id, next_n));
                 break;
             }
@@ -1084,14 +1083,14 @@ pub trait IdDagAlgorithm: IdDagStore {
         for seg in self.iter_flat_segments_with_parent(id)? {
             let seg = seg?;
             let child_id = seg.low()?;
-            trace(&|| format!(" push {:?} via parent index", child_id));
+            trace(&|| format!(" push {child_id:?} via parent index"));
             result.insert(child_id);
         }
         if let Some(seg) = self.find_flat_segment_including_id(id)? {
             let span = seg.span()?;
             if span.high != id {
                 let child_id = id + 1;
-                trace(&|| format!(" push {:?} via flat segment definition", child_id));
+                trace(&|| format!(" push {child_id:?} via flat segment definition"));
                 result.insert(child_id);
             }
         }
@@ -1105,9 +1104,8 @@ pub trait IdDagAlgorithm: IdDagStore {
         if set.count() < 5 {
             let result = set
                 .iter_desc()
-                .fold(Ok(IdSet::empty()), |acc: Result<IdSet>, id| match acc {
-                    Ok(acc) => Ok(acc.union(&self.children_id(id)?)),
-                    Err(err) => Err(err),
+                .try_fold(IdSet::empty(), |acc, id| -> Result<IdSet> {
+                    Ok(acc.union(&self.children_id(id)?))
                 })?;
             #[cfg(test)]
             {
@@ -1175,8 +1173,7 @@ pub trait IdDagAlgorithm: IdDagStore {
                         visit_segments(ctx, missing_range, level - 1)?;
                     } else {
                         return bug(format!(
-                            "flat segments should have covered: {:?} returned by all() (range: {:?})",
-                            missing_range, range,
+                            "flat segments should have covered: {missing_range:?} returned by all() (range: {range:?})",
                         ));
                     }
                 }
@@ -1251,8 +1248,7 @@ pub trait IdDagAlgorithm: IdDagStore {
             if !visited {
                 if level == 0 {
                     return bug(format!(
-                        "flat segments should have covered: {:?} returned by all()",
-                        range,
+                        "flat segments should have covered: {range:?} returned by all()",
                     ));
                 }
                 visit_segments(ctx, range, level - 1)?;
@@ -1321,8 +1317,8 @@ pub trait IdDagAlgorithm: IdDagStore {
                 // `common_ancestors(X)` = `common_ancestors(roots(X))`.
                 let set = self.roots(set)?;
                 set.iter_desc()
-                    .fold(Ok(IdSet::full()), |set: Result<IdSet>, id| {
-                        Ok(set?.intersection(&self.ancestors(id.into())?))
+                    .try_fold(IdSet::full(), |set, id| -> Result<IdSet> {
+                        Ok(set.intersection(&self.ancestors(id.into())?))
                     })?
             }
         };
@@ -1648,7 +1644,7 @@ pub trait IdDagAlgorithm: IdDagStore {
 
                 // Query flat segments.
                 let seg = match self.find_flat_segment_including_id(span.high)? {
-                    None => return bug(format!("flat segments does not cover {:?}", span)),
+                    None => return bug(format!("flat segments does not cover {span:?}")),
                     Some(seg) => seg,
                 };
                 trace(&|| format!("  found flat seg {:?}", &seg));
@@ -1732,7 +1728,7 @@ pub trait IdDagAlgorithm: IdDagStore {
         trace!(target: "dag::algo::suggest_bisect", " untested = {:?}", untested);
 
         let total = untested.count();
-        let ideal = (total + 1) / 2;
+        let ideal = total.div_ceil(2);
 
         // Consider each linear ranges (flat segments).
         let flat_segments =
@@ -1981,13 +1977,13 @@ impl<Store: IdDagStore> Debug for IdDag<Store> {
                 write!(f, "\n")?;
             }
             first = false;
-            write!(f, "Lv{}:", level)?;
+            write!(f, "Lv{level}:")?;
 
             for group in Group::ALL.iter() {
                 let segments = self.next_segments(group.min_id(), level).unwrap();
                 if !segments.is_empty() {
                     for segment in segments {
-                        write!(f, " {:?}", segment)?;
+                        write!(f, " {segment:?}")?;
                     }
                 }
             }

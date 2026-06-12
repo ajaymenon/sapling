@@ -15,6 +15,7 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
+use std::io::Write as _;
 use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
@@ -49,6 +50,10 @@ pub trait CommandExt {
 
     /// Similar to `status` but reports an error for non-zero exits.
     fn checked_run(&mut self) -> io::Result<ExitStatus>;
+
+    /// Similar to `checked_run` but pipes `stdin_data` to the process's stdin.
+    /// Useful for passing long args into commands that support piping.
+    fn checked_run_with_stdin(&mut self, stdin_data: &[u8]) -> io::Result<ExitStatus>;
 
     /// Create a `Command` to run `shell_cmd` through system's shell. This uses "cmd.exe"
     /// on Windows and "/bin/sh" otherwise. Do not add more args to the returned
@@ -107,7 +112,7 @@ impl Error for CommandError {
 }
 
 fn os_str_to_naive_quoted_str(s: &OsStr) -> String {
-    let debug_format = format!("{:?}", s);
+    let debug_format = format!("{s:?}");
     if debug_format.len() == s.len() + 2
         && debug_format.split_ascii_whitespace().take(2).count() == 1
     {
@@ -147,13 +152,13 @@ impl CommandError {
             {
                 #[cfg(unix)]
                 match std::os::unix::process::ExitStatusExt::signal(exit) {
-                    Some(sig) => self.title = format!("Command terminated by signal {}", sig),
+                    Some(sig) => self.title = format!("Command terminated by signal {sig}"),
                     None => {}
                 }
             }
             Some(code) => {
                 if code != 0 {
-                    self.title = format!("Command exited with code {}", code);
+                    self.title = format!("Command exited with code {code}");
                 }
             }
         }
@@ -224,6 +229,28 @@ impl CommandExt for Command {
     fn checked_run(&mut self) -> io::Result<ExitStatus> {
         let status = self
             .status()
+            .map_err(|e| CommandError::new(self, Some(e)).into_io_error())?;
+        if !status.success() {
+            return Err(CommandError::new(self, None)
+                .with_status(&status)
+                .into_io_error());
+        }
+        Ok(status)
+    }
+
+    fn checked_run_with_stdin(&mut self, stdin_data: &[u8]) -> io::Result<ExitStatus> {
+        self.stdin(Stdio::piped());
+        let mut child = self
+            .spawn()
+            .map_err(|e| CommandError::new(self, Some(e)).into_io_error())?;
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(stdin_data)
+            .map_err(|e| CommandError::new(self, Some(e)).into_io_error())?;
+        let status = child
+            .wait()
             .map_err(|e| CommandError::new(self, Some(e)).into_io_error())?;
         if !status.success() {
             return Err(CommandError::new(self, None)
@@ -433,8 +460,6 @@ mod unix {
 mod tests {
     use std::path::Path;
 
-    use io::Write as _;
-
     use super::*;
 
     // It's hard to test the real effects. Here we just check command still runs.
@@ -448,11 +473,7 @@ mod tests {
         } else {
             vec!["cmd.exe", "/c", "echo foo > a"]
         };
-        let mut command = if cfg!(unix) {
-            Command::new(args[0])
-        } else {
-            Command::new(args[0])
-        };
+        let mut command = Command::new(args[0]);
         let mut child = command
             .args(&args[1..])
             .current_dir(dir.path())

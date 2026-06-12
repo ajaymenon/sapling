@@ -9,12 +9,13 @@
 #include <gflags/gflags.h>
 #include <cstdlib>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/DirEntry.h"
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/OverlayFile.h"
+#include "eden/fs/inodes/test/OverlayTestUtil.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 
 using namespace facebook::eden;
@@ -42,14 +43,15 @@ void createGoldMasterOverlay(AbsolutePath overlayPath) {
   ObjectId id3{folly::ByteRange{"e0e0e0e0e0e0e0e0e0e0"_sp}};
   ObjectId id4{folly::ByteRange{"44444444444444444444"_sp}};
 
+  auto noopErrorLogger = makeTestErrorLogger();
   auto overlay = Overlay::create(
       overlayPath,
       CaseSensitivity::Sensitive,
       InodeCatalogType::Legacy,
       kDefaultInodeCatalogOptions,
-      std::make_shared<NullStructuredLogger>(),
+      makeTestEdenFsEventsLogger(),
+      /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
-      true,
       *EdenConfig::createTestEdenConfig());
 
   auto fileInode = overlay->allocateInodeNumber();

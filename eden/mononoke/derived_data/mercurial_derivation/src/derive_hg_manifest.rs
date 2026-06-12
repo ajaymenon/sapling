@@ -17,10 +17,7 @@ use blobstore::KeyedBlobstore;
 use blobstore::Loadable;
 use cloned::cloned;
 use context::CoreContext;
-use futures::channel::mpsc;
 use futures::future;
-use futures::future::BoxFuture;
-use futures::future::FutureExt;
 use futures::future::TryFutureExt;
 use futures::future::try_join_all;
 use manifest::Entry;
@@ -28,7 +25,7 @@ use manifest::LeafInfo;
 use manifest::ManifestChanges;
 use manifest::Traced;
 use manifest::TreeInfo;
-use manifest::derive_manifest_with_io_sender;
+use manifest::derive_manifest;
 use manifest::derive_manifests_for_simple_stack_of_commits;
 use manifest::flatten_subentries;
 use mercurial_types::HgFileNodeId;
@@ -47,23 +44,23 @@ use mononoke_types::RepoPath;
 use mononoke_types::SortedVectorTrieMap;
 use mononoke_types::TrackedFileChange;
 use mononoke_types::path::MPath;
-use restricted_paths::ArcRestrictedPaths;
-use restricted_paths::ManifestType;
-use restricted_paths::RestrictedPathManifestIdEntry;
+use restricted_paths_common::ArcRestrictedPathsConfigBased;
+use restricted_paths_common::ManifestType;
+use restricted_paths_common::RestrictedPathManifestIdEntry;
 use sorted_vector_map::SortedVectorMap;
 use tracing::warn;
 
 use crate::derive_hg_changeset::store_file_change;
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
-struct ParentIndex(usize);
+pub(crate) struct ParentIndex(pub(crate) usize);
 
 pub async fn derive_simple_hg_manifest_stack_without_copy_info(
     ctx: CoreContext,
     blobstore: Arc<dyn KeyedBlobstore>,
     manifest_changes: Vec<ManifestChanges<TrackedFileChange>>,
     parent: Option<HgManifestId>,
-    restricted_paths: ArcRestrictedPaths,
+    restricted_paths: ArcRestrictedPathsConfigBased,
 ) -> Result<HashMap<ChangesetId, HgManifestId>, Error> {
     let res = derive_manifests_for_simple_stack_of_commits(
         ctx.clone(),
@@ -80,7 +77,7 @@ pub async fn derive_simple_hg_manifest_stack_without_copy_info(
                         .into_iter()
                         .map(|p| Traced::assign(ParentIndex(0), p.into_untraced()))
                         .collect();
-                    create_hg_manifest(ctx.clone(), blobstore.clone(), None, tree_info, restricted_paths).await
+                    create_hg_manifest(ctx.clone(), blobstore.clone(), tree_info, restricted_paths).await
                 }
             }
         },
@@ -144,7 +141,7 @@ pub async fn derive_simple_hg_manifest_stack_without_copy_info(
 pub async fn derive_hg_manifest(
     ctx: CoreContext,
     blobstore: Arc<dyn KeyedBlobstore>,
-    restricted_paths: ArcRestrictedPaths,
+    restricted_paths: ArcRestrictedPathsConfigBased,
     parents: impl IntoIterator<Item = HgManifestId>,
     changes: impl IntoIterator<Item = (NonRootMPath, Option<(FileType, HgFileNodeId)>)> + 'static,
     subtree_changes: Option<&HgSubtreeChanges>,
@@ -165,7 +162,7 @@ pub async fn derive_hg_manifest(
         None => Vec::new(),
     };
 
-    let tree_id = derive_manifest_with_io_sender(
+    let tree_id = derive_manifest(
         ctx.clone(),
         blobstore.clone(),
         parents.clone(),
@@ -173,11 +170,10 @@ pub async fn derive_hg_manifest(
         subtree_changes,
         {
             cloned!(ctx, blobstore, restricted_paths);
-            move |tree_info, sender| {
+            move |tree_info| {
                 create_hg_manifest(
                     ctx.clone(),
                     blobstore.clone(),
-                    Some(sender),
                     tree_info,
                     restricted_paths.clone(),
                 )
@@ -185,7 +181,7 @@ pub async fn derive_hg_manifest(
         },
         {
             cloned!(ctx, blobstore);
-            move |leaf_info, _sender| create_hg_file(ctx.clone(), blobstore.clone(), leaf_info)
+            move |leaf_info| create_hg_file(ctx.clone(), blobstore.clone(), leaf_info)
         },
     )
     .await?;
@@ -200,7 +196,7 @@ pub async fn derive_hg_manifest(
                 subentries: Default::default(),
             };
             let (_, traced_tree_id) =
-                create_hg_manifest(ctx, blobstore, None, tree_info, restricted_paths).await?;
+                create_hg_manifest(ctx, blobstore, tree_info, restricted_paths).await?;
             Ok(traced_tree_id.into_untraced())
         }
     }
@@ -211,7 +207,6 @@ pub async fn derive_hg_manifest(
 async fn create_hg_manifest(
     ctx: CoreContext,
     blobstore: Arc<dyn KeyedBlobstore>,
-    sender: Option<mpsc::UnboundedSender<BoxFuture<'static, Result<(), Error>>>>,
     tree_info: TreeInfo<
         Traced<ParentIndex, HgManifestId>,
         Traced<ParentIndex, (FileType, HgFileNodeId)>,
@@ -220,7 +215,7 @@ async fn create_hg_manifest(
             Entry<Traced<ParentIndex, HgManifestId>, Traced<ParentIndex, (FileType, HgFileNodeId)>>,
         >,
     >,
-    restricted_paths: ArcRestrictedPaths,
+    restricted_paths: ArcRestrictedPathsConfigBased,
 ) -> Result<((), Traced<ParentIndex, HgManifestId>), Error> {
     let TreeInfo {
         subentries,
@@ -328,54 +323,31 @@ async fn create_hg_manifest(
         None, // hashing
         // Adding a switch value to be able to disable writes only
         Some("hg_manifest_write"),
-    )?;
+    );
     // Track restricted paths by storing manifest IDs for directories that match restricted path prefixes
-    if restricted_paths_enabled
-        && let path @ RepoPath::DirectoryPath(non_root_path) = &path
-        && restricted_paths.is_restricted_path(non_root_path)
-    {
-        let entry = RestrictedPathManifestIdEntry::new(
-            ManifestType::Hg,
-            mfid.to_string().into(),
-            path.clone(),
-        )?;
+    if restricted_paths_enabled {
+        if let path @ RepoPath::DirectoryPath(non_root_path) = &path {
+            let is_restricted = restricted_paths.is_restriction_root(non_root_path);
+            if is_restricted {
+                let entry = RestrictedPathManifestIdEntry::new(
+                    ManifestType::Hg,
+                    mfid.to_string().into(),
+                    path.clone(),
+                )?;
 
-        // Add to restricted paths database asynchronously
-        // We don't await this to avoid blocking manifest derivation
-        let restricted_paths_fut = {
-            cloned!(ctx, restricted_paths);
-            async move {
+                // Track restricted path - log error but don't fail manifest derivation
                 if let Err(e) = restricted_paths
                     .manifest_id_store()
                     .add_entry(&ctx, entry)
                     .await
                 {
-                    // Log error but don't fail manifest derivation
                     warn!("Failed to track restricted path: {e}");
                 }
-                Ok(())
             }
-        };
-
-        // Send the future to be executed along with the manifest upload
-        if let Some(ref sender) = sender {
-            sender
-                .unbounded_send(restricted_paths_fut.boxed())
-                .map_err(|err| format_err!("failed to send restricted paths future {}", err))?;
-        } else {
-            // If no sender, execute immediately
-            let _ = restricted_paths_fut.await;
         }
     }
 
-    match sender {
-        Some(sender) => {
-            sender
-                .unbounded_send(upload_fut.boxed())
-                .map_err(|err| format_err!("failed to send hg manifest future {}", err))?;
-        }
-        None => upload_fut.await?,
-    }
+    upload_fut.await?;
     Ok(((), Traced::generate(mfid)))
 }
 
@@ -464,17 +436,21 @@ async fn resolve_conflict(
 
 /// Extract hg-relevant parents from a set of Traced entries. This means we ignore any parents
 /// except for p1 and p2.
-fn hg_parents<T: Copy>(parents: &[Traced<ParentIndex, T>]) -> (Option<T>, Option<T>) {
+///
+/// The bound is `Clone` rather than `Copy` so callers can instantiate `T` with non-`Copy`
+/// leaf types. `Copy` callers pay nothing extra: `<T as Clone>::clone` for a `Copy` type
+/// lowers to a memcpy.
+pub(crate) fn hg_parents<T: Clone>(parents: &[Traced<ParentIndex, T>]) -> (Option<T>, Option<T>) {
     let mut parents = parents.iter().filter_map(|t| match t.id() {
         Some(ParentIndex(0)) | Some(ParentIndex(1)) => Some(t.untraced()),
         Some(_) | None => None,
     });
 
-    (parents.next().copied(), parents.next().copied())
+    (parents.next().cloned(), parents.next().cloned())
 }
 
 /// Take an iterator, if it has just one value, return it. Otherwise, return None.
-fn unique_or_nothing<T: PartialEq>(iter: impl Iterator<Item = T>) -> Option<T> {
+pub(crate) fn unique_or_nothing<T: PartialEq>(iter: impl Iterator<Item = T>) -> Option<T> {
     let mut ret = None;
 
     for e in iter {

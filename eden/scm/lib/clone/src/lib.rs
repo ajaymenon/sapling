@@ -68,7 +68,7 @@ pub fn init_working_copy(
     if !sparse_profiles.is_empty() {
         let mut sparse_contents: Vec<u8> = Vec::new();
         for profile in &sparse_profiles {
-            write!(&mut sparse_contents, "%include {}\n", profile)
+            write!(&mut sparse_contents, "%include {profile}\n")
                 .io_context("error generating sparse contents")?;
         }
         atomic_write(&repo.dot_hg_path().join("sparse"), |f| {
@@ -105,6 +105,7 @@ pub fn init_working_copy(
     Ok(())
 }
 
+#[cfg(feature = "eden")]
 #[derive(Debug, thiserror::Error)]
 pub enum EdenCloneError {
     #[error("Failed cloning eden checkout\n Stdout: '{0}'\n Stderr: '{1}'")]
@@ -113,14 +114,7 @@ pub enum EdenCloneError {
     MissingCommandConfig(),
 }
 
-fn get_eden_clone_command(config: &dyn Config) -> Result<Command> {
-    let eden_command = config.get_opt::<String>("edenfs", "command")?;
-    match eden_command {
-        Some(cmd) => Ok(Command::new(cmd)),
-        None => Err(EdenCloneError::MissingCommandConfig().into()),
-    }
-}
-
+#[cfg(feature = "eden")]
 #[tracing::instrument]
 fn run_eden_clone_command(clone_command: &mut Command) -> Result<()> {
     let output = clone_command.output().with_context(|| {
@@ -128,11 +122,10 @@ fn run_eden_clone_command(clone_command: &mut Command) -> Result<()> {
         // On Windows, users frequently hit clone errors caused by EdenFS not being installed.
         if cfg!(windows) && !binary_path.exists() {
             format!(
-                "failed to execute {:?}: edenfs binary not found at {:?}.",
-                clone_command, binary_path
+                "failed to execute {clone_command:?}: edenfs binary not found at {binary_path:?}."
             )
         } else {
-            format!("failed to execute {:?}", clone_command)
+            format!("failed to execute {clone_command:?}")
         }
     })?;
 
@@ -153,50 +146,36 @@ fn run_eden_clone_command(clone_command: &mut Command) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "eden")]
 #[instrument(err)]
 pub fn eden_clone(
-    backing_repo: &Repo,
+    repo: &Repo,
     working_copy: &Path,
     target: Option<HgId>,
     filters: Option<HashSet<Text>>,
 ) -> Result<()> {
-    let config = backing_repo.config();
+    let config = repo.config();
 
-    let mut clone_command = get_eden_clone_command(config)?;
-
-    // allow tests to specify different configuration directories from prod defaults
-    if let Some(base_dir) = config.get_opt::<PathBuf>("edenfs", "basepath")? {
-        clone_command.args([
-            "--config-dir".into(),
-            base_dir.join("eden"),
-            "--etc-eden-dir".into(),
-            base_dir.join("etc_eden"),
-            "--home-dir".into(),
-            base_dir.join("home"),
-        ]);
-    }
+    // We don't have `clone` supported in rust edenfs cli for now. Specifying
+    // python cli to avoid the overhead of falling back.
+    // We should remove this hack once `clone` is supported in rust.
+    let mut clone_command =
+        edenfs_client::build_eden_command_type(config, edenfs_client::EdenCmdType::Python)?;
 
     clone_command.args([
         OsStr::new("clone"),
-        backing_repo.path().as_os_str(),
+        repo.shared_path().as_os_str(),
         working_copy.as_os_str(),
     ]);
 
-    let enable_windows_symlinks = if let Ok(enabled_everywhere) =
-        config.get_or_default::<bool>("experimental", "windows-symlinks")
-    {
-        enabled_everywhere
-    } else {
-        config
-            .get_or_default::<Vec<String>>("experimental", "windows-symlinks")?
-            .contains(&"edenfs".to_owned())
-    };
-    if enable_windows_symlinks {
-        clone_command.args(["--enable-windows-symlinks".to_string()]);
-    }
-
     if let Some(rev) = target {
         clone_command.args(["-r", &rev.to_hex()]);
+        if config
+            .get_or_default::<bool>("clone", "use-skip-commit-resolve")
+            .unwrap_or(false)
+        {
+            clone_command.arg("--skip-commit-resolve");
+        }
     } else {
         clone_command.arg("--allow-empty-repo");
     }
@@ -225,6 +204,201 @@ pub fn eden_clone(
     }
 
     run_eden_clone_command(&mut clone_command).context("error performing eden clone")
+}
+
+/// Snapshot the user-specific EdenFS config that should be copied to another checkout.
+///
+/// This reads the source checkout's `config.toml` and returns its raw contents only
+/// when it contains user-managed settings that need to be preserved across
+/// `worktree add`:
+///   - `[redirections]`: user-specific redirections
+///   - `[profiles]`: active prefetch profiles such as `"edenfs"`
+///   - `[predictive-prefetch]`: predictive prefetch settings
+///
+/// Returning the raw TOML lets callers read source state under a short-lived lock and
+/// apply it later after the destination checkout has been created.
+#[cfg(feature = "eden")]
+pub fn snapshot_eden_user_config(source_client_dir: &Path) -> Result<Option<String>> {
+    let source_config_path = source_client_dir.join("config.toml");
+    let source_content = fs::read_to_string(&source_config_path)
+        .with_context(|| format!("failed to read {}", source_config_path.display()))?;
+    let source_table: toml::Table = source_content
+        .parse()
+        .with_context(|| format!("failed to parse {}", source_config_path.display()))?;
+
+    if !has_copyable_eden_user_config(&source_table) {
+        return Ok(None);
+    }
+
+    Ok(Some(source_content))
+}
+
+/// Apply a previously snapped EdenFS user config to a destination checkout.
+///
+/// The snapshot is the raw `config.toml` content returned by
+/// [`snapshot_eden_user_config`]. This writes the copyable user-specific sections
+/// into the destination checkout's Eden client config, then runs
+/// `eden redirect fixup` if redirections were copied.
+///
+/// NOTE: If `eden redirect fixup` proves unreliable, an alternative approach
+/// would be to call `eden redirect add` for each redirection individually
+/// instead of writing config.toml and running `eden redirect fixup`.
+#[cfg(feature = "eden")]
+pub fn apply_eden_user_config_snapshot(
+    config: &dyn Config,
+    source_content: &str,
+    dest_mount: &Path,
+) -> Result<()> {
+    let source_table: toml::Table = source_content
+        .parse()
+        .context("failed to parse snapped source config.toml")?;
+    apply_eden_user_config_table(config, &source_table, dest_mount)
+}
+
+/// Return whether the parsed Eden client config contains any user-specific state we
+/// should carry over to a new checkout.
+#[cfg(feature = "eden")]
+fn has_copyable_eden_user_config(source_table: &toml::Table) -> bool {
+    let source_redirections = source_table.get("redirections").and_then(|v| v.as_table());
+    let source_profiles = source_table.get("profiles").and_then(|v| v.as_table());
+    let source_predictive = source_table
+        .get("predictive-prefetch")
+        .and_then(|v| v.as_table());
+
+    source_redirections.is_some_and(|t| !t.is_empty())
+        || source_profiles.is_some_and(|t| !t.is_empty())
+        || source_predictive.is_some_and(|t| !t.is_empty())
+}
+
+/// Apply the copyable user-specific portions of a parsed Eden client config to the
+/// destination checkout.
+#[cfg(feature = "eden")]
+fn apply_eden_user_config_table(
+    config: &dyn Config,
+    source_table: &toml::Table,
+    dest_mount: &Path,
+) -> Result<()> {
+    let source_redirections = source_table.get("redirections").and_then(|v| v.as_table());
+    let source_profiles = source_table.get("profiles").and_then(|v| v.as_table());
+    let source_predictive = source_table
+        .get("predictive-prefetch")
+        .and_then(|v| v.as_table());
+
+    let has_redirections = source_redirections.is_some_and(|t| !t.is_empty());
+    let has_profiles = source_profiles.is_some_and(|t| !t.is_empty());
+    let has_predictive = source_predictive.is_some_and(|t| !t.is_empty());
+
+    if !has_redirections && !has_profiles && !has_predictive {
+        return Ok(());
+    }
+
+    // Resolve the new worktree's client directory.
+    // Use edenfs_client::get_client_dir which handles platform differences:
+    // - Unix: reads .eden/client symlink
+    // - Windows: parses .eden/config TOML for Config.client
+    let dest_client_dir = edenfs_client::get_client_dir(dest_mount)?;
+    let dest_config_path = dest_client_dir.join("config.toml");
+
+    let dest_content = fs::read_to_string(&dest_config_path)
+        .with_context(|| format!("failed to read {}", dest_config_path.display()))?;
+    let mut dest_table: toml::Table = dest_content
+        .parse()
+        .with_context(|| format!("failed to parse {}", dest_config_path.display()))?;
+
+    if let Some(redirections) = source_redirections {
+        dest_table.insert(
+            "redirections".to_string(),
+            toml::Value::Table(redirections.clone()),
+        );
+    }
+    if let Some(profiles) = source_profiles {
+        dest_table.insert("profiles".to_string(), toml::Value::Table(profiles.clone()));
+    }
+    if let Some(predictive) = source_predictive {
+        dest_table.insert(
+            "predictive-prefetch".to_string(),
+            toml::Value::Table(predictive.clone()),
+        );
+    }
+
+    let new_content = toml::to_string(&dest_table).context("failed to serialize config.toml")?;
+    atomic_write(&dest_config_path, |f| f.write_all(new_content.as_bytes()))?;
+
+    // Apply redirections by running `eden redirect fixup`
+    if has_redirections {
+        let mut cmd = edenfs_client::build_eden_command(config)?;
+        cmd.args(["redirect", "fixup", "--mount"]);
+        cmd.arg(dest_mount);
+        let output = cmd.output().with_context(|| {
+            format!(
+                "failed to run eden redirect fixup for {}",
+                dest_mount.display()
+            )
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "eden redirect fixup failed for {}: {}",
+                dest_mount.display(),
+                stderr.trim()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "eden")]
+pub fn copy_eden_user_config(
+    config: &dyn Config,
+    source_client_dir: &Path,
+    dest_mount: &Path,
+) -> Result<()> {
+    if let Some(source_content) = snapshot_eden_user_config(source_client_dir)? {
+        apply_eden_user_config_snapshot(config, &source_content, dest_mount)?;
+    }
+    Ok(())
+}
+
+/// Copy the sparse/filter config from a source checkout to a new one.
+///
+/// If the source checkout has a `sparse` file in its dot directory,
+/// copies it to the destination so the new checkout has the same
+/// active filters.
+pub fn copy_sparse_config(source_dot_dir: &Path, dest_dot_dir: &Path) -> Result<()> {
+    if let Some(source_content) = snapshot_sparse_config(source_dot_dir)? {
+        write_sparse_config(&source_content, dest_dot_dir)?;
+    }
+    Ok(())
+}
+
+/// Snapshot the source checkout's sparse config for later application.
+///
+/// Returning the file contents lets callers read the source config before starting
+/// slower destination work, then write the same config into the new checkout later.
+pub fn snapshot_sparse_config(source_dot_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let sparse_path = source_dot_dir.join("sparse");
+    if sparse_path.exists() {
+        Ok(Some(fs::read(&sparse_path).with_context(|| {
+            format!("failed to read sparse config {}", sparse_path.display())
+        })?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Write a previously snapped sparse config into the destination checkout.
+///
+/// An empty snapshot is treated as a no-op so callers can forward the result of
+/// [`snapshot_sparse_config`] directly.
+pub fn write_sparse_config(source_content: &[u8], dest_dot_dir: &Path) -> Result<()> {
+    if !source_content.is_empty() {
+        let dest_sparse = dest_dot_dir.join("sparse");
+        atomic_write(&dest_sparse, |f| f.write_all(source_content)).with_context(|| {
+            format!("failed to copy sparse config to {}", dest_sparse.display())
+        })?;
+    }
+    Ok(())
 }
 
 /// Get the tag to use for streaming clone from config.
@@ -345,16 +519,12 @@ fn streaming_clone_inner(
     // Validate that the actual bytes written match the expected sizes from metadata
     if index_bytes_written != expected_index_size {
         bail!(
-            "Streaming clone index size mismatch: expected {} bytes, but wrote {} bytes",
-            expected_index_size,
-            index_bytes_written
+            "Streaming clone index size mismatch: expected {expected_index_size} bytes, but wrote {index_bytes_written} bytes"
         );
     }
     if data_bytes_written != expected_data_size {
         bail!(
-            "Streaming clone data size mismatch: expected {} bytes, but wrote {} bytes",
-            expected_data_size,
-            data_bytes_written
+            "Streaming clone data size mismatch: expected {expected_data_size} bytes, but wrote {data_bytes_written} bytes"
         );
     }
 

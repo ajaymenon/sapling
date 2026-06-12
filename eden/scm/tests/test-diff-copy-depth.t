@@ -11,23 +11,23 @@
   >     echo "-- With $i"
   > 
   >     touch file
-  >     hg add file
-  >     hg ci -m "Add"
+  >     sl add file
+  >     sl ci -m "Add"
   > 
-  >     hg cp file $i
-  >     hg ci -m "a -> $i"
+  >     sl cp file $i
+  >     sl ci -m "a -> $i"
   > 
-  >     hg cp $i other-file
+  >     sl cp $i other-file
   >     echo "different" >> $i
-  >     hg ci -m "$i -> other-file"
+  >     sl ci -m "$i -> other-file"
   > 
-  >     hg cp other-file somename
+  >     sl cp other-file somename
   > 
   >     echo "Status":
-  >     hg st -C
+  >     sl st -C
   >     echo
   >     echo "Diff:"
-  >     hg diff -g
+  >     sl diff -g
   > 
   >     cd ..
   >     rm -rf t

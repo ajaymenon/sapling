@@ -10,17 +10,13 @@ oncall("scm_client_infra")
 buck_genrule(
     name = "eden",
     out = "eden-stamp",
-    cmd = "echo $(location //eden/fs/cli:edenfsctl) " +
-          "$(location //eden/fs/service:edenfs) " +
-          "$(location //eden/fs/service:edenfs_privhelper) " +
-          "> $OUT",
+    cmd = "echo $(location //eden/fs/cli:edenfsctl) " + "$(location //eden/fs/service:edenfs) " + "$(location //eden/fs/service:edenfs_privhelper) " + "> $OUT",
     compatible_with = [
         "ovr_config//os:linux",
         "ovr_config//os:macos",
     ],
 )
 
-# TODO: T246598314: Unify with rpm.builder in eden/fs
 fbpkg.builder(
     name = "scm.edenfs",
     architectures = [
@@ -30,8 +26,11 @@ fbpkg.builder(
     buck_opts = fbpkg.buck_opts(
         mode = "opt",
     ),
-
-    # This is doing (almost) the same as eden/fs/facebook/packaging/packman.yml
+    compatible_with = [
+        "ovr_config//os:linux",
+    ],
+    # This is doing (almost) the same as the historical EdenFS packaging config
+    # (https://fburl.com/code/lmpy7mvj).
     # For the config we cannot do with fbpkg.builder (e.g. set mode for a binary) we
     # should rely on Chef or an installation script to config correctly.
     #

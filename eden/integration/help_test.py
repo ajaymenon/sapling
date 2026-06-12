@@ -4,7 +4,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
 
 from .lib import edenclient, testcase
 
@@ -18,6 +18,7 @@ class HelpTest(testcase.IntegrationTestCase):
     """
 
     def test_eden_cli_help_returns_without_error(self) -> None:
+        # pyrefly: ignore [bad-context-manager]
         with edenclient.EdenFS() as client:
             cmd_result = client.run_unchecked("help")
             self.assertEqual(0, cmd_result.returncode)

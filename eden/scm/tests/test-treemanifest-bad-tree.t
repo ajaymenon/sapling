@@ -9,7 +9,7 @@
   $ clone master client
   $ cd client
   $ echo a >> a
-  $ hg commit -Aqm a
+  $ sl commit -Aqm a
 
 Create an empty commit with a misconstructed memctx in the same transaction as a normal commit
   $ cat >> $TESTTMP/repro.py <<EOF
@@ -44,5 +44,5 @@ Create an empty commit with a misconstructed memctx in the same transaction as a
   >             user="author",  # commit author
   >         ).commit()
   > EOF
-  $ hg repro --config extensions.repro="$TESTTMP/repro.py" 2>&1 | grep SystemError
+  $ sl repro --config extensions.repro="$TESTTMP/repro.py" 2>&1 | grep SystemError
   [1]

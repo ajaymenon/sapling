@@ -37,14 +37,29 @@ def create_thrift_client(
     eden_dir: Optional[str] = None,
     socket_path: Optional[str] = None,
     timeout: float = 0,
+    socket_init_timeout: float = 120,
 ) -> Generator[EdenService.Sync, None, None]:
     """
     Create a synchronous Thrift client for communicating with the Eden Thrift server.
 
+    We default to no per-RPC timeout because picking the right duration is hard,
+    and safely retrying an arbitrary thrift call may not be safe. The initial
+    socket connection, however, is bounded by default so a misbehaving or
+    blocked IPC channel surfaces as a fast TransportError instead of an
+    indefinite hang.
+
     Args:
-        eden_dir: Path to the Eden mount directory. Used to derive the socket path if socket_path is not provided.
+        eden_dir: Path to the Eden mount directory. Used to derive the socket
+            path if socket_path is not provided.
         socket_path: Socket path to connect to the Eden server directly.
-        timeout: Timeout in seconds for client operations.
+        timeout: Default per-RPC timeout in seconds. Each RPC call will time
+            out after this duration unless overridden per-call. 0 means no
+            timeout.
+        socket_init_timeout: Timeout in seconds for the initial socket connection.
+            Defaults to 120s for parity with the Rust EdenFS client at
+            eden/fs/cli_rs/edenfs-client/src/client/connector.rs. Pass 0 to
+            disable the timeout if you need unbounded wait (e.g., while waiting
+            for an EdenFS daemon to come up).
 
     Yields:
         A sync EdenFS client connected to the specified Eden mount.
@@ -63,7 +78,8 @@ def create_thrift_client(
         with get_sync_client(
             EdenService,
             path=socket_path,
-            timeout=timeout,
+            timeout=socket_init_timeout,
+            channel_timeout=timeout,
             client_type=ClientType.THRIFT_ROCKET_CLIENT_TYPE,
         ) as client:
             yield client
@@ -75,20 +91,37 @@ def create_async_thrift_client(
     eden_dir: Optional[str] = None,
     socket_path: Optional[str] = None,
     timeout: float = 0,
+    socket_init_timeout: float = 120,
 ) -> EdenService.Async:
     """
     Create a Thrift client for communicating with the Eden Thrift server.
 
+    We default to no per-RPC timeout because picking the right duration is hard,
+    and safely retrying an arbitrary thrift call may not be safe. The initial
+    socket connection, however, is bounded by default so a misbehaving or
+    blocked IPC channel surfaces as a fast TransportError instead of an
+    indefinite hang.
+
     Args:
-        eden_dir: Path to the Eden mount directory. Used to derive the socket path if socket_path is not provided.
+        eden_dir: Path to the Eden mount directory. Used to derive the socket
+            path if socket_path is not provided.
         socket_path: Socket path to connect to the Eden server directly.
-        timeout: Timeout in seconds for client operations.
+        timeout: Default per-RPC timeout in seconds. Each RPC call will time
+            out after this duration unless overridden per-call with
+            rpc_options. 0 means no timeout.
+        socket_init_timeout: Timeout in seconds for the initial socket connection.
+            Defaults to 120s for parity with the Rust EdenFS client at
+            eden/fs/cli_rs/edenfs-client/src/client/connector.rs. Pass 0 to
+            disable the timeout if you need unbounded wait (e.g., while waiting
+            for an EdenFS daemon to come up).
+
     Returns:
-        An async context manager for an EdenFS client connected to the specified Eden mount.
+        An async context manager for an EdenFS client connected to the
+        specified Eden mount.
+
     Raises:
         TypeError: If neither eden_dir nor socket_path is provided.
     """
-
     if socket_path is None:
         if eden_dir is not None:
             socket_path = os.path.join(eden_dir, SOCKET_PATH)
@@ -98,6 +131,7 @@ def create_async_thrift_client(
     return get_client(
         EdenService,
         path=socket_path,
-        timeout=timeout,
+        timeout=socket_init_timeout,
+        channel_timeout=timeout,
         client_type=ClientType.THRIFT_ROCKET_CLIENT_TYPE,
     )

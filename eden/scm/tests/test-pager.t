@@ -4,7 +4,6 @@
 #inprocess-hg-incompatible
 
   $ eagerepo
-  $ setconfig devel.segmented-changelog-rev-compat=true
   $ cat >> fakepager.py <<EOF
   > import sys
   > printed = False
@@ -20,22 +19,22 @@ fake pager that lets us see when the pager was running.
   $ setconfig ui.assume-tty=yes ui.color=no
   $ cat >>$HGRCPATH <<EOF
   > [pager]
-  > pager = hg debugpython $TESTTMP/fakepager.py
+  > pager = sl debugpython $TESTTMP/fakepager.py
   > EOF
 
-  $ hg init repo
+  $ sl init repo
   $ cd repo
   $ echo a >> a
-  $ hg add a
-  $ hg ci -m 'add a'
+  $ sl add a
+  $ sl ci -m 'add a'
   $ for x in `seq 1 10`; do
   >   echo a $x >> a
-  >   hg ci -m "modify a $x"
+  >   sl ci -m "modify a $x"
   > done
 
 By default diff and log are paged, but id is not:
 
-  $ hg diff -c bce2655495562347d8ef11e2ffe1e0e6f9fdbbf2 --pager=yes
+  $ sl diff -c bce2655495562347d8ef11e2ffe1e0e6f9fdbbf2 --pager=yes
   paged! 'diff -r f4be7687d414 -r bce265549556 a\n'
   paged! '--- a/a\tThu Jan 01 00:00:00 1970 +0000\n'
   paged! '+++ b/a\tThu Jan 01 00:00:00 1970 +0000\n'
@@ -44,7 +43,7 @@ By default diff and log are paged, but id is not:
   paged! ' a 1\n'
   paged! '+a 2\n'
 
-  $ hg log --limit 2
+  $ sl log --limit 2
   paged! 'commit:      46106edeeb38\n'
   paged! 'user:        test\n'
   paged! 'date:        Thu Jan 01 00:00:00 1970 +0000\n'
@@ -56,24 +55,24 @@ By default diff and log are paged, but id is not:
   paged! 'summary:     modify a 9\n'
   paged! '\n'
 
-  $ hg id
+  $ sl id
   46106edeeb38
 
 We can control the pager from the config
 
-  $ hg log --limit 1 --config 'ui.paginate=False'
+  $ sl log --limit 1 --config 'ui.paginate=False'
   commit:      46106edeeb38
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
   summary:     modify a 10
   
-  $ hg log --limit 1 --config 'ui.paginate=0'
+  $ sl log --limit 1 --config 'ui.paginate=0'
   commit:      46106edeeb38
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
   summary:     modify a 10
   
-  $ hg log --limit 1 --config 'ui.paginate=1'
+  $ sl log --limit 1 --config 'ui.paginate=1'
   paged! 'commit:      46106edeeb38\n'
   paged! 'user:        test\n'
   paged! 'date:        Thu Jan 01 00:00:00 1970 +0000\n'
@@ -87,7 +86,7 @@ explicit --pager=on should take precedence over other configurations
   > [ui]
   > paginate = false
   > EOF
-  $ hg log --limit 1 --pager=on
+  $ sl log --limit 1 --pager=on
   paged! 'commit:      46106edeeb38\n'
   paged! 'user:        test\n'
   paged! 'date:        Thu Jan 01 00:00:00 1970 +0000\n'
@@ -99,7 +98,7 @@ explicit --pager=on should take precedence over other configurations
   > # true is default value of ui.paginate
   > paginate = true
   > EOF
-  $ hg log --limit 1 --pager=off
+  $ sl log --limit 1 --pager=off
   commit:      46106edeeb38
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
@@ -109,12 +108,12 @@ explicit --pager=on should take precedence over other configurations
 We can enable the pager on id:
 
 BROKEN: should be paged
-  $ hg --config pager.attend-id=yes id
+  $ sl --config pager.attend-id=yes id
   46106edeeb38
 
 Setting attend-$COMMAND to a false value works, even with pager in
 core:
-  $ hg --config pager.attend-diff=no diff -c bce2655495562347d8ef11e2ffe1e0e6f9fdbbf2
+  $ sl --config pager.attend-diff=no diff -c bce2655495562347d8ef11e2ffe1e0e6f9fdbbf2
   diff -r f4be7687d414 -r bce265549556 a
   --- a/a	Thu Jan 01 00:00:00 1970 +0000
   +++ b/a	Thu Jan 01 00:00:00 1970 +0000
@@ -125,7 +124,7 @@ core:
 
 Command aliases should have same behavior as main command
 
-  $ hg history --limit 2
+  $ sl log --limit 2
   paged! 'commit:      46106edeeb38\n'
   paged! 'user:        test\n'
   paged! 'date:        Thu Jan 01 00:00:00 1970 +0000\n'
@@ -139,7 +138,7 @@ Command aliases should have same behavior as main command
 
 Abbreviated command alias should also be paged
 
-  $ hg history -l 1
+  $ sl log -l 1
   paged! 'commit:      46106edeeb38\n'
   paged! 'user:        test\n'
   paged! 'date:        Thu Jan 01 00:00:00 1970 +0000\n'
@@ -148,18 +147,18 @@ Abbreviated command alias should also be paged
 
 Attend for an abbreviated command does not work
 
-  $ hg --config pager.attend-ident=true ident
+  $ sl --config pager.attend-ident=true ident
   46106edeeb38
 
 Pager should not start if stdout is not a tty.
 
-  $ hg log -l1 -q --config ui.assume-tty=no
+  $ sl log -l1 -q --config ui.assume-tty=no
   46106edeeb38
 
 Pager should be disabled if pager.pager is empty (otherwise the output would
 be silently lost.)
 
-  $ hg log -l1 -q --config pager.pager=
+  $ sl log -l1 -q --config pager.pager=
   46106edeeb38
 
 Pager with color enabled allows colors to come through by default,
@@ -170,7 +169,7 @@ even though stdout is no longer a tty.
   > [color]
   > mode = ansi
   > EOF
-  $ hg log --limit 3
+  $ sl log --limit 3
   paged! '\x1b[0m\x1b[1m\x1b[93mcommit:      46106edeeb38\x1b[0m\n'
   paged! 'user:        test\n'
   paged! 'date:        Thu Jan 01 00:00:00 1970 +0000\n'
@@ -190,7 +189,7 @@ even though stdout is no longer a tty.
 #if no-chg
 An invalid pager command name is reported sensibly if we don't have to
 use shell=True in the subprocess call:
-  $ hg log --limit 3 --config pager.pager=/this-command-better-never-exist
+  $ sl log --limit 3 --config pager.pager=/this-command-better-never-exist
   missing pager command '*/this-command-better-never-exist', skipping pager (glob)
   \x1b[0m\x1b[1m\x1b[93mcommit:      46106edeeb38\x1b[0m (esc)
   user:        test
@@ -211,7 +210,7 @@ use shell=True in the subprocess call:
 
 A complicated pager command gets worse behavior. Bonus points if you can
 improve this.
-  $ hg log --limit 3 \
+  $ sl log --limit 3 \
   >   --config pager.pager='this-command-better-never-exist --seriously' \
   >  2>/dev/null || true
 
@@ -222,27 +221,27 @@ Pager works with shell aliases.
   > echoa = !echo a
   > EOF
 
-  $ hg echoa
+  $ sl echoa
   a
 BROKEN: should be paged
-  $ hg --config pager.attend-echoa=yes echoa
+  $ sl --config pager.attend-echoa=yes echoa
   a
 
-Pager works with hg aliases including environment variables.
+Pager works with sl aliases including environment variables.
 
   $ cat >> $HGRCPATH <<'EOF'
   > [alias]
-  > printa = log -T "$A\n" -r 0
+  > printa = log -T "$A\n" -r 'desc("add a")'
   > EOF
 
-  $ A=1 hg --config pager.attend-printa=yes printa
+  $ A=1 sl --config pager.attend-printa=yes printa
   paged! '$A\n'
-  $ A=2 hg --config pager.attend-printa=yes printa
+  $ A=2 sl --config pager.attend-printa=yes printa
   paged! '$A\n'
 
 Something that's explicitly attended is still not paginated if the
 pager is globally set to off using a flag:
-  $ A=2 hg --config pager.attend-printa=yes printa --pager=no
+  $ A=2 sl --config pager.attend-printa=yes printa --pager=no
   $A
 
 Pager should not override the exit code of other commands
@@ -262,12 +261,12 @@ Pager should not override the exit code of other commands
   > fortytwo = $TESTTMP/fortytwo.py
   > EOF
 
-  $ hg fortytwo --pager=on
+  $ sl fortytwo --pager=on
   paged! '42\n'
   [42]
 
 A command that asks for paging using ui.pager() directly works:
-  $ hg blame --color=no a
+  $ sl blame --color=no a
   paged! '1f0dee641bb7: a\n'
   paged! 'f4be7687d414: a 1\n'
   paged! 'bce265549556: a 2\n'
@@ -280,20 +279,20 @@ A command that asks for paging using ui.pager() directly works:
   paged! '6dd8ea7dd621: a 9\n'
   paged! '46106edeeb38: a 10\n'
 but not with HGPLAIN
-  $ HGPLAIN=1 hg blame a
-   0: a
-   1: a 1
-   2: a 2
-   3: a 3
-   4: a 4
-   5: a 5
-   6: a 6
-   7: a 7
-   8: a 8
-   9: a 9
-  10: a 10
+  $ HGPLAIN=1 sl blame -c a
+  1f0dee641bb7: a
+  f4be7687d414: a 1
+  bce265549556: a 2
+  e5baa915639e: a 3
+  64d06b3cd986: a 4
+  1656f9ff0378: a 5
+  d0767a268e61: a 6
+  d92a10dd26e4: a 7
+  cff05a6312fe: a 8
+  6dd8ea7dd621: a 9
+  46106edeeb38: a 10
 explicit flags work too:
-  $ hg blame --pager=no --color=no a
+  $ sl blame --pager=no --color=no a
   1f0dee641bb7: a
   f4be7687d414: a 1
   bce265549556: a 2
@@ -308,11 +307,11 @@ explicit flags work too:
 
 A command with --output option:
 
-  $ hg cat -r'desc(add)' a
+  $ sl cat -r'desc(add)' a
   paged! 'a\n'
-  $ hg cat -r'desc(add)' a --output=-
+  $ sl cat -r'desc(add)' a --output=-
   paged! 'a\n'
-  $ hg cat -r'desc(add)' a --output=out
+  $ sl cat -r'desc(add)' a --output=out
   $ rm out
 
 Put annotate in the ignore list for pager:
@@ -320,7 +319,7 @@ Put annotate in the ignore list for pager:
   > [pager]
   > ignore = annotate
   > EOF
-  $ hg blame --color=no a
+  $ sl blame --color=no a
   1f0dee641bb7: a
   f4be7687d414: a 1
   bce265549556: a 2
@@ -342,7 +341,7 @@ During pushbuffer, pager should not start:
   >     ui.write(ui.popbuffer())
   > EOF
 
-  $ hg --config extensions.pushbuffer=$TESTTMP/pushbufferpager.py cat a -r 'desc(add)'
+  $ sl --config extensions.pushbuffer=$TESTTMP/pushbufferpager.py cat a -r 'desc(add)'
   content
   paged! 'a\n'
 
@@ -357,17 +356,17 @@ Environment variables like LESS and LV are set automatically:
 
   $ cat >> $HGRCPATH <<EOF
   > [alias]
-  > noop = log -r 0 -T ''
+  > noop = log -r 'desc("add a")' -T ''
   > [ui]
   > formatted=1
   > [pager]
-  > pager = hg debugpython $TESTTMP/printlesslv.py
+  > pager = sl debugpython $TESTTMP/printlesslv.py
   > EOF
   $ unset LESS
   $ unset LV
-  $ hg noop --pager=on
+  $ sl noop --pager=on
   LESS=FRX
   LV=-c
-  $ LESS=EFGH hg noop --pager=on
+  $ LESS=EFGH sl noop --pager=on
   LESS=EFGH
   LV=-c

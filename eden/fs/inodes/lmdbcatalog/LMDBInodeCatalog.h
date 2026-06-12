@@ -46,6 +46,10 @@ class LMDBInodeCatalog : public InodeCatalog {
     return false;
   }
 
+  bool supportsWal() const override {
+    return false;
+  }
+
   void maintenance() override;
 
   std::vector<InodeNumber> getAllParentInodeNumbers() override;
@@ -64,8 +68,10 @@ class LMDBInodeCatalog : public InodeCatalog {
   std::optional<overlay::OverlayDir> loadAndRemoveOverlayDir(
       InodeNumber inodeNumber) override;
 
-  void saveOverlayDir(InodeNumber inodeNumber, overlay::OverlayDir&& odir)
-      override;
+  void saveOverlayDir(
+      InodeNumber inodeNumber,
+      overlay::OverlayDir&& odir,
+      bool crashSafe = true) override;
 
   void saveOverlayDir(InodeNumber inodeNumber, std::string&& odir);
 
@@ -78,7 +84,6 @@ class LMDBInodeCatalog : public InodeCatalog {
   InodeNumber scanLocalChanges(
       std::shared_ptr<ReloadableConfig> config,
       AbsolutePathPiece mountPath,
-      bool windowsSymlinksEnabled,
       InodeCatalog::LookupCallback& callback) override;
 
   std::optional<fsck::InodeInfo> loadInodeInfo(InodeNumber number) override;

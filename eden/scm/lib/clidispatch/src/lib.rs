@@ -8,7 +8,9 @@
 #![allow(dead_code)]
 #![allow(unexpected_cfgs)]
 
+pub mod acl;
 pub mod command;
+mod configure_libraries;
 pub mod context;
 pub mod dispatch;
 pub mod errors;

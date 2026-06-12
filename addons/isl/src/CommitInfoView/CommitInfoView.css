@@ -65,14 +65,24 @@
   margin: calc(-1 * var(--halfpad));
 }
 
+.commit-info-title-wrapper {
+  display: flex;
+  align-items: center;
+  gap: var(--pad);
+}
+
+.commit-info-title-wrapper:hover .hover-edit-button,
+.commit-info-title-wrapper:focus-within .hover-edit-button {
+  opacity: 1;
+}
+
 .commit-info-rendered-field {
   cursor: pointer;
   white-space: pre-wrap;
-  margin: calc(-1 * var(--pad));
   margin-bottom: var(--pad);
   transition: background-color 0.1s;
   border-radius: var(--pad);
-  padding: var(--pad);
+  padding-top: 0;
 }
 
 .commit-info-rendered-textarea,
@@ -81,7 +91,7 @@
   white-space: pre-wrap;
   transition: background-color 0.1s;
   border-radius: var(--pad);
-  padding: var(--pad);
+  padding: var(--pad) 0;
   word-break: break-word;
 }
 
@@ -94,7 +104,7 @@
 }
 
 .commit-info-section .see-more-container {
-  margin: calc(-1 * var(--pad));
+  margin-left: 0;
   margin-bottom: var(--pad);
 }
 
@@ -174,19 +184,31 @@
   display: none;
 }
 
+.commit-info-field-buttons {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
 .hover-edit-button {
   opacity: 0;
-  transition: opacity 0.1s;
+  transition:
+    opacity 0.1s,
+    background-color 0.1s,
+    transform 0.1s;
   display: flex;
+  cursor: pointer;
+  border-radius: var(--halfpad);
+  background: none;
+  border: none;
+  padding: 2px;
+  color: inherit;
 }
-.commit-info-rendered-title:focus-within .hover-edit-button,
-.commit-info-rendered-field:focus-within .hover-edit-button,
-.commit-info-rendered-textarea:focus-within .hover-edit-button,
-.commit-info-rendered-custom:focus-within .hover-edit-button,
-.commit-info-rendered-title:hover .hover-edit-button,
-.commit-info-rendered-field:hover .hover-edit-button,
-.commit-info-rendered-textarea:hover .hover-edit-button,
-.commit-info-rendered-custom:hover .hover-edit-button {
+.hover-edit-button:hover {
+  transform: scale(1.1);
+}
+.commit-info-section:focus-within .hover-edit-button,
+.commit-info-section:hover .hover-edit-button {
   opacity: 1;
 }
 
@@ -202,12 +224,12 @@
 
 .commit-info-section {
   margin: var(--pad);
-  margin-top: calc(2 * var(--pad));
 }
 
 .commit-info-title-byline {
   padding: 5px;
   margin: 0 var(--halfpad);
+  margin-bottom: var(--pad);
   display: flex;
   flex-wrap: nowrap;
   gap: var(--halfpad);
@@ -265,7 +287,6 @@
   flex-direction: row;
   align-items: center;
   justify-content: flex-end;
-  gap: var(--pad);
   font-size: 90%;
   margin-bottom: calc(-1.5 * var(--pad));
   border-radius: var(--pad);
@@ -281,6 +302,7 @@
   align-items: center;
   flex-wrap: wrap;
   padding: var(--halfpad) 0;
+  min-height: calc(var(--pad));
   --token-height: 26px;
 }
 .commit-info-tokenized-field vscode-text-field {
@@ -295,7 +317,7 @@
 }
 
 .commit-info-tokenized-field .token,
-.suggested-reviewers .token {
+.commit-suggestions .token {
   padding: 0;
   background-color: var(--tooltip-background);
   padding: 0 var(--pad);

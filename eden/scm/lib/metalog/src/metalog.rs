@@ -238,7 +238,7 @@ impl MetaLog {
 
     /// Lookup a blob by key.
     pub fn get(&self, name: &str) -> Result<Option<Bytes>> {
-        tracing::trace!("get {}", name);
+        tracing::trace!(root=?self.orig_root_id, "get {}", name);
         match self.root.map.get(name) {
             Some(SerId20(id)) => Ok(self.blobs.read().get(*id)?),
             None => Ok(None),
@@ -247,7 +247,7 @@ impl MetaLog {
 
     /// Get the content hash of a key.
     pub fn get_hash(&self, name: &str) -> Option<Id20> {
-        tracing::trace!("get_hash {}", name);
+        tracing::trace!(root=?self.orig_root_id, "get_hash {}", name);
         self.root.map.get(name).map(|SerId20(id)| *id)
     }
 
@@ -255,7 +255,7 @@ impl MetaLog {
     ///
     /// Changes are not flushed to disk. Use `flush` to write them.
     pub fn set(&mut self, name: &str, value: &[u8]) -> Result<Id20> {
-        tracing::trace!("set {}", name);
+        tracing::trace!(root=?self.orig_root_id, "set {}", name);
         let delta_base_candidates = match self.root.map.get(name) {
             Some(SerId20(id)) => vec![*id],
             None => Vec::new(),
@@ -269,7 +269,7 @@ impl MetaLog {
     ///
     /// Changes are not flushed to disk. Use `flush` to write them.
     pub fn remove(&mut self, name: &str) -> Result<()> {
-        tracing::trace!("remove {}", name);
+        tracing::trace!(root=?self.orig_root_id, "remove {}", name);
         self.root.map.remove(name);
         Ok(())
     }
@@ -298,11 +298,12 @@ impl MetaLog {
     pub fn commit(&mut self, options: CommitOptions) -> Result<Id20> {
         if !self.is_dirty() {
             // Nothing changed.
+            tracing::debug!(root=?self.orig_root_id, "commit (nothing changed)");
             return Ok(self.orig_root_id);
         }
-        tracing::trace!("commit (before lock)");
+        tracing::trace!(root=?self.orig_root_id, "commit (before lock)");
         let _lock = ScopedDirLock::new(&self.path);
-        tracing::debug!("commit (locked, detached = {})", options.detached);
+        tracing::debug!(root=?self.orig_root_id, "commit (locked, detached = {})", options.detached);
         let (_, actual_compaction_epoch) = resolve_compaction_epoch(&self.path)?;
         if self.compaction_epoch != actual_compaction_epoch {
             return Err(Error(format!(
@@ -684,8 +685,8 @@ mod tests {
     use indexedlog::DefaultOpenOptions;
     use quickcheck::quickcheck;
     use rand_chacha::ChaChaRng;
-    use rand_core::RngCore;
-    use rand_core::SeedableRng;
+    use rand_core::Rng as _;
+    use rand_core::SeedableRng as _;
     use tempfile::TempDir;
 
     use super::*;
@@ -978,9 +979,7 @@ mod tests {
 
         assert!(
             post_compact_root_size < pre_compact_root_size,
-            "roots size should be smaller after compaction, before: {}, after: {}",
-            pre_compact_root_size,
-            post_compact_root_size
+            "roots size should be smaller after compaction, before: {pre_compact_root_size}, after: {post_compact_root_size}"
         );
         assert!(
             post_compact_blob_size < pre_compact_blob_size,

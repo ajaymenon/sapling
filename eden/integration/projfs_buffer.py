@@ -4,7 +4,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
 
 import os
 import subprocess
@@ -19,6 +19,7 @@ from .lib.find_executables import FindExe
 
 if sys.platform == "win32":
     import ctypes
+    import ctypes.wintypes
 
     win_kernel = ctypes.windll.kernel32
 

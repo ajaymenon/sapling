@@ -4,7 +4,7 @@
 
 
   $ disable copytrace
-  $ hg debugextensions --excludedefault
+  $ sl debugextensions --excludedefault
   remotenames (untested!)
   treemanifest (untested!)
 
@@ -18,7 +18,7 @@
 
   $ setconfig extensions.hotfix1=python-base64:Cgo=
 
-  $ hg debugextensions --excludedefault
+  $ sl debugextensions --excludedefault
   ext1 (untested!)
   ext2 (3.2.1!)
   histedit
@@ -27,7 +27,7 @@
   remotenames (untested!)
   treemanifest (untested!)
 
-  $ hg debugextensions -v --excludedefault
+  $ sl debugextensions -v --excludedefault
   ext1
     location: *ext1.py* (glob)
     bundled: no
@@ -52,7 +52,7 @@
     location: *treemanifest* (glob)
     bundled: no
 
-  $ hg debugextensions --excludedefault -Tjson | sed 's|\\\\|/|g'
+  $ sl debugextensions --excludedefault -Tjson | sed 's|\\\\|/|g'
   [
    {
     "buglink": "",
@@ -105,7 +105,7 @@
    }
   ]
 
-  $ hg debugextensions -T '{ifcontains("3.1", testedwith, "{name}\n")}'
+  $ sl debugextensions -T '{ifcontains("3.1", testedwith, "{name}\n")}'
   ext2
-  $ hg debugextensions \
+  $ sl debugextensions \
   > -T '{ifcontains("3.2", testedwith, "no substring match: {name}\n")}'

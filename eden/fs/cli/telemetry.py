@@ -10,6 +10,7 @@ import abc
 import getpass
 import json
 import logging
+import os
 import platform
 import random
 import subprocess
@@ -20,6 +21,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Type, Union
 
 from . import hostname, version
+
+try:
+    from eden.fs.cli.facebook.hostcaps import get_fb_info
+except ImportError:
+    # in OSS define a stub
+    def get_fb_info() -> Optional[Dict[str, str]]:
+        return None
 
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -167,6 +175,22 @@ class TelemetryLogger(abc.ABC):
         sample.add_string("os", self.os)
         sample.add_string("osver", self.os_version)
         sample.add_string("edenver", self.eden_version)
+
+        agent_metadata = os.environ.get("CODING_AGENT_METADATA")
+        if agent_metadata:
+            for part in agent_metadata.split(","):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    if key == "id":
+                        sample.add_string("agentic_fingerprint_id", value)
+                    elif key == "invocation_id":
+                        sample.add_string("agentic_fingerprint_invocation_id", value)
+
+        fb_info = get_fb_info()
+        if fb_info:
+            for key, value in fb_info.items():
+                sample.add_string(key, value)
+
         sample.add_fields(**kwargs)
         return sample
 
@@ -264,6 +288,7 @@ class ExternalTelemetryLogger(BaseJsonTelemetryLogger):
                 ),
             }
         try:
+            # pyrefly: ignore [bad-argument-type]
             rc = subprocess.call(cmd, **kwargs)
             if rc != 0:
                 log.warning(f"telemetry log command returned non-zero exit code {rc}")

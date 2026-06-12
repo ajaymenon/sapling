@@ -68,13 +68,12 @@ pub enum MergeMode<R> {
     },
 }
 
-fn get_squashing_overrides(repo_name: &str, target_bookmark: &str) -> (Option<i64>, bool) {
-    let switchval = format!("{}:{}", repo_name, target_bookmark);
+fn get_squashing_overrides(repo_name: &str, target_bookmark: &str) -> Result<(Option<i64>, bool)> {
+    let switchval = format!("{repo_name}:{target_bookmark}");
     let squashing_limit = justknobs::get(
         "scm/mononoke:megarepo_override_squashing_limit",
         Some(&switchval),
-    )
-    .unwrap_or(0);
+    );
 
     let maybe_squashing_limit = if squashing_limit == 0 {
         None
@@ -82,13 +81,7 @@ fn get_squashing_overrides(repo_name: &str, target_bookmark: &str) -> (Option<i6
         Some(squashing_limit)
     };
 
-    let author_check = justknobs::eval(
-        "scm/mononoke:megarepo_override_author_check",
-        None,
-        Some(&switchval),
-    )
-    .unwrap_or(true);
-    (maybe_squashing_limit, author_check)
+    Ok((maybe_squashing_limit, false))
 }
 
 pub struct SquashingConfig {
@@ -173,7 +166,7 @@ impl<'a, R: MononokeRepo> SyncChangeset<'a, R> {
         let maybe_squashing_config = match &source_config.merge_mode {
             Some(megarepo_config::MergeMode::squashed(sq)) => {
                 let (maybe_squash_limit, check_author) =
-                    get_squashing_overrides(target_repo.name(), &target.bookmark);
+                    get_squashing_overrides(target_repo.name(), &target.bookmark)?;
                 Some(SquashingConfig {
                     squash_limit: maybe_squash_limit
                         .unwrap_or(sq.squash_limit)
@@ -398,10 +391,7 @@ impl<'a, R: MononokeRepo> SyncChangeset<'a, R> {
         let latest_synced = state.latest_synced_changesets.get(source_name);
         if Some(&source_cs_id) != latest_synced {
             return Err(MegarepoError::request(anyhow!(
-                "In target commit {} latest synced source commit is {:?}, but expected {}",
-                actual_target_location,
-                latest_synced,
-                source_cs_id,
+                "In target commit {actual_target_location} latest synced source commit is {latest_synced:?}, but expected {source_cs_id}",
             )));
         }
 
@@ -503,23 +493,21 @@ async fn sync_changeset_to_target<R: MononokeRepo>(
             .map_err(MegarepoError::internal)?
             .ok_or_else(|| {
                 MegarepoError::internal(anyhow!(
-                    "failed to rewrite commit {}, target: {:?}",
-                    source_cs_id,
-                    target
+                    "failed to rewrite commit {source_cs_id}, target: {target:?}"
                 ))
             })
         }
         MergeMode::Squashed { side_commits } => {
-            let side_commits_info = stream::iter(side_commits.into_iter())
+            let side_commits_info = stream::iter(side_commits)
                 .map(|cs_ctx| async move {
                     let hash = match cs_ctx.git_sha1().await? {
                         None => format!("HG hash: {}", cs_ctx.id()),
-                        Some(hash) => format!("Git hash: {}", hash),
+                        Some(hash) => format!("Git hash: {hash}"),
                     };
                     let author_date = cs_ctx.author_date().await?;
                     let message = cs_ctx.message().await?;
                     let title = message.trim_start().lines().next().unwrap_or("");
-                    Ok::<_, MegarepoError>(format!(" * {}\t{}\t{}", hash, author_date, title))
+                    Ok::<_, MegarepoError>(format!(" * {hash}\t{author_date}\t{title}"))
                 })
                 .buffer_unordered(100)
                 .try_collect()
@@ -537,9 +525,7 @@ async fn sync_changeset_to_target<R: MononokeRepo>(
             .map_err(MegarepoError::internal)?
             .ok_or_else(|| {
                 MegarepoError::internal(anyhow!(
-                    "failed to rewrite as squashed commit {}, target: {:?}",
-                    source_cs_id,
-                    target
+                    "failed to rewrite as squashed commit {source_cs_id}, target: {target:?}"
                 ))
             })
         }
@@ -577,9 +563,7 @@ fn find_latest_synced_cs_id(
         Ok(latest_synced_cs_id.clone())
     } else {
         Err(MegarepoError::internal(anyhow!(
-            "Source {:?} was not synced into target {:?}",
-            source_name,
-            target
+            "Source {source_name:?} was not synced into target {target:?}"
         )))
     }
 }

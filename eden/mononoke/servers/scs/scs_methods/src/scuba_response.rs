@@ -128,13 +128,23 @@ impl AddScubaResponse for thrift::CommitFindFilesStreamItem {}
 
 impl AddScubaResponse for thrift::CommitInfo {}
 
+impl AddScubaResponse for thrift::CommitFingerprintResponse {}
+
 impl AddScubaResponse for thrift::CommitLookupResponse {}
+
+impl AddScubaResponse for thrift::CommitFilterAncestorsResponse {
+    fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("response_num_ancestors", self.ancestors.len());
+    }
+}
 
 impl AddScubaResponse for thrift::CommitLookupPushrebaseHistoryResponse {}
 
 impl AddScubaResponse for thrift::CommitHistoryResponse {}
 
 impl AddScubaResponse for thrift::CommitHgMutationHistoryResponse {}
+
+impl AddScubaResponse for thrift::CommitGitMutationHistoryResponse {}
 
 impl AddScubaResponse for thrift::CommitDirectoryBranchClustersResponse {
     fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
@@ -152,6 +162,8 @@ impl AddScubaResponse for thrift::CommitLinearHistoryResponse {}
 impl AddScubaResponse for thrift::CommitListDescendantBookmarksResponse {}
 
 impl AddScubaResponse for thrift::CommitRunHooksResponse {}
+
+impl AddScubaResponse for thrift::CommitRateLimitCheckResponse {}
 
 impl AddScubaResponse for thrift::CommitSubtreeChangesResponse {}
 

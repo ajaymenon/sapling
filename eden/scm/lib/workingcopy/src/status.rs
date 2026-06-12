@@ -337,7 +337,7 @@ mod tests {
             unimplemented!()
         }
 
-        fn flush(&mut self) -> Result<types::HgId> {
+        fn persist(&mut self, _opts: manifest::PersistOpts<'_, Self>) -> Result<types::HgId> {
             unimplemented!()
         }
 
@@ -418,7 +418,7 @@ mod tests {
     fn compare_status(status: Status, expected_list: &[(&str, Option<FileStatus>)]) {
         for (path, expected) in expected_list {
             let actual = status.status(RepoPath::from_str(path).expect("path"));
-            assert_eq!(&actual, expected, "status for '{}'", path);
+            assert_eq!(&actual, expected, "status for '{path}'");
         }
     }
 

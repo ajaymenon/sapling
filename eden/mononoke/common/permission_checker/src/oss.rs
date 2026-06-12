@@ -63,6 +63,12 @@ impl MononokeIdentity {
         bail!("Decoding from JSON is not yet implemented for MononokeIdentity")
     }
 
+    pub fn try_from_legacy_encoded(_: &str) -> Result<MononokeIdentitySet> {
+        bail!(
+            "Decoding legacy scm_forwarded_identities is not yet implemented for MononokeIdentity"
+        )
+    }
+
     pub fn try_from_x509(cert: &X509) -> Result<MononokeIdentitySet> {
         let subject_vec: Result<Vec<_>> = cert
             .subject_name()
@@ -78,34 +84,15 @@ impl MononokeIdentity {
         let subject_name = subject_vec?.as_slice().join(",");
 
         let mut idents = MononokeIdentitySet::new();
-        idents.insert(MononokeIdentity::new("X509_SUBJECT_NAME", subject_name));
+        idents.insert(MononokeIdentity::from_legacy_type_data(
+            "X509_SUBJECT_NAME",
+            subject_name,
+        ));
         Ok(idents)
-    }
-
-    pub fn with_auth_idents(
-        id_type: impl Into<String>,
-        id_data: impl Into<String>,
-        _auth_ident: Option<AuthenticatedIdentity>,
-    ) -> Self {
-        Self::TypeData {
-            id_type: id_type.into(),
-            id_data: id_data.into(),
-        }
-    }
-
-    pub fn auth_ident(&self) -> Option<&AuthenticatedIdentity> {
-        match self {
-            Self::Authenticated(auth_id) => Some(auth_id),
-            Self::TypeData { .. } => None,
-        }
     }
 }
 
 impl MononokeIdentitySetExt for MononokeIdentitySet {
-    fn is_quicksand(&self) -> bool {
-        false
-    }
-
     fn likely_an_agent(&self) -> bool {
         false
     }
@@ -126,11 +113,7 @@ impl MononokeIdentitySetExt for MononokeIdentitySet {
         None
     }
 
-    fn main_client_identity(
-        &self,
-        _sandcastle_alias: Option<&str>,
-        _clientinfo_atlas_env_id: Option<&str>,
-    ) -> String {
+    fn main_client_identity(&self, _sandcastle_alias: Option<&str>) -> String {
         String::from("PLACEHOLDER_CLIENT_IDENTITY")
     }
 

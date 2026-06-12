@@ -39,6 +39,7 @@ use rustc_hash::FxHashSet;
 use sha1::Digest;
 use sha1::Sha1;
 use tokio::io::AsyncWrite;
+use weight_observer::WeightedItem;
 
 use crate::Repo;
 use crate::mapping::bonsai_git_mappings_by_bonsai;
@@ -142,8 +143,8 @@ impl RefTarget {
 impl Display for RefTarget {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         match self {
-            RefTarget::Plain(oid) => write!(f, "{}", oid),
-            RefTarget::WithMetadata(oid, meta) => write!(f, "{} {}", oid, meta),
+            RefTarget::Plain(oid) => write!(f, "{oid}"),
+            RefTarget::WithMetadata(oid, meta) => write!(f, "{oid} {meta}"),
         }
     }
 }
@@ -454,7 +455,7 @@ impl FetchFilter {
 /// given range of commits
 pub struct PackItemStreamResponse<'a> {
     /// The stream of packfile items that were generated for the given range of commits
-    pub items: BoxStream<'a, Result<PackfileItem>>,
+    pub items: BoxStream<'a, Result<WeightedItem<PackfileItem>>>,
     /// The number of packfile items that were generated for the given range of commits
     pub num_items: usize,
     /// The set of refs mapped to their Git commit ID or tag ID that are included in the
@@ -464,7 +465,7 @@ pub struct PackItemStreamResponse<'a> {
 
 impl<'a> PackItemStreamResponse<'a> {
     pub fn new(
-        items: BoxStream<'a, Result<PackfileItem>>,
+        items: BoxStream<'a, Result<WeightedItem<PackfileItem>>>,
         num_items: usize,
         included_refs: HashMap<String, RefTarget>,
     ) -> Self {
@@ -509,7 +510,7 @@ impl LsRefsResponse {
             write_binary_packetline(ref_line(SYMREF_HEAD, target).as_bytes(), writer).await?;
         }
         let mut sorted_refs = self.included_refs.iter().collect::<Vec<_>>();
-        sorted_refs.sort_by(|(ref_a_name, _), (ref_b_name, _)| ref_a_name.cmp(ref_b_name));
+        sorted_refs.sort_by_key(|(ref_a_name, _)| *ref_a_name);
         for (name, target) in sorted_refs {
             if name.as_str() != SYMREF_HEAD {
                 write_binary_packetline(ref_line(name, target).as_bytes(), writer).await?;
@@ -523,7 +524,7 @@ impl LsRefsResponse {
 /// fetch request command
 pub struct FetchResponse<'a> {
     /// The stream of packfile items that were generated for the fetch request command
-    pub items: BoxStream<'a, Result<PackfileItem>>,
+    pub items: BoxStream<'a, Result<WeightedItem<PackfileItem>>>,
     // The number of commits that are included in the generated packfile
     pub num_commits: usize,
     // The number of trees and blobs that are included in the generated packfile
@@ -534,7 +535,7 @@ pub struct FetchResponse<'a> {
 
 impl<'a> FetchResponse<'a> {
     pub fn new(
-        items: BoxStream<'a, Result<PackfileItem>>,
+        items: BoxStream<'a, Result<WeightedItem<PackfileItem>>>,
         num_commits: usize,
         num_trees_and_blobs: usize,
         num_tags: usize,
@@ -842,8 +843,7 @@ impl BonsaiBookmarks {
             .map(|(bookmark, cs_id)| {
                 let git_objectid = bonsai_git_map.get(&cs_id).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "No Git ObjectId found for changeset {:?} when converting to GitBookmarks",
-                        cs_id
+                        "No Git ObjectId found for changeset {cs_id:?} when converting to GitBookmarks"
                     )
                 })?;
                 Ok((bookmark, *git_objectid))

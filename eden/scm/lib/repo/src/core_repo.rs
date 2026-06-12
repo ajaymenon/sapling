@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use configloader::Config;
+use context::CoreContext;
 use manifest_tree::ReadTreeManifest;
 use manifest_tree::TreeManifest;
 use pathmatcher::DynMatcher;
+use revsets::utils::ResolveResult;
 use storemodel::FileStore;
 use storemodel::TreeStore;
 use types::HgId;
@@ -81,23 +83,30 @@ impl CoreRepo {
     ///
     /// For `Repo`, this uses the working copy's treestate for resolving "." and similar.
     /// For `SlapiRepo`, this only supports remote lookups (hash prefixes and bookmarks).
-    pub fn resolve_commit(&self, change_id: &str) -> Result<HgId> {
+    pub fn resolve_commit(&self, change_id: &str) -> Result<ResolveResult> {
         match self {
-            CoreRepo::Disk(repo) => {
-                #[cfg(feature = "wdir")]
-                {
-                    let wc = repo.working_copy()?;
-                    let wc = wc.read();
-                    let treestate = wc.treestate();
-                    let treestate = treestate.lock();
-                    repo.resolve_commit(Some(&treestate), change_id)
-                }
-                #[cfg(not(feature = "wdir"))]
-                {
-                    repo.resolve_commit(None, change_id)
-                }
-            }
+            CoreRepo::Disk(repo) => repo.resolve_commit(change_id),
             CoreRepo::Slapi(repo) => repo.resolve_commit(change_id),
+        }
+    }
+
+    /// Resolve a change identifier to a TreeManifest.
+    ///
+    /// If `change_id` is "wdir", returns a manifest representing the current working copy
+    /// state including uncommitted changes. This is only supported for `Repo` (disk-based).
+    ///
+    /// Otherwise, resolves the commit and fetches its TreeManifest.
+    ///
+    /// Returns the commit HgId (or WDIR_ID for "wdir") and the TreeManifest.
+    pub fn resolve_manifest(
+        &self,
+        ctx: &CoreContext,
+        change_id: &str,
+        matcher: DynMatcher,
+    ) -> Result<(HgId, TreeManifest)> {
+        match self {
+            CoreRepo::Disk(repo) => repo.resolve_manifest(ctx, change_id, matcher),
+            CoreRepo::Slapi(repo) => repo.resolve_manifest(change_id),
         }
     }
 

@@ -49,6 +49,7 @@ use tracing::Level;
 use tracing::dispatcher;
 use tracing::dispatcher::Dispatch;
 use tracing::metadata::LevelFilter;
+use tracing_backtrace::BacktraceLayer;
 use tracing_collector::TracingData;
 use tracing_sampler::SamplingLayer;
 use tracing_subscriber::Layer;
@@ -167,7 +168,7 @@ pub fn run_command(args: Vec<String>, io: &IO) -> i32 {
     let exit_code = (|| {
         let cwd = match current_dir(io) {
             Err(e) => {
-                let _ = io.write_err(format!("abort: cannot get current directory: {}\n", e));
+                let _ = io.write_err(format!("abort: cannot get current directory: {e}\n"));
                 return exitcode::IOERR;
             }
             Ok(dir) => dir,
@@ -192,6 +193,7 @@ pub fn run_command(args: Vec<String>, io: &IO) -> i32 {
                 errors::print_error(
                     &err,
                     io,
+                    None,
                     global_opts.as_ref().is_none_or(|opts| opts.traceback),
                 );
                 255
@@ -248,14 +250,14 @@ fn dispatch_command(
         match runlog::Logger::from_repo(dispatcher.repo(), dispatcher.args()[1..].to_vec()) {
             Ok(logger) => Some(logger),
             Err(err) => {
-                let _ = io.write_err(format!("Error creating runlogger: {}\n", err));
+                let _ = io.write_err(format!("Error creating runlogger: {err}\n"));
                 None
             }
         };
 
     setup_http(dispatcher.global_opts());
 
-    let _ = spawn_progress_thread(
+    let _ = setup_progress_thread(
         dispatcher.config(),
         dispatcher.global_opts(),
         io,
@@ -339,7 +341,12 @@ fn dispatch_command(
                     std::thread::sleep(Duration::from_secs(5));
                 }
 
-                errors::print_error(&err, io, dispatcher.global_opts().traceback);
+                errors::print_error(
+                    &err,
+                    io,
+                    Some(dispatcher.config().as_ref()),
+                    dispatcher.global_opts().traceback,
+                );
                 errors::upload_traceback(&err, start_time.epoch_ms());
                 255
             }
@@ -348,7 +355,12 @@ fn dispatch_command(
 
     if !fell_back {
         if let Err(err) = io.wait_pager().context("error flushing command output") {
-            errors::print_error(&err, io, dispatcher.global_opts().traceback);
+            errors::print_error(
+                &err,
+                io,
+                Some(dispatcher.config().as_ref()),
+                dispatcher.global_opts().traceback,
+            );
             return 255;
         }
     }
@@ -418,76 +430,12 @@ fn current_dir(io: &IO) -> io::Result<PathBuf> {
     result
 }
 
-/// Make tracing write logs to `io` if `LOG` environment is set.
-/// Return `true` if it is set, or `false` if nothing happens.
-///
-/// `collector` is used to integrate with the `TracingCollector`,
-/// which can integrate with Python via bindings.
-fn setup_tracing_io(
-    io: &IO,
-    collector: Option<tracing_collector::TracingCollector>,
-) -> Result<bool> {
-    let is_test = is_inside_test();
-    let mut env_filter_dirs: Option<String> = identity::debug_env_var("LOG").map(|v| v.1);
-
-    // Ensure EnvFilter is used in tests so it can be changed on the fly.
-    if is_test && env_filter_dirs.is_none() {
-        env_filter_dirs = Some(String::new());
-    }
-
-    if let Some(dirs) = env_filter_dirs {
-        // Apply "reload" side effects first.
-        let error = io.error();
-        let can_color = error.can_color();
-        tracing_reload::update_writer(Box::new(error));
-        tracing_reload::update_env_filter_directives(&dirs)?;
-
-        // This might error out if called 2nd time per process.
-        let env_filter = tracing_reload::reloadable_env_filter()?;
-
-        let env_logger = FmtLayer::new()
-            .with_span_events(FmtSpan::ACTIVE)
-            .with_ansi(can_color)
-            .with_writer(tracing_reload::reloadable_writer);
-        if is_test {
-            // In tests, disable color and timestamps for cleaner output.
-            let env_logger = env_logger.without_time().with_ansi(false);
-            match collector {
-                None => {
-                    let subscriber = tracing_subscriber::Registry::default()
-                        .with(env_logger.with_filter(env_filter))
-                        .with(SamplingLayer::new());
-                    tracing::subscriber::set_global_default(subscriber)?;
-                }
-                Some(collector) => {
-                    let subscriber = tracing_subscriber::Registry::default()
-                        .with(collector.and_then(env_logger).with_filter(env_filter))
-                        .with(SamplingLayer::new());
-                    tracing::subscriber::set_global_default(subscriber)?;
-                }
-            };
-        } else {
-            match collector {
-                None => {
-                    let subscriber = tracing_subscriber::Registry::default()
-                        .with(env_logger.with_filter(env_filter))
-                        .with(SamplingLayer::new());
-                    tracing::subscriber::set_global_default(subscriber)?;
-                }
-                Some(collector) => {
-                    let subscriber = tracing_subscriber::Registry::default()
-                        .with(collector.and_then(env_logger).with_filter(env_filter))
-                        .with(SamplingLayer::new());
-                    tracing::subscriber::set_global_default(subscriber)?;
-                }
-            }
-        }
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
+/// Setup tracing with multiple layers:
+/// - TracingCollector: collects spans, events so they can be logged.
+/// - FmtLayer: print out tracing messages if `SL_LOG` gets set.
+/// - BacktraceLayer: print backtraces for matching events if `SL_BTLOG` gets set.
+/// - SamplingLayer: convenient way to use tracing to report to the telemetry
+///   program (meta-only).
 fn setup_tracing(global_opts: &Option<HgGlobalOpts>, io: &IO) -> Result<Arc<Mutex<TracingData>>> {
     // Setup TracingData singleton (currently owned by pytracing).
     {
@@ -501,9 +449,51 @@ fn setup_tracing(global_opts: &Option<HgGlobalOpts>, io: &IO) -> Result<Arc<Mute
         }
     }
     let data = pytracing::DATA.clone();
-
     let collector = tracing_collector::TracingCollector::new(data.clone());
-    if !setup_tracing_io(io, Some(collector))? {
+
+    let is_test = is_inside_test();
+    let mut env_filter_dirs: Option<String> = identity::debug_env_var("LOG").map(|v| v.1);
+    let env_filter_dirs_btlog: Option<String> = identity::debug_env_var("BTLOG").map(|v| v.1);
+    let mut can_color = false;
+
+    // Ensure EnvFilter is used in tests so it can be changed on the fly.
+    if is_test && env_filter_dirs.is_none() {
+        env_filter_dirs = Some(String::new());
+    }
+
+    if env_filter_dirs.is_some() || env_filter_dirs_btlog.is_some() {
+        let error = io.error();
+        can_color = error.can_color();
+        tracing_reload_states::RELOADABLE_WRITER.update(Box::new(error));
+    }
+
+    let mut inner: Vec<tracing_dyn_layer::BoxedLayer<_>> = Vec::new();
+
+    if let Some(dirs) = env_filter_dirs {
+        // LOG is set: configure human-readable stderr output.
+        tracing_reload_states::LOG_FILTER.update_directives(&dirs)?;
+
+        let env_filter = tracing_reload_states::LOG_FILTER.env_filter()?;
+
+        let env_logger = FmtLayer::new()
+            .with_span_events(FmtSpan::ACTIVE)
+            .with_ansi(can_color)
+            .with_writer(|| tracing_reload_states::RELOADABLE_WRITER.clone());
+
+        let env_logger: tracing_dyn_layer::BoxedLayer<_> = if is_test {
+            env_logger.without_time().with_ansi(false).boxed()
+        } else {
+            env_logger.boxed()
+        };
+
+        inner.push(
+            collector
+                .and_then(env_logger)
+                .with_filter(env_filter)
+                .boxed(),
+        );
+    } else {
+        // No LOG: collector-only with a level filter.
         let level = identity::debug_env_var("TRACE_LEVEL")
             .map(|v| v.1)
             .and_then(|s| Level::from_str(&s).ok())
@@ -516,17 +506,27 @@ fn setup_tracing(global_opts: &Option<HgGlobalOpts>, io: &IO) -> Result<Arc<Mute
                 Level::INFO
             });
 
-        let collector = tracing_collector::TracingCollector::new(data.clone());
-        let subscriber = tracing_subscriber::Registry::default()
-            .with(collector.with_filter::<LevelFilter>(level.into()))
-            .with(SamplingLayer::new());
-        tracing::subscriber::set_global_default(subscriber)?;
+        inner.push(collector.with_filter::<LevelFilter>(level.into()).boxed());
     }
+
+    // BacktraceLayer: print backtraces for matching tracing events (SL_BTLOG).
+    if let Some(dirs) = env_filter_dirs_btlog {
+        tracing_reload_states::BTLOG_FILTER.update_directives(&dirs)?;
+        let bt_filter = tracing_reload_states::BTLOG_FILTER.env_filter()?;
+        let bt_layer = BacktraceLayer::new()
+            .with_writer(|| Box::new(tracing_reload_states::RELOADABLE_WRITER.clone()));
+        inner.push(bt_layer.with_filter(bt_filter).boxed());
+    }
+
+    inner.push(SamplingLayer::new().boxed());
+
+    let subscriber = tracing_subscriber::Registry::default().with(tracing_dyn_layer::layers(inner));
+    tracing::subscriber::set_global_default(subscriber)?;
 
     Ok(data)
 }
 
-fn spawn_progress_thread(
+fn setup_progress_thread(
     config: &dyn Config,
     global_opts: &HgGlobalOpts,
     io: &IO,
@@ -580,59 +580,62 @@ fn spawn_progress_thread(
         ..Default::default()
     };
 
-    let registry = Registry::main();
-
     hg_http::enable_progress_reporting();
 
-    // Not fatal if we cannot spawn the progress rendering thread.
-    let thread_name = "rust-progress".to_string();
-    let _ = thread::Builder::new().name(thread_name).spawn(move || {
-        let mut last_changes = Vec::new();
-        let mut last_runlog_time: Option<Instant> = None;
+    // Defer spawning the progress thread until a model is registered.
+    Registry::main().on_first_registration(Box::new(move || {
+        // Not fatal if we cannot spawn the progress rendering thread.
+        let _ = thread::Builder::new()
+            .name("rust-progress".to_string())
+            .spawn(move || {
+                let registry = Registry::main();
+                let mut last_changes = Vec::new();
+                let mut last_runlog_time: Option<Instant> = None;
 
-        while Weak::upgrade(&in_scope).is_some() {
-            let now = Instant::now();
+                while Weak::upgrade(&in_scope).is_some() {
+                    let now = Instant::now();
 
-            if lockstep {
-                registry.wait();
-            }
-
-            registry.remove_orphan_progress_bar();
-
-            if !disable_rendering {
-                let (term_width, term_height) = progress.term_size();
-                config.term_width = term_width;
-                config.term_height = term_height;
-
-                let changes = (render_function)(registry, &config);
-                if changes != last_changes {
-                    // This might block (so we use a thread, not an async task)
-                    let _ = progress.set(&changes);
-                    last_changes = changes;
-                }
-            }
-
-            if let Some(run_logger) = &run_logger {
-                if last_runlog_time.is_none_or(|i| now - i >= runlog_interval) {
-                    let progress = registry
-                        .list_progress_bar()
-                        .into_iter()
-                        .map(runlog::Progress::new)
-                        .collect();
-
-                    if let Err(err) = run_logger.update_progress(progress) {
-                        tracing::warn!(target: "runlog", ?err, "error updating runlog progress");
+                    if lockstep {
+                        registry.wait();
                     }
 
-                    last_runlog_time = Some(now);
-                }
-            }
+                    registry.remove_orphan_progress_bar();
 
-            if !lockstep {
-                thread::sleep(interval);
-            }
-        }
-    });
+                    if !disable_rendering {
+                        let (term_width, term_height) = progress.term_size();
+                        config.term_width = term_width;
+                        config.term_height = term_height;
+
+                        let changes = (render_function)(registry, &config);
+                        if changes != last_changes {
+                            // This might block (so we use a thread, not an async task)
+                            let _ = progress.set(&changes);
+                            last_changes = changes;
+                        }
+                    }
+
+                    if let Some(run_logger) = &run_logger {
+                        if last_runlog_time.is_none_or(|i| now - i >= runlog_interval) {
+                            let progress = registry
+                                .list_progress_bar()
+                                .into_iter()
+                                .map(runlog::Progress::new)
+                                .collect();
+
+                            if let Err(err) = run_logger.update_progress(progress) {
+                                tracing::warn!(target: "runlog", ?err, "error updating runlog progress");
+                            }
+
+                            last_runlog_time = Some(now);
+                        }
+                    }
+
+                    if !lockstep {
+                        thread::sleep(interval);
+                    }
+                }
+            });
+    }));
 
     Ok(())
 }
@@ -684,9 +687,11 @@ pub(crate) fn write_trace(io: &IO, path: &str, data: &TracingData) -> Result<()>
 
     match format {
         Format::Ascii => {
-            let mut ascii_opts = tracing_collector::model::AsciiOptions::default();
-            ascii_opts.min_duration_parent_percentage_to_show = 10;
-            ascii_opts.min_duration_to_hide = 100000;
+            let ascii_opts = tracing_collector::model::AsciiOptions {
+                min_duration_parent_percentage_to_show: 10,
+                min_duration_to_hide: 100000,
+                ..Default::default()
+            };
             out.write_all(data.ascii(&ascii_opts).as_bytes())?;
             out.flush()?;
         }
@@ -735,23 +740,16 @@ fn log_start(args: Vec<String>, now: StartTime) -> tracing::Span {
         blackbox::log(&blackbox::event::Event::Tags { names });
     }
 
-    let mut parent_names = Vec::new();
-    let mut parent_pids = Vec::new();
-    // On Windows, getting the ppid and exe name requires `CreateToolhelp32Snapshot`,
-    // which can take hundreds of milliseconds. So we skip doing that here.
-    if !inside_test && !cfg!(windows) {
-        let mut ppid = procinfo::parent_pid(0);
-        // In theory, the OS should not report a cyclic process graph (ex. pid 1
-        // has parent pid = 1). Practically `parent_pids` takes snapshots
-        // every time on Windows (unnecessarily) and is subject to races. Be
-        // extra careful here so the loop wouldn't be infinite.
-        while ppid != 0 && parent_pids.len() < 16 && !parent_pids.contains(&ppid) {
-            let name = procinfo::exe_name(ppid);
-            parent_names.push(name);
-            parent_pids.push(ppid);
-            ppid = procinfo::parent_pid(ppid);
-        }
-    }
+    // TODO: enable process_ancestors() on Windows once we confirm it is fast enough.
+    // Previously the Windows implementation of `procinfo::process_ancestors` was
+    // slow, so we disabled it.
+    let (parent_names, parent_pids) = if !inside_test && !cfg!(windows) {
+        let ancestors = procinfo::process_ancestors(16);
+        let (names, pids) = ancestors.into_iter().map(|p| (p.name, p.pid)).unzip();
+        (names, pids)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let span = tracing::info_span!("run");
 
@@ -905,10 +903,11 @@ fn log_perftrace(io: &IO, config: &dyn Config, start_time: StartTime) -> Result<
 
     if let Some(threshold) = config.get_opt::<Duration>("tracing", "threshold")? {
         if *elapsed >= threshold {
-            let mut ascii_opts = tracing_collector::model::AsciiOptions::default();
-
             // Minimum resolution = 1% of duration.
-            ascii_opts.min_duration_to_hide = (elapsed.as_micros() / 100) as u64;
+            let ascii_opts = tracing_collector::model::AsciiOptions {
+                min_duration_to_hide: (elapsed.as_micros() / 100) as u64,
+                ..Default::default()
+            };
 
             let tracing_summary = pytracing::DATA.lock().ascii(&ascii_opts);
             if config.get_or_default("tracing", "stderr")? {
@@ -993,7 +992,7 @@ fn log_metrics(io: &IO, config: &dyn Config) -> Result<()> {
                     .iter()
                     .any(|prefix| key.starts_with(prefix.as_ref()))
         }) {
-            writeln!(io.error(), "{key}: {}", value)?;
+            writeln!(io.error(), "{key}: {value}")?;
         }
     }
 
@@ -1050,15 +1049,25 @@ fn setup_http(global_opts: &HgGlobalOpts) {
 }
 
 fn setup_atexit(start_time: StartTime) {
-    atexit::AtExit::new(Box::new(move || {
-        let duration_ms = start_time.elapsed().as_millis() as u64;
+    atexit::AtExit::new(
+        "flush sampling (measuredtimes)",
+        Box::new(move || {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
 
-        tracing::debug!(target: "measuredtimes", command_duration=duration_ms);
+            tracing::debug!(target: "measuredtimes", command_duration=duration_ms);
 
-        // Make extra sure our metrics are written out.
-        sampling::flush();
-    }))
-    .named("flush sampling".into())
+            // Make extra sure our metrics are written out.
+            sampling::flush();
+        }),
+    )
+    .queued();
+
+    atexit::AtExit::new(
+        "http client shutdown",
+        Box::new(move || {
+            hg_http::shutdown();
+        }),
+    )
     .queued();
 }
 
@@ -1130,7 +1139,7 @@ fn commandserver_serve(args: &[String], io: &IO) -> i32 {
         libc::setsid();
     }
 
-    let _ = setup_tracing_io(io, None);
+    // Commandserver is not enabled. Okay to skip tracing setup here.
     tracing::debug!("preparing commandserver");
 
     let python = HgPython::new(args);

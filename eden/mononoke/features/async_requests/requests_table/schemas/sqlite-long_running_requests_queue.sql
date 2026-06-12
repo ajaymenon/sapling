@@ -20,7 +20,9 @@
   `status` VARCHAR(32) NOT NULL, -- enum('new','inprogress','ready','polled','failed') NOT NULL DEFAULT 'new',
   `claimed_by` VARCHAR(255) NULL,
   `num_retries` TINYINT UNSIGNED DEFAULT NULL,
-  `failed_at` BIGINT(20) DEFAULT NULL
+  `failed_at` BIGINT(20) DEFAULT NULL,
+  `root_request_id` INTEGER DEFAULT NULL,
+  `created_by` VARCHAR(255) DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS `long_running_request_queue_request_status` ON `long_running_request_queue` (`status`, `request_type`);
@@ -30,3 +32,5 @@ CREATE INDEX IF NOT EXISTS `long_running_request_queue_abandoned_request_index` 
 CREATE INDEX IF NOT EXISTS `long_running_request_queue_abandoned_request_index_any` ON `long_running_request_queue` (`status`, `inprogress_last_updated_at`);
 CREATE INDEX IF NOT EXISTS `long_running_request_queue_list_requests` ON `long_running_request_queue` (`status`, `repo_id`, `inprogress_last_updated_at`, `created_at`);
 CREATE INDEX IF NOT EXISTS `long_running_request_queue_list_requests_any` ON `long_running_request_queue` (`status`, `inprogress_last_updated_at`, `created_at`);
+CREATE INDEX IF NOT EXISTS `long_running_request_queue_root_request` ON `long_running_request_queue` (`root_request_id`);
+CREATE UNIQUE INDEX IF NOT EXISTS `long_running_request_queue_root_request_dedupe` ON `long_running_request_queue` (`root_request_id`, `request_type`, `repo_id`, `args_blobstore_key`);

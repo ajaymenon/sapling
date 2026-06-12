@@ -10,6 +10,7 @@ use anyhow::Result;
 use anyhow::bail;
 use fbthrift::compact_protocol;
 use sorted_vector_map::SortedVectorMap;
+use thrift_convert::ThriftConvert;
 
 use crate::blob::Blob;
 use crate::blob::BlobstoreValue;
@@ -145,8 +146,7 @@ impl FsnodeEntry {
                 Ok(FsnodeEntry::Directory(fsnode_directory))
             }
             thrift::fsnodes::FsnodeEntry::UnknownField(unknown) => bail!(
-                "Unknown field encountered when parsing thrift::fsnodes::FsnodeEntry: {}",
-                unknown,
+                "Unknown field encountered when parsing thrift::fsnodes::FsnodeEntry: {unknown}",
             ),
         }
     }
@@ -215,7 +215,7 @@ impl FsnodeFile {
         &self.content_sha256
     }
 
-    pub(crate) fn from_thrift(t: thrift::fsnodes::FsnodeFile) -> Result<FsnodeFile> {
+    pub fn from_thrift(t: thrift::fsnodes::FsnodeFile) -> Result<FsnodeFile> {
         let content_id = ContentId::from_thrift(t.content_id)?;
         let file_type = FileType::from_thrift(t.file_type)?;
         let size = t.size as u64;
@@ -230,7 +230,7 @@ impl FsnodeFile {
         })
     }
 
-    pub(crate) fn into_thrift(self) -> thrift::fsnodes::FsnodeFile {
+    pub fn into_thrift(self) -> thrift::fsnodes::FsnodeFile {
         thrift::fsnodes::FsnodeFile {
             content_id: self.content_id.into_thrift(),
             file_type: self.file_type.into_thrift(),

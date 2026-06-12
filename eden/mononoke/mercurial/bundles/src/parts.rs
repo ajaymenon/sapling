@@ -22,22 +22,16 @@ use futures::StreamExt;
 use futures::TryFutureExt;
 use futures::TryStreamExt;
 use futures::future;
-use futures::future::BoxFuture;
 use futures::stream;
-use futures::stream::BoxStream;
 use futures_stats::TimedFutureExt;
 use mercurial_mutation::HgMutationEntry;
 use mercurial_types::Delta;
 use mercurial_types::HgBlobNode;
 use mercurial_types::HgChangesetId;
-use mercurial_types::HgFileNodeId;
 use mercurial_types::HgNodeHash;
 use mercurial_types::NULL_HASH;
-use mercurial_types::NonRootMPath;
-use mercurial_types::RepoPath;
 use mercurial_types::RevFlags;
 use mononoke_types::DateTime;
-use mononoke_types::path::MPath;
 use phases::Phase;
 
 use super::changegroup::CgDeltaChunk;
@@ -49,14 +43,10 @@ use super::chunk::Chunk;
 use super::infinitepush::infinitepush_mutation_packer;
 use super::obsmarkers::MetadataEntry;
 use super::obsmarkers::packer::obsmarkers_packer_stream;
-use super::wirepack;
-use super::wirepack::packer::pack_wirepack;
 use crate::errors::ErrorKind;
 use crate::part_encode::PartEncodeBuilder;
 use crate::part_header::PartHeaderType;
 use crate::part_header::PartId;
-
-pub type FilenodeEntry = (HgFileNodeId, HgChangesetId, HgBlobNode, Option<RevFlags>);
 
 pub fn listkey_part<N, S, K, V>(namespace: N, items: S) -> Result<PartEncodeBuilder>
 where
@@ -111,11 +101,7 @@ where
     Ok(builder)
 }
 
-pub fn changegroup_part<CS>(
-    changelogentries: CS,
-    filenodeentries: Option<BoxStream<'static, Result<(NonRootMPath, Vec<FilenodeEntry>), Error>>>,
-    version: CgVersion,
-) -> Result<PartEncodeBuilder>
+pub fn changegroup_part<CS>(changelogentries: CS, version: CgVersion) -> Result<PartEncodeBuilder>
 where
     CS: Stream<Item = Result<(HgNodeHash, HgBlobNode), Error>> + Send + 'static,
 {
@@ -129,28 +115,20 @@ where
         .chain(stream::once(future::ok(Part::SectionEnd(
             Section::Changeset,
         ))))
-        // One more SectionEnd entry is necessary because hg client excepts filelog section
+        // One more SectionEnd entry is necessary because hg client expects filelog section
         // even if it's empty. Add a fake SectionEnd part (the choice of
         // Manifest is just for convenience).
         .chain(stream::once(future::ok(Part::SectionEnd(
             Section::Manifest,
         ))));
 
-    let changelogentries = if version == CgVersion::Cg3Version {
+    let changegroup = if version == CgVersion::Cg3Version {
         // Changegroup V3 requires one empty chunk after manifest section
         // hence adding Part::SectionEnd below
         changelogentries
             .chain(stream::once(future::ok(Part::SectionEnd(
                 Section::Manifest,
             ))))
-            .left_stream()
-    } else {
-        changelogentries.right_stream()
-    };
-
-    let changegroup = if let Some(filenodeentries) = filenodeentries {
-        changelogentries
-            .chain(convert_file_stream(filenodeentries, version))
             .left_stream()
     } else {
         changelogentries.right_stream()
@@ -199,50 +177,6 @@ where
     })
 }
 
-fn convert_file_stream<FS>(
-    filenodeentries: FS,
-    cg_version: CgVersion,
-) -> impl Stream<Item = Result<Part, Error>>
-where
-    FS: Stream<Item = Result<(NonRootMPath, Vec<FilenodeEntry>), Error>> + Send + 'static,
-{
-    filenodeentries
-        .map_ok(move |(path, nodes)| {
-            let mut items = vec![];
-            for (node, hg_cs_id, blobnode, flags) in nodes {
-                let parents = blobnode.parents().get_nodes();
-                let p1 = parents.0.unwrap_or(NULL_HASH);
-                let p2 = parents.1.unwrap_or(NULL_HASH);
-                let base = NULL_HASH;
-                // Linknode is the same as node
-                let linknode = hg_cs_id.into_nodehash();
-                let text = blobnode.as_blob().as_inner().clone();
-                let delta = Delta::new_fulltext(text.to_vec());
-
-                let deltachunk = CgDeltaChunk {
-                    node: node.into_nodehash(),
-                    p1,
-                    p2,
-                    base,
-                    linknode,
-                    delta,
-                    flags,
-                };
-                if flags.is_some() && cg_version == CgVersion::Cg2Version {
-                    return stream::once(future::err(Error::msg(
-                        "internal error: unexpected flags in cg2 generation",
-                    )))
-                    .left_stream();
-                }
-                items.push(Part::CgChunk(Section::Filelog(path.clone()), deltachunk));
-            }
-
-            items.push(Part::SectionEnd(Section::Filelog(path)));
-            stream::iter(items).map(anyhow::Ok).right_stream()
-        })
-        .try_flatten()
-}
-
 pub fn replycaps_part(caps: Bytes) -> Result<PartEncodeBuilder> {
     let mut builder = PartEncodeBuilder::mandatory(PartHeaderType::Replycaps)?;
     builder.set_data_fixed(Chunk::new(caps)?);
@@ -258,115 +192,6 @@ pub fn common_heads_part(heads: Vec<HgChangesetId>) -> Result<PartEncodeBuilder>
 
     let mut builder = PartEncodeBuilder::mandatory(PartHeaderType::B2xCommonHeads)?;
     builder.set_data_fixed(Chunk::new(w)?);
-
-    Ok(builder)
-}
-
-pub struct TreepackPartInput {
-    pub node: HgNodeHash,
-    pub p1: Option<HgNodeHash>,
-    pub p2: Option<HgNodeHash>,
-    pub content: Bytes,
-    pub fullpath: MPath,
-    pub linknode: HgNodeHash,
-}
-
-// Controls whether client should store trees in hg cache (which means
-// they might be deleted and refetched from the server) or they should be stored
-// in .hg directory (which means client should never delete them).
-// Normally this should only be used for hydrated commit cloud commits, and
-// with hg server deprecation it won't be necessary anymore.
-#[derive(Clone, Copy)]
-pub enum StoreInHgCache {
-    Yes,
-    No,
-}
-
-pub fn treepack_part<S>(entries: S, hg_cache_policy: StoreInHgCache) -> Result<PartEncodeBuilder>
-where
-    S: Stream<Item = Result<BoxFuture<'static, Result<TreepackPartInput, Error>>, Error>>
-        + Send
-        + 'static,
-{
-    treepack_part_impl(entries, PartHeaderType::B2xTreegroup2, hg_cache_policy)
-}
-
-pub fn pushrebase_treepack_part<S>(entries: S) -> Result<PartEncodeBuilder>
-where
-    S: Stream<Item = Result<BoxFuture<'static, Result<TreepackPartInput, Error>>, Error>>
-        + Send
-        + 'static,
-{
-    treepack_part_impl(entries, PartHeaderType::B2xRebasePack, StoreInHgCache::Yes)
-}
-
-fn treepack_part_impl<S>(
-    entries: S,
-    header_type: PartHeaderType,
-    hg_cache_policy: StoreInHgCache,
-) -> Result<PartEncodeBuilder>
-where
-    S: Stream<Item = Result<BoxFuture<'static, Result<TreepackPartInput, Error>>, Error>>
-        + Send
-        + 'static,
-{
-    let mut builder = PartEncodeBuilder::mandatory(header_type)?;
-    builder.add_mparam("version", "1")?;
-    match hg_cache_policy {
-        StoreInHgCache::Yes => {
-            builder.add_mparam("cache", "True")?;
-        }
-        StoreInHgCache::No => {
-            builder.add_mparam("cache", "False")?;
-        }
-    };
-
-    builder.add_mparam("category", "manifests")?;
-
-    let buffer_size =
-        justknobs::get_as::<usize>("scm/mononoke:repo_client_gettreepack_buffer_size", None)
-            .unwrap_or(1000);
-
-    let wirepack_parts = entries
-        .try_buffered(buffer_size)
-        .map_ok(|input| {
-            let path = match input.fullpath.into_optional_non_root_path() {
-                Some(path) => RepoPath::DirectoryPath(path),
-                None => RepoPath::RootPath,
-            };
-
-            let history_meta = wirepack::Part::HistoryMeta {
-                path: path.clone(),
-                entry_count: 1,
-            };
-
-            let history = wirepack::Part::History(wirepack::HistoryEntry {
-                node: input.node.clone(),
-                p1: input.p1.into(),
-                p2: input.p2.into(),
-                linknode: input.linknode,
-                // No copies/renames for trees
-                copy_from: None,
-            });
-
-            let data_meta = wirepack::Part::DataMeta {
-                path,
-                entry_count: 1,
-            };
-
-            let data = wirepack::Part::Data(wirepack::DataEntry {
-                node: input.node,
-                delta_base: NULL_HASH,
-                delta: Delta::new_fulltext(input.content.to_vec()),
-                metadata: None,
-            });
-
-            stream::iter(vec![history_meta, history, data_meta, data]).map(anyhow::Ok)
-        })
-        .try_flatten()
-        .chain(stream::once(future::ok(wirepack::Part::End)));
-
-    builder.set_data_generated(pack_wirepack(wirepack_parts, wirepack::Kind::Tree));
 
     Ok(builder)
 }
@@ -416,8 +241,8 @@ pub fn replychangegroup_part(
     in_reply_to: PartId,
 ) -> Result<PartEncodeBuilder> {
     let mut builder = PartEncodeBuilder::mandatory(PartHeaderType::ReplyChangegroup)?;
-    builder.add_mparam("return", format!("{}", res))?;
-    builder.add_mparam("in-reply-to", format!("{}", in_reply_to))?;
+    builder.add_mparam("return", format!("{res}"))?;
+    builder.add_mparam("in-reply-to", format!("{in_reply_to}"))?;
 
     Ok(builder)
 }
@@ -439,7 +264,7 @@ pub fn replypushkey_part(res: bool, in_reply_to: PartId) -> Result<PartEncodeBui
     } else {
         builder.add_mparam("return", "0")?;
     }
-    builder.add_mparam("in-reply-to", format!("{}", in_reply_to))?;
+    builder.add_mparam("in-reply-to", format!("{in_reply_to}"))?;
 
     Ok(builder)
 }

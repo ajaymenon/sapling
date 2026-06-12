@@ -37,11 +37,11 @@ use mononoke_api::FileId;
 use mononoke_api::FileType;
 use mononoke_api::HgChangesetId;
 use mononoke_api::HgChangesetIdPrefix;
-use mononoke_api::TreeId;
 use mononoke_api::specifiers::GitSha1;
 use mononoke_api::specifiers::GitSha1Prefix;
 use mononoke_api::specifiers::Globalrev;
 use mononoke_api::specifiers::Svnrev;
+use mononoke_types::content_manifest::compat;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
 use mononoke_types::path::MPath;
@@ -59,10 +59,7 @@ pub trait FromRequest<T: ?Sized> {
 impl FromRequest<str> for BookmarkKey {
     fn from_request(bookmark: &str) -> Result<BookmarkKey, thrift::RequestError> {
         BookmarkKey::new(bookmark).map_err(|e| {
-            scs_errors::invalid_request(format!(
-                "failed parsing bookmark out of {}: {:?}",
-                bookmark, e
-            ))
+            scs_errors::invalid_request(format!("failed parsing bookmark out of {bookmark}: {e:?}"))
         })
     }
 }
@@ -76,8 +73,7 @@ impl FromRequest<thrift::BookmarkKindRestrictions> for BookmarkKindRestrictions 
             &thrift::BookmarkKindRestrictions::ONLY_SCRATCH => Ok(Self::OnlyScratch),
             &thrift::BookmarkKindRestrictions::ONLY_PUBLISHING => Ok(Self::OnlyPublishing),
             other => Err(scs_errors::invalid_request(format!(
-                "Unknown BookmarkKindRestrictions: {}",
-                other
+                "Unknown BookmarkKindRestrictions: {other}"
             ))),
         }
     }
@@ -111,7 +107,7 @@ impl FromRequest<thrift::CandidateSelectionHint> for CandidateSelectionHintArgs 
                 Ok(CandidateSelectionHintArgs::Exact(changeset_specifier))
             }
             thrift::CandidateSelectionHint::UnknownField(f) => Err(scs_errors::invalid_request(
-                format!("unsupported candidate selection hint: {:?}", f),
+                format!("unsupported candidate selection hint: {f:?}"),
             )),
         }
     }
@@ -144,7 +140,7 @@ impl FromRequest<thrift::CommitId> for ChangesetSpecifier {
             }
             thrift::CommitId::globalrev(rev) => {
                 let rev = Globalrev::new((*rev).try_into().map_err(|_| {
-                    scs_errors::invalid_request(format!("cannot parse globalrev {} to u64", rev))
+                    scs_errors::invalid_request(format!("cannot parse globalrev {rev} to u64"))
                 })?);
                 Ok(ChangesetSpecifier::Globalrev(rev))
             }
@@ -161,7 +157,7 @@ impl FromRequest<thrift::CommitId> for ChangesetSpecifier {
             }
             thrift::CommitId::svnrev(rev) => {
                 let rev = Svnrev::new((*rev).try_into().map_err(|_| {
-                    scs_errors::invalid_request(format!("cannot parse svn revision {} to u64", rev))
+                    scs_errors::invalid_request(format!("cannot parse svn revision {rev} to u64"))
                 })?);
                 Ok(ChangesetSpecifier::Svnrev(rev))
             }
@@ -201,8 +197,7 @@ impl FromRequest<thrift::CopyInfo> for CopyInfo {
             thrift::CopyInfo::COPY => Ok(CopyInfo::Copy),
             thrift::CopyInfo::MOVE => Ok(CopyInfo::Move),
             val => Err(scs_errors::invalid_request(format!(
-                "unsupported copy info ({})",
-                val
+                "unsupported copy info ({val})"
             ))),
         }
     }
@@ -263,8 +258,7 @@ impl FromRequest<thrift::CommitIdentityScheme> for CommitIdentityScheme {
             thrift::CommitIdentityScheme::HG => Ok(CommitIdentityScheme::HG),
             thrift::CommitIdentityScheme::GIT => Ok(CommitIdentityScheme::GIT),
             _ => Err(scs_errors::invalid_request(format!(
-                "unsupported identity scheme: {}",
-                scheme
+                "unsupported identity scheme: {scheme}"
             ))),
         }
     }
@@ -286,11 +280,45 @@ macro_rules! impl_from_request_binary_id(
     }
 );
 
-impl_from_request_binary_id!(TreeId, "tree id");
 impl_from_request_binary_id!(FileId, "file id");
 impl_from_request_binary_id!(Sha1, "sha-1");
 impl_from_request_binary_id!(Sha256, "sha-256");
 impl_from_request_binary_id!(GitSha1, "git-sha-1");
+
+// compat::ContentManifestId is Either<ContentManifestId, FsnodeId>.
+// Use the id_type field from TreeIdSpecifier to determine the correct variant.
+// When id_type is absent (old clients), default to FsnodeId.
+impl FromRequest<thrift::TreeIdSpecifier> for compat::ContentManifestId {
+    fn from_request(tree_id: &thrift::TreeIdSpecifier) -> Result<Self, thrift::RequestError> {
+        let id = &tree_id.id;
+        match tree_id.id_type {
+            Some(thrift::TreeIdType::CONTENT_MANIFEST) => {
+                mononoke_types::ContentManifestId::from_bytes(id)
+                    .map(compat::ContentManifestId::from)
+                    .map_err(|e| {
+                        scs_errors::invalid_request(format!(
+                            "invalid content manifest tree id ({}): {}",
+                            hex_string(id),
+                            e,
+                        ))
+                    })
+            }
+            Some(thrift::TreeIdType::FSNODE) | None => mononoke_types::FsnodeId::from_bytes(id)
+                .map(compat::ContentManifestId::from)
+                .map_err(|e| {
+                    scs_errors::invalid_request(format!(
+                        "invalid tree id ({}): {}",
+                        hex_string(id),
+                        e,
+                    ))
+                }),
+            Some(val) => Err(scs_errors::invalid_request(format!(
+                "unsupported tree id type ({})",
+                val.0,
+            ))),
+        }
+    }
+}
 
 impl FromRequest<thrift::RepoCreateCommitParamsFileType> for FileType {
     fn from_request(
@@ -302,8 +330,7 @@ impl FromRequest<thrift::RepoCreateCommitParamsFileType> for FileType {
             thrift::RepoCreateCommitParamsFileType::LINK => Ok(FileType::Symlink),
             thrift::RepoCreateCommitParamsFileType::GIT_SUBMODULE => Ok(FileType::GitSubmodule),
             val => Err(scs_errors::invalid_request(format!(
-                "unsupported file type ({})",
-                val
+                "unsupported file type ({val})"
             ))),
         }
     }
@@ -370,6 +397,20 @@ impl FromRequest<thrift::RepoCreateCommitParamsCommitInfo> for CreateInfo {
 
 impl FromRequest<thrift::CreateCommitChecks> for CreateChangesetChecks {
     fn from_request(checks: &thrift::CreateCommitChecks) -> Result<Self, thrift::RequestError> {
+        let reject_fix = |mode: &thrift::CreateCommitCheckMode, field: &str| {
+            if *mode == thrift::CreateCommitCheckMode::FIX {
+                Err(scs_errors::invalid_request(format!(
+                    "FIX mode is not supported for '{field}'; only CHECK and SKIP are valid",
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        reject_fix(&checks.copy_from_path_check, "copy_from_path_check")?;
+        reject_fix(
+            &checks.prefix_files_deleted_check,
+            "prefix_files_deleted_check",
+        )?;
         Ok(CreateChangesetChecks {
             noop_file_changes: CreateChangesetCheckMode::from_request(
                 &checks.noop_file_changes_check,
@@ -378,6 +419,10 @@ impl FromRequest<thrift::CreateCommitChecks> for CreateChangesetChecks {
                 &checks.deleted_files_existed_in_a_parent_check,
             )?,
             empty_changeset: CreateChangesetCheckMode::from_request(&checks.empty_changeset_check)?,
+            copy_from_path: CreateChangesetCheckMode::from_request(&checks.copy_from_path_check)?,
+            prefix_files_deleted: CreateChangesetCheckMode::from_request(
+                &checks.prefix_files_deleted_check,
+            )?,
         })
     }
 }
@@ -391,8 +436,7 @@ impl FromRequest<thrift::CreateCommitCheckMode> for CreateChangesetCheckMode {
             thrift::CreateCommitCheckMode::CHECK => Ok(CreateChangesetCheckMode::Check),
             thrift::CreateCommitCheckMode::FIX => Ok(CreateChangesetCheckMode::Fix),
             val => Err(scs_errors::invalid_request(format!(
-                "unsupported create commit check mode ({})",
-                val
+                "unsupported create commit check mode ({val})"
             ))),
         }
     }
@@ -429,11 +473,11 @@ where
 {
     if range.contains(&value) {
         T::try_from(value).map_err(|e| {
-            let msg = format!("failed to convert {} ({}): {}", name, value, e);
+            let msg = format!("failed to convert {name} ({value}): {e}");
             scs_errors::internal_error(msg).into()
         })
     } else {
-        let msg = format!("{} ({}) out of range ({:?})", name, value, range);
+        let msg = format!("{name} ({value}) out of range ({range:?})");
         Err(scs_errors::invalid_request(msg).into())
     }
 }
@@ -445,7 +489,7 @@ pub(crate) fn validate_timestamp(
     match ts {
         None | Some(0) => Ok(None),
         Some(ts) if ts < 0 => {
-            Err(scs_errors::invalid_request(format!("{} ({}) cannot be negative", name, ts)).into())
+            Err(scs_errors::invalid_request(format!("{name} ({ts}) cannot be negative")).into())
         }
         Some(ts) => Ok(Some(ts)),
     }

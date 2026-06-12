@@ -24,6 +24,7 @@ import {useContextMenu} from 'shared/ContextMenu';
 import {basename, notEmpty} from 'shared/utils';
 import {copyUrlForFile, supportsBrowseUrlForHash} from './BrowseRepo';
 import {type ChangedFilesDisplayType} from './ChangedFileDisplayTypePicker';
+import {showComparison} from './ComparisonView/atoms';
 import {generatedStatusDescription, generatedStatusToLabel} from './GeneratedFile';
 import {PartialFileSelectionWithMode} from './PartialFileSelection';
 import {confirmSuggestedEditsForFiles} from './SuggestedEdits';
@@ -91,12 +92,30 @@ export function File({
         onClick: () => platform.openContainingFolder?.(file.path),
       });
     }
-    if (comparison != null && platform.openDiff != null) {
+    if (platform.revealInFileExplorer != null) {
+      options.push({
+        label: t(isMac ? 'Reveal in Finder' : 'Reveal in File Explorer'),
+        onClick: () => platform.revealInFileExplorer?.(file.path),
+      });
+    }
+    if (platform.revealInExplorerView != null) {
+      options.push({
+        label: t('Reveal in Explorer View'),
+        onClick: () => platform.revealInExplorerView?.(file.path),
+      });
+    }
+    if (comparison != null) {
       options.push({
         label: t('Open Diff View ($comparison)', {
           replace: {$comparison: labelForComparison(comparison)},
         }),
-        onClick: () => platform.openDiff?.(file.path, comparison),
+        onClick: () => {
+          if (platform.openDiff != null) {
+            platform.openDiff(file.path, comparison);
+          } else {
+            showComparison(comparison, file.path);
+          }
+        },
       });
     }
 
@@ -214,7 +233,7 @@ function FileActions({
 
   const actions: Array<React.ReactNode> = [];
 
-  if (platform.openDiff != null && !conflictStatuses.has(file.status)) {
+  if (!conflictStatuses.has(file.status)) {
     actions.push(
       <Tooltip title={t('Open diff view')} key="open-diff-view" delayMs={1000}>
         <Button
@@ -222,7 +241,11 @@ function FileActions({
           icon
           data-testid="file-open-diff-button"
           onClick={() => {
-            platform.openDiff?.(file.path, comparison);
+            if (platform.openDiff != null) {
+              platform.openDiff(file.path, comparison);
+            } else {
+              showComparison(comparison, file.path);
+            }
           }}>
           <Icon icon="request-changes" />
         </Button>

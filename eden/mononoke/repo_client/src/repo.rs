@@ -13,6 +13,7 @@ use bookmarks::Bookmarks;
 use bookmarks_cache::BookmarksCache;
 use commit_graph::CommitGraph;
 use commit_graph::CommitGraphWriter;
+use dbbookmarks::SqlBookmarks;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
 use git_source_of_truth::GitSourceOfTruthConfig;
@@ -31,7 +32,6 @@ use repo_identity::RepoIdentity;
 use repo_lock::RepoLock;
 use repo_permission_checker::RepoPermissionChecker;
 use sql_query_config::SqlQueryConfig;
-use streaming_clone::StreamingClone;
 
 #[facet::container]
 #[derive(Clone)]
@@ -43,6 +43,7 @@ pub struct RepoClientRepo(
     RepoCrossRepo,
     RepoBookmarkAttrs,
     dyn Bookmarks,
+    SqlBookmarks,
     dyn BookmarkUpdateLog,
     FilestoreConfig,
     dyn MutableCounters,
@@ -55,7 +56,6 @@ pub struct RepoClientRepo(
     dyn CommitGraphWriter,
     dyn Filenodes,
     SqlQueryConfig,
-    StreamingClone,
     dyn BookmarksCache,
     dyn HgMutationStore,
     dyn GitSourceOfTruthConfig,

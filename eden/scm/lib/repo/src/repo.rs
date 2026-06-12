@@ -18,30 +18,35 @@ use configloader::Config;
 use configloader::config::ConfigSet;
 use configloader::hg::PinnedConfig;
 use configloader::hg::RepoInfo;
+use context::CoreContext;
 use eagerepo::EagerRepoStore;
 use edenapi::SaplingRemoteApi;
 use edenapi::SaplingRemoteApiError;
+use grepocompat::trees::synthesize_grepo_projects;
 use identity::Identity;
 use manifest_tree::ReadTreeManifest;
+use manifest_tree::TreeManifest;
 use metalog::MetaLog;
 use metalog::RefName;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
+use pathmatcher::DynMatcher;
 use repo_minimal_info::RepoMinimalInfo;
 use repo_minimal_info::Requirements;
 pub use repo_minimal_info::read_sharedpath;
 use repolock::RepoLocker;
 use revisionstore::scmstore;
 use revisionstore::trait_impls::ArcFileStore;
-use revsets::errors::RevsetLookupError;
 use revsets::utils as revset_utils;
+pub use revsets::utils::ResolveResult;
 use rewrite_macros::cached_field;
 use storemodel::FileStore;
 use storemodel::StoreInfo;
 use storemodel::StoreOutput;
 use storemodel::TreeStore;
-use treestate::treestate::TreeState;
 use types::HgId;
+use types::hgid::NULL_ID;
+use types::hgid::WDIR_ID;
 use types::repo::StorageFormat;
 use util::path::absolute;
 #[cfg(feature = "wdir")]
@@ -55,7 +60,10 @@ use crate::slapi_client::LazyCapabilities;
 use crate::slapi_client::get_eden_api;
 use crate::slapi_client::get_eden_api_with_capabilities;
 use crate::slapi_client::get_optional_eden_api;
-use crate::trees::TreeManifestResolver;
+use crate::trees::GrepoTreeResolver;
+use crate::trees::LocalTreeResolver;
+use crate::trees::SlapiTreeResolver;
+use crate::trees::UnionTreeResolver;
 
 #[derive(Clone)]
 pub struct Repo {
@@ -74,6 +82,11 @@ pub struct Repo {
     eager_store: Option<EagerRepoStore>,
     locker: Arc<RepoLocker>,
     tree_resolver: OnceCell<Arc<dyn ReadTreeManifest>>,
+    permission_denied_paths: Option<context::PermissionDeniedPaths>,
+    // Working copy p1 at repo load time. This is normally what "." revset should resolve
+    // to (i.e. we don't want to lazily load p1 since it can be changing).
+    // `None` means we couldn't read it. Null p1 is `Some(NULL_ID)`.
+    p1_at_load_time: Option<HgId>,
 }
 
 impl Deref for Repo {
@@ -158,6 +171,14 @@ impl Repo {
 
         let locker = Arc::new(RepoLocker::new(&config, info.store_path.clone())?);
 
+        #[cfg(feature = "wdir")]
+        let p1 = workingcopy::fast_path_wdir_parents(&info.path, info.ident)
+            .ok()
+            .map(|parents| parents.p1().copied().unwrap_or(NULL_ID));
+
+        #[cfg(not(feature = "wdir"))]
+        let p1 = None;
+
         Ok(Repo {
             info,
             config: Arc::new(config),
@@ -173,7 +194,9 @@ impl Repo {
             working_copy: Default::default(),
             eager_store: None,
             tree_resolver: Default::default(),
+            permission_denied_paths: None,
             locker,
+            p1_at_load_time: p1,
         })
     }
 
@@ -371,11 +394,19 @@ impl Repo {
         // Trigger construction of file store.
         let _ = self.file_store();
 
-        let ts = build_scm_tree_store(self, self.file_scm_store())?;
+        let ts = build_scm_tree_store(
+            self,
+            self.file_scm_store(),
+            self.permission_denied_paths.clone(),
+        )?;
         let _ = self.tree_scm_store.set(ts.clone());
         let _ = self.tree_store.set(ts.clone());
 
         Ok(ts)
+    }
+
+    pub fn set_permission_denied_paths(&mut self, paths: context::PermissionDeniedPaths) {
+        self.permission_denied_paths = Some(paths);
     }
 
     // This should only be used to share stores with Python.
@@ -392,51 +423,79 @@ impl Repo {
 
     pub fn tree_resolver(&self) -> Result<Arc<dyn ReadTreeManifest + Send + Sync>> {
         let tr = self.tree_resolver.get_or_try_init(|| {
-            Ok::<_, anyhow::Error>(Arc::new(TreeManifestResolver::new(
+            let tree_store = self.tree_store()?;
+            let local: Arc<dyn ReadTreeManifest + Send + Sync> = Arc::new(LocalTreeResolver::new(
                 self.dag_commits()?,
-                self.tree_store()?,
-            )))
+                tree_store.clone(),
+            ));
+
+            // If SLAPI is available, also try resolving remotely to a tree. This works
+            // even if we haven't pulled the commit into our local commit graph.
+            let mut resolver: Arc<dyn ReadTreeManifest + Send + Sync> =
+                match self.optional_eden_api() {
+                    Ok(Some(eden_api)) => {
+                        let slapi: Arc<dyn ReadTreeManifest + Send + Sync> =
+                            Arc::new(SlapiTreeResolver::new(eden_api, tree_store));
+                        Arc::new(UnionTreeResolver::new(vec![local, slapi]))
+                    }
+                    _ => local,
+                };
+
+            if self.requirements.contains("grepo") {
+                let file_store = self.file_store()?;
+                let tree_store = self.tree_store()?;
+                let synthesize_fn = Arc::new(move |manifest: &TreeManifest| {
+                    synthesize_grepo_projects(&tree_store, &file_store, manifest)
+                });
+                resolver = Arc::new(GrepoTreeResolver::new(resolver, synthesize_fn))
+            }
+
+            Ok::<_, anyhow::Error>(resolver)
         })?;
         Ok(tr.clone())
     }
 
-    pub fn resolve_commit(&self, treestate: Option<&TreeState>, change_id: &str) -> Result<HgId> {
+    #[tracing::instrument(skip(self), ret)]
+    pub fn resolve_commit(&self, change_id: &str) -> Result<ResolveResult> {
         let dag = self.dag_commits()?;
         let dag = dag.read();
         let metalog = self.metalog()?;
         let metalog = metalog.read();
         let edenapi = self.optional_eden_api().map_err(|err| err.tag_network())?;
+
         revset_utils::resolve_single(
             self.config(),
             change_id,
             &dag.id_map_snapshot()?,
             &dag.dag_snapshot()?,
             &metalog,
-            treestate,
+            // Use p1 from initial Repo load. This avoids us accidentally resolving "." to
+            // something "too new" when other sl commands are updating p1.
+            self.p1_at_load_time,
             edenapi.as_deref(),
         )
     }
 
-    pub fn resolve_commit_opt(
-        &self,
-        treestate: Option<&TreeState>,
-        change_id: &str,
-    ) -> Result<Option<HgId>> {
-        match self.resolve_commit(treestate, change_id) {
-            Ok(id) => Ok(Some(id)),
-            Err(err) => match err.downcast_ref::<RevsetLookupError>() {
-                Some(RevsetLookupError::RevsetNotFound(_)) => Ok(None),
-                _ => Err(err),
-            },
-        }
+    pub fn resolve_commit_opt(&self, change_id: &str) -> Result<Option<HgId>> {
+        Ok(self.resolve_commit(change_id)?.any().ok())
     }
 
     pub fn invalidate_stores(&self) -> Result<()> {
         if let Some(file_store) = self.file_store.get() {
-            file_store.refresh()?;
+            file_store.sync()?;
         }
         if let Some(tree_store) = self.tree_store.get() {
-            tree_store.refresh()?;
+            tree_store.sync()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_stores(&self) -> Result<()> {
+        if let Some(file_store) = self.file_store.get() {
+            file_store.flush()?;
+        }
+        if let Some(tree_store) = self.tree_store.get() {
+            tree_store.flush()?;
         }
         Ok(())
     }
@@ -466,6 +525,14 @@ impl Repo {
                 Ok(Some((file_store, tree_store)))
             }
         }
+    }
+
+    pub fn add_commit(&self, new_commit: commits_trait::NewCommit) -> Result<HgId> {
+        let dag = self.dag_commits()?;
+        async_runtime::try_block_unless_interrupted(commits::add_new_commit(
+            &mut **dag.write(),
+            new_commit,
+        ))
     }
 }
 
@@ -509,6 +576,39 @@ impl Repo {
         .map_err(errors::InvalidWorkingCopy::from)?;
 
         Ok(Arc::new(RwLock::new(wc)))
+    }
+}
+
+impl Repo {
+    /// Resolve a change identifier to a TreeManifest.
+    ///
+    /// If `change_id` is "wdir", returns a manifest representing the current working copy
+    /// state including uncommitted changes (requires "wdir" feature).
+    ///
+    /// Otherwise, resolves the commit and fetches its TreeManifest.
+    ///
+    /// Returns the commit HgId (or WDIR_ID for "wdir") and the TreeManifest.
+    #[allow(unused_variables)]
+    pub fn resolve_manifest(
+        &self,
+        ctx: &CoreContext,
+        change_id: &str,
+        matcher: DynMatcher,
+    ) -> Result<(HgId, TreeManifest)> {
+        if change_id == "wdir" {
+            #[cfg(feature = "wdir")]
+            {
+                let wc = self.working_copy()?;
+                let wc = wc.read();
+                return Ok((WDIR_ID, wc.working_manifest(ctx, matcher, false)?));
+            }
+            #[cfg(not(feature = "wdir"))]
+            anyhow::bail!("not compiled with 'wdir' support");
+        }
+
+        let commit_id = self.resolve_commit(change_id)?.any()?;
+        let tree_resolver = self.tree_resolver()?;
+        Ok((commit_id, tree_resolver.get(&commit_id)?))
     }
 }
 

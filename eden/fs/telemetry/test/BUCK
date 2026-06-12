@@ -1,7 +1,16 @@
 load("@fbcode_macros//build_defs:cpp_benchmark.bzl", "cpp_benchmark")
+load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
 load("@fbcode_macros//build_defs:cpp_unittest.bzl", "cpp_unittest")
 
 oncall("scm_client_infra")
+
+cpp_library(
+    name = "capturing_scribe_logger",
+    headers = ["CapturingScribeLogger.h"],
+    exported_deps = [
+        "//eden/common/telemetry:scribe_logger",
+    ],
+)
 
 cpp_unittest(
     name = "task_trace_test",
@@ -51,14 +60,89 @@ cpp_benchmark(
         ["*Benchmark.cpp"],
         exclude = [
             "ActivityBufferBenchmark.cpp",
+            "LoggingBenchmark.cpp",
         ],
     ),
     deps = [
         "fbsource//third-party/benchmark:benchmark",
-        "//eden/common/telemetry:telemetry",
-        "//eden/common/utils/benchharness:benchharness",
+        "//eden/common/telemetry:log_info",
+        "//eden/common/telemetry:scribe_logger",
+        "//eden/common/utils:ref_ptr",
+        "//eden/fs/telemetry:stats",
+        "//eden/fs/telemetry:xplat_keys",
+        "//eden/fs/telemetry/facebook:XplatTransforms",
+        "//eden/fs/telemetry/facebook:eden_telemetry_identity",
+        "//eden/fs/telemetry/facebook:xplat_logger",
         "//folly/init:init",
-        "//folly/synchronization/test:barrier",
+        "//folly/json:dynamic",
+        "//scribe/api/producer/structured:compact_message",
+    ],
+)
+
+cpp_benchmark(
+    name = "logging_benchmark",
+    srcs = [
+        "LoggingBenchmark.cpp",
+    ],
+    compatible_with = [
+        "ovr_config//os:linux",
+        "ovr_config//os:macos",
+    ],
+    deps = [
+        "fbsource//third-party/benchmark:benchmark",
+        "//eden/common/telemetry:log_info",
+        "//eden/common/telemetry:scribe_logger",
+        "//eden/common/utils:ref_ptr",
+        "//eden/fs/config:config",
+        "//eden/fs/telemetry:stats",
+        "//eden/fs/telemetry:xplat_keys",
+        "//eden/fs/telemetry/facebook:XplatTransforms",
+        "//eden/fs/telemetry/facebook:eden_telemetry_identity",
+        "//eden/fs/telemetry/facebook:xplat_logger",
+        "//eden/fs/telemetry/facebook/if:edenfs_file_access_entry-cpp2-types",
+        "//folly/init:init",
+        "//folly/json:dynamic",
+        "//scribe/api/producer/structured:compact_message",
+    ],
+)
+
+cpp_unittest(
+    name = "throw_trace_capture_test",
+    srcs = [
+        "ThrowTraceCaptureTest.cpp",
+    ],
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "//eden/fs/telemetry:throw_trace_capture",
+        "//folly:c_portability",
+    ],
+)
+
+cpp_unittest(
+    name = "stack_trace_uploader_test",
+    srcs = [
+        "StackTraceUploaderTest.cpp",
+    ],
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "//eden/fs/telemetry:stack_trace_uploader",
+    ],
+)
+
+cpp_unittest(
+    name = "error_info_builder_test",
+    srcs = [
+        "EdenErrorInfoBuilderTest.cpp",
+    ],
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "//eden/common/telemetry:log_info",
+        "//eden/fs/telemetry:error_info",
+        "//eden/fs/telemetry:throw_trace_capture",  # @manual needed for --wrap __cxa_throw linker flag
+        "//folly:c_portability",
     ],
 )
 
@@ -75,5 +159,24 @@ cpp_unittest(
         "//eden/common/telemetry:scribe_logger",
         "//eden/fs/telemetry:structured_logger",
         "//folly/json:dynamic",
+    ],
+)
+
+cpp_unittest(
+    name = "eden_fs_events_logger_test",
+    srcs = [
+        "EdenFsEventsLoggerTest.cpp",
+    ],
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "//eden/common/telemetry:log_info",
+        "//eden/common/telemetry:structured_logger",
+        "//eden/fs/config:config",
+        "//eden/fs/telemetry:stats",
+        "//eden/fs/telemetry:structured_logger",
+        "//eden/fs/telemetry:xplat_keys",
+        "//eden/fs/telemetry/facebook:eden_telemetry_identity",
+        "//eden/fs/telemetry/facebook:xplat_logger",
     ],
 )

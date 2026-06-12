@@ -9,7 +9,6 @@ import type {Tracker} from 'isl-server/src/analytics/tracker';
 import type {UseUncommittedSelection} from './partialSelection';
 import type {CommitInfo, Diagnostic, DiagnosticAllowlist} from './types';
 
-import * as stylex from '@stylexjs/stylex';
 import {Checkbox} from 'isl-components/Checkbox';
 import {Column, Row} from 'isl-components/Flex';
 import {Icon} from 'isl-components/Icon';
@@ -17,9 +16,9 @@ import {Subtle} from 'isl-components/Subtle';
 import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom} from 'jotai';
 import {basename} from 'shared/utils';
-import {spacing} from '../../components/theme/tokens.stylex';
 import serverAPI from './ClientToServerAPI';
 import {Collapsable} from './Collapsable';
+import css from './Diagnostics.module.css';
 import {Internal} from './Internal';
 import {tracker} from './analytics';
 import {getFeatureFlag} from './featureFlags';
@@ -38,33 +37,6 @@ const hideNonBlockingDiagnosticsAtom = localStorageBackedAtom<boolean>(
   'isl.hide-non-blocking-diagnostics',
   true,
 );
-
-const styles = stylex.create({
-  diagnosticList: {
-    paddingInline: spacing.double,
-    paddingBlock: spacing.half,
-    gap: 0,
-  },
-  nowrap: {
-    whiteSpace: 'nowrap',
-  },
-  diagnosticRow: {
-    maxWidth: 'max(400px, 80vw)',
-    padding: spacing.half,
-    cursor: 'pointer',
-    ':hover': {
-      backgroundColor: 'var(--hover-darken)',
-    },
-  },
-  allDiagnostics: {
-    maxHeight: 'calc(100vh - 200px)',
-    minHeight: '50px',
-    overflowY: 'scroll',
-  },
-  confirmCheckbox: {
-    paddingTop: spacing.double,
-  },
-});
 
 export function isBlockingDiagnostic(
   d: Diagnostic,
@@ -225,7 +197,7 @@ function DiagnosticsList({
   const [shouldWarn, setShouldWarn] = useAtom(shouldWarnAboutDiagnosticsAtom);
   return (
     <>
-      <Column alignStart xstyle={styles.allDiagnostics}>
+      <Column alignStart className={css.allDiagnostics}>
         {diagnostics.map(([filepath, diagnostics]) => {
           const sortedDiagnostics = [...diagnostics].filter(d =>
             hideNonBlocking ? isBlockingDiagnostic(d) : true,
@@ -246,13 +218,13 @@ function DiagnosticsList({
                     <Subtle>{filepath}</Subtle>
                   </Row>
                 }>
-                <Column alignStart xstyle={styles.diagnosticList}>
+                <Column alignStart className={css.diagnosticList}>
                   {sortedDiagnostics.map((d, i) => (
                     <Row
                       role="button"
                       tabIndex={0}
                       key={i}
-                      xstyle={styles.diagnosticRow}
+                      className={css.diagnosticRow}
                       onClick={() => {
                         platform.openFile(filepath, {line: d.range.startLine + 1});
                         tracker.track('DiagnosticsConfirmationAction', {
@@ -262,12 +234,12 @@ function DiagnosticsList({
                       {iconForDiagnostic(d)}
                       <span>{d.message}</span>
                       {d.source && (
-                        <Subtle {...stylex.props(styles.nowrap)}>
+                        <Subtle className={css.nowrap}>
                           {d.source}
                           {d.code ? `(${d.code})` : null}
                         </Subtle>
                       )}{' '}
-                      <Subtle {...stylex.props(styles.nowrap)}>
+                      <Subtle className={css.nowrap}>
                         [Ln {d.range.startLine}, Col {d.range.startCol}]
                       </Subtle>
                     </Row>
@@ -278,7 +250,7 @@ function DiagnosticsList({
           );
         })}
       </Column>
-      <Row xstyle={styles.confirmCheckbox}>
+      <Row className={css.confirmCheckbox}>
         <Checkbox
           checked={!shouldWarn}
           onChange={checked => {

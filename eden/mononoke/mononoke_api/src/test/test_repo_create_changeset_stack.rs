@@ -44,11 +44,7 @@ async fn create_changeset_stack<R: MononokeRepo>(
         repo,
         changes_stack,
         stack_parents,
-        CreateChangesetChecks {
-            noop_file_changes: CreateChangesetCheckMode::Check,
-            deleted_files_existed_in_a_parent: CreateChangesetCheckMode::Check,
-            empty_changeset: CreateChangesetCheckMode::Check,
-        },
+        CreateChangesetChecks::check(),
     )
     .await
 }
@@ -66,6 +62,8 @@ async fn create_changeset_stack_fix_request<R: MononokeRepo>(
             noop_file_changes: CreateChangesetCheckMode::Fix,
             deleted_files_existed_in_a_parent: CreateChangesetCheckMode::Fix,
             empty_changeset: CreateChangesetCheckMode::Fix,
+            copy_from_path: CreateChangesetCheckMode::Check,
+            prefix_files_deleted: CreateChangesetCheckMode::Check,
         },
     )
     .await
@@ -122,9 +120,8 @@ async fn create_changesets_sequentially<R: MononokeRepo>(
     let bubble = None;
     let git_extra_headers = None;
     let mut parents = stack_parents;
-    let mut change_num = 1;
     let mut result = Vec::new();
-    for changes in changes_stack {
+    for (change_num, changes) in (1..).zip(changes_stack) {
         let info = CreateInfo {
             author: author.clone(),
             author_date,
@@ -140,17 +137,12 @@ async fn create_changesets_sequentially<R: MononokeRepo>(
                 info,
                 changes,
                 bubble,
-                CreateChangesetChecks {
-                    noop_file_changes: CreateChangesetCheckMode::Check,
-                    deleted_files_existed_in_a_parent: CreateChangesetCheckMode::Check,
-                    empty_changeset: CreateChangesetCheckMode::Check,
-                },
+                CreateChangesetChecks::check(),
             )
             .await?
             .changeset_ctx;
         parents = vec![commit.id()];
         result.push(commit);
-        change_num += 1;
     }
     Ok(result)
 }

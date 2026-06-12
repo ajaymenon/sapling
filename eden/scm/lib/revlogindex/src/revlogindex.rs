@@ -221,7 +221,7 @@ impl RevlogIndex {
                         return Ok(gca);
                     }
                     sv |= poison;
-                    if revs.iter().any(|&r| r == v) {
+                    if revs.contains(&v) {
                         break;
                     }
                 }
@@ -763,7 +763,7 @@ impl RevlogIndex {
         // Convert parent revs to parent nodes. This is because revs are
         // easy to get wrong: ex. some nodes already exist in updated revlog.
         let parent_map = self.pending_parent_map().map_err(|e| {
-            CorruptionError::Generic(format!("cannot calculate pending graph: {}", e))
+            CorruptionError::Generic(format!("cannot calculate pending graph: {e}"))
         })?;
 
         let _lock = ScopedDirLock::new(
@@ -901,7 +901,7 @@ impl RevlogIndex {
 
         // Update meta file with the new logical length.
         let new_len = revlog_index_size + new_index.len();
-        atomic_write_plain(&meta_len_path, format!("{}", new_len).as_bytes(), false)?;
+        atomic_write_plain(&meta_len_path, format!("{new_len}").as_bytes(), false)?;
 
         // Reload.
         *self = Self::new(&self.index_path, &self.nodemap_path)?;
@@ -2386,18 +2386,18 @@ commit 3"#
     }
 
     fn to_xxd(data: &[u8]) -> String {
-        let mut result = String::with_capacity((data.len() + 15) / 16 * 67 + 1);
+        let mut result = String::with_capacity(data.len().div_ceil(16) * 67 + 1);
         result.push('\n');
         for (i, chunk) in data.chunks(16).enumerate() {
             result += &format!("{:08x}: ", i * 16);
             for slice in chunk.chunks(2) {
                 match slice {
-                    [b1, b2] => result += &format!("{:02x}{:02x} ", b1, b2),
-                    [b1] => result += &format!("{:02x}   ", b1),
+                    [b1, b2] => result += &format!("{b1:02x}{b2:02x} "),
+                    [b1] => result += &format!("{b1:02x}   "),
                     _ => {}
                 }
             }
-            result += &"     ".repeat(8 - (chunk.len() + 1) / 2);
+            result += &"     ".repeat(8 - chunk.len().div_ceil(2));
             result += " ";
             for &byte in chunk {
                 let ch = match byte {
@@ -2426,8 +2426,8 @@ commit 3"#
             let dir = dir.path();
             move || -> RevlogIndex {
                 let id = id.fetch_add(1, SeqCst);
-                let revlog_path = dir.join(format!("{}.i", id));
-                let nodemap_path = dir.join(format!("{}.nodemap", id));
+                let revlog_path = dir.join(format!("{id}.i"));
+                let nodemap_path = dir.join(format!("{id}.nodemap"));
                 RevlogIndex::new(&revlog_path, &nodemap_path).unwrap()
             }
         };

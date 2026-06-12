@@ -26,6 +26,9 @@ use sql::mysql;
 pub use tracing;
 
 use crate::ThriftConvert;
+use crate::acl_manifest::AclManifest;
+use crate::acl_manifest::AclManifestEntry;
+use crate::acl_manifest::AclManifestEntryBlob;
 use crate::basename_suffix_skeleton_manifest_v3::BssmV3Directory;
 use crate::basename_suffix_skeleton_manifest_v3::BssmV3Entry;
 use crate::blob::Blob;
@@ -38,11 +41,17 @@ use crate::content_manifest::ContentManifest;
 use crate::content_manifest::ContentManifestEntry;
 use crate::content_metadata_v2::ContentMetadataV2;
 use crate::deleted_manifest_v2::DeletedManifestV2;
+use crate::directory_branch_cluster_manifest::DirectoryBranchClusterManifest;
+use crate::directory_branch_cluster_manifest::DirectoryBranchClusterManifestEntry;
 use crate::fastlog_batch::FastlogBatch;
 use crate::file_contents::FileContents;
 use crate::fsnode::Fsnode;
 use crate::hash::Blake2;
 use crate::hash::Blake2Prefix;
+use crate::history_manifest::HistoryManifestDeletedNode;
+use crate::history_manifest::HistoryManifestDirectory;
+use crate::history_manifest::HistoryManifestEntry;
+use crate::history_manifest::HistoryManifestFile;
 use crate::inferred_copy_from::InferredCopyFrom;
 use crate::inferred_copy_from::InferredCopyFromEntry;
 use crate::rawbundle2::RawBundle2;
@@ -193,6 +202,41 @@ pub struct CaseConflictSkeletonManifestId(Blake2);
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
 pub struct ShardedMapV2NodeCcsmId(Blake2);
 
+/// An identifier for directory branch cluster manifest
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct DirectoryBranchClusterManifestId(Blake2);
+
+/// An identifier for a sharded map node used in directory branch cluster manifest
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct ShardedMapV2NodeDbcmId(Blake2);
+/// An identifier for an ACL manifest
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct AclManifestId(Blake2);
+
+/// An identifier for a sharded map node used in ACL manifest
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct ShardedMapV2NodeAclManifestId(Blake2);
+
+/// An identifier for a content-addressed ACL manifest entry blob
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct AclManifestEntryBlobId(Blake2);
+
+/// An identifier for a history manifest file node
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct HistoryManifestFileId(Blake2);
+
+/// An identifier for a history manifest deleted node
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct HistoryManifestDeletedNodeId(Blake2);
+
+/// An identifier for a history manifest directory node
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct HistoryManifestDirectoryId(Blake2);
+
+/// An identifier for a sharded map node used in history manifest
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct ShardedMapV2NodeHistoryManifestId(Blake2);
+
 /// An identifier for an fsnode
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
 pub struct FsnodeId(Blake2);
@@ -269,6 +313,7 @@ macro_rules! impl_typed_hash_no_context {
 
 
             #[cfg(test)]
+            #[allow(dead_code)]
             pub(crate) fn from_byte_array(arr: [u8; 32]) -> Self {
                 Self::new($crate::private::Blake2::from_byte_array(arr))
             }
@@ -545,7 +590,36 @@ macro_rules! impl_typed_hash {
             }
         }
 
-    }
+    };
+    // Variant that skips the Loadable impl so it can be provided manually
+    {
+        hash_type => $typed: ident,
+        thrift_hash_type => $thrift_hash_type: path,
+        value_type => $value_type: ty,
+        context_type => $typed_context: ident,
+        context_key => $key: expr,
+        no_loadable => true,
+    } => {
+        $crate::impl_typed_hash_no_context! {
+            hash_type => $typed,
+            thrift_type => $thrift_hash_type,
+            blobstore_key => $key,
+        }
+
+        $crate::impl_typed_context! {
+            hash_type => $typed,
+            context_type => $typed_context,
+            context_key => $key,
+        }
+
+        impl MononokeId for $typed {
+            #[inline]
+            fn sampling_fingerprint(&self) -> u64 {
+                self.0.sampling_fingerprint()
+            }
+        }
+
+    };
 }
 
 macro_rules! impl_edenapi_hash_convert {
@@ -681,11 +755,99 @@ impl_typed_hash! {
 }
 
 impl_typed_hash! {
+    hash_type => DirectoryBranchClusterManifestId,
+    thrift_hash_type => thrift::id::DirectoryBranchClusterManifestId,
+    value_type => DirectoryBranchClusterManifest,
+    context_type => DirectoryBranchClusterManifestContext,
+    context_key => "dbcm",
+}
+
+impl_typed_hash! {
+    hash_type => ShardedMapV2NodeDbcmId,
+    thrift_hash_type => thrift::id::ShardedMapV2NodeId,
+    value_type => ShardedMapV2Node<DirectoryBranchClusterManifestEntry>,
+    context_type => ShardedMapV2NodeDbcmContext,
+    context_key => "dbcm.map2node",
+}
+
+impl_typed_hash! {
+    hash_type => AclManifestId,
+    thrift_hash_type => thrift::id::AclManifestId,
+    value_type => AclManifest,
+    context_type => AclManifestContext,
+    context_key => "aclmf",
+}
+
+impl_typed_hash! {
+    hash_type => ShardedMapV2NodeAclManifestId,
+    thrift_hash_type => thrift::id::ShardedMapV2NodeId,
+    value_type => ShardedMapV2Node<AclManifestEntry>,
+    context_type => ShardedMapV2NodeAclManifestContext,
+    context_key => "aclmf.map2node",
+}
+
+impl_typed_hash! {
+    hash_type => AclManifestEntryBlobId,
+    thrift_hash_type => thrift::id::AclManifestEntryBlobId,
+    value_type => AclManifestEntryBlob,
+    context_type => AclManifestEntryBlobContext,
+    context_key => "aclmf.entry",
+}
+
+impl_typed_hash! {
     hash_type => FsnodeId,
     thrift_hash_type => thrift::id::FsnodeId,
     value_type => Fsnode,
     context_type => FsnodeIdContext,
     context_key => "fsnode",
+    no_loadable => true,
+}
+
+// FsnodeId gets a manual Loadable impl that deserializes on a blocking thread.
+// Fsnode blobs for large directories can take 120-160ms to deserialize, which
+// blocks the tokio reactor and causes APP_QUEUE_TIMEOUT.
+#[async_trait]
+impl Loadable for FsnodeId {
+    type Value = Fsnode;
+
+    async fn load<'a, B: KeyedBlobstore>(
+        &'a self,
+        ctx: &'a CoreContext,
+        blobstore: &'a B,
+    ) -> Result<Self::Value, LoadableError> {
+        let id = *self;
+        let blobstore_key = id.blobstore_key();
+        let bytes = blobstore
+            .get(ctx, &blobstore_key)
+            .await?
+            .ok_or_else(|| LoadableError::Missing(blobstore_key.clone()))?;
+
+        let now = std::time::Instant::now();
+        let blob: Blob<FsnodeId> = Blob::new(id, bytes.into_raw_bytes());
+        let len = blob.len();
+
+        const LARGE_FSNODE_THRESHOLD: usize = 102_400;
+        let ret = if len > LARGE_FSNODE_THRESHOLD {
+            tokio::task::spawn_blocking(move || {
+                <Fsnode as BlobstoreValue>::from_blob(blob).map_err(LoadableError::Error)
+            })
+            .await
+            .map_err(|e| LoadableError::Error(anyhow::anyhow!("spawn_blocking join error: {e}")))?
+        } else {
+            <Fsnode as BlobstoreValue>::from_blob(blob).map_err(LoadableError::Error)
+        };
+
+        let diff = now.elapsed().as_millis();
+        if diff > SLOW_DESERIAZLIZATION_THRESHOLD_MS {
+            tracing::warn!(
+                "Slow load of {} ({} bytes) took {:?}",
+                blobstore_key,
+                len,
+                now.elapsed()
+            );
+        }
+        ret
+    }
 }
 
 impl_typed_hash! {
@@ -702,6 +864,38 @@ impl_typed_hash! {
     value_type => ShardedMapV2Node<ContentManifestEntry>,
     context_type => ShardedMapV2NodeContentManifestContext,
     context_key => "contentmf.map2node",
+}
+
+impl_typed_hash! {
+    hash_type => HistoryManifestFileId,
+    thrift_hash_type => thrift::id::HistoryManifestFileId,
+    value_type => HistoryManifestFile,
+    context_type => HistoryManifestFileIdContext,
+    context_key => "historymf.file",
+}
+
+impl_typed_hash! {
+    hash_type => HistoryManifestDeletedNodeId,
+    thrift_hash_type => thrift::id::HistoryManifestDeletedNodeId,
+    value_type => HistoryManifestDeletedNode,
+    context_type => HistoryManifestDeletedNodeIdContext,
+    context_key => "historymf.delnode",
+}
+
+impl_typed_hash! {
+    hash_type => HistoryManifestDirectoryId,
+    thrift_hash_type => thrift::id::HistoryManifestDirectoryId,
+    value_type => HistoryManifestDirectory,
+    context_type => HistoryManifestDirectoryIdContext,
+    context_key => "historymf.dir",
+}
+
+impl_typed_hash! {
+    hash_type => ShardedMapV2NodeHistoryManifestId,
+    thrift_hash_type => thrift::id::ShardedMapV2NodeId,
+    value_type => ShardedMapV2Node<HistoryManifestEntry>,
+    context_type => ShardedMapV2NodeHistoryManifestContext,
+    context_key => "historymf.map2node",
 }
 
 impl_typed_hash! {
@@ -892,106 +1086,112 @@ mod test {
         // These IDs are persistent, and this test is really to make sure that they don't change
         // accidentally.
         let id = ChangesetId::new(Blake2::from_byte_array([1; 32]));
-        assert_eq!(id.blobstore_key(), format!("changeset.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("changeset.blake2.{id}"));
 
         let id = ContentId::new(Blake2::from_byte_array([1; 32]));
-        assert_eq!(id.blobstore_key(), format!("content.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("content.blake2.{id}"));
 
         let id = ShardedMapNodeDMv2Id::from_byte_array([1; 32]);
         assert_eq!(
             id.blobstore_key(),
-            format!("deletedmanifest2.mapnode.blake2.{}", id)
+            format!("deletedmanifest2.mapnode.blake2.{id}")
         );
 
         let id = ShardedMapV2NodeBssmV3Id::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("bssm3.map2node.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("bssm3.map2node.blake2.{id}"));
 
         let id = ShardedMapV2NodeSkeletonManifestV2Id::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("skmf2.map2node.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("skmf2.map2node.blake2.{id}"));
 
         let id = ShardedMapV2NodeCcsmId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("ccsm.map2node.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("ccsm.map2node.blake2.{id}"));
+
+        let id = DirectoryBranchClusterManifestId::from_byte_array([1; 32]);
+        assert_eq!(id.blobstore_key(), format!("dbcm.blake2.{id}"));
+
+        let id = ShardedMapV2NodeDbcmId::from_byte_array([1; 32]);
+        assert_eq!(id.blobstore_key(), format!("dbcm.map2node.blake2.{id}"));
 
         let id = ShardedMapV2NodeTestShardedManifestId::from_byte_array([1; 32]);
         assert_eq!(
             id.blobstore_key(),
-            format!("testshardedmanifest.map2node.blake2.{}", id)
+            format!("testshardedmanifest.map2node.blake2.{id}")
         );
 
         let id = ContentChunkId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("chunk.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("chunk.blake2.{id}"));
 
         let id = RawBundle2Id::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("rawbundle2.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("rawbundle2.blake2.{id}"));
 
         let id = FileUnodeId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("fileunode.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("fileunode.blake2.{id}"));
 
         let id = ManifestUnodeId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("manifestunode.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("manifestunode.blake2.{id}"));
 
         let id = DeletedManifestV2Id::from_byte_array([1; 32]);
-        assert_eq!(
-            id.blobstore_key(),
-            format!("deletedmanifest2.blake2.{}", id)
-        );
+        assert_eq!(id.blobstore_key(), format!("deletedmanifest2.blake2.{id}"));
 
         let id = BssmV3DirectoryId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("bssm3.blake2.{}", id),);
+        assert_eq!(id.blobstore_key(), format!("bssm3.blake2.{id}"),);
 
         let id = SkeletonManifestV2Id::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("skmf2.blake2.{}", id),);
+        assert_eq!(id.blobstore_key(), format!("skmf2.blake2.{id}"),);
 
         let id = CaseConflictSkeletonManifestId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("ccsm.blake2.{}", id),);
+        assert_eq!(id.blobstore_key(), format!("ccsm.blake2.{id}"),);
 
         let id = TestManifestId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("testmanifest.blake2.{}", id),);
+        assert_eq!(id.blobstore_key(), format!("testmanifest.blake2.{id}"),);
 
         let id = TestShardedManifestId::from_byte_array([1; 32]);
         assert_eq!(
             id.blobstore_key(),
-            format!("testshardedmanifest.blake2.{}", id),
+            format!("testshardedmanifest.blake2.{id}"),
         );
 
         let id = FsnodeId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("fsnode.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("fsnode.blake2.{id}"));
 
         let id = ContentManifestId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("contentmf.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("contentmf.blake2.{id}"));
 
         let id = ShardedMapV2NodeContentManifestId::from_byte_array([1; 32]);
         assert_eq!(
             id.blobstore_key(),
-            format!("contentmf.map2node.blake2.{}", id)
+            format!("contentmf.map2node.blake2.{id}")
         );
 
         let id = SkeletonManifestId::from_byte_array([1; 32]);
-        assert_eq!(
-            id.blobstore_key(),
-            format!("skeletonmanifest.blake2.{}", id)
-        );
+        assert_eq!(id.blobstore_key(), format!("skeletonmanifest.blake2.{id}"));
 
         let id = ContentMetadataV2Id::from_byte_array([1; 32]);
-        assert_eq!(
-            id.blobstore_key(),
-            format!("content_metadata2.blake2.{}", id)
-        );
+        assert_eq!(id.blobstore_key(), format!("content_metadata2.blake2.{id}"));
 
         let id = FastlogBatchId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("fastlogbatch.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("fastlogbatch.blake2.{id}"));
 
         let id = RedactionKeyListId::from_byte_array([1; 32]);
-        assert_eq!(
-            id.blobstore_key(),
-            format!("redactionkeylist.blake2.{}", id)
-        );
+        assert_eq!(id.blobstore_key(), format!("redactionkeylist.blake2.{id}"));
 
         let id = ShardedMapV2NodeInferredCopyFromId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("icf.map2node.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("icf.map2node.blake2.{id}"));
 
         let id = InferredCopyFromId::from_byte_array([1; 32]);
-        assert_eq!(id.blobstore_key(), format!("icf.blake2.{}", id));
+        assert_eq!(id.blobstore_key(), format!("icf.blake2.{id}"));
+
+        let id = HistoryManifestFileId::from_byte_array([1; 32]);
+        assert_eq!(id.blobstore_key(), format!("historymf.file.blake2.{id}"));
+
+        let id = HistoryManifestDirectoryId::from_byte_array([1; 32]);
+        assert_eq!(id.blobstore_key(), format!("historymf.dir.blake2.{id}"));
+
+        let id = ShardedMapV2NodeHistoryManifestId::from_byte_array([1; 32]);
+        assert_eq!(
+            id.blobstore_key(),
+            format!("historymf.map2node.blake2.{id}")
+        );
     }
 
     #[mononoke::test]
@@ -1051,6 +1251,11 @@ mod test {
         let deserialized = serde_json::from_str(&serialized).unwrap();
         assert_eq!(id, deserialized);
 
+        let id = DirectoryBranchClusterManifestId::from_byte_array([1; 32]);
+        let serialized = serde_json::to_string(&id).unwrap();
+        let deserialized = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(id, deserialized);
+
         let id = TestManifestId::from_byte_array([1; 32]);
         let serialized = serde_json::to_string(&id).unwrap();
         let deserialized = serde_json::from_str(&serialized).unwrap();
@@ -1092,6 +1297,21 @@ mod test {
         assert_eq!(id, deserialized);
 
         let id = InferredCopyFromId::from_byte_array([1; 32]);
+        let serialized = serde_json::to_string(&id).unwrap();
+        let deserialized = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(id, deserialized);
+
+        let id = HistoryManifestFileId::from_byte_array([1; 32]);
+        let serialized = serde_json::to_string(&id).unwrap();
+        let deserialized = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(id, deserialized);
+
+        let id = HistoryManifestDirectoryId::from_byte_array([1; 32]);
+        let serialized = serde_json::to_string(&id).unwrap();
+        let deserialized = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(id, deserialized);
+
+        let id = ShardedMapV2NodeHistoryManifestId::from_byte_array([1; 32]);
         let serialized = serde_json::to_string(&id).unwrap();
         let deserialized = serde_json::from_str(&serialized).unwrap();
         assert_eq!(id, deserialized);

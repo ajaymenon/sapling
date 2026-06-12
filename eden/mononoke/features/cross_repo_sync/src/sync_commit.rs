@@ -107,11 +107,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let source_repo_id = self.get_source_repo_id();
         let target_repo_id = self.get_target_repo_id();
-        write!(
-            f,
-            "CommitSyncData{{{}->{}}}",
-            source_repo_id, target_repo_id
-        )
+        write!(f, "CommitSyncData{{{source_repo_id}->{target_repo_id}}}")
     }
 }
 
@@ -401,8 +397,7 @@ where
         version_name: CommitSyncConfigVersion,
     ) -> Result<(), Error> {
         let xrepo_sync_disable_all_syncs =
-            justknobs::eval("scm/mononoke:xrepo_sync_disable_all_syncs", None, None)
-                .unwrap_or_default();
+            justknobs::eval("scm/mononoke:xrepo_sync_disable_all_syncs", None, None);
         if xrepo_sync_disable_all_syncs {
             return Err(ErrorKind::XRepoSyncDisabled.into());
         }
@@ -478,7 +473,7 @@ where
             Some(version) => version,
             None => synced_ancestors_versions
                 .get_only_version()?
-                .ok_or_else(|| format_err!("no versions found for {}", commit_with_no_parent))?,
+                .ok_or_else(|| format_err!("no versions found for {commit_with_no_parent}"))?,
         };
         Ok(version)
     }
@@ -762,7 +757,7 @@ async fn sync_commit_impl<R: Repo>(
                     )
                     .await
                     .with_context(|| {
-                        format_err!("failed to sync ancestor {} of {}", ancestor, source_cs_id)
+                        format_err!("failed to sync ancestor {ancestor} of {source_cs_id}")
                     })?;
 
                 Some(version)
@@ -782,10 +777,7 @@ async fn sync_commit_impl<R: Repo>(
             .await?;
             Ok(())
         };
-        let xrepo_disable_commit_sync_lease =
-            justknobs::eval("scm/mononoke:xrepo_disable_commit_sync_lease", None, None)
-                .unwrap_or_default();
-        if xrepo_disable_commit_sync_lease || disable_lease {
+        if disable_lease {
             sync().await?;
         } else {
             run_with_lease(
@@ -802,7 +794,7 @@ async fn sync_commit_impl<R: Repo>(
     let commit_sync_outcome = commit_sync_data
         .get_commit_sync_outcome(ctx, source_cs_id)
         .await?
-        .ok_or_else(|| format_err!("was not able to remap a commit {}", source_cs_id))?;
+        .ok_or_else(|| format_err!("was not able to remap a commit {source_cs_id}"))?;
     use CommitSyncOutcome::*;
     let res = match commit_sync_outcome {
         NotSyncCandidate(_) => None,
@@ -839,7 +831,7 @@ async fn unsafe_sync_commit_impl<'a, R: Repo>(
             )
             .and_then(move |maybe_outcome| match maybe_outcome {
                 Some(outcome) => future::ok((p, outcome)),
-                None => future::err(format_err!("{} does not have CommitSyncOutcome", p)),
+                None => future::err(format_err!("{p} does not have CommitSyncOutcome")),
             })
     }))
     .buffered(100)

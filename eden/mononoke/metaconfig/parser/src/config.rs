@@ -17,9 +17,11 @@ use anyhow::Result;
 use anyhow::anyhow;
 use cached_config::ConfigHandle;
 use cached_config::ConfigStore;
+use metaconfig_types::AclRegionConfig;
 use metaconfig_types::AsyncRequestsConfig;
 use metaconfig_types::BlobConfig;
 use metaconfig_types::CensoredScubaParams;
+use metaconfig_types::CommitIdentityScheme;
 use metaconfig_types::CommonConfig;
 use metaconfig_types::ObjectsCountMultiplier;
 use metaconfig_types::Redaction;
@@ -35,6 +37,8 @@ use repos::RawRepoConfigs;
 use repos::RawRepoDefinition;
 use repos::RawRestrictedPathsConfig;
 use repos::RawStorageConfig;
+use repos::RepoSpec;
+use repos::TierManifest;
 
 use crate::convert::Convert;
 use crate::errors::ConfigurationError;
@@ -58,6 +62,8 @@ pub fn load_common_config(
 pub struct RepoConfigs {
     /// Configs for all repositories
     pub repos: HashMap<String, RepoConfig>,
+    /// Index from RepositoryId to repo name for O(1) lookup by id
+    pub repos_by_id: HashMap<RepositoryId, String>,
     /// Common configs for all repos
     pub common: CommonConfig,
 }
@@ -80,6 +86,28 @@ pub fn configerator_config_handle(
     }
 }
 
+/// Creates a ConfigHandle for a TierManifest from a Configerator path.
+///
+/// Used in the per-repo config split-loading path where the manifest lists
+/// all repos in a tier along with their individual config paths.
+pub fn configerator_manifest_handle(
+    manifest_path: &str,
+    config_store: &ConfigStore,
+) -> Result<ConfigHandle<TierManifest>> {
+    config_store.get_config_handle::<TierManifest>(manifest_path.to_owned())
+}
+
+/// Creates a ConfigHandle for a single repo's RawRepoConfig from a Configerator path.
+///
+/// Used in the per-repo config split-loading path where each repo has its own
+/// config file referenced by the TierManifest.
+pub fn configerator_repo_config_handle(
+    config_path: &str,
+    config_store: &ConfigStore,
+) -> Result<ConfigHandle<RawRepoConfig>> {
+    config_store.get_config_handle::<RawRepoConfig>(config_path.to_owned())
+}
+
 /// Load configuration for repositories and storage.
 pub fn load_repo_configs(
     config_path: impl AsRef<Path>,
@@ -91,10 +119,7 @@ pub fn load_repo_configs(
 
 /// Empty repo configs useful for testing purposes
 pub fn load_empty_repo_configs() -> RepoConfigs {
-    RepoConfigs {
-        repos: HashMap::new(),
-        common: CommonConfig::default(),
-    }
+    RepoConfigs::new(HashMap::new(), CommonConfig::default())
 }
 
 /// Load configuration based on the provided raw configs.
@@ -137,12 +162,24 @@ pub fn load_configs_from_raw(
         .map(|(k, v)| Ok((k, v.convert()?)))
         .collect::<Result<_>>()?;
     Ok((
-        RepoConfigs {
-            repos: resolved_repo_configs,
-            common,
-        },
+        RepoConfigs::new(resolved_repo_configs, common),
         StorageConfigs { storage },
     ))
+}
+
+/// Pre-resolved metadata for a repo configuration.
+///
+/// These fields come from different sources depending on the loading path:
+/// - In the monolithic path: extracted from `RawRepoDefinition`
+/// - In the per-repo split-loading path: defaults are used
+struct RepoMetadata {
+    repoid: RepositoryId,
+    enabled: bool,
+    hipster_acl: Option<String>,
+    readonly: RepoReadOnly,
+    default_commit_identity_scheme: CommitIdentityScheme,
+    enable_git_bundle_uri: bool,
+    acl_region_config: Option<AclRegionConfig>,
 }
 
 fn parse_with_repo_definition(
@@ -166,25 +203,177 @@ fn parse_with_repo_definition(
         enable_git_bundle_uri,
     } = repo_definition;
 
+    let repoid = RepositoryId::new(repoid.context("missing repoid from configuration")?);
+    let enabled = enabled.unwrap_or(true);
     let enable_git_bundle_uri = enable_git_bundle_uri.unwrap_or(false);
-
     let default_commit_identity_scheme = default_commit_identity_scheme
         .convert()?
         .unwrap_or_default();
+    let readonly = if readonly.unwrap_or_default() {
+        RepoReadOnly::ReadOnly("Set by config option".to_string())
+    } else {
+        RepoReadOnly::ReadWrite
+    };
+    let acl_region_config = acl_region_config
+        .map(|key| {
+            named_acl_region_configs.get(&key).cloned().ok_or_else(|| {
+                ConfigurationError::InvalidConfig(format!(
+                    "ACL region config \"{key}\" not defined"
+                ))
+            })
+        })
+        .transpose()?
+        .convert()?;
 
     let named_repo_config_name = repo_config
         .ok_or_else(|| ConfigurationError::InvalidConfig("No named_repo_config".to_string()))?;
-
     let named_repo_config = named_repo_configs
         .get(named_repo_config_name.as_str())
         .ok_or_else(|| {
             ConfigurationError::InvalidConfig(format!(
-                "no named_repo_config \"{}\" for repo \"{:?}\".",
-                named_repo_config_name, repo_name
+                "no named_repo_config \"{named_repo_config_name}\" for repo \"{repo_name:?}\"."
             ))
         })?
         .clone();
 
+    build_repo_config(
+        named_repo_config,
+        RepoMetadata {
+            repoid,
+            enabled,
+            hipster_acl,
+            readonly,
+            default_commit_identity_scheme,
+            enable_git_bundle_uri,
+            acl_region_config,
+        },
+        named_storage_configs,
+    )
+}
+
+/// Parse a single RawRepoConfig into a RepoConfig for the per-repo split-loading path.
+///
+/// Unlike `parse_with_repo_definition` which gets repo metadata from `RawRepoDefinition`,
+/// this function takes `repo_id` directly (from the TierManifest) and uses sensible defaults
+/// for other metadata fields (enabled=true, readonly=false, etc.).
+///
+/// `named_storage_configs` typically comes from `TierManifest.storage`.
+pub fn parse_raw_repo_config(
+    raw_repo_config: RawRepoConfig,
+    repo_id: i32,
+    named_storage_configs: &HashMap<String, RawStorageConfig>,
+) -> Result<RepoConfig> {
+    build_repo_config(
+        raw_repo_config,
+        RepoMetadata {
+            repoid: RepositoryId::new(repo_id),
+            enabled: true,
+            hipster_acl: None,
+            readonly: RepoReadOnly::ReadWrite,
+            default_commit_identity_scheme: Default::default(),
+            enable_git_bundle_uri: false,
+            acl_region_config: None,
+        },
+        named_storage_configs,
+    )
+}
+
+/// Creates a ConfigHandle for a repo's RepoSpec from a Configerator path.
+///
+/// Used in the direct RepoSpec consumption path where each repo has its own
+/// RepoSpec file and tier overrides are resolved at runtime.
+pub fn configerator_repo_spec_handle(
+    config_path: &str,
+    config_store: &ConfigStore,
+) -> Result<ConfigHandle<RepoSpec>> {
+    config_store.get_config_handle::<RepoSpec>(config_path.to_owned())
+}
+
+/// Merge a tier-specific override on top of a base RawRepoConfig.
+///
+/// For each field in the override, if it is set (not None/null), it replaces
+/// the corresponding field in the base. Unset fields in the override leave the
+/// base value unchanged.
+///
+/// Uses JSON-based merging to handle all fields generically, avoiding the need
+/// to enumerate all ~50 fields of RawRepoConfig. This matches the Python
+/// pipeline's merge semantics in repo_spec_processing.cinc.
+fn merge_raw_repo_config(
+    base: RawRepoConfig,
+    tier_override: &RawRepoConfig,
+) -> Result<RawRepoConfig> {
+    let mut base_json = serde_json::to_value(&base)?;
+    let override_json = serde_json::to_value(tier_override)?;
+
+    if let (serde_json::Value::Object(base_map), serde_json::Value::Object(override_map)) =
+        (&mut base_json, override_json)
+    {
+        for (key, value) in override_map {
+            if !value.is_null() {
+                base_map.insert(key, value);
+            }
+        }
+    }
+
+    serde_json::from_value(base_json).context("Failed to deserialize merged RawRepoConfig")
+}
+
+/// Parse a RepoSpec into a RepoConfig for a specific tier.
+///
+/// Resolves tier_overrides by merging the tier-specific partial config on top
+/// of the base repo_config. Uses the RepoSpec's identity fields (hipster_acl,
+/// enabled, readonly, etc.) instead of hardcoded defaults.
+///
+/// `named_storage_configs` typically comes from `TierManifest.storage`.
+pub fn parse_repo_spec(
+    repo_spec: RepoSpec,
+    tier_name: &str,
+    named_storage_configs: &HashMap<String, RawStorageConfig>,
+) -> Result<RepoConfig> {
+    let base_config = repo_spec.repo_config.unwrap_or_default();
+    let resolved_config = match repo_spec.tier_overrides {
+        Some(ref overrides) => match overrides.get(tier_name) {
+            Some(tier_override) => merge_raw_repo_config(base_config, tier_override)?,
+            None => base_config,
+        },
+        None => base_config,
+    };
+
+    let readonly = if repo_spec.readonly {
+        RepoReadOnly::ReadOnly("Set by config option".to_string())
+    } else {
+        RepoReadOnly::ReadWrite
+    };
+
+    let default_commit_identity_scheme = Some(repo_spec.default_commit_identity_scheme)
+        .convert()?
+        .unwrap_or_default();
+
+    build_repo_config(
+        resolved_config,
+        RepoMetadata {
+            repoid: RepositoryId::new(repo_spec.repo_id),
+            enabled: repo_spec.enabled,
+            hipster_acl: Some(repo_spec.hipster_acl).filter(|acl| !acl.is_empty()),
+            readonly,
+            default_commit_identity_scheme,
+            enable_git_bundle_uri: repo_spec.enable_git_bundle_uri.unwrap_or(false),
+            acl_region_config: None,
+        },
+        named_storage_configs,
+    )
+}
+
+/// Shared conversion logic: converts a `RawRepoConfig` plus pre-resolved
+/// metadata into a `RepoConfig`.
+///
+/// Both `parse_with_repo_definition` (monolithic loading path) and
+/// `parse_raw_repo_config` (per-repo split-loading path) delegate to this function.
+fn build_repo_config(
+    raw_repo_config: RawRepoConfig,
+    metadata: RepoMetadata,
+    named_storage_configs: &HashMap<String, RawStorageConfig>,
+) -> Result<RepoConfig> {
     let RawRepoConfig {
         storage_config,
         storage,
@@ -209,7 +398,6 @@ fn parse_with_repo_definition(
         scuba_local_path_hooks,
         enforce_lfs_acl_check,
         repo_client_use_warm_bookmarks_cache,
-        repo_client_knobs,
         phabricator_callsign,
         walker_config,
         cross_repo_commit_validation_config,
@@ -221,6 +409,7 @@ fn parse_with_repo_definition(
         metadata_logger_config,
         commit_cloud_config,
         zelos_config,
+        pipeline_zelos_config,
         bookmark_name_for_objects_count,
         default_objects_count,
         override_objects_count,
@@ -234,14 +423,11 @@ fn parse_with_repo_definition(
         directory_branch_cluster_config,
         restricted_paths_config,
         remote_diff_config,
+        commit_rate_limit_config,
         ..
-    } = named_repo_config;
+    } = raw_repo_config;
 
     let named_storage_config = storage_config;
-
-    let repoid = RepositoryId::new(repoid.context("missing repoid from configuration")?);
-
-    let enabled = enabled.unwrap_or(true);
 
     let hooks: Vec<_> = hooks.unwrap_or_default().convert()?;
 
@@ -252,7 +438,7 @@ fn parse_with_repo_definition(
             .or_else(|| named_storage_configs.get(name))
             .cloned()
             .ok_or_else(|| {
-                ConfigurationError::InvalidConfig(format!("Storage \"{}\" not defined", name))
+                ConfigurationError::InvalidConfig(format!("Storage \"{name}\" not defined"))
             })?;
 
         raw_storage_config.convert()
@@ -281,12 +467,6 @@ fn parse_with_repo_definition(
         .map(|v| v.try_into())
         .transpose()?
         .unwrap_or(0);
-
-    let readonly = if readonly.unwrap_or_default() {
-        RepoReadOnly::ReadOnly("Set by config option".to_string())
-    } else {
-        RepoReadOnly::ReadWrite
-    };
 
     let redaction = if redaction.unwrap_or(true) {
         Redaction::Enabled
@@ -323,20 +503,6 @@ fn parse_with_repo_definition(
     let repo_client_use_warm_bookmarks_cache =
         repo_client_use_warm_bookmarks_cache.unwrap_or(false);
 
-    let repo_client_knobs = repo_client_knobs.convert()?.unwrap_or_default();
-
-    let acl_region_config = acl_region_config
-        .map(|key| {
-            named_acl_region_configs.get(&key).cloned().ok_or_else(|| {
-                ConfigurationError::InvalidConfig(format!(
-                    "ACL region config \"{}\" not defined",
-                    key
-                ))
-            })
-        })
-        .transpose()?
-        .convert()?;
-
     let cross_repo_commit_validation_config = cross_repo_commit_validation_config.convert()?;
 
     let sparse_profiles_config = sparse_profiles_config.convert()?;
@@ -347,6 +513,7 @@ fn parse_with_repo_definition(
     let deep_sharding_config = deep_sharding_config.convert()?;
     let metadata_logger_config = metadata_logger_config.convert()?.unwrap_or_default();
     let zelos_config = zelos_config.convert()?;
+    let pipeline_zelos_config = pipeline_zelos_config.convert()?;
     let x_repo_sync_source_mapping = x_repo_sync_source_mapping.convert()?;
 
     let raw_git_configs = git_configs.unwrap_or_default();
@@ -369,12 +536,15 @@ fn parse_with_repo_definition(
     let remote_diff_config = remote_diff_config
         .map(|config| config.convert())
         .transpose()?;
+    let commit_rate_limit_config = commit_rate_limit_config
+        .map(|config| config.convert())
+        .transpose()?;
 
     Ok(RepoConfig {
-        enabled,
+        enabled: metadata.enabled,
         storage_config,
         generation_cache_size,
-        repoid,
+        repoid: metadata.repoid,
         scuba_table_hooks,
         scuba_local_path_hooks,
         cache_warmup,
@@ -385,31 +555,31 @@ fn parse_with_repo_definition(
         pushrebase,
         lfs,
         hash_validation_percentage,
-        readonly,
+        readonly: metadata.readonly,
         redaction,
         infinitepush,
         list_keys_patterns_max,
         filestore,
         hook_max_file_size,
-        hipster_acl,
+        hipster_acl: metadata.hipster_acl,
         source_control_service,
         source_control_service_monitoring,
         derived_data_config,
         enforce_lfs_acl_check,
         repo_client_use_warm_bookmarks_cache,
-        repo_client_knobs,
         phabricator_callsign,
-        acl_region_config,
+        acl_region_config: metadata.acl_region_config,
         walker_config,
         cross_repo_commit_validation_config,
         sparse_profiles_config,
         update_logging_config,
         commit_graph_config,
-        default_commit_identity_scheme,
+        default_commit_identity_scheme: metadata.default_commit_identity_scheme,
         deep_sharding_config,
         everstore_local_path,
         metadata_logger_config,
         zelos_config,
+        pipeline_zelos_config,
         bookmark_name_for_objects_count,
         default_objects_count,
         override_objects_count,
@@ -421,10 +591,11 @@ fn parse_with_repo_definition(
         modern_sync_config,
         log_repo_stats,
         metadata_cache_config,
-        enable_git_bundle_uri,
+        enable_git_bundle_uri: metadata.enable_git_bundle_uri,
         directory_branch_cluster_config,
         restricted_paths_config,
         remote_diff_config,
+        commit_rate_limit_config,
     })
 }
 
@@ -486,8 +657,7 @@ fn parse_common_config(
             .cloned()
             .ok_or_else(|| {
                 ConfigurationError::InvalidConfig(format!(
-                    "Storage \"{}\" not defined for redaction config",
-                    name
+                    "Storage \"{name}\" not defined for redaction config"
                 ))
             })?
             .convert()?
@@ -508,6 +678,8 @@ fn parse_common_config(
         None => AsyncRequestsConfig::default(),
     };
 
+    let rl_land_service_repo_prefix = common.rl_land_service_repo_prefix.filter(|p| !p.is_empty());
+
     Ok(CommonConfig {
         trusted_parties_hipster_tier,
         trusted_parties_allowlist,
@@ -520,15 +692,46 @@ fn parse_common_config(
         git_memory_upper_bound,
         edenapi_dumper_scuba_table,
         async_requests_config,
+        rl_land_service_repo_prefix,
     })
 }
 
 impl RepoConfigs {
-    /// Get individual `RepoConfig`, given a repo_id
-    pub fn get_repo_config(&self, repo_id: RepositoryId) -> Option<(&String, &RepoConfig)> {
-        self.repos
+    /// Create RepoConfigs with auto-built ID index.
+    pub fn new(repos: HashMap<String, RepoConfig>, common: CommonConfig) -> Self {
+        let repos_by_id = repos
             .iter()
-            .find(|(_, repo_config)| repo_config.repoid == repo_id)
+            .map(|(name, config)| (config.repoid, name.clone()))
+            .collect();
+        Self {
+            repos,
+            repos_by_id,
+            common,
+        }
+    }
+
+    /// Get individual `RepoConfig`, given a repo_id. O(1) via index.
+    pub fn get_repo_config(&self, repo_id: RepositoryId) -> Option<(&String, &RepoConfig)> {
+        let name = self.repos_by_id.get(&repo_id)?;
+        self.repos.get(name).map(|config| (name, config))
+    }
+
+    /// O(1) lookup by raw repo id (i32). Constructs RepositoryId internally
+    /// so callers don't need the mononoke_types dependency.
+    pub fn get_repo_config_by_raw_id(&self, repo_id: i32) -> Option<(&String, &RepoConfig)> {
+        self.get_repo_config(RepositoryId::new(repo_id))
+    }
+
+    /// Insert a repo and update the ID index.
+    /// Cleans up stale index entries if the repo's ID changed.
+    pub fn insert_repo(&mut self, name: String, config: RepoConfig) {
+        if let Some(old_config) = self.repos.get(&name) {
+            if old_config.repoid != config.repoid {
+                self.repos_by_id.remove(&old_config.repoid);
+            }
+        }
+        self.repos_by_id.insert(config.repoid, name.clone());
+        self.repos.insert(name, config);
     }
 }
 
@@ -580,6 +783,7 @@ mod test {
     use metaconfig_types::LfsParams;
     use metaconfig_types::LocalDatabaseConfig;
     use metaconfig_types::LoggingDestination;
+    use metaconfig_types::MergeResolutionOverride;
     use metaconfig_types::MetadataCacheConfig;
     use metaconfig_types::MetadataCacheUpdateMode;
     use metaconfig_types::MetadataDatabaseConfig;
@@ -592,7 +796,6 @@ mod test {
     use metaconfig_types::PushrebaseRemoteMode;
     use metaconfig_types::RemoteDatabaseConfig;
     use metaconfig_types::RemoteMetadataDatabaseConfig;
-    use metaconfig_types::RepoClientKnobs;
     use metaconfig_types::RestrictedPathsConfig;
     use metaconfig_types::ShardableRemoteDatabaseConfig;
     use metaconfig_types::ShardedDatabaseConfig;
@@ -751,8 +954,8 @@ mod test {
             crate::raw::read_raw_configs(tmp_dir.path(), &config_store).unwrap();
         for (_config_name, commit_sync_config) in commit_sync {
             let res = commit_sync_config.convert();
-            let msg = format!("{:#?}", res);
-            println!("res = {}", msg);
+            let msg = format!("{res:#?}");
+            println!("res = {msg}");
             assert!(res.is_err());
             assert!(msg.contains("is one of the small repos too"));
         }
@@ -788,8 +991,8 @@ mod test {
             crate::raw::read_raw_configs(tmp_dir.path(), &config_store).unwrap();
         for (_config_name, commit_sync_config) in commit_sync {
             let res = commit_sync_config.convert();
-            let msg = format!("{:#?}", res);
-            println!("res = {}", msg);
+            let msg = format!("{res:#?}");
+            println!("res = {msg}");
             assert!(res.is_err());
             assert!(msg.contains("present multiple times in the same CommitSyncConfig"));
         }
@@ -842,8 +1045,8 @@ mod test {
         let config_store = ConfigStore::new(Arc::new(TestSource::new()), None, None);
         let tmp_dir = write_files(&paths);
         let res = load_repo_configs(tmp_dir.path(), &config_store);
-        let msg = format!("{:#?}", res);
-        println!("res = {}", msg);
+        let msg = format!("{res:#?}");
+        println!("res = {msg}");
         assert!(res.is_err());
         assert!(msg.contains("DuplicatedRepoId"));
     }
@@ -1032,6 +1235,7 @@ mod test {
         git_bundles = { db_address = "git_bundles" }
         repo_metadata = { db_address = "repo_metadata" }
         restricted_paths = { db_address = "restricted_paths" }
+        derived_data_mapping = { unsharded = { db_address = "derived_data_mapping" } }
 
         [main.blobstore.multiplexed_wal]
         multiplex_id = 1
@@ -1177,6 +1381,11 @@ mod test {
                 restricted_paths: Some(RemoteDatabaseConfig {
                     db_address: "restricted_paths".into(),
                 }),
+                commit_derived_data_mapping: Some(ShardableRemoteDatabaseConfig::Unsharded(
+                    RemoteDatabaseConfig {
+                        db_address: "derived_data_mapping".into(),
+                    },
+                )),
             }),
             ephemeral_blobstore: None,
             mutable_blobstore: multiplex,
@@ -1280,6 +1489,9 @@ mod test {
                         casefolding_check_excluded_paths: Default::default(),
                         not_generated_filenodes_limit: 500,
                         monitoring_bookmark: None,
+                        merge_resolution_excluded_path_prefixes: Default::default(),
+                        pessimistic_locking_bookmarks: Vec::new(),
+                        merge_resolution_override: MergeResolutionOverride::UseJk,
                     },
                     block_merges: false,
                     emit_obsmarkers: false,
@@ -1303,7 +1515,6 @@ mod test {
                     namespace: Some(InfinitepushNamespace::new(
                         ComparableRegex::new("foobar/.+").unwrap(),
                     )),
-                    hydrate_getbundle_response: false,
                 },
                 list_keys_patterns_max: 123,
                 hook_max_file_size: 456,
@@ -1348,6 +1559,7 @@ mod test {
                             DerivableType::BlameV2 => 20,
                         },
                         inferred_copy_from_config: Default::default(),
+                        xdb_mapping_shard_ids: Default::default(),
                     },],
                     scuba_table: None,
                     derivation_queue_scuba_table: None,
@@ -1355,12 +1567,11 @@ mod test {
                     blocked_derivation: hashmap! {
                         THREES_CSID => Some(hashset! { DerivableType::Unodes, }),
                     },
+                    extra_types_available_for_read: hashset! {},
+                    pipeline_config: None,
                 },
                 enforce_lfs_acl_check: false,
                 repo_client_use_warm_bookmarks_cache: true,
-                repo_client_knobs: RepoClientKnobs {
-                    allow_short_getpack_history: true,
-                },
                 phabricator_callsign: Some("FBS".to_string()),
                 acl_region_config: Some(AclRegionConfig {
                     allow_rules: vec![AclRegionRule {
@@ -1419,6 +1630,7 @@ mod test {
                     .collect(),
                 }),
                 zelos_config: None,
+                pipeline_zelos_config: None,
                 bookmark_name_for_objects_count: None,
                 default_objects_count: None,
                 override_objects_count: None,
@@ -1451,6 +1663,7 @@ mod test {
                 }),
                 restricted_paths_config: RestrictedPathsConfig::default(),
                 remote_diff_config: None,
+                commit_rate_limit_config: None,
             },
         );
 
@@ -1507,7 +1720,6 @@ mod test {
                 derived_data_config: DerivedDataConfig::default(),
                 enforce_lfs_acl_check: false,
                 repo_client_use_warm_bookmarks_cache: false,
-                repo_client_knobs: RepoClientKnobs::default(),
                 phabricator_callsign: Some("WWW".to_string()),
                 acl_region_config: None,
                 walker_config: None,
@@ -1519,6 +1731,7 @@ mod test {
                 everstore_local_path: None,
                 metadata_logger_config: MetadataLoggerConfig::default(),
                 zelos_config: None,
+                pipeline_zelos_config: None,
                 bookmark_name_for_objects_count: None,
                 default_objects_count: None,
                 override_objects_count: None,
@@ -1538,6 +1751,7 @@ mod test {
                 metadata_cache_config: None,
                 restricted_paths_config: RestrictedPathsConfig::default(),
                 remote_diff_config: None,
+                commit_rate_limit_config: None,
             },
         );
         assert_eq!(
@@ -1569,6 +1783,7 @@ mod test {
                     db_config: None,
                     blobstore: None
                 },
+                rl_land_service_repo_prefix: None,
             }
         );
         assert_eq!(
@@ -1633,8 +1848,8 @@ mod test {
         let config_store = ConfigStore::new(Arc::new(TestSource::new()), None, None);
         let tmp_dir = write_files(&paths);
         let res = load_repo_configs(tmp_dir.path(), &config_store);
-        let msg = format!("{:#?}", res);
-        println!("res = {}", msg);
+        let msg = format!("{res:#?}");
+        println!("res = {msg}");
         assert!(res.is_err());
         assert!(msg.contains("InvalidPushvar"));
     }
@@ -1671,14 +1886,12 @@ mod test {
             let config_store = ConfigStore::new(Arc::new(TestSource::new()), None, None);
             let tmp_dir = write_files(&paths);
             let res = load_repo_configs(tmp_dir.path(), &config_store);
-            println!("res = {:?}", res);
-            let msg = format!("{:?}", res);
-            assert!(res.is_err(), "unexpected success for {}", common);
+            println!("res = {res:?}");
+            let msg = format!("{res:?}");
+            assert!(res.is_err(), "unexpected success for {common}");
             assert!(
                 msg.contains(expect),
-                "wrong failure, wanted \"{}\" in {}",
-                expect,
-                common
+                "wrong failure, wanted \"{expect}\" in {common}"
             );
         }
 
@@ -1710,6 +1923,7 @@ mod test {
         git_bundles = { db_address = "git_bundles" }
         repo_metadata = { db_address = "repo_metadata" }
         restricted_paths = { db_address = "restricted_paths" }
+        derived_data_mapping = { unsharded = { db_address = "derived_data_mapping" } }
 
         [multiplex_store.blobstore.multiplexed_wal]
         multiplex_id = 1
@@ -1830,6 +2044,9 @@ mod test {
                         restricted_paths: Some(RemoteDatabaseConfig {
                             db_address: "restricted_paths".into(),
                         }),
+                        commit_derived_data_mapping: Some(ShardableRemoteDatabaseConfig::Unsharded(RemoteDatabaseConfig {
+                            db_address: "derived_data_mapping".into(),
+                        })),
                     }),
                     ephemeral_blobstore: None,
                     mutable_blobstore: BlobConfig::MultiplexedWal {
@@ -1925,6 +2142,7 @@ mod test {
         git_bundles = { db_address = "git_bundles" }
         repo_metadata = { db_address = "repo_metadata" }
         restricted_paths = { db_address = "restricted_paths" }
+        derived_data_mapping = { unsharded = { db_address = "derived_data_mapping" } }
 
         [storage.multiplex_store.blobstore]
         disabled = {}
@@ -1980,7 +2198,8 @@ mod test {
                         git_bundle_metadata: Some(RemoteDatabaseConfig { db_address: "git_bundles".into(), }),
                         commit_cloud: Some(RemoteDatabaseConfig { db_address: "other_other_other_mutation_db".into(), }),
                         repo_metadata: Some(RemoteDatabaseConfig { db_address: "repo_metadata".into() }),
-                        restricted_paths: Some(RemoteDatabaseConfig { db_address: "restricted_paths".into(), })
+                        restricted_paths: Some(RemoteDatabaseConfig { db_address: "restricted_paths".into(), }),
+                        commit_derived_data_mapping: Some(ShardableRemoteDatabaseConfig::Unsharded(RemoteDatabaseConfig { db_address: "derived_data_mapping".into() })),
                     }),
 
                     ephemeral_blobstore: None,
@@ -2093,5 +2312,314 @@ mod test {
         } else {
             panic!("Multiplexed config is not a multiplexed blobstore");
         }
+    }
+
+    #[mononoke::test]
+    fn test_tier_manifest_and_repo_config_handles() {
+        use cached_config::ModificationTime;
+
+        let manifest_json = r#"{
+            "repos": [
+                {
+                    "repo_name": "test_repo",
+                    "repo_id": 42,
+                    "config_path": "scm/mononoke/repos/test_repo",
+                    "is_deep_sharded": false
+                }
+            ],
+            "common": {},
+            "storage": {}
+        }"#;
+
+        let repo_config_json = r#"{
+            "storage_config": "main_storage"
+        }"#;
+
+        let test_source = Arc::new(TestSource::new());
+        test_source.insert_config(
+            "scm/mononoke/manifests/tiers/test_tier",
+            manifest_json,
+            ModificationTime::UnixTimestamp(1),
+        );
+        test_source.insert_config(
+            "scm/mononoke/repos/test_repo",
+            repo_config_json,
+            ModificationTime::UnixTimestamp(1),
+        );
+
+        let config_store = ConfigStore::new(test_source, None, None);
+
+        // Verify manifest handle can be created and deserialized
+        let manifest_handle =
+            configerator_manifest_handle("scm/mononoke/manifests/tiers/test_tier", &config_store)
+                .expect("Failed to get manifest config handle");
+
+        let manifest = manifest_handle.get();
+        assert_eq!(manifest.repos.len(), 1);
+        assert_eq!(manifest.repos[0].repo_name, "test_repo");
+        assert_eq!(manifest.repos[0].repo_id, 42);
+        assert_eq!(
+            manifest.repos[0].config_path,
+            "scm/mononoke/repos/test_repo"
+        );
+        assert!(!manifest.repos[0].is_deep_sharded);
+
+        // Verify repo config handle can be created and deserialized
+        let repo_config_handle =
+            configerator_repo_config_handle("scm/mononoke/repos/test_repo", &config_store)
+                .expect("Failed to get repo config handle");
+
+        let repo_config = repo_config_handle.get();
+        assert_eq!(repo_config.storage_config, Some("main_storage".to_string()));
+    }
+
+    /// Helper to construct a minimal valid RawStorageConfig for tests.
+    fn test_raw_storage_config() -> RawStorageConfig {
+        use repos::RawBlobstoreConfig;
+        use repos::RawBlobstoreDisabled;
+        use repos::RawDbLocal;
+        use repos::RawMetadataConfig;
+
+        RawStorageConfig {
+            metadata: RawMetadataConfig::local(RawDbLocal {
+                local_db_path: "/tmp/test_db".to_string(),
+            }),
+            blobstore: RawBlobstoreConfig::disabled(RawBlobstoreDisabled {}),
+            ephemeral_blobstore: None,
+            mutable_blobstore: RawBlobstoreConfig::disabled(RawBlobstoreDisabled {}),
+        }
+    }
+
+    #[mononoke::test]
+    fn test_merge_raw_repo_config_override_replaces_set_fields() {
+        // Base config has storage_config set
+        let base = RawRepoConfig {
+            storage_config: Some("base_storage".to_string()),
+            ..Default::default()
+        };
+
+        // Override sets a different storage_config and adds a phabricator_callsign
+        let tier_override = RawRepoConfig {
+            storage_config: Some("override_storage".to_string()),
+            phabricator_callsign: Some("TEST".to_string()),
+            ..Default::default()
+        };
+
+        let merged = merge_raw_repo_config(base, &tier_override).expect("merge should succeed");
+
+        assert_eq!(
+            merged.storage_config,
+            Some("override_storage".to_string()),
+            "Override should replace base storage_config"
+        );
+        assert_eq!(
+            merged.phabricator_callsign,
+            Some("TEST".to_string()),
+            "Override should add phabricator_callsign"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_merge_raw_repo_config_null_fields_preserve_base() {
+        let base = RawRepoConfig {
+            storage_config: Some("base_storage".to_string()),
+            phabricator_callsign: Some("BASE_CALLSIGN".to_string()),
+            ..Default::default()
+        };
+
+        // Override only sets storage_config, leaves phabricator_callsign as None
+        let tier_override = RawRepoConfig {
+            storage_config: Some("override_storage".to_string()),
+            ..Default::default()
+        };
+
+        let merged = merge_raw_repo_config(base, &tier_override).expect("merge should succeed");
+
+        assert_eq!(
+            merged.storage_config,
+            Some("override_storage".to_string()),
+            "Override should replace storage_config"
+        );
+        assert_eq!(
+            merged.phabricator_callsign,
+            Some("BASE_CALLSIGN".to_string()),
+            "Null override field should preserve base value"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_merge_raw_repo_config_empty_override() {
+        let base = RawRepoConfig {
+            storage_config: Some("base_storage".to_string()),
+            phabricator_callsign: Some("CALLSIGN".to_string()),
+            ..Default::default()
+        };
+
+        // Completely empty override should preserve all base fields
+        let tier_override = RawRepoConfig::default();
+
+        let merged = merge_raw_repo_config(base, &tier_override).expect("merge should succeed");
+
+        assert_eq!(merged.storage_config, Some("base_storage".to_string()));
+        assert_eq!(merged.phabricator_callsign, Some("CALLSIGN".to_string()));
+    }
+
+    #[mononoke::test]
+    fn test_parse_repo_spec_basic() {
+        use repos::RawCommitIdentityScheme;
+        use repos::RepoSpec;
+
+        let named_storage = hashmap! {
+            "test_storage".to_string() => test_raw_storage_config(),
+        };
+
+        let repo_spec = RepoSpec {
+            repo_id: 42,
+            repo_name: "test/repo".to_string(),
+            hipster_acl: "acl.test.repo".to_string(),
+            enabled: true,
+            readonly: false,
+            default_commit_identity_scheme: RawCommitIdentityScheme::GIT,
+            enable_git_bundle_uri: Some(true),
+            tiers: vec!["scs".to_string()],
+            repo_config: Some(RawRepoConfig {
+                storage_config: Some("test_storage".to_string()),
+                ..Default::default()
+            }),
+            tier_overrides: None,
+            ..Default::default()
+        };
+
+        let result =
+            parse_repo_spec(repo_spec, "scs", &named_storage).expect("parse should succeed");
+
+        assert_eq!(result.repoid, RepositoryId::new(42));
+        assert!(result.enabled);
+        assert_eq!(result.hipster_acl, Some("acl.test.repo".to_string()));
+        assert_eq!(result.readonly, RepoReadOnly::ReadWrite);
+        assert_eq!(
+            result.default_commit_identity_scheme,
+            CommitIdentityScheme::GIT
+        );
+    }
+
+    #[mononoke::test]
+    fn test_parse_repo_spec_with_tier_overrides() {
+        use repos::RawCommitIdentityScheme;
+        use repos::RepoSpec;
+
+        let named_storage = hashmap! {
+            "test_storage".to_string() => test_raw_storage_config(),
+        };
+
+        let repo_spec = RepoSpec {
+            repo_id: 100,
+            repo_name: "test/overridden".to_string(),
+            hipster_acl: "acl.test.overridden".to_string(),
+            enabled: true,
+            readonly: false,
+            default_commit_identity_scheme: RawCommitIdentityScheme::GIT,
+            enable_git_bundle_uri: None,
+            tiers: vec!["scs".to_string(), "gitimport".to_string()],
+            repo_config: Some(RawRepoConfig {
+                storage_config: Some("test_storage".to_string()),
+                phabricator_callsign: Some("BASE".to_string()),
+                ..Default::default()
+            }),
+            tier_overrides: Some(hashmap! {
+                "scs".to_string() => RawRepoConfig {
+                    phabricator_callsign: Some("SCS_OVERRIDE".to_string()),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+
+        // Parse for the "scs" tier — should get the overridden callsign
+        let scs_result = parse_repo_spec(repo_spec.clone(), "scs", &named_storage)
+            .expect("parse for scs should succeed");
+
+        // Parse for the "gitimport" tier — no override, should get base callsign
+        let gitimport_result = parse_repo_spec(repo_spec.clone(), "gitimport", &named_storage)
+            .expect("parse for gitimport should succeed");
+
+        // SCS tier should use the overridden callsign
+        assert_eq!(
+            scs_result.phabricator_callsign,
+            Some("SCS_OVERRIDE".to_string()),
+            "SCS tier should get the overridden callsign"
+        );
+
+        // Gitimport should preserve base callsign
+        assert_eq!(
+            gitimport_result.phabricator_callsign,
+            Some("BASE".to_string()),
+            "Gitimport tier should preserve base callsign"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_parse_repo_spec_readonly() {
+        use repos::RawCommitIdentityScheme;
+        use repos::RepoSpec;
+
+        let named_storage = hashmap! {
+            "test_storage".to_string() => test_raw_storage_config(),
+        };
+
+        let repo_spec = RepoSpec {
+            repo_id: 200,
+            repo_name: "test/readonly".to_string(),
+            hipster_acl: "acl.test.readonly".to_string(),
+            enabled: false,
+            readonly: true,
+            default_commit_identity_scheme: RawCommitIdentityScheme::GIT,
+            tiers: vec!["scs".to_string()],
+            repo_config: Some(RawRepoConfig {
+                storage_config: Some("test_storage".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result =
+            parse_repo_spec(repo_spec, "scs", &named_storage).expect("parse should succeed");
+
+        assert!(!result.enabled, "enabled should come from RepoSpec");
+        assert_eq!(
+            result.readonly,
+            RepoReadOnly::ReadOnly("Set by config option".to_string()),
+            "readonly=true should produce ReadOnly"
+        );
+    }
+
+    #[mononoke::test]
+    fn test_parse_repo_spec_no_repo_config() {
+        use repos::RawCommitIdentityScheme;
+        use repos::RepoSpec;
+
+        let named_storage = hashmap! {
+            "test_storage".to_string() => test_raw_storage_config(),
+        };
+
+        // RepoSpec with no repo_config (uses default RawRepoConfig)
+        let repo_spec = RepoSpec {
+            repo_id: 300,
+            repo_name: "test/default".to_string(),
+            hipster_acl: "acl.test.default".to_string(),
+            enabled: true,
+            readonly: false,
+            default_commit_identity_scheme: RawCommitIdentityScheme::GIT,
+            tiers: vec!["scs".to_string()],
+            repo_config: None,
+            ..Default::default()
+        };
+
+        // This should fail because default RawRepoConfig has no storage_config
+        let result = parse_repo_spec(repo_spec, "scs", &named_storage);
+        assert!(
+            result.is_err(),
+            "RepoSpec with no repo_config should fail (missing storage_config)"
+        );
     }
 }

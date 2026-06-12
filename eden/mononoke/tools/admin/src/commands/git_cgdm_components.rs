@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeMap;
+
 use anyhow::Context;
 use anyhow::Result;
 use blobstore::KeyedBlobstore;
@@ -50,8 +52,12 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
         None => Default::default(),
     };
 
-    for component in cgdm_components.components {
-        println!("{:?}", component);
+    let components = cgdm_components
+        .components
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    for component in components {
+        println!("{component:?}");
     }
 
     Ok(())

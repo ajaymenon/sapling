@@ -125,8 +125,7 @@ impl RendezVousConnection {
             fetch_synced_commit_mappings: Default::default(),
             opts,
             stats: Arc::new(RendezVousStats::new(format!(
-                "synced_commit_mapping.fetch_synced_commit_mappings.{}",
-                name,
+                "synced_commit_mapping.fetch_synced_commit_mappings.{name}",
             ))),
             conn,
         }
@@ -609,7 +608,7 @@ impl SyncedCommitMapping for SqlSyncedCommitMapping {
                 .client_request_info()
                 .map(|cri| cri.correlator.as_str()),
             Some("synced_commit_mapping.get_equivalent_working_copy"),
-        );
+        )?;
         let used_consistent_reads = cons_read_opts.is_some();
 
         let timed_res = async {
@@ -713,10 +712,7 @@ impl SyncedCommitMapping for SqlSyncedCommitMapping {
 
                 let mapping = maybe_mapping.ok_or_else(|| {
                     anyhow!(
-                        "unexpected empty mapping for {}, {}->{}",
-                        source_bcs_id,
-                        source_repo_id,
-                        target_repo_id
+                        "unexpected empty mapping for {source_bcs_id}, {source_repo_id}->{target_repo_id}"
                     )
                 })?;
                 if target_repo_id == large_repo_id {

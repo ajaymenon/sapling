@@ -30,7 +30,6 @@ use futures::future::ok;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
-use futures::stream::once;
 use mercurial_bundles::Bundle2Item;
 use mercurial_bundles::bundle2;
 use mercurial_bundles::bundle2::Bundle2Stream;
@@ -42,7 +41,6 @@ use tokio::io::AsyncBufRead;
 use tokio::io::AsyncBufReadExt;
 use tokio_util::io::StreamReader;
 
-use crate::GettreepackArgs;
 use crate::SingleRequest;
 use crate::SingleResponse;
 use crate::dechunker::Dechunker;
@@ -172,20 +170,6 @@ impl<H: HgCommands + Send + Sync + 'static> HgCommandHandler<H> {
                 replaydata,
                 respondlightly,
             } => self.handle_unbundle(instream, heads, Some(respondlightly), Some(replaydata)),
-            SingleRequest::Gettreepack(args) => (
-                hgcmds
-                    .gettreepack(args)
-                    .map_ok(SingleResponse::Gettreepack)
-                    .boxed(),
-                ok(instream).boxed(),
-            ),
-            SingleRequest::StreamOutShallow { tag } => (
-                hgcmds
-                    .stream_out_shallow(tag)
-                    .map_ok(SingleResponse::StreamOutShallow)
-                    .boxed(),
-                ok(instream).boxed(),
-            ),
         }
     }
 
@@ -394,24 +378,6 @@ pub trait HgCommands {
     ) -> HgCommandRes<Bytes> {
         unimplemented("unbundle")
     }
-
-    // @wireprotocommand('gettreepack', 'rootdir mfnodes basemfnodes directories')
-    fn gettreepack(&self, _params: GettreepackArgs) -> BoxStream<'static, Result<Bytes, Error>> {
-        once(async { Err(ErrorKind::Unimplemented("gettreepack".into()).into()) }).boxed()
-    }
-
-    // @wireprotocommand('stream_out_shallow', '*')
-    fn stream_out_shallow(&self, _tag: Option<String>) -> BoxStream<'static, Result<Bytes, Error>> {
-        once(async { Err(ErrorKind::Unimplemented("stream_out_shallow".into()).into()) }).boxed()
-    }
-
-    // @wireprotocommand('getcommitdata', 'nodes *')
-    fn getcommitdata(
-        &self,
-        _nodes: Vec<HgChangesetId>,
-    ) -> BoxStream<'static, Result<Bytes, Error>> {
-        once(async { Err(ErrorKind::Unimplemented("getcommitdata".into()).into()) }).boxed()
-    }
 }
 
 #[cfg(test)]
@@ -442,14 +408,14 @@ mod test {
 
         let (r, _) = handler.handle(SingleRequest::Hello, StreamReader::new(stream::empty()));
         let r = assert_one(r.collect::<Vec<_>>().await);
-        println!("hello r = {:?}", r);
+        println!("hello r = {r:?}");
 
         let mut res: HashMap<String, Vec<String>> = HashMap::new();
         res.insert("capabilities".into(), vec!["something".into()]);
 
         match r {
             Ok(SingleResponse::Hello(ref r)) if r == &res => {}
-            bad => panic!("Bad result {:?}", bad),
+            bad => panic!("Bad result {bad:?}"),
         }
 
         Ok(())
@@ -461,11 +427,11 @@ mod test {
 
         let (r, _) = handler.handle(SingleRequest::Heads, StreamReader::new(stream::empty()));
         let r = assert_one(r.collect::<Vec<_>>().await);
-        println!("heads r = {:?}", r);
+        println!("heads r = {r:?}");
 
         match r {
-            Err(ref err) => println!("got expected error {:?}", err),
-            bad => panic!("Bad result {:?}", bad),
+            Err(ref err) => println!("got expected error {err:?}"),
+            bad => panic!("Bad result {bad:?}"),
         }
 
         Ok(())

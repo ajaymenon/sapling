@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+#![recursion_limit = "256"]
+
 use anyhow::Result;
 use async_trait::async_trait;
 use context::CoreContext;
@@ -20,10 +22,52 @@ pub use crate::types::ClaimedBy;
 pub use crate::types::LongRunningRequestEntry;
 pub use crate::types::QueueStats;
 pub use crate::types::QueueStatsEntry;
+pub use crate::types::RecentBackfillEntry;
 pub use crate::types::RequestId;
 pub use crate::types::RequestStatus;
 pub use crate::types::RequestType;
 pub use crate::types::RowId;
+
+/// Controls which repos a queue operation applies to.
+#[derive(Clone, Debug)]
+pub enum QueueRepoFilter {
+    /// Only operate on requests for these specific repos.
+    Only(Vec<RepositoryId>),
+    /// Operate on requests for any repo except these.
+    Except(Vec<RepositoryId>),
+}
+
+/// Controls which request types a queue operation applies to.
+#[derive(Clone, Debug)]
+pub enum QueueRequestTypeFilter {
+    /// Accept all request types (no filtering).
+    All,
+    /// Only accept requests of these types.
+    Only(Vec<RequestType>),
+    /// Accept all request types except these.
+    Except(Vec<RequestType>),
+}
+
+impl QueueRequestTypeFilter {
+    /// Resolve this filter into an explicit include-list of `RequestType`
+    /// values for use in SQL `IN (...)` clauses.
+    pub fn resolve_to_include_list(&self) -> Vec<RequestType> {
+        match self {
+            QueueRequestTypeFilter::All => async_requests_types::ALL_REQUEST_TYPE_NAMES
+                .iter()
+                .map(|s| RequestType(s.to_string()))
+                .collect(),
+            QueueRequestTypeFilter::Only(types) => types.clone(),
+            QueueRequestTypeFilter::Except(excluded) => {
+                async_requests_types::ALL_REQUEST_TYPE_NAMES
+                    .iter()
+                    .filter(|s| !excluded.iter().any(|ex| ex.0 == **s))
+                    .map(|s| RequestType(s.to_string()))
+                    .collect()
+            }
+        }
+    }
+}
 
 /// A queue of long-running requests
 /// This is designed to support the use case of
@@ -44,17 +88,31 @@ pub trait LongRunningRequestsQueue: Send + Sync {
         request_type: &RequestType,
         repo_id: Option<&RepositoryId>,
         args_blobstore_key: &BlobstoreKey,
+        created_by: Option<&str>,
     ) -> Result<RowId>;
 
     /// Claim one of new requests. Mark it as in-progress and return it.
+    /// `repo_filter` controls which repos are eligible for dequeuing.
+    /// `request_type_filter` controls which request types are eligible.
     async fn claim_and_get_new_request(
         &self,
         ctx: &CoreContext,
         claimed_by: &ClaimedBy,
-        supported_repos: Option<&[RepositoryId]>,
+        repo_filter: &QueueRepoFilter,
+        request_type_filter: &QueueRequestTypeFilter,
     ) -> Result<Option<LongRunningRequestEntry>>;
 
-    /// Get the full request object entry by id
+    /// Get the full request object entry by id.
+    ///
+    /// This does not take `request_type`, so callers should only use it for
+    /// diagnostics or cases where the type is expected to be read from the row.
+    async fn get_request_entry_by_id(
+        &self,
+        ctx: &CoreContext,
+        id: &RowId,
+    ) -> Result<Option<LongRunningRequestEntry>>;
+
+    /// Get the full request object entry by id.
     /// Since this does not take `request_type`, it is
     /// mainly intended to be used in tests (`request_type`
     /// is a type-safety feature)
@@ -82,10 +140,12 @@ pub trait LongRunningRequestsQueue: Send + Sync {
 
     /// Find requests that have "inprogress" status but which timestamp
     /// hasn't been updated after `abandoned_timestamp`.
+    /// `request_type_filter` controls which request types are eligible.
     async fn find_abandoned_requests(
         &self,
         ctx: &CoreContext,
-        repo_ids: Option<&[RepositoryId]>,
+        repo_filter: &QueueRepoFilter,
+        request_type_filter: &QueueRequestTypeFilter,
         abandoned_timestamp: Timestamp,
     ) -> Result<Vec<RequestId>>;
 
@@ -130,19 +190,23 @@ pub trait LongRunningRequestsQueue: Send + Sync {
         req_id: &RequestId,
     ) -> Result<Option<(bool, LongRunningRequestEntry)>>;
 
-    /// List all requests, optionally filtered by repo_id and/or date.
+    /// List all requests, filtered by repo and/or date.
     async fn list_requests(
         &self,
         ctx: &CoreContext,
-        repo_ids: Option<&[RepositoryId]>,
+        repo_filter: &QueueRepoFilter,
         last_update_newer_than: Option<&Timestamp>,
     ) -> Result<Vec<LongRunningRequestEntry>>;
 
-    /// Retrieve stats on the queue, optionally filtered by repo_id.
+    /// Retrieve stats on the queue, filtered by repo.
+    /// If `exclude_backfill` is true, derived data backfill request types
+    /// (derive_boundaries, derive_slice, derive_backfill, derive_backfill_repo)
+    /// are excluded from the stats.
     async fn get_queue_stats(
         &self,
         ctx: &CoreContext,
-        repo_ids: Option<&[RepositoryId]>,
+        repo_filter: &QueueRepoFilter,
+        exclude_backfill: bool,
     ) -> Result<QueueStats>;
 
     /// Query how many times the request has been retried.
@@ -155,4 +219,119 @@ pub trait LongRunningRequestsQueue: Send + Sync {
         req_id: &RequestId,
         max_retry_allowed: u8,
     ) -> Result<bool>;
+
+    /// Add a request with optional dependencies.
+    /// A request will remain in 'new' status until ALL of its dependencies reach 'ready' or 'polled' status.
+    async fn add_request_with_dependencies(
+        &self,
+        ctx: &CoreContext,
+        request_type: &RequestType,
+        repo_id: Option<&RepositoryId>,
+        args_blobstore_key: &BlobstoreKey,
+        depends_on: &[RowId],
+        created_by: Option<&str>,
+    ) -> Result<RowId>;
+
+    /// Get all dependency request IDs for a given request.
+    /// Returns the IDs of requests that must complete before this request becomes eligible for execution.
+    async fn get_dependencies(&self, ctx: &CoreContext, request_id: &RowId) -> Result<Vec<RowId>>;
+
+    /// Mark a request as failed and cascade the failure to all dependent requests.
+    /// First marks all dependent requests as failed, then marks the specified request as failed.
+    async fn mark_failed_with_cascade(&self, ctx: &CoreContext, req_id: &RowId) -> Result<bool>;
+
+    /// Count in-progress requests for the given request types
+    async fn count_inprogress_by_types(
+        &self,
+        ctx: &CoreContext,
+        request_types: &[&str],
+    ) -> Result<i64>;
+
+    /// Schedule an execution of a request with a root_request_id linking it
+    /// to the top-level request that spawned it. For repo-scoped requests, if
+    /// the same child request was already enqueued, return the existing row id.
+    async fn add_request_with_root(
+        &self,
+        ctx: &CoreContext,
+        request_type: &RequestType,
+        repo_id: Option<&RepositoryId>,
+        args_blobstore_key: &BlobstoreKey,
+        root_request_id: &RowId,
+        created_by: Option<&str>,
+    ) -> Result<RowId>;
+
+    /// Add a request with dependencies and a root_request_id. For repo-scoped
+    /// requests, if the same child request was already enqueued, return the
+    /// existing row id and add dependencies idempotently.
+    async fn add_request_with_dependencies_and_root(
+        &self,
+        ctx: &CoreContext,
+        request_type: &RequestType,
+        repo_id: Option<&RepositoryId>,
+        args_blobstore_key: &BlobstoreKey,
+        depends_on: &[RowId],
+        root_request_id: &RowId,
+        created_by: Option<&str>,
+    ) -> Result<RowId>;
+
+    /// Get all requests that share a given root_request_id.
+    async fn get_requests_by_root_id(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+    ) -> Result<Vec<LongRunningRequestEntry>>;
+
+    /// Mark all 'new' requests with the given root_request_id as 'failed'.
+    /// Returns the number of requests affected.
+    async fn fail_new_requests_by_root_id(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+    ) -> Result<u64>;
+
+    /// Get aggregated statistics by request type and status for a backfill,
+    /// optionally filtered to a specific repo.
+    async fn get_backfill_stats(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+        repo_id: Option<&RepositoryId>,
+    ) -> Result<Vec<(RequestType, RequestStatus, i64)>>;
+
+    /// Get aggregated statistics by repo and status for a backfill.
+    async fn get_backfill_stats_by_repo(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+    ) -> Result<Vec<(Option<RepositoryId>, RequestStatus, i64)>>;
+
+    /// Get timing statistics for a backfill (completed count, avg duration, date range).
+    async fn get_backfill_timing_stats(
+        &self,
+        ctx: &CoreContext,
+        root_request_id: &RowId,
+    ) -> Result<(i64, Option<f64>, Option<Timestamp>, Option<Timestamp>)>;
+
+    /// List recent backfill jobs with repo counts and aggregated child status counts.
+    async fn list_recent_backfills_with_repo_count(
+        &self,
+        ctx: &CoreContext,
+        min_created_at: &Timestamp,
+    ) -> Result<Vec<RecentBackfillEntry>>;
+
+    /// Get the root backfill entry by ID.
+    async fn get_backfill_root_entry(
+        &self,
+        ctx: &CoreContext,
+        id: &RowId,
+    ) -> Result<
+        Option<(
+            RowId,
+            RequestType,
+            RequestStatus,
+            Timestamp,
+            BlobstoreKey,
+            Option<String>,
+        )>,
+    >;
 }

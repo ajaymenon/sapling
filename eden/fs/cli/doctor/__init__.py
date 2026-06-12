@@ -33,8 +33,8 @@ from eden.fs.cli.doctor.util import (
     get_dependent_repos,
     hg_doctor_in_backing_repo,
 )
-from facebook.eden.ttypes import MountState
-from fb303_core.ttypes import fb303_status
+from eden.fs.service.eden.thrift_types import MountState
+from fb303_core.thrift_types import fb303_status
 from filelock import FileLock, Timeout
 
 from . import (
@@ -329,6 +329,7 @@ class EdenDoctorChecker:
             return
 
         try:
+            # pyrefly: ignore [bad-argument-type]
             process_handle = proc_utils_win.open_process(health_status.pid)
             token_handle = proc_utils_win.open_process_token(process_handle)
             elevated = proc_utils_win.is_token_elevated(token_handle)
@@ -336,6 +337,7 @@ class EdenDoctorChecker:
             self.tracker.add_problem(UnknownElevationProblem(health_status.pid, ex))
             return
 
+        # pyrefly: ignore [unbound-name]
         if elevated:
             self.tracker.add_problem(RunningElevatedProblem(health_status.pid))
 
@@ -368,6 +370,7 @@ class EdenDoctorChecker:
                 self.tracker,
                 list(checkouts.values()),
                 checked_backing_repos,
+                # pyrefly: ignore [bad-argument-type]
                 vscode_extensions_checker=self.vscode_extensions_checker,
                 eden_instance=self.instance,
             )
@@ -487,7 +490,7 @@ class EdenDoctor(EdenDoctorChecker):
                 problem_manual_fixes=fixer.problem_manual_fixes,
                 problem_no_fixes=fixer.problem_no_fixes,
                 problem_advisory_fixes=fixer.problem_advisory_fixes,
-                exception=fixer.problem_failed_fixes_exceptions,
+                exception="\n".join(fixer.problem_failed_fixes_exceptions),
             )
         elif sys.platform == "win32":
             # dry run doesn't run fixes so we count the number of fixable problems rather
@@ -819,9 +822,6 @@ class EdenCheckoutConfigCorruption(FixableProblem):
             nfs=self.is_nfs_default(),
             case_sensitive=sys.platform == "linux",
             overlay_type=None,
-            enable_windows_symlinks=self._checkout_info.instance.get_config_bool(
-                "experimental.windows-symlinks", False
-            ),
             off_mount_repo_dir=self._checkout_info.instance.get_config_bool(
                 "clone.off-mount-repo-dir", False
             ),
@@ -1109,12 +1109,12 @@ def check_running_mount(
             # Exit here but don't reraise since we're already reporting a problem.
             return
         except Exception as ex:
-            raise RuntimeError("Failed to check Mercurial status") from ex
+            raise RuntimeError("Failed to check Sapling status") from ex
 
         try:
             check_filesystems.check_hg_status_match_hg_diff(tracker, instance, checkout)
         except Exception as ex:
-            raise RuntimeError("Failed to compare `hg status` with `hg diff`") from ex
+            raise RuntimeError("Failed to compare `sl status` with `sl diff`") from ex
 
 
 class CheckoutNotConfigured(Problem):
@@ -1198,7 +1198,7 @@ This can happen if your machine was hard-rebooted.
             # retry the mount for this case.
 
         self._out.write(
-            "\nMount failed. Running `hg doctor` in the backing repo and then "
+            "\nMount failed. Running `sl doctor` in the backing repo and then "
             "will retry the mount.\n",
             flush=True,
         )
@@ -1410,7 +1410,7 @@ class SlowHgImportProblem(Problem):
             description=f"Slow file download taking up to {format_approx_duration(max_fetch_duration)} observed",
             remediation="""\
 Try:
-- Running `hg debugnetwork`.
+- Running `sl debugnetwork`.
 - Checking your network connection's performance.
 - Running `eden top` to check whether downloads are making progress.""",
             severity=ProblemSeverity.ADVICE,
@@ -1423,7 +1423,7 @@ def check_slow_hg_import(tracker: ProblemTracker, instance: EdenInstance) -> Non
     )
     threshold = timedelta(seconds=threshold_s)
 
-    with instance.get_thrift_client_legacy() as client:
+    with instance.get_thrift_client() as client:
         max_duration_us = client.getCounter("store.sapling.live_import.max_duration_us")
 
     max_duration = timedelta(microseconds=max_duration_us)

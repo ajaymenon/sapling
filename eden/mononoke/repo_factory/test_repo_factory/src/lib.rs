@@ -38,10 +38,15 @@ use cacheblob::InProcessLease;
 use commit_cloud::ArcCommitCloud;
 use commit_cloud::CommitCloud;
 use commit_cloud::sql::builder::SqlCommitCloudBuilder;
+use commit_derived_data_mapping::CommitDerivedDataMapping;
+use commit_derived_data_mapping::SqlCommitDerivedDataMapping;
 use commit_graph::ArcCommitGraph;
 use commit_graph::ArcCommitGraphWriter;
 use commit_graph::BaseCommitGraphWriter;
 use commit_graph::CommitGraph;
+use commit_rate_limit_config::ArcCommitRateLimit;
+use commit_rate_limit_config::CommitRateLimit;
+use commit_rate_limit_config::build_commit_rate_limit;
 use context::CoreContext;
 use dbbookmarks::ArcSqlBookmarks;
 use dbbookmarks::SqlBookmarksBuilder;
@@ -108,6 +113,8 @@ use repo_bookmark_attrs::ArcRepoBookmarkAttrs;
 use repo_bookmark_attrs::RepoBookmarkAttrs;
 use repo_cross_repo::ArcRepoCrossRepo;
 use repo_cross_repo::RepoCrossRepo;
+use repo_derivation_queues::ArcRepoDerivationQueues;
+use repo_derivation_queues::RepoDerivationQueues;
 use repo_derived_data::ArcRepoDerivedData;
 use repo_derived_data::RepoDerivedData;
 use repo_event_publisher::ArcRepoEventPublisher;
@@ -130,8 +137,10 @@ use repo_sparse_profiles::SqlSparseProfilesSizes;
 use repo_stats_logger::ArcRepoStatsLogger;
 use repo_stats_logger::RepoStatsLogger;
 use restricted_paths::ArcRestrictedPaths;
+use restricted_paths::ArcRestrictedPathsConfigBased;
 use restricted_paths::ArcRestrictedPathsManifestIdStore;
 use restricted_paths::RestrictedPaths;
+use restricted_paths::RestrictedPathsConfigBased;
 use restricted_paths::RestrictedPathsManifestIdCacheBuilder;
 use restricted_paths::SqlRestrictedPathsManifestIdStoreBuilder;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -182,6 +191,7 @@ pub struct TestRepoFactory {
     permission_checker: Option<ArcRepoPermissionChecker>,
     filenodes_override: Option<Box<dyn Fn(ArcFilenodes) -> ArcFilenodes + Send + Sync>>,
     restricted_paths: Option<ArcRestrictedPaths>,
+    repo_derivation_queues: Option<ArcRepoDerivationQueues>,
 }
 
 /// The default derived data types configuration for test repositories.
@@ -210,6 +220,10 @@ pub fn default_test_repo_derived_data_types_config() -> DerivedDataTypesConfig {
             max_num_changed_files: 6_000,
             partial_match_skip_file_extensions: BTreeSet::from([".obj".to_string()]),
         }),
+        xdb_mapping_shard_ids: hashmap! {
+            DerivableType::HistoryManifests => 0,
+            DerivableType::BlameV3 => 0,
+        },
         ..Default::default()
     }
 }
@@ -303,6 +317,7 @@ impl TestRepoFactory {
         metadata_con.execute_batch(SqlRepoLock::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlSparseProfilesSizes::CREATION_QUERY)?;
         metadata_con.execute_batch(StreamingCloneBuilder::CREATION_QUERY)?;
+        metadata_con.execute_batch(SqlCommitDerivedDataMapping::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlCommitGraphStorageBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlCommitCloudBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlRestrictedPathsManifestIdStoreBuilder::CREATION_QUERY)?;
@@ -331,6 +346,7 @@ impl TestRepoFactory {
             bookmarks_cache: None,
             git_symbolic_refs: None,
             restricted_paths: None,
+            repo_derivation_queues: None,
         })
     }
 
@@ -366,6 +382,15 @@ impl TestRepoFactory {
     /// Set the restricted paths for repos built by this factory.
     pub fn with_restricted_paths(&mut self, restricted_paths: ArcRestrictedPaths) -> &mut Self {
         self.restricted_paths = Some(restricted_paths);
+        self
+    }
+
+    /// Set the derivation queues for repos built by this factory.
+    pub fn with_derivation_queues(
+        &mut self,
+        repo_derivation_queues: ArcRepoDerivationQueues,
+    ) -> &mut Self {
+        self.repo_derivation_queues = Some(repo_derivation_queues);
         self
     }
 
@@ -655,7 +680,7 @@ impl TestRepoFactory {
         filenodes: &ArcFilenodes,
         repo_blobstore: &ArcRepoBlobstore,
         filestore_config: &ArcFilestoreConfig,
-        restricted_paths: &ArcRestrictedPaths,
+        restricted_paths_config_based: &ArcRestrictedPathsConfigBased,
     ) -> Result<ArcRepoDerivedData> {
         Ok(Arc::new(RepoDerivedData::new(
             repo_identity.id(),
@@ -670,7 +695,10 @@ impl TestRepoFactory {
             MononokeScubaSampleBuilder::with_discard(),
             repo_config.derived_data_config.clone(),
             None, // derivation_service_client = None
-            restricted_paths.clone(),
+            restricted_paths_config_based.clone(),
+            Arc::new(CommitDerivedDataMapping {
+                sql: SqlCommitDerivedDataMapping::from_sql_connections(self.metadata_db.clone()),
+            }),
         )?))
     }
 
@@ -721,15 +749,18 @@ impl TestRepoFactory {
         )))
     }
 
-    /// Restricted paths
-    pub async fn restricted_paths(
+    /// Build config-based restricted paths
+    pub async fn restricted_paths_config_based(
         &self,
         repo_config: &ArcRepoConfig,
         restricted_paths_manifest_id_store: &ArcRestrictedPathsManifestIdStore,
-    ) -> Result<ArcRestrictedPaths> {
+    ) -> Result<ArcRestrictedPathsConfigBased> {
+        // If a pre-built RestrictedPaths was provided via with_restricted_paths,
+        // use its config_based to ensure repo_derived_data gets the same config.
         if let Some(restricted_paths) = &self.restricted_paths {
-            return Ok(restricted_paths.clone());
+            return Ok(restricted_paths.config_based().clone());
         }
+
         let restricted_paths_config = repo_config.restricted_paths_config.clone();
 
         // Build the manifest id cache with the specified refresh interval
@@ -743,18 +774,47 @@ impl TestRepoFactory {
         .build()
         .await?;
 
+        Ok(Arc::new(RestrictedPathsConfigBased::new(
+            restricted_paths_config,
+            restricted_paths_manifest_id_store.clone(),
+            Some(Arc::new(cache)),
+        )))
+    }
+
+    /// Restricted paths
+    pub fn restricted_paths(
+        &self,
+        restricted_paths_config_based: &ArcRestrictedPathsConfigBased,
+        repo_derived_data: &ArcRepoDerivedData,
+    ) -> Result<ArcRestrictedPaths> {
+        if let Some(restricted_paths) = &self.restricted_paths {
+            return Ok(restricted_paths.clone());
+        }
+
         let acl_provider = DummyAclProvider::new(self.fb)?;
 
         // Create scuba builder with discard for tests
         let scuba_builder = MononokeScubaSampleBuilder::with_discard();
 
         Ok(Arc::new(RestrictedPaths::new(
-            restricted_paths_config,
-            restricted_paths_manifest_id_store.clone(),
+            restricted_paths_config_based.clone(),
             acl_provider,
-            Some(Arc::new(cache)),
             scuba_builder,
-        )))
+            repo_derived_data.clone(),
+        )?))
+    }
+
+    /// Commit rate limit configuration facet.
+    pub fn commit_rate_limit(
+        &self,
+        repo_identity: &ArcRepoIdentity,
+        repo_config: &ArcRepoConfig,
+    ) -> Result<ArcCommitRateLimit> {
+        let commit_rate_limit = match &repo_config.commit_rate_limit_config {
+            Some(config) => build_commit_rate_limit(config, repo_identity.name())?,
+            None => CommitRateLimit::empty(),
+        };
+        Ok(Arc::new(commit_rate_limit))
     }
 
     /// Restricted paths root ids store
@@ -803,7 +863,7 @@ impl TestRepoFactory {
     /// Test repo-handler-base
     pub fn repo_handler_base(
         &self,
-        repo_config: &ArcRepoConfig,
+        _repo_config: &ArcRepoConfig,
         repo_cross_repo: &ArcRepoCrossRepo,
         repo_identity: &ArcRepoIdentity,
         bookmarks: &ArcBookmarks,
@@ -811,7 +871,6 @@ impl TestRepoFactory {
         mutable_counters: &ArcMutableCounters,
     ) -> Result<ArcRepoHandlerBase> {
         let scuba = self.ctx.scuba().clone();
-        let repo_client_knobs = repo_config.repo_client_knobs.clone();
 
         let common_commit_sync_config = repo_cross_repo
             .live_commit_sync_config()
@@ -834,7 +893,6 @@ impl TestRepoFactory {
             });
         Ok(Arc::new(RepoHandlerBase {
             scuba,
-            repo_client_knobs,
             maybe_push_redirector_base,
         }))
     }
@@ -869,6 +927,7 @@ impl TestRepoFactory {
         repo_cross_repo: &ArcRepoCrossRepo,
         commit_graph: &ArcCommitGraph,
         restricted_paths: &ArcRestrictedPaths,
+        commit_rate_limit: &ArcCommitRateLimit,
     ) -> ArcHookManager {
         let hook_repo = HookRepo {
             repo_identity: repo_identity.clone(),
@@ -881,6 +940,7 @@ impl TestRepoFactory {
             repo_cross_repo: repo_cross_repo.clone(),
             commit_graph: commit_graph.clone(),
             restricted_paths: restricted_paths.clone(),
+            commit_rate_limit: commit_rate_limit.clone(),
         };
 
         Arc::new(HookManager::new_test(
@@ -1031,5 +1091,12 @@ impl TestRepoFactory {
     /// Function to create an object to configure push redirection
     pub async fn push_redirection_config(&self) -> Result<ArcPushRedirectionConfig> {
         Ok(Arc::new(NoopPushRedirectionConfig {}))
+    }
+
+    /// Construct RepoDerivationQueues, using override if set, otherwise empty.
+    pub fn repo_derivation_queues(&self) -> ArcRepoDerivationQueues {
+        self.repo_derivation_queues.clone().unwrap_or_else(|| {
+            Arc::new(RepoDerivationQueues::new(std::collections::HashMap::new()))
+        })
     }
 }

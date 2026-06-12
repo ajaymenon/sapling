@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Set
 
-from thrift.Thrift import TApplicationException
+from thrift.python.exceptions import ApplicationError, ApplicationErrorType
 
 from . import cmd_util, configutil, mtab, subcmd as subcmd_mod, tabulate
 from .buck import stop_buckd_for_repo
@@ -417,7 +417,7 @@ class Redirection:
         self, instance: EdenInstance, checkout_path: Path, target: Path
     ) -> None:
         abs_mount_path_in_repo = checkout_path / self.repo_path
-        with instance.get_thrift_client_legacy() as client:
+        with instance.get_thrift_client() as client:
             if abs_mount_path_in_repo.exists():
                 try:
                     # To deal with the case where someone has manually unmounted
@@ -428,8 +428,8 @@ class Redirection:
                     client.removeBindMount(
                         os.fsencode(checkout_path), os.fsencode(self.repo_path)
                     )
-                except TApplicationException as exc:
-                    if exc.type == TApplicationException.UNKNOWN_METHOD:
+                except ApplicationError as exc:
+                    if exc.type == ApplicationErrorType.UNKNOWN_METHOD:
                         print(PLEASE_RESTART, file=sys.stderr)
                     log.debug("removeBindMount failed; ignoring error", exc_info=True)
 
@@ -444,19 +444,19 @@ class Redirection:
                     os.fsencode(self.repo_path),
                     os.fsencode(target),
                 )
-            except TApplicationException as exc:
-                if exc.type == TApplicationException.UNKNOWN_METHOD:
+            except ApplicationError as exc:
+                if exc.type == ApplicationErrorType.UNKNOWN_METHOD:
                     raise Exception(PLEASE_RESTART)
                 raise
 
     def _bind_unmount_linux(self, checkout: EdenCheckout) -> None:
-        with checkout.instance.get_thrift_client_legacy() as client:
+        with checkout.instance.get_thrift_client() as client:
             try:
                 client.removeBindMount(
                     os.fsencode(checkout.path), os.fsencode(self.repo_path)
                 )
-            except TApplicationException as exc:
-                if exc.type == TApplicationException.UNKNOWN_METHOD:
+            except ApplicationError as exc:
+                if exc.type == ApplicationErrorType.UNKNOWN_METHOD:
                     raise Exception(PLEASE_RESTART)
                 raise
 
@@ -1106,7 +1106,22 @@ class FixupCmd(Subcmd):
             redir.remove_existing(checkout)
             if redir.type == RedirectionType.UNKNOWN:
                 continue
-            redir.apply(checkout)
+            try:
+                redir.apply(checkout)
+            except Exception as e:
+                print(
+                    f"Unable to apply redirection `{redir.repo_path}`: {e}",
+                    file=sys.stderr,
+                )
+                with instance.get_telemetry_logger().new_sample(
+                    "redirect_fixup_failure"
+                ) as tel_logger:
+                    tel_logger.add_string("checkout", str(checkout.path))
+                    tel_logger.add_string("repo_path", str(redir.repo_path))
+                    tel_logger.add_string("redir_type", str(redir.type))
+                    tel_logger.add_string("initial_state", str(redir.state))
+                    tel_logger.add_string("source", redir.source)
+                    tel_logger.add_string("error_reason", str(e))
 
         # recompute and display the current state
         redirs = get_effective_redirections(checkout, mount_table, instance)

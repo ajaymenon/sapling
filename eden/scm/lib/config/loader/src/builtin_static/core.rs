@@ -39,6 +39,9 @@ status.added=green bold
 status.clean=none
 status.copied=none
 status.deleted=cyan bold underline
+grep.line_number=green
+grep.match=red bold
+grep.path=magenta
 status.ignored=black bold
 status.modified=blue bold
 status.removed=red bold
@@ -61,11 +64,12 @@ allow-non-interactive-editor=true
 log-implicit-follow-threshold=10000
 
 titles-namespace=true
-local-committemplate=true
 
 run-python-hooks-via-pyhook=true
 
 lock-free-pull=true
+lock-free-git-fetch=true
+lock-free-git-push=true
 
 [zsh]
 completion-age=7
@@ -152,6 +156,7 @@ dirstate.delaywrite=0
 [devel]
 legacy.revnum=accept
 strip-obsmarkers=True
+hard-file-size-limit=10GB
 
 [discovery]
 full-sample-size=200
@@ -255,6 +260,7 @@ buffer-commit-count=100000
 httpbookmarks=True
 httpmutation=True
 master-fastpath=True
+include-default-bookmarks=False
 
 [exchange]
 httpcommitlookup=True
@@ -321,6 +327,9 @@ statefile=
 [smartlog]
 collapse-obsolete=True
 max-commit-threshold=1000
+
+[commit]
+file-size-limit=1GB
 
 [commitcloud]
 servicetype=remote

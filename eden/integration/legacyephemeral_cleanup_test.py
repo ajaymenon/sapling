@@ -4,7 +4,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
 
 
 import os
@@ -54,7 +54,6 @@ class LegacyEphemeralCleanupTest(testcase.EdenRepoTest):
             enable_sqlite_overlay=False,
             use_write_back_cache=False,
             re_use_case="buck2-default",
-            enable_windows_symlinks=False,
             inode_catalog_type="legacyephemeral",
             off_mount_repo_dir=False,
         )

@@ -7,6 +7,7 @@
 
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 
@@ -44,6 +45,8 @@ pub struct LoggingContainer {
     perf_counters: PerfCountersStack,
     sampling_key: Option<SamplingKey>,
     scribe: Scribe,
+    override_sampling: Arc<AtomicBool>,
+    nocache_thriftcache: Arc<AtomicBool>,
 }
 
 impl LoggingContainer {
@@ -59,6 +62,8 @@ impl LoggingContainer {
             perf_counters: Default::default(),
             sampling_key: None,
             scribe,
+            override_sampling: Arc::new(AtomicBool::new(false)),
+            nocache_thriftcache: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -74,6 +79,8 @@ impl LoggingContainer {
             perf_counters: self.perf_counters.clone(),
             sampling_key: Some(sampling_key),
             scribe: self.scribe.clone(),
+            override_sampling: self.override_sampling.clone(),
+            nocache_thriftcache: self.nocache_thriftcache.clone(),
         }
     }
 
@@ -107,6 +114,24 @@ impl LoggingContainer {
             perf_counters: self.perf_counters.clone(),
             sampling_key: self.sampling_key.clone(),
             scribe: self.scribe.clone(),
+            override_sampling: self.override_sampling.clone(),
+            nocache_thriftcache: self.nocache_thriftcache.clone(),
         }
+    }
+
+    pub fn override_sampling(&self) -> bool {
+        self.override_sampling.load(Ordering::Relaxed)
+    }
+
+    pub fn set_override_sampling(&self) {
+        self.override_sampling.store(true, Ordering::Relaxed);
+    }
+
+    pub fn nocache_thriftcache(&self) -> bool {
+        self.nocache_thriftcache.load(Ordering::Relaxed)
+    }
+
+    pub fn set_nocache_thriftcache(&self) {
+        self.nocache_thriftcache.store(true, Ordering::Relaxed);
     }
 }

@@ -4,11 +4,11 @@
 
   $ eagerepo
   $ setconfig devel.segmented-changelog-rev-compat=true
-  $ hg init a
+  $ sl init a
   $ cd a
   $ echo AA > A
-  $ hg commit -qAm "unicode quote: ’"
-  $ hg log -Tjson --debug
+  $ sl commit -qAm "unicode quote: ’"
+  $ sl log -Tjson --debug
   [
    {
     "rev": 0,

@@ -9,13 +9,13 @@ load("@fbsource//tools/build_defs:fb_xplat_rust_library.bzl", "fb_xplat_rust_lib
 load("@fbsource//tools/build_defs:fbsource_utils.bzl", "is_xplat")
 load("@fbsource//tools/target_determinator/macros:ci.bzl", "ci")
 
-oncall("thrift")
+oncall("rust_thrift")
 
 # In order to avoid potentially bringing both fbcode//thrift/lib/rust:fbthrift
 # and fbsource//xplat/thrift/lib/rust:fbthrift into the same build, the
 # unsuffixed target redirects back to fbsource. `fb_xplat_cxx_library` and
 # `cpp_library` have a more complex dependency remapping built-in, that does
-# not exist in rust yet.
+# not exist in rust (yet).
 #
 # buildifier: disable=no-effect
 alias(
@@ -59,13 +59,16 @@ fb_xplat_rust_library(
         "fbsource//third-party/rust:base64",
         "fbsource//third-party/rust:bufsize",
         "fbsource//third-party/rust:bytes",
+        "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:ghost",
+        "fbsource//third-party/rust:memchr",
         "fbsource//third-party/rust:num-derive",
         "fbsource//third-party/rust:num-traits",
         "fbsource//third-party/rust:ordered-float",
         "fbsource//third-party/rust:panic-message",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:thiserror",
+        "fbsource//third-party/rust:unicase",
     ],
 ) if is_xplat() else None

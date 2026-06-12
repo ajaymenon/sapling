@@ -5,20 +5,29 @@ oncall("sapling")
 rust_library(
     name = "clone",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "dependencies_override": {"dependencies": {
-            "sapling-configmodel": {"features": ["convert-path"]},
-        }},
-        "lib": {"name": "clone"},
-        "package": {
-            "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-            "homepage": "https://sapling-scm.com/",
-            "license": "MIT",
-            "name": "sapling-clone",
-            "repository": "https://github.com/facebook/sapling",
+    autocargo = {
+        "cargo_toml_config": {
+            "dependencies_override": {
+                "dependencies": {
+                    "sapling-configmodel": {"features": ["convert-path"]},
+                    "sapling-repo": {"features": ["wdir"]},
+                },
+            },
+            "features": {"eden": ["sapling-edenfs-client"]},
+            "lib": {"name": "clone"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "MIT",
+                "name": "sapling-clone",
+                "repository": "https://github.com/facebook/sapling",
+            },
         },
-    }},
+    },
     crate_root = "src/lib.rs",
+    features = [
+        "eden",
+    ],
     test_deps = [
         "fbsource//third-party/rust:tempfile",
     ],
@@ -28,6 +37,7 @@ rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:shlex",
         "fbsource//third-party/rust:thiserror",
+        "fbsource//third-party/rust:toml",
         "fbsource//third-party/rust:tracing",
         "//eden/scm/lib/async-runtime:async-runtime",
         "//eden/scm/lib/checkout:checkout",
@@ -35,6 +45,7 @@ rust_library(
         "//eden/scm/lib/context:context",
         "//eden/scm/lib/edenapi:edenapi",
         "//eden/scm/lib/edenapi/types:edenapi_types",
+        "//eden/scm/lib/edenfs-client:edenfs-client",
         "//eden/scm/lib/progress/model:progress-model",
         "//eden/scm/lib/repo:repo",
         "//eden/scm/lib/types:types",

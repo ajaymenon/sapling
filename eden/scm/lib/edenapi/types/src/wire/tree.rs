@@ -20,6 +20,10 @@ use crate::tree::TreeChildEntry;
 use crate::tree::TreeChildFileEntry;
 use crate::tree::TreeEntry;
 use crate::tree::TreeRequest;
+pub use crate::tree::WireCheckManifestPermissionRequest;
+pub use crate::tree::WireCheckManifestPermissionResponse;
+pub use crate::tree::WireCheckPathPermissionRequest;
+pub use crate::tree::WireCheckPathPermissionResponse;
 pub use crate::tree::WireUploadTreeEntry;
 pub use crate::tree::WireUploadTreeRequest;
 pub use crate::tree::WireUploadTreeResponse;
@@ -52,6 +56,9 @@ pub struct WireTreeEntry {
 
     #[serde(rename = "5", default, skip_serializing_if = "is_default")]
     pub tree_aux_data: Option<WireTreeAuxData>,
+
+    #[serde(rename = "6", default, skip_serializing_if = "is_default")]
+    pub has_acl: Option<bool>,
 }
 
 impl ToWire for Result<TreeEntry, SaplingRemoteApiServerError> {
@@ -66,6 +73,7 @@ impl ToWire for Result<TreeEntry, SaplingRemoteApiServerError> {
                 children: t.children.to_wire(),
                 error: None,
                 tree_aux_data: t.tree_aux_data.to_wire(),
+                has_acl: t.has_acl,
             },
             Err(e) => WireTreeEntry {
                 key: e.key.to_wire(),
@@ -81,9 +89,9 @@ impl ToApi for WireTreeEntry {
     type Error = WireToApiConversionError;
 
     fn to_api(self) -> Result<Self::Api, Self::Error> {
-        Ok(if let (key, Some(err)) = (self.key.clone(), self.error) {
+        Ok(if let Some(err) = self.error {
             Err(SaplingRemoteApiServerError {
-                key: key.to_api()?,
+                key: self.key.to_api()?,
                 err: err.to_api()?,
             })
         } else {
@@ -96,6 +104,7 @@ impl ToApi for WireTreeEntry {
                 parents: self.parents.to_api()?,
                 children: self.children.to_api()?,
                 tree_aux_data: self.tree_aux_data.to_api()?,
+                has_acl: self.has_acl,
             })
         })
     }
@@ -114,6 +123,9 @@ pub struct WireTreeChildEntry {
 
     #[serde(rename = "5", default, skip_serializing_if = "is_default")]
     tree_aux_data: Option<WireTreeAuxData>,
+
+    #[serde(rename = "6", default, skip_serializing_if = "is_default")]
+    has_acl: Option<bool>,
 }
 
 impl ToWire for Result<TreeChildEntry, SaplingRemoteApiServerError> {
@@ -126,12 +138,14 @@ impl ToWire for Result<TreeChildEntry, SaplingRemoteApiServerError> {
                 file_metadata: t.file_metadata.to_wire(),
                 tree_aux_data: None,
                 error: None,
+                has_acl: None,
             },
             Ok(TreeChildEntry::Directory(t)) => WireTreeChildEntry {
                 key: Some(t.key.to_wire()),
                 file_metadata: None,
                 tree_aux_data: t.tree_aux_data.to_wire(),
                 error: None,
+                has_acl: t.has_acl,
             },
             Err(e) => WireTreeChildEntry {
                 key: e.key.to_wire(),
@@ -147,30 +161,28 @@ impl ToApi for WireTreeChildEntry {
     type Error = WireToApiConversionError;
 
     fn to_api(self) -> Result<Self::Api, Self::Error> {
-        Ok(if let (key, Some(err)) = (self.key.clone(), self.error) {
+        Ok(if let Some(err) = self.error {
             Err(SaplingRemoteApiServerError {
-                key: key.to_api()?,
+                key: self.key.to_api()?,
                 err: err.to_api()?,
             })
+        } else if let Some(file_metadata) = self.file_metadata {
+            Ok(TreeChildEntry::File(TreeChildFileEntry {
+                key: self
+                    .key
+                    .to_api()?
+                    .ok_or(WireToApiConversionError::CannotPopulateRequiredField("key"))?,
+                file_metadata: Some(file_metadata.to_api()?),
+            }))
         } else {
-            Ok(
-                if let (key, Some(file_metadata)) = (self.key.clone(), self.file_metadata) {
-                    TreeChildEntry::File(TreeChildFileEntry {
-                        key: key
-                            .to_api()?
-                            .ok_or(WireToApiConversionError::CannotPopulateRequiredField("key"))?,
-                        file_metadata: Some(file_metadata.to_api()?),
-                    })
-                } else {
-                    TreeChildEntry::Directory(TreeChildDirectoryEntry {
-                        key: self
-                            .key
-                            .to_api()?
-                            .ok_or(WireToApiConversionError::CannotPopulateRequiredField("key"))?,
-                        tree_aux_data: self.tree_aux_data.to_api()?,
-                    })
-                },
-            )
+            Ok(TreeChildEntry::Directory(TreeChildDirectoryEntry {
+                key: self
+                    .key
+                    .to_api()?
+                    .ok_or(WireToApiConversionError::CannotPopulateRequiredField("key"))?,
+                tree_aux_data: self.tree_aux_data.to_api()?,
+                has_acl: self.has_acl,
+            }))
         })
     }
 }
@@ -295,6 +307,7 @@ impl Arbitrary for WireTreeEntry {
             // TODO
             error: None,
             tree_aux_data: Arbitrary::arbitrary(g),
+            has_acl: Arbitrary::arbitrary(g),
         }
     }
 }
@@ -302,12 +315,31 @@ impl Arbitrary for WireTreeEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::auto_wire_tests;
+    use crate::wire::tests::wire_json_hashes;
 
-    auto_wire_tests!(
-        WireTreeAttributesRequest,
-        WireTreeRequest,
-        WireTreeEntry,
-        WireUploadTreeResponse
-    );
+    #[test]
+    fn test_wire_json() {
+        assert_eq!(
+            wire_json_hashes![
+                WireTreeAttributesRequest,
+                WireTreeRequest,
+                WireTreeEntry,
+                WireUploadTreeResponse,
+                WireCheckManifestPermissionRequest,
+                WireCheckManifestPermissionResponse,
+                WireCheckPathPermissionRequest,
+                WireCheckPathPermissionResponse,
+            ],
+            [
+                15797094993456846764,
+                10924715367491403764,
+                5362523196475532670,
+                1654603920758946995,
+                3944835397023904073,
+                10584729664819021666,
+                14938764984221310566,
+                17373835638225901243
+            ]
+        );
+    }
 }

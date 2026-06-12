@@ -25,14 +25,13 @@ use crate::get_edenfs_instance;
 
 pub fn remove_client_config_dir(context: &RemoveContext) -> Result<()> {
     let instance = get_edenfs_instance();
+    let client_dir = instance.client_dir_for_mount_point(&context.canonical_path)?;
 
-    match fs::remove_dir_all(instance.client_dir_for_mount_point(&context.canonical_path)?) {
+    match forcefully_remove_dir_all(&client_dir) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(anyhow!(
-            "Failed to remove client config directory for {}: {}",
-            context,
-            e
+            "Failed to remove client config directory for {context}: {e}"
         )),
     }
 }
@@ -42,7 +41,7 @@ pub fn remove_client_config_entry(context: &RemoveContext) -> Result<()> {
 
     instance
         .remove_path_from_directory_map(&context.canonical_path)
-        .with_context(|| format!("Failed to remove {} from config json file", context))
+        .with_context(|| format!("Failed to remove {context} from config json file"))
 }
 
 #[cfg(unix)]

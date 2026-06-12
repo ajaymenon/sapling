@@ -5,10 +5,14 @@ oncall("sapling")
 rust_python_library(
     name = "pyworkingcopy",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {"features": {
-        "default": [],
-        "eden": ["pyworkingcopyclient/eden"],
-    }}},
+    autocargo = {
+        "cargo_toml_config": {
+            "features": {
+                "default": [],
+                "eden": ["pyworkingcopyclient/eden"],
+            },
+        },
+    },
     crate_root = "src/lib.rs",
     features = ["eden"],
     deps = [
@@ -20,6 +24,7 @@ rust_python_library(
         "//eden/scm/lib/pathmatcher:pathmatcher",
         "//eden/scm/lib/sparse:sparse",
         "//eden/scm/lib/types:types",
+        "//eden/scm/lib/vfs:vfs",
         "//eden/scm/lib/workingcopy:workingcopy",
         "//eden/scm/lib/workingcopy/repostate:repostate",
         "//eden/scm/saplingnative/bindings/modules/pypathmatcher:pypathmatcher",

@@ -275,9 +275,7 @@ impl EntityStore<CachedPrefetchedChangesetEdges> for CacheRequest<'_> {
                 "scm/mononoke:disable_commit_graph_memcache_for_prefetch",
                 None,
                 None,
-            )
-            .unwrap_or_default()
-            {
+            ) {
                 // If asked to prefetch, fetching from memcache is actually
                 // slower, so don't perform memcache look-ups.
                 &MemcacheHandler::Noop
@@ -375,7 +373,7 @@ impl KeyedEntityStore<ChangesetId, CachedPrefetchedChangesetEdges> for CacheRequ
         &self,
         values: impl IntoIterator<Item = (&'a ChangesetId, &'a mut CachedPrefetchedChangesetEdges)>,
     ) -> Result<()> {
-        let should_apply_fallback = self.caching_storage.should_apply_fallback()?;
+        let should_apply_fallback = self.caching_storage.should_apply_fallback();
         let mut fetched = 0;
         for (_cs_id, edges) in values {
             fetched += 1;
@@ -443,19 +441,12 @@ impl CachingCommitGraphStorage {
     /// requested by the user and current rollout values.
     fn request_prefetch_params(prefetch: Prefetch) -> (Prefetch, bool) {
         let prefetch = if justknobs::eval("scm/mononoke:disable_commit_graph_prefetch", None, None)
-            .unwrap_or_default()
         {
             Prefetch::None
         } else {
             prefetch.include_hint()
         };
-        let memcache_prefetch = justknobs::eval(
-            "scm/mononoke:commit_graph_prefetch_store_in_memcache",
-            None,
-            None,
-        )
-        .unwrap_or_default();
-        (prefetch, memcache_prefetch)
+        (prefetch, true)
     }
 
     fn request<'a>(&'a self, ctx: &'a CoreContext, prefetch: Prefetch) -> CacheRequest<'a> {
@@ -485,12 +476,12 @@ impl CachingCommitGraphStorage {
     }
 
     /// Check if fallback should be applied for this repository
-    fn should_apply_fallback(&self) -> Result<bool> {
-        Ok(!justknobs::eval(
+    fn should_apply_fallback(&self) -> bool {
+        !justknobs::eval(
             "scm/mononoke:commit_graph_disable_subtree_source_fallback",
             None,
             Some(self.repo_name()),
-        )?)
+        )
     }
 }
 
@@ -513,7 +504,7 @@ impl CommitGraphStorage for CachingCommitGraphStorage {
             get_or_fill(&self.request_required(ctx, Prefetch::None), hashset![cs_id]).await?;
         Ok(found
             .remove(&cs_id)
-            .ok_or_else(|| anyhow!("Missing changeset from commit graph storage: {}", cs_id))?
+            .ok_or_else(|| anyhow!("Missing changeset from commit graph storage: {cs_id}"))?
             .take())
     }
 

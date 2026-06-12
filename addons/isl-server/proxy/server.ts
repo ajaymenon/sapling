@@ -12,12 +12,14 @@ import type {ServerPlatform} from '../src/serverPlatform';
 import {grammars} from 'isl/src/generated/textmate/TextMateGrammarManifest';
 import fs from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import path from 'node:path';
 import urlModule from 'node:url';
 import WebSocket from 'ws';
 import {repositoryCache} from '../src/RepositoryCache';
 import {CLOSED_AND_SHOULD_NOT_RECONNECT_CODE} from '../src/constants';
 import {onClientConnection} from '../src/index';
+import {makeBrowserServerPlatform} from '../src/serverPlatform';
 import {areTokensEqual} from './proxyUtils';
 
 const ossSmartlogDir = path.join(__dirname, '../../isl');
@@ -31,6 +33,9 @@ export type StartServerArgs = {
   command: string;
   slVersion: string;
   foreground: boolean;
+  bind: string;
+  tlsCert?: string;
+  tlsKey?: string;
 };
 
 export type StartServerResult =
@@ -53,6 +58,9 @@ export function startServer({
   command,
   slVersion,
   foreground,
+  bind,
+  tlsCert,
+  tlsKey,
 }: StartServerArgs): Promise<StartServerResult> {
   const originalProcessCwd = process.cwd();
   const serverRoot = path.isAbsolute(ossSmartlogDir)
@@ -103,9 +111,9 @@ export function startServer({
     }
 
     /**
-     * Create HTTP server.
+     * Create HTTP(S) server.
      */
-    const server = http.createServer(async (req, res) => {
+    const requestHandler: http.RequestListener = async (req, res) => {
       if (req.url) {
         // Only the websocket is sensitive and requires the token.
         // Normal resource requests don't need to check the token.
@@ -148,28 +156,39 @@ export function startServer({
 
       res.writeHead(404, {'Content-Type': 'text/html'});
       res.end('<html><body>Not Found!</body></html>');
-    });
+    };
+
+    const server =
+      tlsCert && tlsKey
+        ? https.createServer(
+            {cert: fs.readFileSync(tlsCert), key: fs.readFileSync(tlsKey)},
+            requestHandler,
+          )
+        : http.createServer(requestHandler);
 
     /**
-     * Listen on localhost:port.
+     * Listen on bind:port.
      */
-    const httpServer = server.listen(port, 'localhost');
+    const httpServer = server.listen(port, bind);
     const wsServer = new WebSocket.Server({noServer: true, path: '/ws'});
     wsServer.on('connection', async (socket, connectionRequest) => {
       // We require websocket connections to contain the token as a URL search parameter.
       let providedToken: string | undefined;
       let cwd: string | undefined;
+      let extraCwds: string[] = [];
       let platform: string | undefined;
       let sessionId: string | undefined;
       if (connectionRequest.url) {
-        const searchParams = getSearchParams(connectionRequest.url);
-        providedToken = searchParams.get('token');
+        const rawSearch = urlModule.parse(connectionRequest.url).search ?? '';
+        const searchParams = new URLSearchParams(rawSearch);
+        providedToken = searchParams.get('token') ?? undefined;
         const cwdParam = searchParams.get('cwd');
-        platform = searchParams.get('platform') as string;
-        sessionId = searchParams.get('sessionId');
+        platform = searchParams.get('platform') ?? undefined;
+        sessionId = searchParams.get('sessionId') ?? undefined;
         if (cwdParam) {
           cwd = decodeURIComponent(cwdParam);
         }
+        extraCwds = searchParams.getAll('extraCwd');
       }
       if (!providedToken) {
         const reason = 'No token provided in websocket request';
@@ -204,8 +223,12 @@ export function startServer({
         case 'obsidian':
           platformImpl = (await import('../platform/obsidianServerPlatform')).platform;
           break;
+        case 'agentHome':
+          platformImpl = (await import('../platform/agentHomeServerPlatform')).platform;
+          break;
         default:
         case undefined:
+          platformImpl = makeBrowserServerPlatform(extraCwds);
           break;
       }
       if (sessionId != null && platformImpl) {

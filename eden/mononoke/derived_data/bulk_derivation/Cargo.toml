@@ -11,7 +11,8 @@ license = "GPLv2+"
 path = "lib.rs"
 
 [dependencies]
-anyhow = "1.0.98"
+acl_manifest = { version = "0.1.0", path = "../acl_manifest" }
+anyhow = "1.0.102"
 async-trait = "0.1.86"
 basename_suffix_skeleton_manifest_v3 = { version = "0.1.0", path = "../basename_suffix_skeleton_manifest_v3" }
 blame = { version = "0.1.0", path = "../blame" }
@@ -23,11 +24,13 @@ context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context"
 deleted_manifest = { version = "0.1.0", path = "../deleted_manifest" }
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
 derived_data_manager = { version = "0.1.0", path = "../manager" }
+directory_branch_cluster_manifest = { version = "0.1.0", path = "../directory_branch_cluster_manifest" }
 fastlog = { version = "0.1.0", path = "../fastlog" }
 filenodes_derivation = { version = "0.1.0", path = "../filenodes_derivation" }
 fsnodes = { version = "0.1.0", path = "../fsnodes" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 git_types = { version = "0.1.0", path = "../../git/git_types" }
+history_manifest = { version = "0.1.0", path = "../history_manifest" }
 inferred_copy_from = { version = "0.1.0", path = "../inferred_copy_from" }
 itertools = "0.14.0"
 mercurial_derivation = { version = "0.1.0", path = "../mercurial_derivation" }

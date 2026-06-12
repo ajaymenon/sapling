@@ -12,8 +12,7 @@ import sys
 from pathlib import Path
 from typing import List, NamedTuple, Optional
 
-from facebook.eden.ttypes import GlobParams, PrefetchParams
-from thrift.Thrift import TApplicationException
+from eden.fs.service.eden.thrift_types import GlobParams, PrefetchParams
 
 from .cmd_util import require_checkout
 from .config import EdenCheckout, EdenInstance
@@ -163,7 +162,7 @@ class GlobCmd(Subcmd):
         )
         parser.add_argument(
             "--list-origin-hash",
-            help="Display the origin hash of the matching files.",
+            help="Display the origin hash of the matching files. Only populated when multiple --revision flags are specified.",
             default=False,
             action="store_true",
         )
@@ -183,7 +182,7 @@ class GlobCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         checkout_and_patterns = _find_checkout_and_patterns(args)
 
-        with checkout_and_patterns.instance.get_thrift_client_legacy() as client:
+        with checkout_and_patterns.instance.get_thrift_client() as client:
             result = client.globFiles(
                 GlobParams(
                     mountPoint=bytes(checkout_and_patterns.checkout.path),
@@ -194,7 +193,7 @@ class GlobCmd(Subcmd):
                     wantDtype=args.dtype,
                     searchRoot=os.fsencode(checkout_and_patterns.rel_path),
                     listOnlyFiles=args.list_only_files,
-                    revisions=args.revision,
+                    revisions=[rev.encode() for rev in args.revision],
                 )
             )
             if args.json:
@@ -212,30 +211,24 @@ class GlobCmd(Subcmd):
                     )
                 )
             else:
-                # Name and origin hashes should be the same size.
-                # If dtype is set then it should also be the same size, otherwise 0
-                if len(result.matchingFiles) != len(result.originHashes):
+                # originHashes may be empty when there are 0 or 1 revisions.
+                # When populated, it should match matchingFiles in length.
+                has_origin_hashes = len(result.originHashes) > 0
+                if has_origin_hashes and len(result.matchingFiles) != len(
+                    result.originHashes
+                ):
                     _println("Error globbing files: mismatched results")
                     return 1
                 if args.dtype:
                     if len(result.dtypes) != len(result.matchingFiles):
                         _println("Error globbing files: mismatched results")
                         return 1
-                    entries = zip(
-                        result.matchingFiles, result.dtypes, result.originHashes
-                    )
-                else:
-                    entries = zip(
-                        result.matchingFiles,
-                        [None] * len(result.matchingFiles),
-                        result.originHashes,
-                    )
-                for name, dtype, ohash in entries:
+                for i, name in enumerate(result.matchingFiles):
                     baseString = os.fsdecode(name)
-                    if args.list_origin_hash:
-                        baseString += f"@{ohash.hex()}"
+                    if args.list_origin_hash and has_origin_hashes:
+                        baseString += f"@{result.originHashes[i].hex()}"
                     if args.dtype:
-                        baseString += f" {parseDtype(dtype)}"
+                        baseString += f" {parseDtype(result.dtypes[i])}"
                     _println(os.fsdecode(baseString))
                 if args.verbose:
                     _println(
@@ -309,7 +302,7 @@ class PrefetchCmd(Subcmd):
             if args.relative:
                 search_root = os.fsencode(checkout_and_patterns.rel_path)
 
-            with checkout_and_patterns.instance.get_thrift_client_legacy() as client:
+            with checkout_and_patterns.instance.get_thrift_client() as client:
                 prefetchResult = client.prefetchFilesV2(
                     PrefetchParams(
                         mountPoint=bytes(checkout_and_patterns.checkout.path),

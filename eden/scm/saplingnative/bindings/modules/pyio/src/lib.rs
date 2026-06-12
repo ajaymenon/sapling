@@ -7,7 +7,9 @@
 
 #![allow(non_camel_case_types)]
 
+mod metadata;
 mod rust_io;
+mod vfs;
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -20,6 +22,9 @@ use cpython_ext::ResultPyErrExt;
 use io::IO as RustIO;
 use io::time_interval;
 use pyconfigloader::config as PyConfig;
+pub use rust_io::IOObject;
+use rust_io::unsupported_operation;
+pub use rust_io::wrap_file_like;
 
 pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     let name = [package, "io"].join(".");
@@ -32,6 +37,10 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
         "shouldcolor",
         py_fn!(py, should_color(config: PyConfig)),
     )?;
+
+    m.add_class::<metadata::metadata>(py)?;
+    m.add_class::<vfs::vfs>(py)?;
+
     Ok(m)
 }
 
@@ -270,7 +279,7 @@ py_class!(pub class BufIO |py| {
             0 => std::io::SeekFrom::Start(offset.try_into().map_pyerr(py)?),
             1 => std::io::SeekFrom::Current(offset),
             2 => std::io::SeekFrom::End(offset),
-            _ => panic!("bad whence: {}", whence),
+            _ => panic!("bad whence: {whence}"),
         }).map_pyerr(py)
     }
 
@@ -334,7 +343,7 @@ py_class!(pub class BufIO |py| {
     }
 
     def fileno(&self) -> PyResult<u64> {
-        Err(PyErr::from_instance(py, py.import("io")?.get(py, "UnsupportedOperation")?))
+        Err(unsupported_operation(py, "fileno is not supported")?)
     }
 });
 

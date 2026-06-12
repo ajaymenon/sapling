@@ -28,6 +28,10 @@ pub struct DenyFilesBuilder {
     /// Deny patterns for pushes, originally intended to this repo
     /// (as opposed to push-redirected ones)
     native_push_only_deny_patterns: Option<Vec<String>>,
+    /// When true, deletions of paths matching `all_push_sources_deny_patterns`
+    /// are also rejected. Defaults to false (matches the historical behavior
+    /// where deletions were always permitted by `all_push_sources_deny_patterns`).
+    block_deletions: bool,
 }
 
 impl DenyFilesBuilder {
@@ -37,6 +41,9 @@ impl DenyFilesBuilder {
         }
         if let Some(v) = config.string_lists.get("native_push_only_deny_patterns") {
             self = self.native_push_only_deny_patterns(v)
+        }
+        if let Some(v) = config.ints_64.get("block_deletions") {
+            self = self.block_deletions(*v != 0)
         }
         self
     }
@@ -59,6 +66,11 @@ impl DenyFilesBuilder {
         self
     }
 
+    pub fn block_deletions(mut self, block_deletions: bool) -> Self {
+        self.block_deletions = block_deletions;
+        self
+    }
+
     pub fn build(self) -> Result<DenyFiles> {
         Ok(DenyFiles {
             all_push_sources_deny_patterns: self
@@ -75,6 +87,7 @@ impl DenyFilesBuilder {
                 .map(LuaPattern::try_from)
                 .collect::<Result<Vec<_>, _>>()
                 .context("Failed to create LuaPattern for native_push_only_deny_patterns")?,
+            block_deletions: self.block_deletions,
         })
     }
 }
@@ -85,6 +98,9 @@ pub struct DenyFiles {
     /// Deny patterns for pushes, originally intended to this repo
     /// (as opposed to push-redirected ones)
     pub native_push_only_deny_patterns: Vec<LuaPattern>,
+    /// When true, deletions matching `all_push_sources_deny_patterns` are
+    /// rejected. Native-only patterns already block deletions unconditionally.
+    pub block_deletions: bool,
 }
 
 impl DenyFiles {
@@ -105,12 +121,13 @@ impl FileHook for DenyFiles {
         push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution> {
         if push_authored_by.service() {
-            return Ok(HookExecution::Accepted);
+            return Ok(HookExecution::accepted());
         }
 
         deny_unacceptable_patterns(
             &self.all_push_sources_deny_patterns,
             &self.native_push_only_deny_patterns,
+            self.block_deletions,
             path,
             cross_repo_push_source,
             change,
@@ -119,11 +136,10 @@ impl FileHook for DenyFiles {
 }
 
 fn rejection<'a, 'b>(path: &'a String, pattern: &'b LuaPattern) -> HookExecution {
-    HookExecution::Rejected(HookRejectionInfo::new_long(
+    HookExecution::rejected(HookRejectionInfo::new_long(
         "Denied filename matched name pattern",
         format!(
-            "Denied filename '{}' matched name pattern '{}'. Rename or remove this file and try again.",
-            path, pattern
+            "Denied filename '{path}' matched name pattern '{pattern}'. Rename or remove this file and try again."
         ),
     ))
 }
@@ -132,6 +148,7 @@ fn rejection<'a, 'b>(path: &'a String, pattern: &'b LuaPattern) -> HookExecution
 fn deny_unacceptable_patterns<'a, 'b, 'c>(
     all_patterns: &'a [LuaPattern],
     native_patterns: &'a [LuaPattern],
+    block_deletions: bool,
     path: &'b NonRootMPath,
     cross_repo_push_source: CrossRepoPushSource,
     change: Option<&'c BasicFileChange>,
@@ -144,9 +161,9 @@ fn deny_unacceptable_patterns<'a, 'b, 'c>(
             }
         }
     }
-    if change.is_none() {
-        // It is acceptable to delete any file
-        return Ok(HookExecution::Accepted);
+    if change.is_none() && !block_deletions {
+        // Deletions are accepted by default; opt in via `block_deletions`.
+        return Ok(HookExecution::accepted());
     }
 
     for pattern in all_patterns {
@@ -155,7 +172,7 @@ fn deny_unacceptable_patterns<'a, 'b, 'c>(
         }
     }
 
-    Ok(HookExecution::Accepted)
+    Ok(HookExecution::accepted())
 }
 
 #[cfg(test)]
@@ -188,22 +205,24 @@ mod test {
         let r = deny_unacceptable_patterns(
             &all,
             &native,
+            false,
             &mp,
             CrossRepoPushSource::NativeToThisRepo,
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
 
         let r = deny_unacceptable_patterns(
             &all,
             &native,
+            false,
             &mp,
             CrossRepoPushSource::PushRedirected,
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
     }
 
     #[mononoke::test]
@@ -213,22 +232,24 @@ mod test {
         let r = deny_unacceptable_patterns(
             &all,
             &native,
+            false,
             &mp,
             CrossRepoPushSource::NativeToThisRepo,
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
 
         let r = deny_unacceptable_patterns(
             &all,
             &native,
+            false,
             &mp,
             CrossRepoPushSource::PushRedirected,
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
     }
 
     #[mononoke::test]
@@ -238,22 +259,24 @@ mod test {
         let r = deny_unacceptable_patterns(
             &all,
             &native,
+            false,
             &mp,
             CrossRepoPushSource::NativeToThisRepo,
             None,
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
 
         let r = deny_unacceptable_patterns(
             &all,
             &native,
+            false,
             &mp,
             CrossRepoPushSource::PushRedirected,
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
     }
 
     #[mononoke::test]
@@ -263,21 +286,84 @@ mod test {
         let r = deny_unacceptable_patterns(
             &all,
             &native,
+            false,
             &mp,
             CrossRepoPushSource::NativeToThisRepo,
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
 
         let r = deny_unacceptable_patterns(
             &all,
             &native,
+            false,
             &mp,
             CrossRepoPushSource::PushRedirected,
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
+    }
+
+    #[mononoke::test]
+    fn test_deletion_allowed_when_block_deletions_off() {
+        let (all, native) = setup_patterns();
+        let mp = mpath("all/1");
+        let r = deny_unacceptable_patterns(
+            &all,
+            &native,
+            false,
+            &mp,
+            CrossRepoPushSource::PushRedirected,
+            None,
+        )
+        .unwrap();
+        assert!(r.is_accepted());
+    }
+
+    #[mononoke::test]
+    fn test_deletion_blocked_when_block_deletions_on() {
+        let (all, native) = setup_patterns();
+        let mp = mpath("all/1");
+        // Native push: rejected (matches all_patterns regardless of source).
+        let r = deny_unacceptable_patterns(
+            &all,
+            &native,
+            true,
+            &mp,
+            CrossRepoPushSource::NativeToThisRepo,
+            None,
+        )
+        .unwrap();
+        assert!(r.is_rejected());
+
+        // Push-redirected: also rejected — this is the new behavior.
+        let r = deny_unacceptable_patterns(
+            &all,
+            &native,
+            true,
+            &mp,
+            CrossRepoPushSource::PushRedirected,
+            None,
+        )
+        .unwrap();
+        assert!(r.is_rejected());
+    }
+
+    #[mononoke::test]
+    fn test_unmatched_deletion_allowed_when_block_deletions_on() {
+        let (all, native) = setup_patterns();
+        let mp = mpath("ababagalamaga");
+        let r = deny_unacceptable_patterns(
+            &all,
+            &native,
+            true,
+            &mp,
+            CrossRepoPushSource::PushRedirected,
+            None,
+        )
+        .unwrap();
+        assert!(r.is_accepted());
     }
 }

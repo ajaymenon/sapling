@@ -8,10 +8,10 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
 async-trait = "0.1.86"
 blobstore = { version = "0.1.0", path = ".." }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
-governor = "0.3.2"
+governor = "0.10.4"
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 nonzero_ext = "0.2"

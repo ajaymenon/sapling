@@ -5,13 +5,15 @@ oncall("sapling")
 rust_python_library(
     name = "pyworkingcopyclient",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "dependencies_override": {"dependencies": {"sapling-edenfs-client": {"optional": True}}},
-        "features": {
-            "default": [],
-            "eden": ["sapling-edenfs-client"],
+    autocargo = {
+        "cargo_toml_config": {
+            "dependencies_override": {"dependencies": {"sapling-edenfs-client": {"optional": True}}},
+            "features": {
+                "default": [],
+                "eden": ["sapling-edenfs-client"],
+            },
         },
-    }},
+    },
     crate_root = "src/lib.rs",
     features = ["eden"],
     deps = [
@@ -19,5 +21,6 @@ rust_python_library(
         "//eden/scm/lib/edenfs-client:edenfs-client",
         "//eden/scm/lib/types:types",
         "//eden/scm/lib/workingcopy:workingcopy",
+        "//eden/scm/saplingnative/bindings/modules/pyconfigloader:pyconfigloader",
     ],
 )

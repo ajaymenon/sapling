@@ -20,6 +20,8 @@ class Executor;
 
 namespace facebook::eden {
 
+class EdenFsEventsLogger;
+class ErrorLogger;
 class FsEventLogger;
 class Notifier;
 class NfsDispatcher;
@@ -46,7 +48,7 @@ class NfsServer {
       folly::EventBase* evb,
       std::shared_ptr<folly::Executor> threadPool,
       bool shouldRunOurOwnRpcbindServer,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       size_t maximumInFlightRequests,
       std::chrono::nanoseconds highNfsRequestsLogInterval,
       std::chrono::nanoseconds longRunningFSRequestThreshold);
@@ -58,6 +60,8 @@ class NfsServer {
    */
   void initialize(folly::SocketAddress addr, bool registerMountdWithRpcbind);
   void initialize(folly::File socket);
+  void resumeMountdAccepting();
+  folly::SocketAddress getMountdAddr() const;
 
   /**
    * Return value of registerMount.
@@ -83,12 +87,14 @@ class NfsServer {
       const folly::Logger* straceLogger,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       std::shared_ptr<FsEventLogger> fsEventLogger,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
+      ErrorLogger& errorLogger,
       folly::Duration requestTimeout,
       std::shared_ptr<Notifier> notifier,
       CaseSensitivity caseSensitive,
       uint32_t iosize,
-      size_t traceBusCapacity);
+      size_t traceBusCapacity,
+      bool fastPathRPCs);
 
   /**
    * Registers an RPC service running a certain protocol version on port.

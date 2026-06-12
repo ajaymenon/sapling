@@ -35,7 +35,6 @@ use connection_security_checker::ConnectionSecurityChecker;
 use environment::RemoteDiffOptions;
 use ephemeral_blobstore::BubbleId;
 use ephemeral_blobstore::RepoEphemeralStore;
-use factory_group::FactoryGroup;
 use fbinit::FacebookInit;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -69,9 +68,9 @@ use mononoke_api::Repo;
 use mononoke_api::RepoContext;
 use mononoke_api::SessionContainer;
 use mononoke_api::TreeContext;
-use mononoke_api::TreeId;
 use mononoke_app::MononokeApp;
 use mononoke_configs::MononokeConfigs;
+use mononoke_types::content_manifest::compat;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
 use permission_checker::AclProvider;
@@ -98,12 +97,13 @@ use crate::scuba_params::AddScubaParams;
 use crate::scuba_response::AddScubaResponse;
 use crate::specifiers::SpecifierExt;
 
-const FORWARDED_IDENTITIES_HEADER: &str = "scm_forwarded_identities";
-const FORWARDED_AUTHENTICATED_IDENTITIES_HEADER: &str = "scm_forwarded_authenticated_identities";
+const FORWARDED_AUTHENTICATED_IDENTITIES_THRIFT_HEADER: &str =
+    "scm_forwarded_authenticated_identities_thrift";
 const FORWARDED_CLIENT_IP_HEADER: &str = "scm_forwarded_client_ip";
 const FORWARDED_CLIENT_PORT_HEADER: &str = "scm_forwarded_client_port";
 const FORWARDED_CLIENT_DEBUG_HEADER: &str = "scm_forwarded_client_debug";
 const FORWARDED_OTHER_CATS_HEADER: &str = "scm_forwarded_other_cats";
+const ALWAYS_LOG_HEADER: &str = "always_log";
 const PER_REQUEST_READ_QPS: usize = 4000;
 const PER_REQUEST_WRITE_QPS: usize = 4000;
 
@@ -149,7 +149,6 @@ pub struct SourceControlServiceImpl {
     pub(crate) identity: Identity,
     pub(crate) scribe: Scribe,
     pub(crate) configs: Arc<MononokeConfigs>,
-    pub(crate) factory_group: Option<Arc<FactoryGroup<2>>>,
     pub(crate) async_requests_queue: Option<Arc<AsyncMethodRequestQueue>>,
     identity_proxy_checker: Arc<ConnectionSecurityChecker>,
     pub(crate) acl_provider: Arc<dyn AclProvider>,
@@ -172,7 +171,6 @@ impl SourceControlServiceImpl {
         identity_proxy_checker: ConnectionSecurityChecker,
         configs: Arc<MononokeConfigs>,
         common_config: &CommonConfig,
-        factory_group: Option<Arc<FactoryGroup<2>>>,
         async_requests_queue: Option<Arc<AsyncMethodRequestQueue>>,
         git_source_of_truth_config: Arc<dyn GitSourceOfTruthConfig>,
         watchdog_max_poll: u64,
@@ -191,7 +189,6 @@ impl SourceControlServiceImpl {
             scribe,
             configs,
             identity_proxy_checker: Arc::new(identity_proxy_checker),
-            factory_group,
             async_requests_queue,
             acl_provider: app.environment().acl_provider.clone(),
             git_source_of_truth_config,
@@ -221,7 +218,18 @@ impl SourceControlServiceImpl {
         let session_uuid = session.metadata().session_id().to_string();
         scuba.add("session_uuid", session_uuid.clone());
 
+        let always_log = req_ctxt
+            .header(ALWAYS_LOG_HEADER)
+            .map_err(scs_errors::internal_error)?
+            .is_some();
+        if always_log {
+            scuba.unsampled();
+        }
+
         let ctx = session.new_context_with_scribe(scuba, self.scribe.clone());
+        if always_log {
+            ctx.set_override_sampling();
+        }
 
         let repo_name = if let Some(specifier) = specifier {
             specifier.scuba_reponame()
@@ -260,10 +268,10 @@ impl SourceControlServiceImpl {
             scuba.add("config_store_last_updated_at", config_info.last_updated_at);
         }
 
-        let sampling_rate =
-            justknobs::get_as::<u64>("scm/mononoke:scs_method_sampling_rate", Some(name))
-                .ok()
-                .and_then(NonZeroU64::new);
+        let sampling_rate = NonZeroU64::new(justknobs::get_as::<u64>(
+            "scm/mononoke:scs_method_sampling_rate",
+            Some(name),
+        ));
         if let Some(sampling_rate) = sampling_rate {
             scuba.sampled(sampling_rate);
         } else {
@@ -295,6 +303,14 @@ impl SourceControlServiceImpl {
                 .collect::<ScubaValue>(),
         );
 
+        scuba.add(
+            "client_identities_typed",
+            identities
+                .iter()
+                .map(|id| id.to_typed_string())
+                .collect::<ScubaValue>(),
+        );
+
         Ok(scuba)
     }
 
@@ -304,43 +320,17 @@ impl SourceControlServiceImpl {
     ) -> Result<Metadata, scs_errors::ServiceError> {
         let header = |h: &str| req_ctxt.header(h).map_err(scs_errors::invalid_request);
 
-        let tls_identities: MononokeIdentitySet = if justknobs::eval(
-            "scm/mononoke:scs_use_authenticated_identities_struct",
-            None,
-            None,
-        )
-        .unwrap_or(false)
-        {
-            // Use authenticated_identities_struct to get full AuthenticatedIdentity thrift structs
-            let auth_idents_vec = req_ctxt
-                .authenticated_identities_struct()
-                .map_err(scs_errors::internal_error)?;
-
-            if auth_idents_vec.is_empty() {
-                // Fall back to legacy identities() method
-                req_ctxt
-                    .identities()
-                    .map_err(scs_errors::internal_error)?
-                    .entries()
-                    .into_iter()
-                    .map(MononokeIdentity::from_identity_ref)
-                    .collect()
-            } else {
-                auth_idents_vec
-                    .into_iter()
-                    .map(MononokeIdentity::Authenticated)
-                    .collect()
-            }
-        } else {
-            // Fall back to legacy identities() method
-            req_ctxt
-                .identities()
-                .map_err(scs_errors::internal_error)?
-                .entries()
-                .into_iter()
-                .map(MononokeIdentity::from_identity_ref)
-                .collect()
-        };
+        // `authenticated_identities_struct()` already returns a normalized
+        // `AuthenticatedIdentity` list — the C++ side wraps legacy custom-OID identities via
+        // `getAuthenticatedIdentitiesFrom(ExtractedIdentityCert*)` (see
+        // `fbcode/access/lib/authn/X509AuthenticationProvider.cpp:30-48`), so no Rust-side
+        // fallback to legacy `identities()` is needed.
+        let tls_identities: MononokeIdentitySet = req_ctxt
+            .authenticated_identities_struct()
+            .map_err(scs_errors::internal_error)?
+            .into_iter()
+            .map(MononokeIdentity::from)
+            .collect();
 
         // Get any valid CAT identities.
         let cats_identities: MononokeIdentitySet = req_ctxt
@@ -350,7 +340,7 @@ impl SourceControlServiceImpl {
             )
             .map_err(scs_errors::internal_error)?
             .into_iter()
-            .map(MononokeIdentity::Authenticated)
+            .map(MononokeIdentity::from)
             .collect();
 
         let client_info: Option<ClientInfo> = req_ctxt
@@ -365,28 +355,21 @@ impl SourceControlServiceImpl {
             .await;
 
         if is_trusted {
-            if let (Some(forwarded_identities), Some(forwarded_ip), Some(forwarded_port)) = (
-                header(FORWARDED_IDENTITIES_HEADER)?,
+            if let (
+                Some(forwarded_authenticated_identities_thrift),
+                Some(forwarded_ip),
+                Some(forwarded_port),
+            ) = (
+                header(FORWARDED_AUTHENTICATED_IDENTITIES_THRIFT_HEADER)?,
                 header(FORWARDED_CLIENT_IP_HEADER)?,
                 header(FORWARDED_CLIENT_PORT_HEADER)?,
             ) {
-                // Check for authenticated identities header first - it takes precedence
                 let mut header_identities: MononokeIdentitySet =
-                    if let Some(forwarded_authenticated_identities) =
-                        header(FORWARDED_AUTHENTICATED_IDENTITIES_HEADER)?
-                    {
-                        // Parse authenticated identities using try_from_json_encoded_with_authn_identities
-                        let idents = MononokeIdentity::try_from_json_encoded_with_authn_identities(
-                            forwarded_authenticated_identities.as_str(),
-                        )
-                        .map_err(scs_errors::invalid_request)?;
-                        debug!("Parsed authenticated identities");
-                        idents
-                    } else {
-                        // Fall back to regular forwarded identities
-                        serde_json::from_str(forwarded_identities.as_str())
-                            .map_err(scs_errors::invalid_request)?
-                    };
+                    MononokeIdentity::try_from_thrift_compact_encoded(
+                        forwarded_authenticated_identities_thrift.as_str(),
+                    )
+                    .map_err(scs_errors::invalid_request)?;
+                debug!("Parsed authenticated identities");
                 let client_ip = Some(
                     forwarded_ip
                         .parse::<IpAddr>()
@@ -399,7 +382,7 @@ impl SourceControlServiceImpl {
                 );
                 let client_debug = header(FORWARDED_CLIENT_DEBUG_HEADER)?.is_some();
 
-                header_identities.extend(cats_identities.into_iter());
+                header_identities.extend(cats_identities);
                 let mut metadata = Metadata::new(
                     None,
                     header_identities,
@@ -420,6 +403,9 @@ impl SourceControlServiceImpl {
                     ClientInfo::default_with_entry_point(ClientEntryPoint::ScsServer)
                 });
                 metadata.add_client_info(client_info);
+                if let Some(client_id) = header("client_id")? {
+                    metadata.add_upstream_client_id(client_id);
+                }
                 return Ok(metadata);
             }
         }
@@ -446,6 +432,9 @@ impl SourceControlServiceImpl {
         let client_info = client_info
             .unwrap_or_else(|| ClientInfo::default_with_entry_point(ClientEntryPoint::ScsServer));
         metadata.add_client_info(client_info);
+        if let Some(client_id) = header("client_id")? {
+            metadata.add_upstream_client_id(client_id);
+        }
         Ok(metadata)
     }
 
@@ -505,7 +494,7 @@ impl SourceControlServiceImpl {
     {
         let repo = self
             .mononoke
-            .repo(ctx, &repo.name)
+            .repo(ctx.clone(), &repo.name)
             .await?
             .ok_or_else(|| scs_errors::repo_not_found(repo.description()))?
             .with_bubble(bubble_fetcher)
@@ -513,6 +502,7 @@ impl SourceControlServiceImpl {
             .with_authorization_context(authz)
             .build()
             .await?;
+        maybe_set_nocache_thriftcache(&ctx, &repo)?;
         Ok(repo)
     }
 
@@ -640,7 +630,7 @@ impl SourceControlServiceImpl {
             }
             thrift::TreeSpecifier::by_id(tree_id) => {
                 let repo = self.repo(ctx, &tree_id.repo).await?;
-                let tree_id = TreeId::from_request(&tree_id.id)?;
+                let tree_id = compat::ContentManifestId::from_request(tree_id)?;
                 let tree = repo
                     .tree(tree_id)
                     .await?
@@ -649,8 +639,7 @@ impl SourceControlServiceImpl {
             }
             thrift::TreeSpecifier::UnknownField(id) => {
                 return Err(scs_errors::invalid_request(format!(
-                    "tree specifier type not supported: {}",
-                    id
+                    "tree specifier type not supported: {id}"
                 ))
                 .into());
             }
@@ -702,8 +691,7 @@ impl SourceControlServiceImpl {
             }
             thrift::FileSpecifier::UnknownField(id) => {
                 return Err(scs_errors::invalid_request(format!(
-                    "file specifier type not supported: {}",
-                    id
+                    "file specifier type not supported: {id}"
                 ))
                 .into());
             }
@@ -724,18 +712,56 @@ impl SourceControlServiceImpl {
     }
 }
 
-fn should_log_memory_usage(method: &str) -> bool {
-    justknobs::eval("scm/mononoke:scs_log_memory_usage", None, Some(method)).unwrap_or(false)
+/// Returns true if the given identity type is covered by KCB's
+/// REQUEST_PRIMARY_IDENTITY_TYPES.
+fn is_kcb_covered(id_type: &str) -> bool {
+    client_identifier_structs::consts::REQUEST_PRIMARY_IDENTITY_TYPES.contains(id_type)
 }
 
-fn log_start(ctx: &CoreContext, method: &str) -> Option<MemoryStats> {
+/// Returns true if the nocache flag should be set, given the repo-level and
+/// path-level ACL-deciding identity types. The flag is set when any identity
+/// type is NOT covered by KCB's REQUEST_PRIMARY_IDENTITY_TYPES.
+fn should_set_nocache_for_identity_types(
+    repo_id_type: Option<&str>,
+    path_id_types: &[String],
+) -> bool {
+    repo_id_type.is_some_and(|id| !is_kcb_covered(id))
+        || path_id_types.iter().any(|id| !is_kcb_covered(id))
+}
+
+/// Checks if any ACL-deciding identity type on the RepoContext is not covered
+/// by KCB's REQUEST_PRIMARY_IDENTITY_TYPES, and if so, sets the nocache_thriftcache
+/// flag on the CoreContext. The thrift macro will then set the ThriftCache nocache
+/// response header.
+fn maybe_set_nocache_thriftcache(
+    ctx: &CoreContext,
+    repo_ctx: &RepoContext<Repo>,
+) -> Result<(), scs_errors::ServiceError> {
+    if !justknobs::eval(
+        "scm/mononoke:scs_thriftcache_nocache_for_non_kcb_identities",
+        None,
+        None,
+    ) {
+        return Ok(());
+    }
+
+    let path_id_types = repo_ctx.path_acl_deciding_identity_types();
+    if should_set_nocache_for_identity_types(
+        repo_ctx.repo_acl_deciding_identity_type(),
+        &path_id_types,
+    ) {
+        ctx.set_nocache_thriftcache();
+    }
+
+    Ok(())
+}
+
+fn log_start(ctx: &CoreContext, _method: &str) -> Option<MemoryStats> {
     let mut start_mem_stats = None;
     let mut scuba = ctx.scuba().clone();
-    if should_log_memory_usage(method) {
-        if let Ok(stats) = memory::get_stats() {
-            scuba.add_memory_stats(&stats);
-            start_mem_stats = Some(stats);
-        }
+    if let Ok(stats) = memory::get_stats() {
+        scuba.add_memory_stats(&stats);
+        start_mem_stats = Some(stats);
     }
     scuba.log_with_msg("Request start", None);
     start_mem_stats
@@ -743,17 +769,15 @@ fn log_start(ctx: &CoreContext, method: &str) -> Option<MemoryStats> {
 
 fn add_request_end_memory_stats(
     scuba: &mut MononokeScubaSampleBuilder,
-    method: &str,
+    _method: &str,
     start_mem_stats: Option<&MemoryStats>,
 ) {
-    if should_log_memory_usage(method) {
-        if let Ok(stats) = memory::get_stats() {
-            scuba.add_memory_stats(&stats);
-            if let Some(start_mem_stats) = start_mem_stats {
-                let rss_used_delta =
-                    start_mem_stats.rss_free_bytes as isize - stats.rss_free_bytes as isize;
-                scuba.add("rss_used_delta", rss_used_delta);
-            }
+    if let Ok(stats) = memory::get_stats() {
+        scuba.add_memory_stats(&stats);
+        if let Some(start_mem_stats) = start_mem_stats {
+            let rss_used_delta =
+                start_mem_stats.rss_free_bytes as isize - stats.rss_free_bytes as isize;
+            scuba.add("rss_used_delta", rss_used_delta);
         }
     }
 }
@@ -805,7 +829,7 @@ fn log_result<T: AddScubaResponse>(
         }
     };
 
-    if let Ok(true) = justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
+    if justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
         STATS::total_method_requests.add_value(1, (method.to_string(),));
         if status == "INTERNAL_ERROR" {
             STATS::total_method_internal_failure.add_value(1, (method.to_string(),));
@@ -829,20 +853,16 @@ fn log_result<T: AddScubaResponse>(
 
     ctx.perf_counters().insert_perf_counters(&mut scuba);
 
+    // Always log requests that touch restricted paths
+    if ctx.override_sampling() {
+        scuba.unsampled();
+    }
+
     scuba.add_future_stats(stats);
     scuba.add("status", status);
     if let Some(error) = error {
-        let scs_error_log_sampling =
-            justknobs::eval("scm/mononoke:scs_error_log_sampling", None, None).unwrap_or(true);
-        if !scs_error_log_sampling {
-            scuba.unsampled();
-        }
         scuba.add("error", error.as_str());
     }
-    scuba.add_opt(
-        "client_identity_variant",
-        ctx.metadata().identities().first().map(|i| i.variant()),
-    );
     scuba.log_with_msg(tag, None);
 
     #[cfg(fbcode_build)]
@@ -908,19 +928,20 @@ fn log_stream_chunk<T: AddScubaResponse>(
 
     ctx.perf_counters().insert_perf_counters(&mut scuba);
 
+    // Always log requests that touch restricted paths
+    if ctx.override_sampling() {
+        scuba.unsampled();
+    }
+
     scuba.add("stream_chunk_count", count);
     scuba.add("status", status);
     if let Some(error) = error {
         scuba.add("error", error.as_str());
     }
-    let sampling_rate = NonZeroU64::new(
-        justknobs::get_as::<u64>(
-            "scm/mononoke:scs_stream_chunk_scuba_sampling_rate",
-            Some(method),
-        )
-        .ok()
-        .unwrap_or(1000),
-    ); // 1:1000 by default to avoid spamming scuba
+    let sampling_rate = NonZeroU64::new(justknobs::get_as::<u64>(
+        "scm/mononoke:scs_stream_chunk_scuba_sampling_rate",
+        Some(method),
+    ));
     if let Some(sampling_rate) = sampling_rate {
         scuba.sampled(sampling_rate);
     }
@@ -978,7 +999,7 @@ fn log_stream_complete(
             None => ("SUCCESS", Outcome::Success, None, 0, 0, 0),
         };
 
-    if let Ok(true) = justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
+    if justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
         STATS::total_method_requests.add_value(1, (method.to_string(),));
         if status == "INTERNAL_ERROR" {
             STATS::total_method_internal_failure.add_value(1, (method.to_string(),));
@@ -1002,6 +1023,11 @@ fn log_stream_complete(
     );
 
     ctx.perf_counters().insert_perf_counters(&mut scuba);
+
+    // Always log requests that touch restricted paths
+    if ctx.override_sampling() {
+        scuba.unsampled();
+    }
 
     // This function combines the stats from the initial phase generating the stream
     // object with stats from stream polling.
@@ -1033,17 +1059,8 @@ fn log_stream_complete(
     scuba.add_try_stream_stats(&combined_stats);
     scuba.add("status", status);
     if let Some(error) = error {
-        let scs_error_log_sampling =
-            justknobs::eval("scm/mononoke:scs_error_log_sampling", None, None).unwrap_or(true);
-        if !scs_error_log_sampling {
-            scuba.unsampled();
-        }
         scuba.add("error", error.as_str());
     }
-    scuba.add_opt(
-        "client_identity_variant",
-        ctx.metadata().identities().first().map(|i| i.variant()),
-    );
     scuba.log_with_msg("Request complete", None);
 
     #[cfg(fbcode_build)]
@@ -1074,12 +1091,14 @@ fn log_cancelled(
     let mut scuba = ctx.scuba().clone();
     add_request_end_memory_stats(&mut scuba, method, start_mem_stats);
     ctx.perf_counters().insert_perf_counters(&mut scuba);
+
+    // Always log requests that touch restricted paths
+    if ctx.override_sampling() {
+        scuba.unsampled();
+    }
+
     scuba.add_future_stats(stats);
     scuba.add("status", "CANCELLED");
-    scuba.add_opt(
-        "client_identity_variant",
-        ctx.metadata().identities().first().map(|i| i.variant()),
-    );
     scuba.log_with_msg("Request cancelled", None);
 
     #[cfg(fbcode_build)]
@@ -1106,10 +1125,9 @@ fn check_memory_usage(
         },
     };
     let rss_min_free_bytes =
-        justknobs::get_as::<usize>("scm/mononoke:scs_rss_min_free_bytes", Some(method))
-            .unwrap_or(0);
+        justknobs::get_as::<usize>("scm/mononoke:scs_rss_min_free_bytes", Some(method));
     let rss_min_free_pct =
-        justknobs::get_as::<i32>("scm/mononoke:scs_rss_min_free_pct", Some(method)).unwrap_or(0);
+        justknobs::get_as::<i32>("scm/mononoke:scs_rss_min_free_pct", Some(method));
 
     if rss_min_free_bytes > 0 || rss_min_free_pct > 0 {
         debug!(
@@ -1216,15 +1234,15 @@ macro_rules! impl_thrift_methods {
                         .instrument(span)
                     };
 
-                    if let Some(factory_group) = &self.0.factory_group {
-                        let group = factory_group.clone();
-                        let queue: usize =
-                            justknobs::get_as::<u64>("scm/mononoke:scs_factory_queue_for_method", Some(stringify!($method_name))).unwrap_or(0) as usize;
-                        group.execute(queue, handler, None).await.map_err(|e| scs_errors::internal_error(e.to_string()))?
-                    } else {
-                        let res: Result<$ok_type, $err_type> = handler.await;
-                        res
+                    let result: Result<$ok_type, $err_type> = handler.await;
+
+                    // If the method set the nocache flag (due to non-KCB identity types),
+                    // propagate it to the ThriftCache response header.
+                    if ctx.nocache_thriftcache() {
+                        let _ = req_ctxt.set_header("nocache", "1");
                     }
+
+                    result
                 };
                 Box::pin(fut)
             }
@@ -1301,15 +1319,15 @@ macro_rules! impl_thrift_stream_methods {
                         .instrument(span)
                     };
 
-                    if let Some(factory_group) = &self.0.factory_group {
-                        let group = factory_group.clone();
-                        let queue: usize =
-                            justknobs::get_as::<u64>("scm/mononoke:scs_factory_queue_for_method", Some(stringify!($method_name))).unwrap_or(0) as usize;
-                        group.execute(queue, handler, None).await.map_err(|e| scs_errors::internal_error(e.to_string()))?
-                    } else {
-                        let res: Result<$ok_type, $err_type> = handler.await;
-                        res
+                    let result: Result<$ok_type, $err_type> = handler.await;
+
+                    // If the method set the nocache flag (due to non-KCB identity types),
+                    // propagate it to the ThriftCache response header.
+                    if ctx.nocache_thriftcache() {
+                        let _ = req_ctxt.set_header("nocache", "1");
                     }
+
+                    result
                 };
                 Box::pin(fut)
             }
@@ -1379,10 +1397,20 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             params: thrift::CommitGenerationParams,
         ) -> Result<i64, service::CommitGenerationExn>;
 
+        async fn commit_fingerprint(
+            commit: thrift::CommitSpecifier,
+            params: thrift::CommitFingerprintParams,
+        ) -> Result<thrift::CommitFingerprintResponse, service::CommitFingerprintExn>;
+
         async fn commit_is_ancestor_of(
             commit: thrift::CommitSpecifier,
             params: thrift::CommitIsAncestorOfParams,
         ) -> Result<bool, service::CommitIsAncestorOfExn>;
+
+        async fn commit_filter_ancestors(
+            commit: thrift::CommitSpecifier,
+            params: thrift::CommitFilterAncestorsParams,
+        ) -> Result<thrift::CommitFilterAncestorsResponse, service::CommitFilterAncestorsExn>;
 
         async fn commit_is_public(
             commit: thrift::CommitSpecifier,
@@ -1429,6 +1457,11 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             params: thrift::CommitHgMutationHistoryParams,
         ) -> Result<thrift::CommitHgMutationHistoryResponse, service::CommitHgMutationHistoryExn>;
 
+        async fn commit_git_mutation_history(
+            commit: thrift::CommitSpecifier,
+            params: thrift::CommitGitMutationHistoryParams,
+        ) -> Result<thrift::CommitGitMutationHistoryResponse, service::CommitGitMutationHistoryExn>;
+
         async fn commit_directory_branch_clusters(
             commit: thrift::CommitSpecifier,
             params: thrift::CommitDirectoryBranchClustersParams,
@@ -1443,6 +1476,11 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             commit: thrift::CommitSpecifier,
             params: thrift::CommitRunHooksParams,
         ) -> Result<thrift::CommitRunHooksResponse, service::CommitRunHooksExn>;
+
+        async fn commit_rate_limit_check(
+            commit: thrift::CommitSpecifier,
+            params: thrift::CommitRateLimitCheckParams,
+        ) -> Result<thrift::CommitRateLimitCheckResponse, service::CommitRateLimitCheckExn>;
 
         async fn commit_subtree_changes(
             commit: thrift::CommitSpecifier,
@@ -1722,5 +1760,180 @@ impl SourceControlService for SourceControlServiceThriftImpl {
                 BoxStream<'static, Result<thrift::CommitFindRestrictedPathsStreamItem, service::CommitFindRestrictedPathsStreamExn>>,
             ),
             service::CommitFindRestrictedPathsExn>;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use justknobs::test_helpers::JustKnobsInMemory;
+    use justknobs::test_helpers::KnobVal;
+    use justknobs::test_helpers::with_just_knobs;
+    use maplit::hashmap;
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    // ---- Tests for is_kcb_covered ----
+
+    #[mononoke::test]
+    fn test_is_kcb_covered_known_types() {
+        // All types in REQUEST_PRIMARY_IDENTITY_TYPES should be covered.
+        for id_type in client_identifier_structs::consts::REQUEST_PRIMARY_IDENTITY_TYPES.iter() {
+            assert!(
+                is_kcb_covered(id_type),
+                "Expected '{id_type}' to be covered by KCB"
+            );
+        }
+    }
+
+    #[mononoke::test]
+    fn test_is_kcb_covered_unknown_type() {
+        assert!(!is_kcb_covered("SOME_UNKNOWN_TYPE"));
+        assert!(!is_kcb_covered(""));
+        assert!(!is_kcb_covered("user")); // case-sensitive
+        assert!(!is_kcb_covered("SERVICE_IDENTITY_V2"));
+    }
+
+    // ---- Tests for should_set_nocache_for_identity_types ----
+
+    #[mononoke::test]
+    fn test_nocache_not_set_when_no_identity_types() {
+        // No repo or path identity types => no nocache.
+        assert!(!should_set_nocache_for_identity_types(None, &[]));
+    }
+
+    #[mononoke::test]
+    fn test_nocache_not_set_for_kcb_repo_identity() {
+        // Repo identity is a KCB type => no nocache.
+        assert!(!should_set_nocache_for_identity_types(Some("USER"), &[]));
+        assert!(!should_set_nocache_for_identity_types(
+            Some("SERVICE_IDENTITY"),
+            &[]
+        ));
+    }
+
+    #[mononoke::test]
+    fn test_nocache_set_for_non_kcb_repo_identity() {
+        // Repo identity is NOT a KCB type => nocache.
+        assert!(should_set_nocache_for_identity_types(
+            Some("CUSTOM_ACL_TYPE"),
+            &[]
+        ));
+    }
+
+    #[mononoke::test]
+    fn test_nocache_not_set_for_kcb_path_identities() {
+        // All path identities are KCB types => no nocache.
+        let path_types = vec!["USER".to_string(), "PROD_CONTROLLER".to_string()];
+        assert!(!should_set_nocache_for_identity_types(None, &path_types));
+    }
+
+    #[mononoke::test]
+    fn test_nocache_set_for_non_kcb_path_identity() {
+        // One path identity is not a KCB type => nocache.
+        let path_types = vec!["USER".to_string(), "CUSTOM_ACL_TYPE".to_string()];
+        assert!(should_set_nocache_for_identity_types(None, &path_types));
+    }
+
+    #[mononoke::test]
+    fn test_nocache_set_when_path_non_kcb_but_repo_is_kcb() {
+        // Repo identity is KCB, but a path identity is not => nocache.
+        let path_types = vec!["CUSTOM_ACL_TYPE".to_string()];
+        assert!(should_set_nocache_for_identity_types(
+            Some("USER"),
+            &path_types
+        ));
+    }
+
+    #[mononoke::test]
+    fn test_nocache_set_for_non_kcb_repo_skips_path_check() {
+        // Non-KCB repo identity triggers nocache regardless of path types.
+        let path_types = vec!["USER".to_string()];
+        assert!(should_set_nocache_for_identity_types(
+            Some("CUSTOM_ACL_TYPE"),
+            &path_types
+        ));
+    }
+
+    // ---- Tests for maybe_set_nocache_thriftcache with JustKnobs ----
+
+    #[mononoke::fbinit_test]
+    fn test_maybe_set_nocache_jk_disabled(fb: fbinit::FacebookInit) {
+        // When the JustKnob is disabled, nocache should NOT be set even with
+        // non-KCB identity types.
+        let ctx = CoreContext::test_mock(fb);
+        assert!(!ctx.nocache_thriftcache());
+
+        with_just_knobs(
+            JustKnobsInMemory::new(hashmap![
+                "scm/mononoke:scs_thriftcache_nocache_for_non_kcb_identities".to_string()
+                    => KnobVal::Bool(false)
+            ]),
+            || {
+                // With JK disabled, the JK check returns false.
+                let jk_enabled = justknobs::eval(
+                    "scm/mononoke:scs_thriftcache_nocache_for_non_kcb_identities",
+                    None,
+                    None,
+                );
+                assert!(!jk_enabled);
+                // Since JK is disabled, nocache should not be set.
+                assert!(!ctx.nocache_thriftcache());
+            },
+        );
+    }
+
+    #[mononoke::fbinit_test]
+    fn test_maybe_set_nocache_jk_enabled_with_non_kcb_type(fb: fbinit::FacebookInit) {
+        // When JK is enabled and identity types are non-KCB, nocache should be set.
+        let ctx = CoreContext::test_mock(fb);
+
+        with_just_knobs(
+            JustKnobsInMemory::new(hashmap![
+                "scm/mononoke:scs_thriftcache_nocache_for_non_kcb_identities".to_string()
+                    => KnobVal::Bool(true)
+            ]),
+            || {
+                let jk_enabled = justknobs::eval(
+                    "scm/mononoke:scs_thriftcache_nocache_for_non_kcb_identities",
+                    None,
+                    None,
+                );
+                assert!(jk_enabled);
+
+                // With non-KCB type, should_set_nocache returns true.
+                assert!(should_set_nocache_for_identity_types(
+                    Some("CUSTOM_ACL_TYPE"),
+                    &[]
+                ));
+
+                // Simulate what maybe_set_nocache_thriftcache does when JK is on
+                // and identity types trigger nocache:
+                if should_set_nocache_for_identity_types(Some("CUSTOM_ACL_TYPE"), &[]) {
+                    ctx.set_nocache_thriftcache();
+                }
+                assert!(ctx.nocache_thriftcache());
+            },
+        );
+    }
+
+    #[mononoke::fbinit_test]
+    fn test_maybe_set_nocache_jk_enabled_with_kcb_type(fb: fbinit::FacebookInit) {
+        // When JK is enabled but all identity types are KCB, nocache should NOT be set.
+        let ctx = CoreContext::test_mock(fb);
+
+        with_just_knobs(
+            JustKnobsInMemory::new(hashmap![
+                "scm/mononoke:scs_thriftcache_nocache_for_non_kcb_identities".to_string()
+                    => KnobVal::Bool(true)
+            ]),
+            || {
+                assert!(!should_set_nocache_for_identity_types(
+                    Some("USER"),
+                    &["SERVICE_IDENTITY".to_string()]
+                ));
+                assert!(!ctx.nocache_thriftcache());
+            },
+        );
     }
 }

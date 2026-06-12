@@ -28,12 +28,14 @@ HttpError = bindings.error.HttpError
 IndexedLogError = bindings.error.IndexedLogError
 InvalidRepoPath = bindings.error.InvalidRepoPath
 LockContendedError = bindings.error.LockContendedError
+MaxFetchCountError = bindings.error.MaxFetchCountError
 MetaLogError = bindings.error.MetaLogError
 NeedSlowPathError = bindings.error.NeedSlowPathError
 NonUTF8PathError = bindings.error.NonUTF8Path
 PathMatcherError = bindings.error.PathMatcherError
 WorkingCopyError = bindings.error.WorkingCopyError
 RepoInitError = bindings.error.RepoInitError
+PermissionDeniedError = bindings.error.PermissionDeniedError
 UncategorizedNativeError = bindings.error.UncategorizedNativeError
 TlsError = bindings.error.TlsError
 

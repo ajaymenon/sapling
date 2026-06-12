@@ -46,7 +46,9 @@ use storemodel::SerializationFormat;
 pub trait ReadCommitText: Sync {
     /// Read raw text for a commit, in hg commit format.
     async fn get_commit_raw_text(&self, vertex: &Vertex) -> Result<Option<Bytes>> {
-        let list = self.get_commit_raw_text_list(&[vertex.clone()]).await?;
+        let list = self
+            .get_commit_raw_text_list(std::slice::from_ref(vertex))
+            .await?;
         Ok(Some(list.into_iter().next().unwrap()))
     }
 
@@ -252,6 +254,8 @@ pub struct ParentlessHgCommit {
     pub raw_text: Bytes,
 }
 
+pub mod new_commit;
 pub mod trait_impls;
 
 pub use anyhow::Result;
+pub use new_commit::NewCommit;

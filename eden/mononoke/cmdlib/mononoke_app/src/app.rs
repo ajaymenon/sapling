@@ -57,6 +57,7 @@ use redactedblobstore::RedactionConfigBlobstore;
 use repo_blobstore::RepoBlobstore;
 use repo_factory::RepoFactory;
 use repo_factory::RepoFactoryBuilder;
+use running::ShutdownGracePeriod;
 use running::run_until_terminated;
 use scuba_ext::MononokeScubaSampleBuilder;
 use services::Fb303Service;
@@ -246,7 +247,7 @@ impl MononokeApp {
         mut self,
         server: ServerFn,
         quiesce: QuiesceFn,
-        shutdown_grace_period: Duration,
+        shutdown_grace_period: impl ShutdownGracePeriod,
         shutdown: ShutdownFut,
         shutdown_timeout: Duration,
         requests_counter: Option<Arc<AtomicI64>>,
@@ -283,7 +284,7 @@ impl MononokeApp {
     pub fn wait_until_terminated<QuiesceFn, ShutdownFut>(
         self,
         quiesce: QuiesceFn,
-        shutdown_grace_period: Duration,
+        shutdown_grace_period: impl ShutdownGracePeriod,
         shutdown: ShutdownFut,
         shutdown_timeout: Duration,
         requests_counter: Option<Arc<AtomicI64>>,
@@ -391,23 +392,13 @@ impl MononokeApp {
     }
 
     pub fn repo_config_by_name(&self, repo_name: &str) -> Result<RepoConfig> {
-        self.repo_configs()
-            .repos
-            .get(repo_name)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown reponame: {:?}", repo_name))
+        self.configs.get_or_load_repo_config(repo_name)
     }
 
     /// Get repo config based on user-provided arguments.
     pub fn repo_config(&self, repo_arg: &RepoArg) -> Result<(String, RepoConfig)> {
         match repo_arg {
-            RepoArg::Id(repo_id) => {
-                let repo_configs = self.repo_configs();
-                let (repo_name, repo_config) = repo_configs
-                    .get_repo_config(*repo_id)
-                    .ok_or_else(|| anyhow!("unknown repoid: {:?}", repo_id))?;
-                Ok((repo_name.clone(), repo_config.clone()))
-            }
+            RepoArg::Id(repo_id) => self.configs.get_or_load_repo_config_by_id(repo_id.id()),
             RepoArg::Name(repo_name) => {
                 let repo_config = self.repo_config_by_name(repo_name)?;
                 Ok((repo_name.to_string(), repo_config))
@@ -504,14 +495,16 @@ impl MononokeApp {
     where
         Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>,
     {
-        let repo_configs = self.repo_configs();
-        let (repo_name, repo_config) = repo_configs
-            .get_repo_config(repo_id)
-            .ok_or_else(|| anyhow!("unknown repoid: {:?}", repo_id))?;
+        // Route through `get_or_load_repo_config_by_id` so split-loaded repos
+        // (only present in the per-tier RepoSpec manifest) resolve correctly.
+        let (repo_name, repo_config) = self
+            .configs
+            .get_or_load_repo_config_by_id(repo_id.id())
+            .with_context(|| format!("unknown repoid: {repo_id:?}"))?;
         let common_config = self.repo_configs().common.clone();
         let repo = self
             .repo_factory
-            .build(repo_name.clone(), repo_config.clone(), common_config)
+            .build(repo_name, repo_config, common_config)
             .await?;
         Ok(repo)
     }
@@ -680,7 +673,7 @@ impl MononokeApp {
             + Sync
             + 'static,
     {
-        let redaction_disabled = false;
+        let redaction_disabled = self.env.redaction_disabled;
         self.open_managed_repos_with_redaction_disabled(service, redaction_disabled)
             .await
     }
@@ -718,30 +711,28 @@ impl MononokeApp {
     {
         let repo_filter = self.environment().filter_repos.clone();
         let service_name = service.clone();
-        let repo_names =
-            self.repo_configs()
-                .repos
-                .clone()
-                .into_iter()
-                .filter_map(|(name, config)| {
-                    let is_matching_filter =
-                        repo_filter.as_ref().is_none_or(|filter| filter(&name));
-                    let is_deep_sharded = service
-                        .as_ref()
-                        .and_then(|service| {
-                            config
-                                .deep_sharding_config
-                                .and_then(|c| c.status.get(service).copied())
-                        })
-                        .unwrap_or(false);
-                    // Initialize repos that are enabled and not deep-sharded (i.e. need to exist
-                    // at service startup)
-                    if config.enabled && !is_deep_sharded && is_matching_filter {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                });
+
+        // Load configs from both legacy blob and manifest
+        let configs = self.configs.load_all_repo_configs()?;
+
+        let repo_names = configs.into_iter().filter_map(|(name, config)| {
+            let is_matching_filter = repo_filter.as_ref().is_none_or(|filter| filter(&name));
+            let is_deep_sharded = service
+                .as_ref()
+                .and_then(|service| {
+                    config
+                        .deep_sharding_config
+                        .and_then(|c| c.status.get(service).copied())
+                })
+                .unwrap_or(false);
+            // Initialize repos that are enabled and not deep-sharded (i.e. need to exist
+            // at service startup)
+            if config.enabled && !is_deep_sharded && is_matching_filter {
+                Some(name)
+            } else {
+                None
+            }
+        });
         self.open_named_managed_repos_with_redaction_disabled(
             repo_names,
             service_name,
@@ -764,7 +755,7 @@ impl MononokeApp {
             + Sync
             + 'static,
     {
-        let redaction_disabled = false;
+        let redaction_disabled = self.env.redaction_disabled;
         self.open_named_managed_repos_with_redaction_disabled(
             repo_names,
             service,
@@ -863,7 +854,7 @@ impl MononokeApp {
         let storage_config = storage_configs
             .storage
             .get(storage_name)
-            .ok_or_else(|| anyhow!("unknown storage name: {:?}", storage_name))?
+            .ok_or_else(|| anyhow!("unknown storage name: {storage_name:?}"))?
             .clone();
 
         let mut blob_config = if use_mutable {
@@ -897,27 +888,25 @@ impl MononokeApp {
         &self,
         repo_blobstore_args: &RepoBlobstoreArgs,
     ) -> Result<Arc<dyn KeyedBlobstore>> {
-        let repo_configs = self.repo_configs();
+        // Route through MononokeConfigs::get_or_load_repo_config* so split-loaded
+        // repos (only present in the per-tier RepoSpec manifest) resolve correctly.
         let (repo_id, mut redaction, storage_config) =
             if let Some(repo_id) = repo_blobstore_args.repo_id {
                 let repo_id = RepositoryId::new(repo_id);
-                let (_repo_name, repo_config) = repo_configs
-                    .get_repo_config(repo_id)
-                    .ok_or_else(|| anyhow!("unknown repoid: {:?}", repo_id))?;
-                (
-                    repo_id,
-                    repo_config.redaction,
-                    repo_config.storage_config.clone(),
-                )
+                let (_repo_name, repo_config) = self
+                    .configs
+                    .get_or_load_repo_config_by_id(repo_id.id())
+                    .with_context(|| format!("unknown repoid: {repo_id:?}"))?;
+                (repo_id, repo_config.redaction, repo_config.storage_config)
             } else if let Some(repo_name) = &repo_blobstore_args.repo_name {
-                let repo_config = repo_configs
-                    .repos
-                    .get(repo_name)
-                    .ok_or_else(|| anyhow!("unknown reponame: {:?}", repo_name))?;
+                let repo_config = self
+                    .configs
+                    .get_or_load_repo_config(repo_name)
+                    .with_context(|| format!("unknown reponame: {repo_name:?}"))?;
                 (
                     repo_config.repoid,
                     repo_config.redaction,
-                    repo_config.storage_config.clone(),
+                    repo_config.storage_config,
                 )
             } else {
                 return Err(anyhow!("Expected either repo_id or repo_name"));
@@ -1015,7 +1004,7 @@ impl MononokeApp {
                             None
                         }
                     })
-                    .ok_or_else(|| anyhow!("could not find a blobstore with id {}", id))?;
+                    .ok_or_else(|| anyhow!("could not find a blobstore with id {id}"))?;
                 *blob_config = inner_blob_config;
             }
             _ => {
@@ -1038,7 +1027,7 @@ pub fn setup_repo_dir<P: AsRef<Path>>(data_dir: P, create: CreateStorage) -> Res
     let data_dir = data_dir.as_ref();
 
     if !data_dir.is_dir() {
-        bail!("{:?} does not exist or is not a directory", data_dir);
+        bail!("{data_dir:?} does not exist or is not a directory");
     }
 
     // Validate directory layout
@@ -1047,15 +1036,15 @@ pub fn setup_repo_dir<P: AsRef<Path>>(data_dir: P, create: CreateStorage) -> Res
         let subdir = data_dir.join(subdir);
 
         if subdir.exists() && !subdir.is_dir() {
-            bail!("{:?} already exists and is not a directory", subdir);
+            bail!("{subdir:?} already exists and is not a directory");
         }
 
         if !subdir.exists() {
             if CreateStorage::ExistingOnly == create {
-                bail!("{:?} not found in ExistingOnly mode", subdir,);
+                bail!("{subdir:?} not found in ExistingOnly mode",);
             }
             fs::create_dir(&subdir)
-                .with_context(|| format!("failed to create subdirectory {:?}", subdir))?;
+                .with_context(|| format!("failed to create subdirectory {subdir:?}"))?;
         }
     }
     Ok(())

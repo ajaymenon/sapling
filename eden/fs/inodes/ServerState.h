@@ -25,10 +25,14 @@ namespace facebook::eden {
 
 class Clock;
 class EdenConfig;
+class EdenFsEventsLogger;
+class EdenErrorInfoBuilder;
 class EdenStats;
+class ErrorLogger;
 class FaultInjector;
 class FsEventLogger;
 class IScribeLogger;
+class XplatLogger;
 class InodeAccessLogger;
 class NfsServer;
 class Notifier;
@@ -58,7 +62,7 @@ class ServerState {
   ServerState(
       UserInfo userInfo,
       EdenStatsPtr edenStats,
-      SessionInfo sessionInfo,
+      SessionInfo sessionInfo, // NOLINT(performance-unnecessary-value-param)
       std::shared_ptr<PrivHelper> privHelper,
       std::shared_ptr<UnboundedQueueExecutor> threadPool,
       std::shared_ptr<folly::Executor> fsChannelThreadPool,
@@ -66,13 +70,15 @@ class ServerState {
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       std::shared_ptr<StructuredLogger> structuredLogger,
       std::shared_ptr<StructuredLogger> notificationsStructuredLogger,
+      std::shared_ptr<ErrorLogger> errorLogger,
       std::shared_ptr<IScribeLogger> scribeLogger,
       std::shared_ptr<ReloadableConfig> reloadableConfig,
       const EdenConfig& initialConfig,
       folly::EventBase* mainEventBase,
       std::shared_ptr<Notifier> notifier,
       bool enableFaultInjection = false,
-      std::shared_ptr<InodeAccessLogger> inodeAccessLogger = nullptr);
+      std::shared_ptr<InodeAccessLogger> inodeAccessLogger = nullptr,
+      XplatLogger* xplatLogger = nullptr);
   ~ServerState();
 
   /**
@@ -168,9 +174,17 @@ class ServerState {
     return structuredLogger_;
   }
 
+  const std::shared_ptr<EdenFsEventsLogger>& getEdenFsEventsLogger() const {
+    return edenFsEventsLogger_;
+  }
+
   const std::shared_ptr<StructuredLogger>& getNotificationsStructuredLogger()
       const {
     return notificationsStructuredLogger_;
+  }
+
+  ErrorLogger& getErrorLogger() const {
+    return *errorLogger_;
   }
 
   /**
@@ -220,7 +234,9 @@ class ServerState {
   std::shared_ptr<Clock> clock_;
   std::shared_ptr<ProcessInfoCache> processInfoCache_;
   std::shared_ptr<StructuredLogger> structuredLogger_;
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
   std::shared_ptr<StructuredLogger> notificationsStructuredLogger_;
+  std::shared_ptr<ErrorLogger> errorLogger_;
   std::shared_ptr<IScribeLogger> scribeLogger_;
   std::unique_ptr<FaultInjector> const faultInjector_;
   std::shared_ptr<NfsServer> nfs_;

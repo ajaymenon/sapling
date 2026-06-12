@@ -28,6 +28,7 @@ use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use ascii::AsciiString;
 use bookmarks_types::BookmarkKey;
 use derive_more::From;
@@ -40,9 +41,7 @@ use mononoke_types::PrefixTrie;
 use mononoke_types::RepositoryId;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::path::MPath;
-use mysql_common::value::convert::ConvIr;
 use mysql_common::value::convert::FromValue;
-use mysql_common::value::convert::ParseIr;
 use parking_lot::RwLock;
 use permission_checker::MononokeIdentity;
 use regex::Regex;
@@ -163,6 +162,8 @@ pub struct CommonConfig {
     pub edenapi_dumper_scuba_table: Option<String>,
     /// Configuration for the async requests system.
     pub async_requests_config: AsyncRequestsConfig,
+    /// Repo name prefix for RL Land Service push diversion.
+    pub rl_land_service_repo_prefix: Option<String>,
 }
 
 /// Configuration for logging of censored blobstore accesses
@@ -230,8 +231,6 @@ pub struct RepoConfig {
     pub enforce_lfs_acl_check: bool,
     /// Whether to use warm bookmark cache while serving data hg wireprotocol
     pub repo_client_use_warm_bookmarks_cache: bool,
-    /// Configuration for repo_client module
-    pub repo_client_knobs: RepoClientKnobs,
     /// Callsign to check phabricator commits
     pub phabricator_callsign: Option<String>,
     /// ACL region configuration
@@ -259,6 +258,8 @@ pub struct RepoConfig {
     pub metadata_logger_config: MetadataLoggerConfig,
     /// Configuration for connecting to Zelos
     pub zelos_config: Option<ZelosConfig>,
+    /// Configuration for connecting to Zelos for the derivation pipeline
+    pub pipeline_zelos_config: Option<ZelosConfig>,
     /// The name of the bookmark used to compute repo size
     pub bookmark_name_for_objects_count: Option<String>,
     /// Default value for the objects count metric if it cannot be determined via TreeInfo.
@@ -295,6 +296,8 @@ pub struct RepoConfig {
     pub restricted_paths_config: RestrictedPathsConfig,
     /// Configuration for remote diff service
     pub remote_diff_config: Option<RemoteDiffConfig>,
+    /// Configuration for commit rate limiting.
+    pub commit_rate_limit_config: Option<CommitRateLimitConfig>,
 }
 
 /// Config determining if the repo is deep sharded in the context of a service.
@@ -343,6 +346,8 @@ pub enum ShardedService {
     BookmarkService,
     /// GitBundleGenerator
     GitBundleGenerator,
+    /// Derivation Pipeline Tailer
+    DerivationPipelineTailer,
 }
 
 /// Indicates types of commit hashes used in a repo context.
@@ -357,13 +362,6 @@ pub enum CommitIdentityScheme {
     BONSAI,
     /// Hashes are of unknown scheme.
     UNKNOWN,
-}
-
-/// Configuration for repo_client module
-#[derive(Eq, Copy, Clone, Default, Debug, PartialEq)]
-pub struct RepoClientKnobs {
-    /// Return shorter file history in getpack call
-    pub allow_short_getpack_history: bool,
 }
 
 /// Config for derived data
@@ -386,6 +384,12 @@ pub struct DerivedDataConfig {
 
     /// Commits with blocked derivation
     pub blocked_derivation: HashMap<ChangesetId, Option<HashSet<DerivableType>>>,
+
+    /// Extra derived data types that are available for read but not necessarily enabled for derivation.
+    pub extra_types_available_for_read: HashSet<DerivableType>,
+
+    /// Repo-level pipeline configuration.
+    pub pipeline_config: Option<DerivationPipelineConfig>,
 }
 
 impl DerivedDataConfig {
@@ -436,6 +440,83 @@ impl DerivedDataConfig {
                     .is_none_or(|types| types.contains(&derivable_type))
             })
     }
+
+    /// Returns whether the named derived data type is readable.
+    /// A type is readable if it's either in the active config's types or in extra_types_available_for_read.
+    pub fn is_readable(&self, derivable_type: DerivableType) -> bool {
+        self.extra_types_available_for_read
+            .contains(&derivable_type)
+            || self.is_enabled(derivable_type)
+    }
+}
+
+/// A single stage in a derivation pipeline, keyed by its absolute path.
+#[derive(Eq, Clone, Debug, PartialEq)]
+pub struct DerivationPipelineStageConfig {
+    /// Absolute paths of stages this one directly depends on.
+    pub dependencies: Vec<MPath>,
+}
+
+/// Pipeline configuration. The terminal stage is the one at `MPath::ROOT`.
+#[derive(Eq, Clone, Debug, PartialEq)]
+pub struct DerivationPipelineConfig {
+    /// Derived data types managed by this pipeline.
+    pub types: BTreeSet<DerivableType>,
+    /// Bookmarks to tail.
+    pub bookmarks: Vec<BookmarkKey>,
+    /// Stage DAG keyed by absolute path.
+    pub stages: HashMap<MPath, DerivationPipelineStageConfig>,
+    /// Maximum commits per batch.
+    pub batch_size: NonZeroU64,
+}
+
+impl DerivationPipelineConfig {
+    /// Validate the pipeline configuration.
+    pub fn validate(&self) -> Result<()> {
+        if self.types.is_empty() {
+            bail!("Derivation pipeline config must have at least one derivable type");
+        }
+
+        for (stage_path, config) in &self.stages {
+            for dep in &config.dependencies {
+                if !self.stages.contains_key(dep) {
+                    bail!("Stage {stage_path:?} depends on {dep:?}, which does not exist",);
+                }
+            }
+        }
+
+        if !self.stages.contains_key(&MPath::ROOT) {
+            bail!("Derivation pipeline config must have a stage at root");
+        }
+
+        for (stage_path, stage) in &self.stages {
+            for dep_path in &stage.dependencies {
+                if !stage_path.is_prefix_of(dep_path)
+                    || dep_path.num_components() != stage_path.num_components() + 1
+                {
+                    bail!(
+                        "Stage {stage_path:?} depends on {dep_path:?}, but the dep path must be exactly one MPathElement deeper than the stage path",
+                    );
+                }
+            }
+        }
+
+        let mut in_degree: HashMap<&MPath, usize> = self.stages.keys().map(|p| (p, 0)).collect();
+        for config in self.stages.values() {
+            for dep in &config.dependencies {
+                if let Some(count) = in_degree.get_mut(dep) {
+                    *count += 1;
+                }
+            }
+        }
+        for (stage_path, &count) in &in_degree {
+            if count == 0 && !stage_path.is_root() {
+                bail!("Stage {stage_path:?} is orphan: not depended on by any other stage",);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Config for derived data types
@@ -485,6 +566,10 @@ pub struct DerivedDataTypesConfig {
 
     /// Config for inferred copy from
     pub inferred_copy_from_config: Option<InferredCopyFromConfig>,
+
+    /// Maps DerivableType to XDB shard ID. Types in this map store their
+    /// mapping in XDB rather than the blobstore.
+    pub xdb_mapping_shard_ids: HashMap<DerivableType, usize>,
 }
 
 /// What type of unode derived data to generate
@@ -501,6 +586,8 @@ pub enum BlameVersion {
     /// Blame v2
     #[default]
     V2,
+    /// Blame v3 (history manifest based)
+    V3,
 }
 
 /// What `GitDeltaManifest` version should be used.
@@ -577,6 +664,59 @@ pub enum RemoteDiffConfig {
     SmcTier(String),
     /// host:port string for remote diff service
     HostPort(String),
+}
+
+/// Configuration for commit rate limiting.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct CommitRateLimitConfig {
+    /// Rate limit rules.
+    pub rules: Vec<CommitRateLimitRuleConfig>,
+    /// Optional cache configuration shared across all rules.
+    pub cache_config: Option<CommitRateLimitCacheConfig>,
+}
+
+/// A single commit rate limit rule.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CommitRateLimitRuleConfig {
+    /// Rule name.
+    pub name: String,
+    /// Eligibility checks (OR semantics).
+    pub eligibility_checks: Vec<CommitRateLimitEligibilityCheck>,
+    /// Rate limit windows (AND semantics).
+    pub limits: Vec<CommitRateLimitWindow>,
+    /// Directory prefixes to scope the rule.
+    pub directories: Vec<String>,
+    /// Whether to enforce per-author.
+    pub per_user: bool,
+}
+
+/// Eligibility check for commit rate limiting.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CommitRateLimitEligibilityCheck {
+    /// Matches commits whose message contains the given tag string (case-sensitive).
+    CommitMessageTag(String),
+    /// Matches commits with the given key in hg_extra.
+    HgExtra(String),
+    /// Always passes.
+    AlwaysPass,
+}
+
+/// A rate limit window.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CommitRateLimitWindow {
+    /// Window duration in seconds.
+    pub window_secs: u64,
+    /// Maximum commits allowed in the window.
+    pub max_commits: u64,
+}
+
+/// Cache configuration for commit rate limiting.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CommitRateLimitCacheConfig {
+    /// Maximum entries in the cache.
+    pub max_entries: u64,
+    /// TTL for cache entries in seconds.
+    pub ttl_secs: u64,
 }
 
 impl RepoConfig {
@@ -732,6 +872,9 @@ pub struct HookBypass {
     commit_message_bypass: Option<String>,
     /// Bypass that checks that a string is in the commit message
     pushvar_name_and_value: Option<(String, String)>,
+    /// AMP group restricting who can use bypass. When set, only group members
+    /// can bypass this hook.
+    permission_group: Option<String>,
 }
 
 impl HookBypass {
@@ -740,6 +883,7 @@ impl HookBypass {
         Self {
             commit_message_bypass: Some(msg),
             pushvar_name_and_value: None,
+            permission_group: None,
         }
     }
 
@@ -748,6 +892,7 @@ impl HookBypass {
         Self {
             commit_message_bypass: None,
             pushvar_name_and_value: Some((name, value)),
+            permission_group: None,
         }
     }
 
@@ -760,6 +905,7 @@ impl HookBypass {
         Self {
             commit_message_bypass: Some(msg),
             pushvar_name_and_value: Some((pushvar_name, pushvar_value)),
+            permission_group: None,
         }
     }
 
@@ -773,6 +919,17 @@ impl HookBypass {
         self.pushvar_name_and_value
             .as_ref()
             .map(|name_and_value| (&name_and_value.0, &name_and_value.1))
+    }
+
+    /// Set the permission group (builder pattern)
+    pub fn with_permission_group(mut self, group: Option<String>) -> Self {
+        self.permission_group = group;
+        self
+    }
+
+    /// Get the permission group
+    pub fn permission_group(&self) -> Option<&str> {
+        self.permission_group.as_deref()
     }
 }
 
@@ -858,6 +1015,117 @@ pub struct PushrebaseFlags {
     pub not_generated_filenodes_limit: u64,
     /// Which bookmark to track in ODS
     pub monitoring_bookmark: Option<String>,
+    /// Path prefixes excluded from merge resolution during pushrebase.
+    /// Files under these prefixes will not be auto-merged; conflicts on
+    /// them will be rejected as before so downstream checks (e.g. Hack
+    /// type-checking in CI land) still trigger.
+    pub merge_resolution_excluded_path_prefixes: PrefixTrie,
+    /// Bookmarks that use pessimistic locking for pushrebase.
+    /// Only effective when the pushrebase_pessimistic_locking JustKnob is enabled.
+    pub pessimistic_locking_bookmarks: Vec<BookmarkKey>,
+    /// Per-request override for `pushrebase_enable_merge_resolution`.
+    /// `UseJk` defers to the JustKnob; `ForceOn`/`ForceOff` wins. Request-scoped,
+    /// never loaded from configerator — set on a cloned `PushrebaseFlags`
+    /// before the pushrebase call (mirrors `rewritedates`).
+    pub merge_resolution_override: MergeResolutionOverride,
+}
+
+/// Per-request override for the `pushrebase_enable_merge_resolution` JustKnob.
+///
+/// `UseJk` (the default) consults the JK as before. `ForceOn`/`ForceOff`
+/// wins over the JK and is used by the QE rollout to assign requests to
+/// a treatment or control arm independent of the global flag.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum MergeResolutionOverride {
+    /// Defer to the `pushrebase_enable_merge_resolution` JustKnob (default).
+    #[default]
+    UseJk,
+    /// Force merge resolution ON for this request, regardless of the JK.
+    ForceOn,
+    /// Force merge resolution OFF for this request, regardless of the JK.
+    ForceOff,
+}
+
+impl MergeResolutionOverride {
+    /// Pushvar key consulted by `from_pushvar_value`. All push surfaces
+    /// (SLAPI Land, SCS RepoLandStack, bundle2 unbundle) read this same
+    /// key so callers (Sandcastle, etc.) set it once regardless of path.
+    pub const PUSHVAR_KEY: &'static str = "MERGE_RESOLUTION_OVERRIDE";
+
+    /// Parse the pushvar value (already looked up from the pushvar map
+    /// by the caller — kept generic over `&[u8]` to avoid pulling
+    /// `bytes` into `metaconfig_types`). Accepts `"true"`/`"1"` -> `ForceOn`,
+    /// `"false"`/`"0"` -> `ForceOff` (case-insensitive). Anything else
+    /// — missing, empty, malformed — returns `UseJk` so callers without
+    /// an opinion fall through to the JK as before.
+    pub fn from_pushvar_value(raw: Option<&[u8]>) -> Self {
+        match raw.map(<[u8]>::to_ascii_lowercase).as_deref() {
+            Some(b"true" | b"1") => Self::ForceOn,
+            Some(b"false" | b"0") => Self::ForceOff,
+            _ => Self::UseJk,
+        }
+    }
+}
+
+#[cfg(test)]
+mod merge_resolution_override_tests {
+    use super::MergeResolutionOverride;
+
+    #[test]
+    fn from_pushvar_value_recognizes_truthy() {
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"true")),
+            MergeResolutionOverride::ForceOn,
+        );
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"TRUE")),
+            MergeResolutionOverride::ForceOn,
+        );
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"True")),
+            MergeResolutionOverride::ForceOn,
+        );
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"1")),
+            MergeResolutionOverride::ForceOn,
+        );
+    }
+
+    #[test]
+    fn from_pushvar_value_recognizes_falsy() {
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"false")),
+            MergeResolutionOverride::ForceOff,
+        );
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"FALSE")),
+            MergeResolutionOverride::ForceOff,
+        );
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"0")),
+            MergeResolutionOverride::ForceOff,
+        );
+    }
+
+    #[test]
+    fn from_pushvar_value_defaults_to_use_jk() {
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(None),
+            MergeResolutionOverride::UseJk,
+        );
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"")),
+            MergeResolutionOverride::UseJk,
+        );
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"yes")),
+            MergeResolutionOverride::UseJk,
+        );
+        assert_eq!(
+            MergeResolutionOverride::from_pushvar_value(Some(b"\xff\xfe")),
+            MergeResolutionOverride::UseJk,
+        );
+    }
 }
 
 impl Default for PushrebaseFlags {
@@ -870,6 +1138,9 @@ impl Default for PushrebaseFlags {
             casefolding_check_excluded_paths: PrefixTrie::new(),
             not_generated_filenodes_limit: 500,
             monitoring_bookmark: None,
+            merge_resolution_excluded_path_prefixes: PrefixTrie::new(),
+            pessimistic_locking_bookmarks: Vec::new(),
+            merge_resolution_override: MergeResolutionOverride::UseJk,
         }
     }
 }
@@ -915,7 +1186,7 @@ pub struct PushrebaseParams {
     pub emit_obsmarkers: bool,
     /// Globalrev configuration
     pub globalrev_config: Option<GlobalrevConfig>,
-    /// Whether Git Mapping should be populated from extras (affects also blobimport)
+    /// Whether Git Mapping should be populated from extras
     pub populate_git_mapping: bool,
     /// For the case when one repo is linked to another (a.k.a. megarepo)
     /// there's a special commit extra that allows changing the mapping
@@ -956,7 +1227,7 @@ pub struct LfsParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize)]
 #[derive(From, Into, mysql::OptTryFromRowField)]
 pub struct BlobstoreId(u64);
-sql::proxy_conv_ir!(BlobstoreId, ParseIr<u64>, u64);
+sql::proxy_conv_ir!(BlobstoreId, u64);
 
 impl BlobstoreId {
     /// Construct blobstore from integer
@@ -981,7 +1252,7 @@ impl From<BlobstoreId> for ScubaValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 #[derive(From, Into, mysql::OptTryFromRowField)]
 pub struct MultiplexId(i32);
-sql::proxy_conv_ir!(MultiplexId, ParseIr<i32>, i32);
+sql::proxy_conv_ir!(MultiplexId, i32);
 
 impl MultiplexId {
     /// Construct a MultiplexId from an i32.
@@ -1274,6 +1545,8 @@ pub struct RemoteMetadataDatabaseConfig {
     pub repo_metadata: Option<RemoteDatabaseConfig>,
     /// Database for restricted paths manifest ids storage
     pub restricted_paths: Option<RemoteDatabaseConfig>,
+    /// Database for commit derived data mapping
+    pub commit_derived_data_mapping: Option<ShardableRemoteDatabaseConfig>,
 }
 
 /// Configuration for the Metadata database when it is remote.
@@ -1297,6 +1570,8 @@ pub struct OssRemoteMetadataDatabaseConfig {
     pub bonsai_blob_mapping: Option<OssRemoteDatabaseConfig>,
     /// Database for deletion log
     pub deletion_log: Option<OssRemoteDatabaseConfig>,
+    /// Database for commit derived data mapping
+    pub commit_derived_data_mapping: Option<OssRemoteDatabaseConfig>,
 }
 
 /// Configuration for the Metadata database
@@ -1408,9 +1683,6 @@ pub struct InfinitepushParams {
     /// Valid namespace for infinite push bookmarks. If None, then infinitepush bookmarks are not
     /// allowed.
     pub namespace: Option<InfinitepushNamespace>,
-
-    /// Whether to put trees/files in the getbundle response for infinitepush commits
-    pub hydrate_getbundle_response: bool,
 }
 
 /// Filestore configuration.
@@ -1545,8 +1817,10 @@ impl From<CommitSyncConfigVersion> for Value {
     }
 }
 
-impl ConvIr<CommitSyncConfigVersion> for CommitSyncConfigVersion {
-    fn new(v: Value) -> Result<Self, FromValueError> {
+impl TryFrom<Value> for CommitSyncConfigVersion {
+    type Error = FromValueError;
+
+    fn try_from(v: Value) -> Result<Self, FromValueError> {
         match v {
             Value::Bytes(bytes) => match String::from_utf8(bytes) {
                 Ok(s) => Ok(CommitSyncConfigVersion(s)),
@@ -1556,14 +1830,6 @@ impl ConvIr<CommitSyncConfigVersion> for CommitSyncConfigVersion {
             },
             v => Err(FromValueError(v)),
         }
-    }
-
-    fn commit(self) -> CommitSyncConfigVersion {
-        self
-    }
-
-    fn rollback(self) -> Value {
-        self.into()
     }
 }
 
@@ -1667,6 +1933,16 @@ impl SourceControlServiceParams {
         false
     }
 
+    /// Returns true if the named service is permitted to bypass create-commit checks.
+    pub fn service_create_commit_check_bypass_permitted(
+        &self,
+        service_identity: impl AsRef<str>,
+    ) -> bool {
+        self.service_write_restrictions
+            .get(service_identity.as_ref())
+            .is_some_and(|r| r.permit_create_commit_check_bypass)
+    }
+
     /// Returns true if the named service is permitted to modify all paths.
     pub fn service_write_all_paths_permitted(&self, service_identity: impl AsRef<str>) -> bool {
         if let Some(restrictions) = self
@@ -1724,6 +2000,9 @@ pub struct ServiceWriteRestrictions {
     /// The service is permitted to modify bookmarks that match this regex in addition
     /// to those specified by `permitted_bookmarks`.
     pub permitted_bookmark_regex: Option<ComparableRegex>,
+
+    /// The service is permitted to bypass create-commit checks.
+    pub permit_create_commit_check_bypass: bool,
 }
 
 /// Configuration for health monitoring of the Source Control Service
@@ -1847,7 +2126,7 @@ impl fmt::Display for WalkerJobType {
             Self::ShallowHgScrub => "shallow-hg-scrub",
             Self::ValidateAll => "validate-all",
         };
-        write!(f, "{}", str_val)
+        write!(f, "{str_val}")
     }
 }
 
@@ -2198,6 +2477,68 @@ pub struct SoftRestrictedPathConfig {
     pub max_copied_files_limit: u64,
 }
 
+/// 4-stage rollout state for AclManifest as the source of truth for
+/// restricted-path enforcement.
+///
+/// Drives the dispatch in `spawn_enforce_restricted_*_access`:
+/// - `Disabled`: only the path-acls config source runs.
+/// - `Shadow`: both run, only config is authoritative; AclManifest is logged for comparison.
+/// - `Both`: both run, deny-if-either combination.
+/// - `Authoritative`: only AclManifest runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AclManifestMode {
+    /// Only the path-acls config source runs.
+    #[default]
+    Disabled,
+    /// Both run, only config is authoritative; AclManifest is logged for comparison.
+    Shadow,
+    /// Both run, deny-if-either combination.
+    Both,
+    /// Only AclManifest runs.
+    Authoritative,
+}
+
+impl AclManifestMode {
+    /// Returns true when the AclManifest source is fully disabled.
+    pub fn is_disabled(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    /// Returns true when path lookup should still use the manifest-id-store-backed config source.
+    pub fn uses_manifest_id_store_for_path_lookup(self) -> bool {
+        matches!(self, Self::Disabled | Self::Shadow)
+    }
+}
+
+/// A single enforcement condition set. All non-empty fields must match (AND).
+/// Multiple sets are evaluated with OR semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnforcementConditionSet {
+    /// If true, this set always matches — skips entry_points and
+    /// require_client_request_flag checks.
+    pub always_enabled: bool,
+    /// Client entry points that trigger enforcement (e.g. "ScsServer", "EdenApi").
+    /// Empty = match all entry points.
+    pub entry_points: Vec<String>,
+    /// Temporary: if true, client must send server_side_tenting=true in metadata.
+    /// Used during the initial rollout stage so clients can opt in to enforcement
+    /// and disable it if it causes issues. Should be removed once rollout is complete.
+    // TODO(T248658346): Remove this field once path ACL enforcement is fully rolled out.
+    pub require_client_request_flag: bool,
+    /// ACL-identity scoping. Empty = match any restricted access (no scoping).
+    /// Non-empty = match only when the access result's `restriction_acls`
+    /// overlaps this list.
+    pub restriction_acls: Vec<MononokeIdentity>,
+    /// Machine tiers (MACHINE_TIER identity values) that trigger enforcement.
+    /// Empty = don't filter on this dimension.
+    pub machine_tiers: Vec<String>,
+    /// Server build rules (the running binary's `build_info` build rule) that
+    /// trigger enforcement. Empty = don't filter on this dimension. Match = the
+    /// server's own build_rule (the value `add_common_server_data` logs to scuba)
+    /// appears in this list.
+    pub build_rules: Vec<String>,
+}
+
 /// Configuration for restricted paths and their associated ACLs
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RestrictedPathsConfig {
@@ -2210,13 +2551,28 @@ pub struct RestrictedPathsConfig {
     pub cache_update_interval_ms: u64,
     /// Soft restricted paths configuration
     pub soft_path_acls: Vec<SoftRestrictedPathConfig>,
-    /// ACLs to conditionally enable enforcement of restricted paths on the server.
-    /// Unauthorized access to restricted paths will be denied if the client
-    /// belongs to any of these ACLs.
-    pub conditional_enforcement_acls: Vec<MononokeIdentity>,
     /// Group name for tooling that should be allowlisted for all restricted paths.
     pub tooling_allowlist_group: Option<String>,
+    /// Group name for tooling that is allowlisted during rollout for all restricted paths.
+    /// Used during rollout for tooling that will likely be permanently allowlisted.
+    pub rollout_allowlist_group: Option<String>,
+    /// Group identity whose members may bypass all Path ACL enforcement — both
+    /// read access to restricted paths and maintainer-gated `.slacl`
+    /// modifications. Intended for admins fighting SEVs or debugging issues.
+    /// `None` disables the bypass.
+    pub admin_bypass_group: Option<MononokeIdentity>,
+    /// Name of the ACL files (default: ".slacl")
+    pub acl_file_name: String,
+    /// Condition sets for conditional enforcement. OR across sets, AND within.
+    pub enforcement_condition_sets: Vec<EnforcementConditionSet>,
+    /// Master kill switch for path ACL enforcement.
+    /// Defaults to `false` so a repo with no explicit value gets no enforcement.
+    pub enforcement_enabled: bool,
+    /// 4-stage rollout state for AclManifest. Defaults to `Disabled`.
+    pub acl_manifest_mode: AclManifestMode,
 }
+
+const DEFAULT_ACL_FILE_NAME: &str = ".slacl";
 
 impl Default for RestrictedPathsConfig {
     fn default() -> Self {
@@ -2225,8 +2581,13 @@ impl Default for RestrictedPathsConfig {
             use_manifest_id_cache: true,
             cache_update_interval_ms: 1000,
             soft_path_acls: Vec::new(),
-            conditional_enforcement_acls: Vec::new(),
             tooling_allowlist_group: None,
+            rollout_allowlist_group: None,
+            admin_bypass_group: None,
+            acl_file_name: DEFAULT_ACL_FILE_NAME.to_string(),
+            enforcement_condition_sets: Vec::new(),
+            enforcement_enabled: false,
+            acl_manifest_mode: AclManifestMode::Disabled,
         }
     }
 }
@@ -2235,5 +2596,167 @@ impl RestrictedPathsConfig {
     /// Checks if the config has any restricted paths
     pub fn is_empty(&self) -> bool {
         self.path_acls.is_empty()
+    }
+
+    /// Get the ACL file name, defaulting to ".slacl"
+    pub fn acl_file_name(&self) -> &str {
+        self.acl_file_name.as_str()
+    }
+}
+
+/// Parsed contents of a restricted paths ACL file (.slacl)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RestrictedPathsAclFile {
+    /// REPO_REGION ACL protecting this directory
+    /// e.x. "repos/hg/fbsource/=project1"
+    repo_region_acl: MononokeIdentity,
+    /// In most cases, we don't want to expose the name of the REPO_REGION ACL
+    /// when we enforce access. Instead, we redirect the client to an AMP group
+    /// that transitively provides access to the ACL.
+    /// If not specified, will default to `repo_region_acl`.
+    permission_request_group: Option<MononokeIdentity>,
+    // TODO(T248660053): possibly add dry-run mode
+}
+
+impl RestrictedPathsAclFile {
+    /// Create a new RestrictedPathsAclFile and ensure it meets all the requirements
+    pub fn new(
+        repo_region_acl: MononokeIdentity,
+        permission_request_group: Option<MononokeIdentity>,
+    ) -> Result<Self> {
+        Self {
+            repo_region_acl,
+            permission_request_group,
+        }
+        .validate()
+    }
+
+    /// REPO_REGION ACL protecting this directory
+    /// e.x. "repos/hg/fbsource/=project1"
+    pub fn repo_region_acl(&self) -> &MononokeIdentity {
+        &self.repo_region_acl
+    }
+
+    /// In most cases, we don't want to expose the name of the REPO_REGION ACL
+    /// when we enforce access. Instead, we redirect the client to an AMP group
+    /// that transitively provides access to the ACL.
+    /// If not specified, will default to `repo_region_acl`.
+    pub fn permission_request_group(&self) -> Option<&MononokeIdentity> {
+        self.permission_request_group.as_ref()
+    }
+
+    /// Run all the necessary validations on the ACL file
+    fn validate(self) -> Result<Self> {
+        match self.repo_region_acl().id_type() {
+            "REPO_REGION" => {}
+            acl_type => bail!("ACL must be of type REPO_REGION, got {acl_type}"),
+        };
+
+        Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    fn mp(s: &str) -> MPath {
+        MPath::new(s.as_bytes()).unwrap()
+    }
+
+    /// Build a stage with the given dependency paths.
+    fn stage(deps: Vec<&str>) -> DerivationPipelineStageConfig {
+        DerivationPipelineStageConfig {
+            dependencies: deps.into_iter().map(mp).collect(),
+        }
+    }
+
+    /// Build a `DerivationPipelineConfig` with the given (path, stage) pairs
+    /// and sane defaults for everything else.
+    fn pipeline_config(
+        stages: Vec<(&str, DerivationPipelineStageConfig)>,
+    ) -> DerivationPipelineConfig {
+        DerivationPipelineConfig {
+            types: BTreeSet::from([DerivableType::Fsnodes]),
+            bookmarks: vec![],
+            stages: stages.into_iter().map(|(p, s)| (mp(p), s)).collect(),
+            batch_size: NonZeroU64::new(100).unwrap(),
+        }
+    }
+
+    /// Assert that `config.validate()` fails with an error message containing
+    /// `substr`.
+    #[track_caller]
+    fn assert_rejects(config: DerivationPipelineConfig, substr: &str) {
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains(substr), "expected {substr:?}, got: {err}");
+    }
+
+    #[mononoke::test]
+    fn test_pipeline_config_valid_dag_validates_successfully() {
+        let config = pipeline_config(vec![
+            ("", stage(vec!["a", "b"])),
+            ("a", stage(vec![])),
+            ("b", stage(vec![])),
+        ]);
+        config
+            .validate()
+            .expect("valid config should pass validation");
+    }
+
+    #[mononoke::test]
+    fn test_pipeline_config_rejects_empty_types() {
+        let config = DerivationPipelineConfig {
+            types: BTreeSet::new(),
+            ..pipeline_config(vec![("", stage(vec![]))])
+        };
+        assert_rejects(config, "at least one derivable type");
+    }
+
+    #[mononoke::test]
+    fn test_pipeline_config_rejects_non_prefix_dep_path() {
+        // `fbcode/foo` depends on `scripts/bar` — not a prefix.
+        let config = pipeline_config(vec![
+            ("scripts/bar", stage(vec![])),
+            ("fbcode/foo", stage(vec!["scripts/bar"])),
+            ("", stage(vec!["fbcode/foo"])),
+        ]);
+        assert_rejects(config, "exactly one MPathElement deeper");
+    }
+
+    #[mononoke::test]
+    fn test_pipeline_config_rejects_dep_two_elements_deeper() {
+        // `fbcode` depends on `fbcode/foo/bar` — two elements deeper.
+        let config = pipeline_config(vec![
+            ("fbcode/foo/bar", stage(vec![])),
+            ("fbcode", stage(vec!["fbcode/foo/bar"])),
+            ("", stage(vec!["fbcode"])),
+        ]);
+        assert_rejects(config, "exactly one MPathElement deeper");
+    }
+
+    #[mononoke::test]
+    fn test_pipeline_config_rejects_missing_dependency() {
+        let config = pipeline_config(vec![("", stage(vec!["nonexistent"]))]);
+        assert_rejects(config, "does not exist");
+    }
+
+    #[mononoke::test]
+    fn test_pipeline_config_rejects_no_root_stage() {
+        let config = pipeline_config(vec![("a", stage(vec![]))]);
+        assert_rejects(config, "stage at root");
+    }
+
+    #[mononoke::test]
+    fn test_pipeline_config_rejects_orphan_stage() {
+        let config = pipeline_config(vec![("", stage(vec![])), ("orphan", stage(vec![]))]);
+        assert_rejects(config, "orphan");
+    }
+
+    #[mononoke::test]
+    fn test_acl_manifest_mode_default_is_disabled() {
+        assert_eq!(AclManifestMode::default(), AclManifestMode::Disabled);
     }
 }

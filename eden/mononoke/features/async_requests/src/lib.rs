@@ -15,10 +15,17 @@ pub use error::AsyncRequestsError;
 mod queue;
 pub use queue::AsyncMethodRequestQueue;
 pub use queue::ClaimedBy;
+pub use queue::DequeuedRequest;
 pub use queue::PollError;
+pub use queue::QueueRepoFilter;
+pub use queue::QueueRequestTypeFilter;
 pub use queue::RequestId;
 
 pub mod tokens {
+    pub use crate::types::DeriveBackfillRepoToken;
+    pub use crate::types::DeriveBackfillToken;
+    pub use crate::types::DeriveBoundariesToken;
+    pub use crate::types::DeriveSliceToken;
     pub use crate::types::MegarepoAddBranchingTargetToken;
     pub use crate::types::MegarepoAddTargetToken;
     pub use crate::types::MegarepoChangeTargetConfigToken;

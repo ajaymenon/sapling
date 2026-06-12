@@ -8,8 +8,10 @@
 #pragma once
 
 #include <folly/Function.h>
+#include <folly/SharedMutex.h>
 #include <folly/Synchronized.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -115,10 +117,18 @@ class Journal {
   // Functions for reading the current state of the journal:
 
   /**
-   * Returns a copy of the tip of the journal.
+   * Returns a copy of the tip of the journal and marks the journal as observed.
+   * This unblocks subscriber notifications on the next addDelta call.
    * Will return a nullopt if the journal is empty.
    */
-  std::optional<JournalDeltaInfo> getLatest();
+  std::optional<JournalDeltaInfo> observeLatest();
+
+  /**
+   * Returns a copy of the tip of the journal without marking the journal
+   * as observed. Use this when you only need the current position and
+   * don't want to unblock subscriber notifications.
+   */
+  std::optional<JournalDeltaInfo> peekLatest() const;
 
   /**
    * Returns an accumulation of all deltas with sequence number >= limitSequence
@@ -157,8 +167,8 @@ class Journal {
    * batch of mutations where it is not appropriate to do any heavy lifting.
    *
    * To minimize notification traffic, the Journal may coalesce redundant
-   * modifications between subscriber notifications and calls to getLatest or
-   * accumulateRange.
+   * modifications between subscriber notifications and calls to observeLatest
+   * or accumulateRange.
    *
    * The return value of registerSubscriber is an identifier than can be passed
    * to cancelSubscriber to later remove the registration.
@@ -227,11 +237,6 @@ class Journal {
     size_t memoryLimit = kDefaultJournalMemoryLimit;
     size_t deltaMemoryUsage = 0;
 
-    // Set to false when a delta is added.
-    // Set to true when getLatest() or accumulateRange() are called.
-    // If true before calling addDelta, subscribers are notified.
-    bool lastModificationHasBeenObserved = true;
-
     JournalDeltaPtr frontPtr() noexcept;
     void popFront();
     JournalDeltaPtr backPtr() noexcept;
@@ -253,8 +258,74 @@ class Journal {
         return rootUpdateDeltas.front().sequenceID;
       }
     }
+
+    /**
+     * Mark the journal as observed. Callable with at least a read lock
+     * (const method). Unblocks subscriber notifications on the next addDelta.
+     */
+    void markObserved() const {
+      lastModificationHasBeenObserved_.store(true);
+    }
+
+    /**
+     * Atomically clear the observed flag and return its previous value.
+     * Requires write lock (non-const method).
+     * Returns true if subscribers should be notified.
+     */
+    [[nodiscard]] bool clearObserved() {
+      return lastModificationHasBeenObserved_.exchange(false);
+    }
+
+    /**
+     * Update the high-water mark for files accumulated in a single
+     * accumulateRange call. Callable with at least a read lock (const method).
+     */
+    void updateMaxFilesAccumulated(size_t filesAccumulated) const {
+      auto current = maxFilesAccumulated_.load();
+      while (filesAccumulated > current &&
+             !maxFilesAccumulated_.compare_exchange_weak(
+                 current, filesAccumulated)) {
+      }
+    }
+
+    /**
+     * Returns the high-water mark for files accumulated.
+     */
+    size_t getMaxFilesAccumulated() const {
+      return maxFilesAccumulated_.load();
+    }
+
+    /**
+     * Resets the high-water mark. Requires write lock (non-const method).
+     */
+    void resetMaxFilesAccumulated() {
+      maxFilesAccumulated_.store(0);
+    }
+
+   private:
+    // Atomic flag for notification coalescing.
+    //
+    // Locking safety: this is std::atomic because markObserved() (which
+    // stores true) is called under rlock, allowing concurrent readers.
+    // The interesting cases:
+    //
+    //  - Multiple concurrent rlock holders call markObserved(): all
+    //    store true idempotently — no lost updates.
+    //  - markObserved() (rlock) vs clearObserved() (wlock): cannot run
+    //    concurrently — SharedMutex excludes readers while a writer
+    //    holds the lock.
+    //  - Two concurrent addDelta calls racing on clearObserved(): cannot
+    //    happen — clearObserved() runs under wlock, so only one writer
+    //    can exchange the flag at a time.
+    //
+    // Net result: the only concurrent access pattern is multiple
+    // store(true) calls, which is safe and idempotent.
+    mutable std::atomic<bool> lastModificationHasBeenObserved_{true};
+
+    // High-water mark for files accumulated. Updated via CAS under rlock.
+    mutable std::atomic<size_t> maxFilesAccumulated_{0};
   };
-  folly::Synchronized<DeltaState, std::mutex> deltaState_;
+  folly::Synchronized<DeltaState, folly::SharedMutex> deltaState_;
 
   /**
    * Removes the oldest deltas until the memory usage of the journal is below
@@ -292,6 +363,9 @@ class Journal {
   void notifySubscribers() const;
 
   size_t estimateMemoryUsage(const DeltaState& deltaState) const;
+
+  static std::optional<JournalDeltaInfo> getLatestInfo(
+      const DeltaState& deltaState);
 
   /**
    * Runs from the latest delta to the delta with sequence ID (if 'lengthLimit'

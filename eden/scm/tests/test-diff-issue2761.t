@@ -10,26 +10,25 @@
 # Test issue2761
 
   $ eagerepo
-  $ setconfig devel.segmented-changelog-rev-compat=true
-  $ hg init repo
+  $ sl init repo
   $ cd repo
 
   $ touch to-be-deleted
-  $ hg add
+  $ sl add
   adding to-be-deleted
-  $ hg ci -m first
+  $ sl ci -m first
   $ echo a > to-be-deleted
-  $ hg ci -m second
+  $ sl ci -m second
   $ rm to-be-deleted
-  $ hg diff -r 0
+  $ sl diff -r 'desc(first)'
 
 # Same issue, different code path
 
-  $ hg up -C .
+  $ sl up -C .
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ touch does-not-exist-in-1
-  $ hg add
+  $ sl add
   adding does-not-exist-in-1
-  $ hg ci -m third
+  $ sl ci -m third
   $ rm does-not-exist-in-1
-  $ hg diff -r 1
+  $ sl diff -r 'desc(second)'

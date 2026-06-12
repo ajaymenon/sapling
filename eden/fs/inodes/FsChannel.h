@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <folly/coro/safe/NowTask.h>
 #include "eden/common/utils/ImmediateFuture.h"
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/utils/FsChannelTypes.h"
@@ -125,6 +126,9 @@ class FsChannel {
    */
   [[nodiscard]] virtual ImmediateFuture<folly::Unit> waitForPendingWrites() = 0;
 
+  [[nodiscard]] virtual folly::coro::now_task<folly::Unit>
+  co_waitForPendingWrites() = 0;
+
   /**
    * During checkout or other Thrift calls that modify the filesystem, those
    * modifications may be invisible to the filesystem's own caches. Therefore,
@@ -146,6 +150,24 @@ class FsChannel {
   std::unique_ptr<RequestPermit> acquireFsRequestPermit() {
     if (requestRateLimiter_) {
       return requestRateLimiter_->acquirePermit();
+    }
+    return nullptr;
+  }
+
+  /**
+   * Returns true if request rate limiting is enabled.
+   */
+  bool isRateLimitingEnabled() const {
+    return requestRateLimiter_ != nullptr;
+  }
+
+  /**
+   * Non-blocking variant of acquireFsRequestPermit(). Returns nullptr if
+   * rate limiting is disabled or no capacity is available.
+   */
+  std::unique_ptr<RequestPermit> tryAcquireFsRequestPermit() {
+    if (requestRateLimiter_) {
+      return requestRateLimiter_->tryAcquirePermit();
     }
     return nullptr;
   }

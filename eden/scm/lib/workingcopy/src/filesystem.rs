@@ -7,12 +7,14 @@
 
 mod dotgit;
 mod filesystem;
+pub(crate) mod grepo;
 pub mod physicalfs;
 pub mod watchmanfs;
 
 pub use dotgit::DotGitFileSystem;
 pub use filesystem::FileSystem;
 pub use filesystem::PendingChange;
+pub use grepo::GrepoFileSystem;
 pub use physicalfs::PhysicalFileSystem;
 pub use watchmanfs::WatchmanFileSystem;
 
@@ -27,4 +29,5 @@ pub enum FileSystemType {
     Watchman,
     Eden,
     DotGit,
+    Grepo,
 }

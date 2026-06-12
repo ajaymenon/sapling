@@ -53,6 +53,9 @@ async function waitReadyExample() {
   try {
     // Wait for EdenFS to be ready (useful after restart or initial setup)
     console.log('Waiting for EdenFS to be ready...');
+    client.on('debug', (message) => {
+      console.log('Debug:', message);
+    });
     const isReady = await client.waitReady({
       timeout: 10000, // Wait up to 10 seconds
     });
@@ -114,6 +117,7 @@ async function subscriptionExample() {
         includedSuffixes: ['.js', '.ts', '.py'], // Only watch specific file types
         excludedRoots: ['node_modules', '.git'], // Exclude certain directories
         deferredStates: ['test'], // Wait for these states to be deasserted
+        unpackCommitTransitions: true, // Unpack commit transitions into file changes
       },
       (error, resp) => {
         if (error) {

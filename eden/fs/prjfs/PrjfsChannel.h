@@ -36,7 +36,7 @@ class Notifier;
 class ReloadableConfig;
 class PrjfsChannelInner;
 class PrjfsRequestContext;
-class StructuredLogger;
+class EdenFsEventsLogger;
 class FaultInjector;
 
 using EdenStatsPtr = RefPtr<EdenStats>;
@@ -170,7 +170,7 @@ class PrjfsChannelInner {
   PrjfsChannelInner(
       std::unique_ptr<PrjfsDispatcher> dispatcher,
       const folly::Logger* straceLogger,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       FaultInjector& faultInjector,
       ProcessAccessLog& processAccessLog,
       std::shared_ptr<ReloadableConfig>& config,
@@ -186,6 +186,8 @@ class PrjfsChannelInner {
   PrjfsChannelInner& operator=(const PrjfsChannelInner&) = delete;
 
   ImmediateFuture<folly::Unit> waitForPendingNotifications();
+
+  folly::coro::now_task<folly::Unit> co_waitForPendingNotifications();
 
   /**
    * Start a directory listing.
@@ -367,8 +369,8 @@ class PrjfsChannelInner {
     return processAccessLog_;
   }
 
-  std::shared_ptr<StructuredLogger> getStructuredLogger() const {
-    return structuredLogger_;
+  std::shared_ptr<EdenFsEventsLogger> getEdenFsEventsLogger() const {
+    return edenFsEventsLogger_;
   }
 
   std::chrono::nanoseconds getLongRunningFSRequestThreshold() const {
@@ -412,7 +414,7 @@ class PrjfsChannelInner {
   }
 
   const std::atomic<size_t>& getTraceDetailedArguments() const {
-    return traceDetailedArguments_;
+    return *traceDetailedArguments_;
   }
 
   const EdenStatsPtr& getStats() const {
@@ -463,8 +465,7 @@ class PrjfsChannelInner {
   std::unique_ptr<PrjfsDispatcher> dispatcher_;
   const folly::Logger* const straceLogger_{nullptr};
 
-  // scuba logger
-  const std::shared_ptr<StructuredLogger> structuredLogger_;
+  const std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
 
   FaultInjector& faultInjector_;
 
@@ -499,7 +500,7 @@ class PrjfsChannelInner {
   folly::Synchronized<TelemetryState> telemetryState_;
   std::vector<TraceSubscriptionHandle<PrjfsTraceEvent>>
       traceSubscriptionHandles_;
-  std::atomic<size_t> traceDetailedArguments_;
+  std::shared_ptr<std::atomic<size_t>> traceDetailedArguments_;
   // The TraceBus must be the last member because its subscribed functions may
   // close over `this` and can run until the TraceBus itself is deallocated.
   std::shared_ptr<TraceBus<PrjfsTraceEvent>> traceBus_;
@@ -526,7 +527,7 @@ class PrjfsChannel : public FsChannel {
       std::unique_ptr<PrjfsDispatcher> dispatcher,
       std::shared_ptr<ReloadableConfig> config,
       const folly::Logger* straceLogger,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       FaultInjector& faultInjector,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       Guid guid,
@@ -556,6 +557,8 @@ class PrjfsChannel : public FsChannel {
    * received notifications have completed.
    */
   ImmediateFuture<folly::Unit> waitForPendingWrites() override;
+
+  folly::coro::now_task<folly::Unit> co_waitForPendingWrites() override;
 
   /**
    * Background correctness checkers might notice that EdenFS has an incorrect

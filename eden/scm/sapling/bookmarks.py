@@ -24,6 +24,7 @@ from . import (
     encoding,
     error,
     git,
+    identity,
     lock as lockmod,
     mutation,
     scmutil,
@@ -42,6 +43,11 @@ activebookmarklabel = "bookmarks.active bookmarks.current"
 
 # namespace to use when recording an hg journal entry
 journalremotebookmarktype = "remotebookmark"
+
+# All bookmark kinds accepted by edenapi.listbookmarkpatterns(). Use this to
+# match the old listkeyspatterns wireproto behavior which returned all bookmarks
+# regardless of kind.
+ALL_BOOKMARK_KINDS = ["Scratch", "Publishing", "PullDefaultPublishing"]
 
 
 def _getbkfile(repo):
@@ -104,8 +110,8 @@ class bmstore(dict):
                             feature="fix-bookmark-changelog-order-failed",
                         )
                         repo.ui.warn(
-                            _("unknown reference in .hg/bookmarks: %s %s\n")
-                            % (refspec, hex(node))
+                            _("unknown reference in %s/bookmarks: %s %s\n")
+                            % (identity.default().dotdir(), refspec, hex(node))
                         )
 
         except IOError as inst:

@@ -420,6 +420,10 @@ def readconfig(repo):
     return config
 
 
+# `fetch.negotiationAlgorithm = skipping` dramatically reduces the number of
+# round-trips during `git fetch` negotiation by skipping intermediate commits.
+# This is the single biggest win for fetch performance on large repos.
+#
 # By default, `git maintenance run --auto` (run by `git fetch`) triggers GC,
 # which runs repack. The gc/repack can cause compatibility issues with
 # shallow/not-shallow mix, such as some blob or tree cannot be read. `repack
@@ -434,6 +438,8 @@ def readconfig(repo):
 # The multi-pack-index (incremental-repack) is incompatible with the libgit2
 # we're using, unfortunately...
 MAINTAINED_GIT_CONFIG = """
+[fetch]
+  negotiationAlgorithm = skipping
 [maintenance "gc"]
   enabled = false
 [maintenance "loose-objects"]
@@ -759,6 +765,9 @@ def pullrefspecs(repo, url, refspecs):
         # Nothing to pull
         return 0
     args = ["fetch", "--no-tags", "--prune"]
+    depth = repo.ui.configint("git", "depth")
+    if depth:
+        args.append(f"--depth={depth}")
     if repo.ui.configbool("git", "shallow"):
         filter_config = repo.ui.config("git", "filter")
         if filter_config:
@@ -766,11 +775,12 @@ def pullrefspecs(repo, url, refspecs):
     if _supportwritefetchhead(repo):
         args.append("--no-write-fetch-head")
     args += [url] + refspecs
-    with repo.lock():
+    lockfree = repo.config.get.as_bool("experimental", "lock-free-git-fetch")
+    with repo.lock(lockfree=lockfree):
         ret = rungit(repo, args)
         if ret == 0:
             refnames = [s.split(":", 1)[1] for s in refspecs if ":" in s]
-            with repo.transaction("pull"):
+            with repo.transaction("pull", lockfree=lockfree):
                 _syncfromgit(repo, refnames)
     return ret
 
@@ -785,6 +795,7 @@ def push(repo, dest, pushnode_to_pairs, force=False):
     """
     url, remote = urlremote(repo.ui, dest)
     refspecs = []
+    refname_to_node_pairs = []
     for pushnode, to in pushnode_to_pairs:
         if pushnode is None:
             fromspec = ""
@@ -793,23 +804,58 @@ def push(repo, dest, pushnode_to_pairs, force=False):
         else:
             fromspec = "%s" % hex(pushnode)
         refname = RefName(name=to)
+        refname_to_node_pairs.append((refname, pushnode))
         refspec = "%s:%s" % (fromspec, refname)
         refspecs.append(refspec)
     if not refspecs:
         return 0
-    with repo.lock(), repo.transaction("push"):
-        ret = rungit(repo, ["push", url, *refspecs])
+    lockfree = repo.config.get.as_bool("experimental", "lock-free-git-push")
+    with (
+        repo.lock(lockfree=lockfree),
+        repo.transaction("push", lockfree=lockfree),
+    ):
+        # Loading changelog can trigger git refs -> metalog sync.
+        # Ensure that we don't trigger it during updatereferences below.
+        repo.changelog
+
+        configs = None
+        # file:// protocol doesn't support push negotiation. Disable it to
+        # avoid noisy warnings when push.negotiate is enabled globally.
+        if "://" not in url or url.startswith("file://"):
+            configs = ["push.negotiate=false"]
+        gitdir = readgitdir(repo)
+        ret = rungitnorepo(
+            repo.ui, ["push", url, *refspecs], gitdir=gitdir, configs=configs
+        )
         # update remotenames
         if ret == 0:
-            name = refname.withremote(remote).remotename
+            # The above `git push` uses url, not name like "origin".
+            # It does update git references.
+            #
+            # Here, we first update metalog remote, then sync metalog
+            # changes back to git.
+            #
+            # Note: in dotsl mode, the metalog is expected to be the
+            # source of truth. In dotgit mode, git refs are source
+            # of truth, but we still need this code path to update it.
             metalog = repo.metalog()
-            namenodes = bookmod.decoderemotenames(metalog["remotenames"])
-            if pushnode is None:
-                namenodes.pop(name, None)
-            else:
-                if not to.startswith(COMMIT_CLOUD_UPLOAD_REF):
-                    namenodes[name] = pushnode
-            metalog["remotenames"] = bookmod.encoderemotenames(namenodes)
+            namenodes = metalog.get_remotenames()
+            for refname, pushnode in refname_to_node_pairs:
+                name = refname.withremote(remote).remotename
+                if pushnode is None:
+                    namenodes.pop(name, None)
+                else:
+                    if not str(refname).startswith(COMMIT_CLOUD_UPLOAD_REF):
+                        namenodes[name] = pushnode
+            metalog.set_remotenames(namenodes)
+            # Sync metalog changes back to git references from metalog.
+            # This is also called at the end of a transaction, but that
+            # might happen too late and is risky - if something
+            # invalidates changelog, and the next changelog initialization
+            # could trigger git refs -> metalog sync that overrides the
+            # above metalog changes. So we explicitly call metalog ->
+            # git refs sync here.
+            repo.changelog.inner.updatereferences(metalog)
     return ret
 
 
@@ -838,6 +884,10 @@ def parsesubmodules(ctx):
         repo.ui.note(_("submodules are disabled via git.submodules\n"))
         return {}
     if ".gitmodules" not in ctx:
+        from . import grepo
+
+        if grepo.GREPO_REQUIREMENT in repo.requirements:
+            return grepo.getgreposubmodules(ctx, repo)
         return {}
 
     data = ctx[".gitmodules"].data()
@@ -1021,6 +1071,14 @@ class Submodule:
             ui.debug(" initializing submodule workingcopy at %s\n" % repopath)
             repo = setup_repository(self.parentrepo.baseui, repopath, submodule=self)
         else:
+            # Audit the submodule path before any filesystem operations to prevent
+            # symlink traversal attacks (e.g., a symlink in the working copy could
+            # redirect makedirs into .sl/, overwriting internal config).
+            self.parentrepo.wvfs.audit(self.path)
+            # The path auditor only checks parent components for symlinks, not the
+            # final path itself. Explicitly reject if the submodule path is a symlink.
+            if self.parentrepo.wvfs.islink(self.path):
+                raise error.Abort(_("submodule path '%s' is a symlink") % self.path)
             if self.parentrepo.wvfs.isfile(self.path):
                 ui.debug(" unlinking conflicted submodule file at %s\n" % self.path)
                 self.parentrepo.wvfs.unlink(self.path)
@@ -1144,9 +1202,12 @@ class Submodule:
         repopath = self.parentrepo.wvfs.join(self.path)
         dotgit_path = os.path.join(repopath, ".git")
 
-        if DOTGIT_REQUIREMENT in self.parentrepo.requirements and os.path.exists(
-            dotgit_path
-        ):
+        from .grepo import GREPO_REQUIREMENT
+
+        if (
+            DOTGIT_REQUIREMENT in self.parentrepo.requirements
+            or GREPO_REQUIREMENT in self.parentrepo.requirements
+        ) and os.path.exists(dotgit_path):
             # dotgit repo, .git/sl not yet initialized.
             # read git HEAD directly.
             git = bindings.gitcompat.BareGit(dotgit_path, self.parentrepo.ui._rcfg)

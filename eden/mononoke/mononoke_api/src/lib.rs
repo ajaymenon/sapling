@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Error;
+use arc_swap::ArcSwap;
 pub use bookmarks::BookmarkCategory;
 pub use bookmarks::BookmarkKey;
 use maplit::hashmap;
@@ -29,6 +30,7 @@ pub mod errors;
 pub mod file;
 pub mod path;
 pub mod repo;
+pub mod restricted_paths;
 pub mod sparse_profile;
 pub mod specifiers;
 pub mod tree;
@@ -38,6 +40,9 @@ mod xrepo;
 mod test;
 
 // Re-export types that are useful for clients.
+pub use commit_rate_limit::CommitRateLimitCheckResult;
+pub use commit_rate_limit::RateLimitOutcome;
+pub use commit_rate_limit::RuleCheckResult;
 pub use context::CoreContext;
 pub use context::LoggingContainer;
 pub use context::SessionContainer;
@@ -48,6 +53,7 @@ pub use crate::changeset::ChangesetDiffItem;
 pub use crate::changeset::ChangesetFileOrdering;
 pub use crate::changeset::ChangesetHistoryOptions;
 pub use crate::changeset::ChangesetLinearHistoryOptions;
+pub use crate::changeset::FingerprintVersion;
 pub use crate::changeset::Generation;
 pub use crate::changeset_path::ChangesetPathContentContext;
 pub use crate::changeset_path::ChangesetPathHistoryOptions;
@@ -73,6 +79,7 @@ pub use crate::repo::BookmarkInfo;
 pub use crate::repo::MononokeRepo;
 pub use crate::repo::Repo;
 pub use crate::repo::RepoContext;
+pub use crate::repo::RepoWithBubble;
 pub use crate::repo::StoreRequest;
 pub use crate::repo::XRepoLookupExactBehaviour;
 pub use crate::repo::XRepoLookupSyncBehaviour;
@@ -87,6 +94,9 @@ pub use crate::repo::create_changeset::CreateInfo;
 pub use crate::repo::land_stack::PushrebaseOutcome;
 pub use crate::repo::update_submodule_expansion::SubmoduleExpansionUpdate;
 pub use crate::repo::update_submodule_expansion::SubmoduleExpansionUpdateCommitInfo;
+pub use crate::restricted_paths::PathAccessInfo;
+pub use crate::restricted_paths::RestrictedChangeGroup;
+pub use crate::restricted_paths::RestrictedPathsChangesInfo;
 pub use crate::specifiers::ChangesetId;
 pub use crate::specifiers::ChangesetIdPrefix;
 pub use crate::specifiers::ChangesetPrefixSpecifier;
@@ -96,28 +106,38 @@ pub use crate::specifiers::Globalrev;
 pub use crate::specifiers::HgChangesetId;
 pub use crate::specifiers::HgChangesetIdPrefix;
 pub use crate::tree::TreeContext;
-pub use crate::tree::TreeEntry;
-pub use crate::tree::TreeId;
 pub use crate::tree::TreeSummary;
 pub use crate::xrepo::CandidateSelectionHintArgs;
 
 /// An instance of Mononoke, which may manage multiple repositories.
 pub struct Mononoke<R> {
-    // Collection of instantiated repos currently being served.
+    // Collection of instantiated repos currently being served by this task.
+    // Deep-sharded: a given SCS task only holds the repos assigned to it by
+    // shardmanager, not the full tier.
     pub repos: Arc<MononokeRepos<R>>,
-    // The collective list of all enabled repos that exist
-    // in the current tier (e.g. prod, backup, etc.)
-    pub repo_names_in_tier: HashMap<String, CommitIdentityScheme>,
+    // Tier-wide list of all enabled repos (name -> default identity scheme),
+    // sourced from configerator. Distinct from `repos` because `list_repos`
+    // must return the tier-wide view, not this task's sharded subset.
+    //
+    // Wrapped in ArcSwap so MononokeConfigUpdateReceiver can refresh it on
+    // every config change; reads from `list_repos` are lock-free via .load().
+    pub repo_names_in_tier: Arc<ArcSwap<HashMap<String, CommitIdentityScheme>>>,
 }
 
-impl<R: MononokeRepo> Mononoke<R> {
-    /// Create a MononokeAPI instance for MononokeRepos
+impl<R> Mononoke<R> {
+    /// Create a MononokeAPI instance for MononokeRepos.
     ///
-    /// Takes extra argument containing list of all available repos
-    /// (used to power APIs listing repos; TODO: change that arg to MononokeConfigs)
+    /// `repo_names_in_tier` is shared with the owning MononokeReposManager and
+    /// its MononokeConfigUpdateReceiver — updates land via the same ArcSwap.
+    ///
+    /// Note: a previous TODO suggested replacing this arg with `MononokeConfigs`
+    /// so the tier list could be derived on demand. We deliberately keep the
+    /// pre-computed ArcSwap: deriving from configs would iterate ~thousands of
+    /// repos per `list_repos` call and would require plumbing `MononokeConfigs`
+    /// through to here, which Mononoke<R> intentionally does not depend on.
     pub fn new(
         repos: Arc<MononokeRepos<R>>,
-        repo_names_in_tier: HashMap<String, CommitIdentityScheme>,
+        repo_names_in_tier: Arc<ArcSwap<HashMap<String, CommitIdentityScheme>>>,
     ) -> Result<Self, Error> {
         Ok(Self {
             repos,
@@ -125,6 +145,48 @@ impl<R: MononokeRepo> Mononoke<R> {
         })
     }
 
+    /// Return the raw underlying repo corresponding to the provided
+    /// repo name.
+    pub fn raw_repo(&self, name: impl AsRef<str>) -> Option<Arc<R>> {
+        self.repos.get_by_name(name.as_ref())
+    }
+
+    /// Return the raw underlying repo corresponding to the provided
+    /// repo id.
+    pub fn raw_repo_by_id(&self, id: i32) -> Option<Arc<R>> {
+        self.repos.get_by_id(id)
+    }
+
+    /// Get all known repository ids
+    pub fn known_repo_ids(&self) -> Vec<RepositoryId> {
+        self.repos.iter_ids().map(RepositoryId::new).collect()
+    }
+
+    /// Returns an `Iterator` over all repo names.
+    pub fn repo_names(&self) -> impl Iterator<Item = String> + use<R> {
+        self.repos.iter_names()
+    }
+
+    pub fn repos(&self) -> impl Iterator<Item = Arc<R>> + use<R> {
+        self.repos.iter()
+    }
+}
+
+impl<R: RepoIdentityRef> Mononoke<R> {
+    pub fn repo_name_from_id(&self, repo_id: RepositoryId) -> Option<String> {
+        self.repos
+            .get_by_id(repo_id.id())
+            .map(|repo| repo.repo_identity().name().to_string())
+    }
+
+    pub fn repo_id_from_name(&self, name: impl AsRef<str>) -> Option<RepositoryId> {
+        self.repos
+            .get_by_name(name.as_ref())
+            .map(|repo| repo.repo_identity().id())
+    }
+}
+
+impl<R> Mononoke<R> {
     /// Start a request on a repository by name.
     // Method is async and fallible as in the future this may involve
     // instantiating the repo lazily.
@@ -156,45 +218,9 @@ impl<R: MononokeRepo> Mononoke<R> {
             )),
         }
     }
+}
 
-    /// Return the raw underlying repo corresponding to the provided
-    /// repo name.
-    pub fn raw_repo(&self, name: impl AsRef<str>) -> Option<Arc<R>> {
-        self.repos.get_by_name(name.as_ref())
-    }
-
-    /// Return the raw underlying repo corresponding to the provided
-    /// repo id.
-    pub fn raw_repo_by_id(&self, id: i32) -> Option<Arc<R>> {
-        self.repos.get_by_id(id)
-    }
-
-    /// Get all known repository ids
-    pub fn known_repo_ids(&self) -> Vec<RepositoryId> {
-        self.repos.iter_ids().map(RepositoryId::new).collect()
-    }
-
-    /// Returns an `Iterator` over all repo names.
-    pub fn repo_names(&self) -> impl Iterator<Item = String> + use<R> {
-        self.repos.iter_names()
-    }
-
-    pub fn repos(&self) -> impl Iterator<Item = Arc<R>> + use<R> {
-        self.repos.iter()
-    }
-
-    pub fn repo_name_from_id(&self, repo_id: RepositoryId) -> Option<String> {
-        self.repos
-            .get_by_id(repo_id.id())
-            .map(|repo| repo.repo_identity().name().to_string())
-    }
-
-    pub fn repo_id_from_name(&self, name: impl AsRef<str>) -> Option<RepositoryId> {
-        self.repos
-            .get_by_name(name.as_ref())
-            .map(|repo| repo.repo_identity().id())
-    }
-
+impl<R: MononokeRepo> Mononoke<R> {
     /// Report configured monitoring stats
     pub async fn report_monitoring_stats(&self, ctx: &CoreContext) -> Result<(), MononokeError> {
         for repo in self.repos.iter() {
@@ -242,7 +268,7 @@ pub mod test_impl {
             mononoke_repos.populate(repos);
             Ok(Self {
                 repos: Arc::new(mononoke_repos),
-                repo_names_in_tier,
+                repo_names_in_tier: Arc::new(ArcSwap::from_pointee(repo_names_in_tier)),
             })
         }
 
@@ -266,7 +292,7 @@ pub mod test_impl {
             ]);
             Ok(Self {
                 repos: Arc::new(mononoke_repos),
-                repo_names_in_tier,
+                repo_names_in_tier: Arc::new(ArcSwap::from_pointee(repo_names_in_tier)),
             })
         }
     }

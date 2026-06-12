@@ -113,7 +113,7 @@ impl IdMap {
             .create(true)
             .index("id", |data| {
                 assert!(Self::MAGIC_CLEAR_NON_MASTER.len() < 8);
-                assert!(Group::BITS == 8);
+                const { assert!(Group::BITS == 8) };
                 if data.starts_with(Self::MAGIC_DELETION_PREFIX) {
                     let items =
                         decode_deletion_entry(data).expect("deletion entry should be valid");
@@ -256,8 +256,7 @@ impl IdMap {
                 return Ok(());
             } else {
                 return bug(format!(
-                    "new entry {} = {:?} conflicts with an existing entry {} = {:?}",
-                    id, name, id, existing_name
+                    "new entry {id} = {name:?} conflicts with an existing entry {id} = {existing_name:?}"
                 ));
             }
         }
@@ -272,8 +271,7 @@ impl IdMap {
                 return Ok(());
             } else {
                 return bug(format!(
-                    "new entry {} = {:?} conflicts with an existing entry {} = {:?}",
-                    id, name, existing_id, name
+                    "new entry {id} = {name:?} conflicts with an existing entry {existing_id} = {name:?}"
                 ));
             }
         }
@@ -441,7 +439,7 @@ impl fmt::Debug for IdMap {
             } else {
                 String::from_utf8_lossy(name).to_string()
             };
-            write!(f, "  {}: {},\n", name, id)?;
+            write!(f, "  {name}: {id},\n")?;
         }
         write!(f, "}}\n")?;
         Ok(())

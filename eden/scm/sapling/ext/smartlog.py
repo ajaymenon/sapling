@@ -29,6 +29,7 @@ import datetime
 import re
 import sys
 import time
+from dataclasses import dataclass, field, replace
 
 import bindings
 from sapling import (
@@ -45,6 +46,7 @@ from sapling import (
     registrar,
     revset,
     revsetlang,
+    scmutil,
     smartset,
     templater,
     util,
@@ -329,13 +331,17 @@ def smartlognodes(repo, headnodes, masternodes):
     return nodes
 
 
+def _ignorebookmarks(repo):
+    return re.compile(repo.ui.config("smartlog", "ignorebookmarks", "!"))
+
+
 @revsetpredicate("interestingbookmarks()")
 def interestingheads(repo, subset, x):
     """Set of interesting bookmarks (local and remote)"""
     rev = repo.changelog.rev
     heads = set()
     books = bookmarks.bmstore(repo)
-    ignore = re.compile(repo.ui.config("smartlog", "ignorebookmarks", "!"))
+    ignore = _ignorebookmarks(repo)
     for b in books:
         if not ignore.match(b):
             heads.add(rev(books[b]))
@@ -344,6 +350,8 @@ def interestingheads(repo, subset, x):
     if hasattr(repo, "names") and "remotebookmarks" in repo.names:
         ns = repo.names["remotebookmarks"]
         for name in _reposnames(repo):
+            if ignore.match(name):
+                continue
             nodes = ns.namemap(repo, name)
             if nodes:
                 heads.add(rev(nodes[0]))
@@ -355,11 +363,14 @@ def interestingheads(repo, subset, x):
 def interestingmaster(repo, subset, x):
     """Interesting 'master' commit"""
 
+    ignore = _ignorebookmarks(repo)
     names = set(bookmarks.bmstore(repo).keys())
     if hasattr(repo, "names") and "remotebookmarks" in repo.names:
         names.update(set(repo.names["remotebookmarks"].listnames(repo)))
 
     for name in _reposnames(repo):
+        if ignore.match(name):
+            continue
         if name in names:
             revs = repo.revs("%s", name)
             break
@@ -518,6 +529,19 @@ def getrevs(ui, repo, masterstring, headrevs):
 
 if interactiveui is not None:
 
+    @dataclass
+    class _visiblecommitrender:
+        ctx: object
+        current_lines: list
+        width: int
+        revcache: dict
+        matchfn: object
+        full_span: tuple
+        message_column: int
+        normal_lines: list
+        current_message_lines: list
+        highlighted_lines: list = field(default=None)
+
     class interactivesmartlog(interactiveui.viewframe):
         def __init__(self, ui, repo, masterstring, headrevs, template, opts):
             super().__init__(ui, repo)
@@ -542,6 +566,7 @@ if interactiveui is not None:
             self.revdag, self.reserved = getdag(
                 self.ui, self.repo, sorted(revs), self.masterstring, self.template
             )
+            self._render_cache = None
 
         def render(self):
             ui = self.ui
@@ -553,15 +578,41 @@ if interactiveui is not None:
 
             current_line = 0
             selected_rows = None
+            visible_commits = {}
+            visible_indices = {}
 
-            def on_output(ctx, output):
+            def on_output(ctx, output, metadata=None):
                 nonlocal current_line
                 nonlocal selected_rows
-                height = output.count("\n")
+                metadata = metadata or {}
+                lines = output.splitlines()
+                height = len(lines)
+                start_line = current_line
                 selected_ctx = self.revdag[self.dag_index][2]
                 if ctx == selected_ctx:
                     # start and end indices (inclusive)
-                    selected_rows = (current_line, current_line + height - 1)
+                    selected_rows = (start_line, start_line + height - 1)
+                message_column = 0
+                current_message_lines = metadata.get("message", "").splitlines()
+                for row_index, message_line in enumerate(current_message_lines):
+                    if not message_line or row_index >= len(lines):
+                        continue
+                    prefix_pos = lines[row_index].find(message_line)
+                    if prefix_pos != -1:
+                        message_column = prefix_pos
+                        break
+                visible_commits[ctx] = _visiblecommitrender(
+                    ctx=ctx,
+                    current_lines=lines,
+                    width=metadata.get("width", 0),
+                    revcache=metadata.get("revcache", {}),
+                    matchfn=metadata.get("matchfn"),
+                    full_span=(start_line, start_line + height),
+                    message_column=message_column,
+                    normal_lines=None if ctx == selected_ctx else lines,
+                    current_message_lines=current_message_lines,
+                    highlighted_lines=lines if ctx == selected_ctx else None,
+                )
                 current_line += height
 
             cmdutil.displaygraph(
@@ -574,19 +625,148 @@ if interactiveui is not None:
                 on_output=on_output,
             )
             output = ui.popbuffer().splitlines()
-            if selected_rows is None:
-                return output, None
-            return output, (selected_rows[1], interactiveui.Alignment.bottom)
+            alignment = None
+            if selected_rows is not None:
+                alignment = (selected_rows[1], interactiveui.Alignment.bottom)
+            renderstate = interactiveui.getrenderstate(self, output, alignment)
+            for index, node in enumerate(self.revdag):
+                ctx = node[2]
+                commitrender = visible_commits.get(ctx)
+                if commitrender is None:
+                    continue
+                span_start, span_end = commitrender.full_span
+                if (
+                    span_start < renderstate.visible_start
+                    or span_end > renderstate.visible_end
+                ):
+                    continue
+                visible_indices[index] = ctx
+                visible_commits[ctx] = replace(
+                    commitrender,
+                    full_span=(
+                        span_start - renderstate.visible_start,
+                        span_end - renderstate.visible_start,
+                    ),
+                )
+            self._render_cache = {
+                "renderstate": renderstate,
+                "visible_commits": visible_commits,
+                "visible_indices": visible_indices,
+                "status": self.status,
+            }
+            return output, alignment
 
-        def handlekeypress(self, key):
+        def _render_message_variant(self, commitrender, highlighted):
+            displayer = cmdutil.show_changeset(
+                self.ui, self.repo, self.opts, buffered=True
+            )
+            props = {}
+            if highlighted:
+                props["highlighted_node"] = commitrender.ctx.hex()
+            displayer.show(
+                commitrender.ctx,
+                revcache=commitrender.revcache,
+                matchfn=commitrender.matchfn,
+                _graphwidth=commitrender.width,
+                **props,
+            )
+            msg_lines = [
+                s if isinstance(s, str) else s.decode(errors="replace")
+                for s in displayer.hunk.pop(commitrender.ctx.rev())
+            ]
+            displayer.flush(commitrender.ctx)
+            displayer.close()
+            return "".join(msg_lines).splitlines()
+
+        def _build_variant(self, commitrender, message_lines):
+            built_lines = []
+            for index, current_line in enumerate(commitrender.current_lines):
+                if index >= len(commitrender.current_message_lines):
+                    built_lines.append(current_line)
+                    continue
+                source_message = commitrender.current_message_lines[index]
+                if source_message:
+                    prefix_pos = current_line.find(source_message)
+                    if prefix_pos == -1:
+                        built_lines.append(current_line)
+                        continue
+                    prefix = current_line[:prefix_pos]
+                    suffix = current_line[prefix_pos + len(source_message) :]
+                else:
+                    prefix = current_line.rstrip()
+                    if len(prefix) < commitrender.message_column:
+                        prefix = prefix.ljust(commitrender.message_column)
+                    suffix = ""
+                new_message = message_lines[index] if index < len(message_lines) else ""
+                if new_message:
+                    if source_message:
+                        built_lines.append(prefix + new_message + suffix)
+                    else:
+                        built_lines.append(prefix + new_message + suffix)
+                else:
+                    built_lines.append((prefix + suffix).rstrip())
+            return built_lines
+
+        def _ensure_variant(self, commitrender, highlighted):
+            if highlighted:
+                if commitrender.highlighted_lines is None:
+                    message_lines = self._render_message_variant(commitrender, True)
+                    commitrender.highlighted_lines = self._build_variant(
+                        commitrender, message_lines
+                    )
+                return commitrender.highlighted_lines
+            if commitrender.normal_lines is None:
+                message_lines = self._render_message_variant(commitrender, False)
+                commitrender.normal_lines = self._build_variant(
+                    commitrender, message_lines
+                )
+            return commitrender.normal_lines
+
+        def _maybe_partial_move(self, old_index, new_index):
+            render_cache = self._render_cache
+            if render_cache is None:
+                return False
+            if self.status != render_cache["status"]:
+                return False
+            renderstate = render_cache["renderstate"]
+            width, height = scmutil.termsize(self.ui)
+            if width != renderstate.width or height != renderstate.height:
+                return False
+            if old_index == new_index:
+                return False
+            old_ctx = render_cache["visible_indices"].get(old_index)
+            new_ctx = render_cache["visible_indices"].get(new_index)
+            if old_ctx is None or new_ctx is None:
+                return False
+            old_render = render_cache["visible_commits"].get(old_ctx)
+            new_render = render_cache["visible_commits"].get(new_ctx)
+            if old_render is None or new_render is None:
+                return False
+            updates = []
+            for commitrender, highlighted in (
+                (old_render, False),
+                (new_render, True),
+            ):
+                lines = self._ensure_variant(commitrender, highlighted)
+                start, _end = commitrender.full_span
+                for row_offset, line in enumerate(lines):
+                    screen_row = start + row_offset
+                    render_cache["renderstate"].visible_lines[screen_row] = line
+                    updates.append((screen_row, line))
+            interactiveui.rewrite_rows(self, updates)
+            return True
+
+        def _flushmovement(self, delta):
+            if delta == 0:
+                return False
+            old_index = self.dag_index
+            self.dag_index = min(max(self.dag_index + delta, 0), len(self.revdag) - 1)
+            return self.dag_index != old_index
+
+        def _handlenonmovementkeypress(self, key):
             if key == self.KEY_Q:
                 self.finish()
-            if key == self.KEY_J or key == self.KEY_DOWN:
-                if self.dag_index < len(self.revdag) - 1:
-                    self.dag_index += 1
-            if key == self.KEY_K or key == self.KEY_UP:
-                if self.dag_index > 0:
-                    self.dag_index -= 1
+                return False
             if key == self.KEY_RETURN:
                 self.ui.pushbuffer(error=True)
                 selected_ctx = self.revdag[self.dag_index][2]
@@ -608,9 +788,11 @@ if interactiveui is not None:
                 except Exception as ex:
                     self.ui.write_err("operation failed: %s\n" % ex)
                 self.status = self.ui.popbuffer()
+                return self._active
             if key == self.KEY_R:
                 self.rebase_source = self.revdag[self.dag_index]
                 self.status = _("rebasing from %s") % (self.rebase_source[2])
+                return True
             if key == self.KEY_S:
                 bindings.commands.run(
                     util.hgcmd()
@@ -621,6 +803,7 @@ if interactiveui is not None:
                         "pager.interface=fullscreen",
                     ]
                 )
+                return True
             if key == self.KEY_SHIFT_H:
                 bindings.commands.run(
                     util.hgcmd()
@@ -631,6 +814,44 @@ if interactiveui is not None:
                 )
                 # I couldn't figure out how to make the graph refresh so will just end
                 self.finish()
+                return False
+            return False
+
+        def handlekeypress(self, key):
+            if key == self.KEY_J or key == self.KEY_DOWN:
+                self._flushmovement(1)
+                return
+            if key == self.KEY_K or key == self.KEY_UP:
+                self._flushmovement(-1)
+                return
+            self._handlenonmovementkeypress(key)
+
+        def handlekeypresses(self, keys):
+            redraw = False
+            movement = 0
+            for key in keys:
+                if key == self.KEY_J or key == self.KEY_DOWN:
+                    movement += 1
+                    continue
+                if key == self.KEY_K or key == self.KEY_UP:
+                    movement -= 1
+                    continue
+                redraw = self._flushmovement(movement) or redraw
+                movement = 0
+                redraw = self._handlenonmovementkeypress(key) or redraw
+                if not self._active:
+                    return False
+            if movement != 0:
+                old_index = self.dag_index
+                moved = self._flushmovement(movement)
+                if (
+                    moved
+                    and not redraw
+                    and self._maybe_partial_move(old_index, self.dag_index)
+                ):
+                    moved = False
+                redraw = moved or redraw
+            return redraw
 
 
 def _smartlog(ui, repo, *pats, **opts):
@@ -649,16 +870,28 @@ def _smartlog(ui, repo, *pats, **opts):
 
         viewobj = interactivesmartlog(ui, repo, masterstring, headrevs, template, opts)
         if util.istest():
-            input_str = ui.fin.readline()
+            input_str = ui.fin.read()
+            if isinstance(input_str, str):
+                input_str = input_str.encode()
+            input_str = input_str.replace(b"\n", b"")
             index = 0
+            special_keys = (
+                interactiveui.viewframe.KEY_UP,
+                interactiveui.viewframe.KEY_DOWN,
+                interactiveui.viewframe.KEY_RIGHT,
+                interactiveui.viewframe.KEY_LEFT,
+            )
 
             def getchar():
                 nonlocal input_str
                 nonlocal index
-                # Automatically quit at end of input
                 if index >= len(input_str):
-                    return b"q"
-                ch = input_str[index]
+                    return None
+                for key in special_keys:
+                    if input_str.startswith(key, index):
+                        index += len(key)
+                        return key
+                ch = input_str[index : index + 1]
                 index += 1
                 return ch
 
@@ -678,7 +911,7 @@ def _smartlog(ui, repo, *pats, **opts):
     cmdutil.displaygraph(ui, repo, revdag, displayer, reserved=reserved)
 
     try:
-        with open(repo.localvfs.join("completionhints"), "w+") as f:
+        with open(repo.localvfs.join("completionhints"), "w") as f:
             for rev in revdag:
                 commit_hash = rev[2].node()
                 f.write(nodemod.short(commit_hash) + "\n")

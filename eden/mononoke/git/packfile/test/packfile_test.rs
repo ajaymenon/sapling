@@ -131,7 +131,7 @@ fn validate_packfile_item_encoding() -> anyhow::Result<()> {
     decoder.write_all(encoded_bytes.as_ref())?;
     decoded_bytes = decoder.finish()?;
     // Validate the decoded bytes represent a valid Git object
-    ObjectRef::from_loose(decoded_bytes.as_ref())
+    ObjectRef::from_loose(decoded_bytes.as_ref(), gix_hash::Kind::Sha1)
         .expect("Expected successful Git object creation from decoded bytes");
     Ok(())
 }
@@ -144,7 +144,7 @@ async fn validate_basic_packfile_generation() -> anyhow::Result<()> {
         PackfileWriter::new(Vec::new(), 3, concurrency, DeltaForm::RefAndOffset);
     // Validate we are able to write the objects to the packfile without errors
     packfile_writer
-        .write(objects_stream)
+        .write_unweighted(objects_stream)
         .await
         .expect("Expected successful write of objects to packfile");
     // Validate we are able to finish writing to the packfile and generate the final checksum
@@ -162,7 +162,7 @@ async fn validate_packfile_generation_format() -> anyhow::Result<()> {
         PackfileWriter::new(Vec::new(), 3, concurrency, DeltaForm::RefAndOffset);
     // Validate we are able to write the objects to the packfile without errors
     packfile_writer
-        .write(objects_stream)
+        .write_unweighted(objects_stream)
         .await
         .expect("Expected successful write of objects to packfile");
     // Validate we are able to finish writing to the packfile and generate the final checksum
@@ -214,7 +214,7 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
     }))?;
     // Validate we are able to write the object to the packfile without errors
     packfile_writer
-        .write(stream::iter(vec![PackfileItem::new_base(
+        .write_unweighted(stream::iter(vec![PackfileItem::new_base(
             tag_object.raw().clone(),
         )]))
         .await
@@ -225,7 +225,7 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
         }))?;
     // Validate we are able to write the object to the packfile without errors
     packfile_writer
-        .write(stream::iter(vec![PackfileItem::new_base(
+        .write_unweighted(stream::iter(vec![PackfileItem::new_base(
             blob_object.raw().clone(),
         )]))
         .await
@@ -240,7 +240,7 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
         }))?;
     // Validate we are able to write the object to the packfile without errors
     packfile_writer
-        .write(stream::iter(vec![PackfileItem::new_base(
+        .write_unweighted(stream::iter(vec![PackfileItem::new_base(
             tree_object.raw().clone(),
         )]))
         .await
@@ -288,7 +288,7 @@ async fn validate_roundtrip_packfile_generation() -> anyhow::Result<()> {
         PackfileWriter::new(Vec::new(), 3, concurrency, DeltaForm::RefAndOffset);
     // Validate we are able to write the objects to the packfile without errors
     packfile_writer
-        .write(objects_stream)
+        .write_unweighted(objects_stream)
         .await
         .expect("Expected successful write of objects to packfile");
     // Validate we are able to finish writing to the packfile and generate the final checksum
@@ -328,7 +328,7 @@ async fn validate_delta_packfile_generation() -> anyhow::Result<()> {
         PackfileWriter::new(Vec::new(), 4, concurrency, DeltaForm::OnlyOffset);
     // Validate we are able to write the objects to the packfile without errors
     packfile_writer
-        .write(objects_stream)
+        .write_unweighted(objects_stream)
         .await
         .expect("Expected successful write of objects to packfile");
     // Validate we are able to finish writing to the packfile and generate the final checksum
@@ -380,7 +380,7 @@ async fn validate_basic_bundle_generation() -> anyhow::Result<()> {
     .expect("Expected successful creation of BundleWriter");
     // Validate we are able to successfully write objects to the bundle
     bundle_writer
-        .write(objects_stream)
+        .write_unweighted(objects_stream)
         .await
         .expect("Expected successful write of objects to bundle.");
     // Validate we are able to finish writing to the bundle
@@ -421,7 +421,7 @@ async fn validate_staggered_bundle_generation() -> anyhow::Result<()> {
     }))?;
     // Validate we are able to write the object to the bundle without errors
     bundle_writer
-        .write(stream::iter(vec![PackfileItem::new_base(
+        .write_unweighted(stream::iter(vec![PackfileItem::new_base(
             tag_object.raw().clone(),
         )]))
         .await
@@ -432,7 +432,7 @@ async fn validate_staggered_bundle_generation() -> anyhow::Result<()> {
         }))?;
     // Validate we are able to write the object to the bundle without errors
     bundle_writer
-        .write(stream::iter(vec![PackfileItem::new_base(
+        .write_unweighted(stream::iter(vec![PackfileItem::new_base(
             blob_object.raw().clone(),
         )]))
         .await
@@ -443,7 +443,7 @@ async fn validate_staggered_bundle_generation() -> anyhow::Result<()> {
         }))?;
     // Validate we are able to write the object to the bundle without errors
     bundle_writer
-        .write(stream::iter(vec![PackfileItem::new_base(
+        .write_unweighted(stream::iter(vec![PackfileItem::new_base(
             tree_object.raw().clone(),
         )]))
         .await

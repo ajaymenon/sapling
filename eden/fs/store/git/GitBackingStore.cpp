@@ -106,9 +106,8 @@ std::string GitBackingStore::renderObjectId(const ObjectId& objectId) {
   return objectId.asHexString();
 }
 
-ImmediateFuture<BackingStore::GetRootTreeResult> GitBackingStore::getRootTree(
-    const RootId& rootId,
-    const ObjectFetchContextPtr& /*context*/) {
+BackingStore::GetRootTreeResult GitBackingStore::getRootTreeImpl(
+    const RootId& rootId) {
   // TODO: Use a separate thread pool to do the git I/O
   XLOGF(DBG4, "resolving tree for commit {}", rootId);
 
@@ -141,6 +140,19 @@ ImmediateFuture<BackingStore::GetRootTreeResult> GitBackingStore::getRootTree(
 
   // Now get the specified tree.
   return GetRootTreeResult{getTreeImpl(treeID), treeID};
+}
+
+ImmediateFuture<BackingStore::GetRootTreeResult> GitBackingStore::getRootTree(
+    const RootId& rootId,
+    const ObjectFetchContextPtr& /*context*/) {
+  return getRootTreeImpl(rootId);
+}
+
+folly::coro::now_task<BackingStore::GetRootTreeResult>
+GitBackingStore::co_getRootTree(
+    const RootId& rootId,
+    const ObjectFetchContextPtr& /*context*/) {
+  co_return getRootTreeImpl(rootId);
 }
 
 folly::SemiFuture<BackingStore::GetTreeAuxResult>
@@ -215,6 +227,23 @@ TreePtr GitBackingStore::getTreeImpl(const ObjectId& id) {
   return std::make_shared<TreePtr::element_type>(std::move(entries), id);
 }
 
+folly::coro::now_task<BackingStore::GetTreeAuxResult>
+GitBackingStore::co_getTreeAuxData(
+    const ObjectId& /*id*/,
+    const ObjectFetchContextPtr& /*context*/) {
+  co_yield folly::coro::co_error(
+      std::domain_error(
+          "getTreeAuxData is not implemented for GitBackingStores"));
+}
+
+folly::coro::now_task<BackingStore::GetTreeResult> GitBackingStore::co_getTree(
+    const ObjectId& id,
+    const ObjectFetchContextPtr& /*context*/) {
+  // TODO: Use a separate thread pool to do the git I/O
+  co_return BackingStore::GetTreeResult{
+      getTreeImpl(id), ObjectFetchContext::Origin::FromDiskCache};
+}
+
 SemiFuture<BackingStore::GetBlobResult> GitBackingStore::getBlob(
     const ObjectId& id,
     const ObjectFetchContextPtr& /*context*/) {
@@ -271,6 +300,14 @@ GitBackingStore::getBlobAuxData(const ObjectId&, const ObjectFetchContextPtr&) {
       nullptr, ObjectFetchContext::Origin::NotFetched};
 }
 
+folly::coro::now_task<BackingStore::GetBlobAuxResult>
+GitBackingStore::co_getBlobAuxData(
+    const ObjectId& id,
+    const ObjectFetchContextPtr& context) {
+  co_return BackingStore::GetBlobAuxResult{
+      nullptr, ObjectFetchContext::Origin::NotFetched};
+}
+
 ImmediateFuture<BackingStore::GetGlobFilesResult> GitBackingStore::getGlobFiles(
     const RootId& /* id */,
     const std::vector<std::string>& /* globs */,
@@ -278,6 +315,15 @@ ImmediateFuture<BackingStore::GetGlobFilesResult> GitBackingStore::getGlobFiles(
   return folly::makeFuture<GetGlobFilesResult>(
       std::runtime_error("getGlobFiles() is not supported on git"));
 };
+
+folly::coro::now_task<BackingStore::GetGlobFilesResult>
+GitBackingStore::co_getGlobFiles(
+    const RootId& /* id */,
+    const std::vector<std::string>& /* globs */,
+    const std::vector<std::string>& /* prefixes */) {
+  co_yield folly::coro::co_error(
+      std::runtime_error("getGlobFiles() is not supported on git"));
+}
 
 git_oid GitBackingStore::root2Oid(const RootId& rootId) {
   auto& value = rootId.value();

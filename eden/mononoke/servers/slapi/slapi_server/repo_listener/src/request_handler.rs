@@ -88,7 +88,6 @@ pub async fn request_handler(
         mut scuba,
         repo,
         maybe_push_redirector_args,
-        repo_client_knobs,
     } = handler;
 
     // Upgrade log to include server drain
@@ -99,7 +98,6 @@ pub async fn request_handler(
         scuba.add("config_store_last_updated_at", config_info.last_updated_at);
     }
     scuba.add_metadata(&metadata);
-    scuba.sample_for_identities(metadata.identities());
 
     let rate_limiter = rate_limiter.map(|r| r.get_rate_limiter());
     if let Some(ref rate_limiter) = rate_limiter {
@@ -116,7 +114,7 @@ pub async fn request_handler(
                 atlas,
             )
         } {
-            scuba.log_with_msg("Request rejected due to load shedding", format!("{}", err));
+            scuba.log_with_msg("Request rejected due to load shedding", format!("{err}"));
             error!("Request rejected due to load shedding: {}", err);
             log_error_to_client(
                 stderr,
@@ -135,7 +133,7 @@ pub async fn request_handler(
 
     if !is_allowed_to_repo {
         let err: Error = ErrorKind::AuthorizationFailed.into();
-        scuba.log_with_msg("Authorization failed", format!("{}", err));
+        scuba.log_with_msg("Authorization failed", format!("{err}"));
         error!("Authorization failed: {}", err);
         log_error_to_client(stderr, "Authorization failed:", &format!("{err}"));
 
@@ -157,13 +155,7 @@ pub async fn request_handler(
     let mut logging = LoggingContainer::new(fb, scuba.clone());
     logging.with_scribe(scribe);
 
-    let repo_client = RepoClient::new(
-        repo,
-        session.clone(),
-        logging,
-        maybe_push_redirector_args,
-        repo_client_knobs,
-    );
+    let repo_client = RepoClient::new(repo, session.clone(), logging, maybe_push_redirector_args);
     let request_perf_counters = repo_client.request_perf_counters();
 
     // Construct a hg protocol handler
@@ -220,11 +212,11 @@ pub async fn request_handler(
         Err(err) => {
             if err.is::<mpsc::SendError>() {
                 STATS::request_outcome_permille.add_value(0);
-                scuba.log_with_msg("Request finished - Client Disconnected", format!("{}", err));
+                scuba.log_with_msg("Request finished - Client Disconnected", format!("{err}"));
             } else {
                 STATS::request_failure.add_value(1);
                 STATS::request_outcome_permille.add_value(0);
-                scuba.log_with_msg("Request finished - Failure", format!("{:#?}", err));
+                scuba.log_with_msg("Request finished - Failure", format!("{err:#?}"));
             }
         }
     }

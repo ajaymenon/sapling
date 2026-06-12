@@ -8,8 +8,8 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.98"
-async-compression = { version = "0.4.9", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
+anyhow = "1.0.102"
+async-compression = { version = "0.4.42", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
 async-stream = "0.3"
 bufsize = "1.0.10"
 byteorder = "1.5"
@@ -19,7 +19,6 @@ futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 lazy_static = "1.5"
 maplit = "1.0"
 mercurial_mutation = { version = "0.1.0", path = "../mutation" }
@@ -28,14 +27,14 @@ mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 percent-encoding = "2.1"
 phases = { version = "0.1.0", path = "../../repo_attributes/phases" }
-pin-project = "1.1.10"
-quickcheck = "1.0"
+pin-project = "1.1.13"
+quickcheck = "1.1"
 sapling-revisionstore_types = { version = "0.1.0", path = "../../../scm/lib/revisionstore/types" }
 sapling-types = { version = "0.1.0", path = "../../../scm/lib/types" }
 sapling-vlqencoding = { version = "0.1.0", path = "../../../scm/lib/vlqencoding" }
 thiserror = "2.0.18"
-tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
-tokio-util = { version = "0.7.15", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
+tokio-util = { version = "0.7.18", features = ["full"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

@@ -12,7 +12,7 @@
 //! 2. Optionally deleting those blobs from a target blobstore directory
 //! 3. Inserting WAL entries for the target blobstore
 //!
-//! This is useful for testing the blobstore healer without using blobimport.
+//! This is useful for testing the blobstore healer.
 
 use std::fs;
 use std::path::Path;
@@ -121,7 +121,7 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
             let storage_config = storage_configs
                 .storage
                 .get(storage_id)
-                .ok_or_else(|| anyhow!("Storage config not found for ID: {}", storage_id))?;
+                .ok_or_else(|| anyhow!("Storage config not found for ID: {storage_id}"))?;
 
             // Extract queue_db and multiplex_id from MultiplexedWal config
             let (queue_db, multiplex_id) = match &storage_config.blobstore {
@@ -132,8 +132,7 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
                 } => (queue_db, *multiplex_id),
                 _ => {
                     return Err(anyhow!(
-                        "Storage config for '{}' is not MultiplexedWal",
-                        storage_id
+                        "Storage config for '{storage_id}' is not MultiplexedWal"
                     ));
                 }
             };
@@ -153,12 +152,14 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
 
         // Legacy approach: Use target_blobstore_id directly as multiplex_id
         (None, Some(target_blobstore_id)) => {
-            // Get repo config and extract blobstore config directly
-            let repo_configs = app.repo_configs();
-            let (_repo_name, repo_config) = repo_configs
-                .get_repo_config(repo.repo_identity().id())
-                .ok_or_else(|| {
-                    anyhow!(
+            // Get repo config and extract blobstore config directly.
+            // Route through `get_or_load_repo_config_by_id` so split-loaded
+            // repos (only present in the per-tier RepoSpec manifest) resolve.
+            let (_repo_name, repo_config) = app
+                .configs()
+                .get_or_load_repo_config_by_id(repo.repo_identity().id().id())
+                .with_context(|| {
+                    format!(
                         "Repo config not found for repo_id: {:?}",
                         repo.repo_identity().id()
                     )
@@ -258,10 +259,7 @@ fn delete_blobs(target_dir: &Path, blob_keys: &[(String, u64)]) -> Result<()> {
 
     for (key, _) in blob_keys {
         // Try both with and without "blob-" prefix
-        let paths = [
-            target_dir.join(format!("blob-{}", key)),
-            target_dir.join(key),
-        ];
+        let paths = [target_dir.join(format!("blob-{key}")), target_dir.join(key)];
 
         for path in &paths {
             if path.exists() {

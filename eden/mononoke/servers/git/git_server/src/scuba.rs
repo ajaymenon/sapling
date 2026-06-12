@@ -43,6 +43,8 @@ pub enum MononokeGitScubaKey {
     NWants,
     ClientMainId,
     ClientIdentities,
+    ClientIdentitiesTyped,
+    ProtocolVersion,
 }
 
 impl AsRef<str> for MononokeGitScubaKey {
@@ -67,6 +69,8 @@ impl AsRef<str> for MononokeGitScubaKey {
             Self::NHaves => "n_haves",
             Self::ClientMainId => "client_main_id",
             Self::ClientIdentities => "client_identities",
+            Self::ClientIdentitiesTyped => "client_identities_typed",
+            Self::ProtocolVersion => "protocol_version",
         }
     }
 }
@@ -178,10 +182,20 @@ impl MononokeGitScubaHandler {
             scuba.add(MononokeGitScubaKey::PackfileSize, push_data.packfile_size);
         }
         if let Some(err) = info.first_error() {
-            scuba.add(MononokeGitScubaKey::Error, format!("{:?}", err));
+            scuba.add(MononokeGitScubaKey::Error, format!("{err:?}"));
         }
         scuba.add(MononokeGitScubaKey::ErrorCount, info.error_count());
-        scuba.add("log_tag", "MononokeGit Request Processed");
+
+        let stream_aborted = info
+            .stream_stats
+            .as_ref()
+            .is_some_and(|stats| !stats.completed);
+        let log_tag = if stream_aborted {
+            "MononokeGit Request Aborted"
+        } else {
+            "MononokeGit Request Processed"
+        };
+        scuba.add("log_tag", log_tag);
         scuba.unsampled();
         scuba.log();
     }
@@ -198,15 +212,29 @@ impl MononokeGitScubaHandler {
         main_client_id: Option<String>,
         identities: &MononokeIdentitySet,
         error: String,
+        status_code: StatusCode,
+        user_agent: Option<String>,
+        client_correlator: Option<String>,
+        client_entrypoint: Option<String>,
     ) {
         scuba.add(MononokeGitScubaKey::Repo, repo_name.to_string());
         scuba.add(MononokeGitScubaKey::Error, error);
         // TODO(T247968902) logging of status code should be consolidated in one place
-        scuba.add("http_status", StatusCode::TOO_MANY_REQUESTS.as_u16());
+        scuba.add("http_status", status_code.as_u16());
         scuba.add_opt(MononokeGitScubaKey::ClientMainId, main_client_id);
+        scuba.add_opt("user_agent", user_agent);
+        scuba.add_opt("client_correlator", client_correlator);
+        scuba.add_opt("client_entry_point", client_entrypoint);
         scuba.add(
             MononokeGitScubaKey::ClientIdentities,
             identities.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+        );
+        scuba.add(
+            MononokeGitScubaKey::ClientIdentitiesTyped,
+            identities
+                .iter()
+                .map(|i| i.to_typed_string())
+                .collect::<Vec<_>>(),
         );
         scuba.add("log_tag", "MononokeGit Request Rejected");
         scuba.unsampled();

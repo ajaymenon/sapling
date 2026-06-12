@@ -10,17 +10,17 @@ use std::num::NonZeroU64;
 use std::panic::RefUnwindSafe;
 
 use futures_stats::FutureStats;
+use gotham::helpers::http::Body;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham_derive::StateData;
-use hyper::Body;
-use hyper::Method;
-use hyper::Response;
-use hyper::StatusCode;
-use hyper::Uri;
-use hyper::header;
-use hyper::header::AsHeaderName;
-use hyper::header::HeaderMap;
+use http::Method;
+use http::Response;
+use http::StatusCode;
+use http::Uri;
+use http::header;
+use http::header::AsHeaderName;
+use http::header::HeaderMap;
 use scopeguard::ScopeGuard;
 use scuba_ext::MononokeScubaSampleBuilder;
 use scuba_ext::ScubaValue;
@@ -73,6 +73,8 @@ pub enum HttpScubaKey {
     ClientIp,
     /// The client identities received for the client, if any.
     ClientIdentities,
+    /// The client identities with variant type appended, if any.
+    ClientIdentitiesTyped,
     /// Alias of the sandcastle job, if any.
     SandcastleAlias,
     /// Nonce of the sandcastle job, if any.
@@ -83,6 +85,8 @@ pub enum HttpScubaKey {
     ClientAtlas,
     /// Atlas environment ID, if any.
     ClientAtlasEnvId,
+    /// Whether running on Atlas for reinforcement learning (RL) use cases.
+    ClientAtlasRl,
     /// A unique ID identifying this request.
     RequestId,
     /// How long it took to send headers.
@@ -112,6 +116,14 @@ pub enum HttpScubaKey {
     XFBNetworkType,
     /// Whether identities contain AGENT taint
     LikelyAgentic,
+    /// The client's unix username, derived from its USER identity, if any.
+    UnixUsername,
+    /// A unique ID identifying the client session.
+    SessionUuid,
+    /// Tupperware job handle of the client, if any.
+    ClientTwJob,
+    /// Tupperware task handle of the client, if any.
+    ClientTwTask,
 }
 
 impl AsRef<str> for HttpScubaKey {
@@ -132,11 +144,13 @@ impl AsRef<str> for HttpScubaKey {
             ResponseContentEncoding => "response_content_encoding",
             ClientIp => "client_ip",
             ClientIdentities => "client_identities",
+            ClientIdentitiesTyped => "client_identities_typed",
             SandcastleAlias => "sandcastle_alias",
             SandcastleNonce => "sandcastle_nonce",
             SandcastleVCS => "sandcastle_vcs",
             ClientAtlas => "client_atlas",
             ClientAtlasEnvId => "client_atlas_env_id",
+            ClientAtlasRl => "client_atlas_rl",
             RequestId => "request_id",
             HeadersDurationMs => "headers_duration_ms",
             DurationMs => "duration_ms",
@@ -151,6 +165,10 @@ impl AsRef<str> for HttpScubaKey {
             XFBGitWrapper => "git_wrapper",
             XFBNetworkType => "fb_network_type",
             LikelyAgentic => "likely_agentic",
+            UnixUsername => "unix_username",
+            SessionUuid => "session_uuid",
+            ClientTwJob => "client_tw_job",
+            ClientTwTask => "client_tw_task",
         }
     }
 }
@@ -321,12 +339,20 @@ fn populate_scuba(scuba: &mut MononokeScubaSampleBuilder, state: &mut State) {
             scuba.add_client_request_info(client_info);
         }
         let identities = metadata.identities();
-        scuba.sample_for_identities(identities);
+        let identities_typed: Vec<_> = identities.iter().map(|i| i.to_typed_string()).collect();
         let identities: Vec<_> = identities.iter().map(|i| i.to_string()).collect();
         scuba.add(HttpScubaKey::ClientIdentities, identities);
+        scuba.add(HttpScubaKey::ClientIdentitiesTyped, identities_typed);
 
-        let client_identity_variant = metadata.identities().first().map(|i| i.variant());
-        scuba.add_opt("client_identity_variant", client_identity_variant);
+        // The EdenAPI path does not call MononokeScubaSampleBuilder::add_metadata,
+        // so the metadata-derived columns below are populated here by hand to
+        // match the wireproto path. Column names are kept for compatibility with
+        // historical logging.
+        scuba.add(HttpScubaKey::SessionUuid, metadata.session_id().to_string());
+
+        if let Some(unix_name) = metadata.unix_name() {
+            scuba.add(HttpScubaKey::UnixUsername, unix_name);
+        }
 
         let sandcastle_alias = metadata.sandcastle_alias();
         scuba.add(HttpScubaKey::SandcastleAlias, sandcastle_alias);
@@ -343,6 +369,15 @@ fn populate_scuba(scuba: &mut MononokeScubaSampleBuilder, state: &mut State) {
         let client_atlas_env_id = metadata.clientinfo_atlas_env_id();
         scuba.add(HttpScubaKey::ClientAtlasEnvId, client_atlas_env_id);
 
+        let client_atlas_rl = metadata.clientinfo_atlas_rl();
+        scuba.add(HttpScubaKey::ClientAtlasRl, client_atlas_rl);
+
+        let client_tw_job = metadata.clientinfo_tw_job();
+        scuba.add(HttpScubaKey::ClientTwJob, client_tw_job);
+
+        let client_tw_task = metadata.clientinfo_tw_task();
+        scuba.add(HttpScubaKey::ClientTwTask, client_tw_task);
+
         let fetch_cause = metadata.fetch_cause();
         scuba.add(HttpScubaKey::FetchCause, fetch_cause);
         scuba.add(HttpScubaKey::LikelyAgentic, metadata.likely_an_agent());
@@ -352,6 +387,13 @@ fn populate_scuba(scuba: &mut MononokeScubaSampleBuilder, state: &mut State) {
             HttpScubaKey::FetchFromCASAttempted,
             fetch_from_cas_attempted,
         );
+
+        if let Some(client_hostname) = metadata.client_hostname() {
+            scuba.add("source_hostname", client_hostname.to_owned());
+        }
+        if let Some(revproxy_region) = metadata.revproxy_region().as_deref() {
+            scuba.add("source_region", revproxy_region);
+        }
     }
 
     if let Some(config_version) = ConfigInfo::try_borrow_from(state) {
@@ -390,8 +432,7 @@ fn log_stats<H: ScubaHandler>(
             let threshold: u64 = justknobs::get_as::<u64>(
                 "scm/mononoke_timeouts:edenapi_unsampled_duration_threshold_ms",
                 None,
-            )
-            .unwrap_or_default();
+            );
 
             if duration.as_millis_unchecked() > threshold {
                 scuba.unsampled();
@@ -520,27 +561,17 @@ impl<H: ScubaHandler> Middleware for ScubaMiddleware<H> {
 
             if let Some(uri) = Uri::try_borrow_from(state) {
                 if uri.path() == "/health_check" || uri.path() == "/proxygen/health_check" {
-                    if !justknobs::eval("scm/mononoke:health_check_scuba_log_enabled", None, None)
-                        .unwrap_or(false)
-                    {
-                        return;
-                    }
-
                     let sampling_rate = core::num::NonZeroU64::new(
                         if status.as_u16() >= 200 || status.as_u16() < 299 {
-                            const FALLBACK_SAMPLING_RATE: u64 = 1000;
                             justknobs::get_as::<u64>(
                                 "scm/mononoke:health_check_scuba_log_success_sampling_rate",
                                 None,
                             )
-                            .unwrap_or(FALLBACK_SAMPLING_RATE)
                         } else {
-                            const FALLBACK_SAMPLING_RATE: u64 = 1;
                             justknobs::get_as::<u64>(
                                 "scm/mononoke:health_check_scuba_log_failure_sampling_rate",
                                 None,
                             )
-                            .unwrap_or(FALLBACK_SAMPLING_RATE)
                         },
                     );
                     if let Some(sampling_rate) = sampling_rate {

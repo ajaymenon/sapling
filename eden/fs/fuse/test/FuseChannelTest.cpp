@@ -6,18 +6,23 @@
  */
 
 #include "eden/fs/fuse/FuseChannel.h"
+#include "eden/fs/fuse/IoUringFuseTransport.h"
 
 #include <folly/Random.h>
 #include <folly/executors/GlobalExecutor.h>
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
+#if EDEN_HAVE_FUSE_IO_URING
+#include <sys/utsname.h>
+#endif
+#include <cerrno>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/EnumValue.h"
 #include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/fs/fuse/FuseDispatcher.h"
 #include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/testharness/FakeFuse.h"
 #include "eden/fs/testharness/TestDispatcher.h"
 
@@ -60,14 +65,17 @@ fuse_entry_out genRandomLookupResponse(uint64_t nodeid) {
   response.attr.gid = Random::rand32();
   response.attr.rdev = Random::rand32();
   response.attr.blksize = Random::rand32();
-  response.attr.padding = Random::rand32();
+  response.attr.flags = Random::rand32();
   return response;
 }
 
 class FuseChannelTest : public ::testing::Test {
  protected:
   std::unique_ptr<FuseChannel, FsChannelDeleter> createChannel(
-      size_t numThreads = 2) {
+      size_t numThreads = 2,
+      uint32_t fuseMaxPages = 0,
+      bool useIoUring = false,
+      std::string ioUringKernelReleaseRegex = {}) {
     auto testDispatcher = std::make_unique<TestDispatcher>(stats_.copy());
     dispatcher_ = testDispatcher.get();
     return makeFuseChannel(
@@ -80,7 +88,8 @@ class FuseChannelTest : public ::testing::Test {
         &straceLogger,
         std::make_shared<ProcessInfoCache>(),
         /*fsEventLogger=*/nullptr,
-        /*structuredLogger=*/std::make_shared<NullStructuredLogger>(),
+        /*edenFsEventsLogger=*/nullptr,
+        /*errorLogger=*/noopErrorLogger_,
         std::chrono::seconds(60),
         /*notifications=*/nullptr,
         CaseSensitivity::Sensitive,
@@ -90,7 +99,12 @@ class FuseChannelTest : public ::testing::Test {
         /*highFuseRequestsLogInterval=*/std::chrono::minutes{10},
         /*longRunningFSRequestThreshold=*/std::chrono::minutes{5},
         /*useWriteBackCache=*/false,
-        /*fuseTraceBusCapacity*/ kTraceBusCapacity);
+        /*fuseTraceBusCapacity*/ kTraceBusCapacity,
+        /*fuseBdiReadAheadKb=*/std::nullopt,
+        /*fuseMaxPages=*/fuseMaxPages,
+        /*useIoUring=*/useIoUring,
+        std::move(ioUringKernelReleaseRegex),
+        /*ioUringQueueDepth=*/8);
   }
 
   FuseChannel::StopFuture performInit(
@@ -98,13 +112,23 @@ class FuseChannelTest : public ::testing::Test {
       uint32_t majorVersion = FUSE_KERNEL_VERSION,
       uint32_t minorVersion = FUSE_KERNEL_MINOR_VERSION,
       uint32_t maxReadahead = 0,
-      uint32_t flags = 0) {
+      uint32_t flags = 0,
+      uint32_t flags2 = 0) {
     auto initFuture = channel->initialize();
     EXPECT_FALSE(initFuture.isReady());
 
     // Send the INIT packet
-    auto reqID =
-        fuse_.sendInitRequest(majorVersion, minorVersion, maxReadahead, flags);
+    struct fuse_init_in initArg = {};
+    initArg.major = majorVersion;
+    initArg.minor = minorVersion;
+    initArg.max_readahead = maxReadahead;
+    initArg.flags = flags;
+#ifdef FUSE_INIT_EXT
+    initArg.flags2 = flags2;
+#else
+    (void)flags2;
+#endif
+    auto reqID = fuse_.sendRequest(FUSE_INIT, FUSE_ROOT_ID, initArg);
 
     // Wait for the INIT response
     auto response = fuse_.recvResponse();
@@ -122,6 +146,7 @@ class FuseChannelTest : public ::testing::Test {
 
   FakeFuse fuse_;
   EdenStatsPtr stats_ = makeRefPtr<EdenStats>();
+  ErrorLogger noopErrorLogger_{nullptr, {}, nullptr};
   TestDispatcher* dispatcher_;
   AbsolutePath mountPath_{canonicalPath("/fake/mount/path")};
 };
@@ -200,6 +225,100 @@ TEST_F(FuseChannelTest, testTakeoverStop) {
   EXPECT_EQ(flags, fuseStopData->fuseSettings.flags);
 }
 
+#if EDEN_HAVE_FUSE_IO_URING
+std::string getRunningKernelReleaseForTest() {
+  struct utsname uts = {};
+  if (uname(&uts) != 0) {
+    return {};
+  }
+  return uts.release;
+}
+
+TEST_F(FuseChannelTest, testInitNegotiatesIoUringOnlyOnAllowedKernel) {
+  auto channel = createChannel(
+      /*numThreads=*/2,
+      /*fuseMaxPages=*/0,
+      /*useIoUring=*/true,
+      /*ioUringKernelReleaseRegex=*/"^" + getRunningKernelReleaseForTest());
+  auto completeFuture = performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      0,
+      FUSE_INIT_EXT,
+      static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+
+  channel->takeoverStop();
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  ASSERT_NE(nullptr, fuseStopData);
+  EXPECT_TRUE(fuseStopData->fuseSettings.flags & FUSE_INIT_EXT);
+  EXPECT_TRUE(
+      fuseStopData->fuseSettings.flags2 &
+      static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+}
+
+TEST_F(FuseChannelTest, testInitDoesNotNegotiateIoUringOnDisallowedKernel) {
+  auto channel = createChannel(
+      /*numThreads=*/2,
+      /*fuseMaxPages=*/0,
+      /*useIoUring=*/true,
+      /*ioUringKernelReleaseRegex=*/
+      "^not-" + getRunningKernelReleaseForTest());
+  auto completeFuture = performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      0,
+      FUSE_INIT_EXT,
+      static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+
+  channel->takeoverStop();
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  ASSERT_NE(nullptr, fuseStopData);
+  EXPECT_FALSE(
+      fuseStopData->fuseSettings.flags2 &
+      static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32));
+}
+
+TEST_F(FuseChannelTest, testTakeoverKeepsDevFuseWithoutNegotiatedIoUring) {
+  auto channel = createChannel(/*numThreads=*/2, /*fuseMaxPages=*/0, true);
+  fuse_init_out connInfo = {};
+  connInfo.major = FUSE_KERNEL_VERSION;
+  connInfo.minor = FUSE_KERNEL_MINOR_VERSION;
+
+  auto completeFuture = channel->initializeFromTakeover(connInfo);
+
+  EXPECT_FALSE(channel->usesIoUringTransport());
+
+  channel->takeoverStop();
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  ASSERT_NE(nullptr, fuseStopData);
+  EXPECT_EQ(FuseChannel::StopReason::TAKEOVER, fuseStopData->reason);
+}
+
+TEST_F(FuseChannelTest, testTakeoverRestoresNegotiatedIoUringTransport) {
+  auto channel = createChannel(/*numThreads=*/2, /*fuseMaxPages=*/0, false);
+  fuse_init_out connInfo = {};
+  connInfo.major = FUSE_KERNEL_VERSION;
+  connInfo.minor = FUSE_KERNEL_MINOR_VERSION;
+  connInfo.flags = FUSE_INIT_EXT;
+  connInfo.flags2 = static_cast<uint32_t>(FUSE_OVER_IO_URING >> 32);
+
+  auto completeFuture = channel->initializeFromTakeover(connInfo);
+
+  EXPECT_TRUE(channel->usesIoUringTransport());
+
+  channel->takeoverStop();
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  ASSERT_NE(nullptr, fuseStopData);
+  EXPECT_EQ(FuseChannel::StopReason::TAKEOVER, fuseStopData->reason);
+}
+#endif
+
 TEST_F(FuseChannelTest, testInitUnmountRace) {
   auto channel = createChannel();
   auto completeFuture = performInit(channel.get());
@@ -222,6 +341,46 @@ TEST_F(FuseChannelTest, testInitUnmountRace) {
            << enumValue(fuseStopData->reason);
   }
 }
+
+#if EDEN_HAVE_FUSE_IO_URING
+TEST_F(FuseChannelTest, ioUringSubmitAndWaitErrorPolicy) {
+  EXPECT_TRUE(IoUringFuseTransport::isTransientSubmitAndWaitError(-EINTR));
+  EXPECT_TRUE(IoUringFuseTransport::isTransientSubmitAndWaitError(-EAGAIN));
+  EXPECT_FALSE(IoUringFuseTransport::isTransientSubmitAndWaitError(-EIO));
+
+  EXPECT_TRUE(
+      IoUringFuseTransport::shouldRetrySubmitAndWaitError(-EINTR, false));
+  EXPECT_TRUE(
+      IoUringFuseTransport::shouldRetrySubmitAndWaitError(-EAGAIN, false));
+  EXPECT_FALSE(
+      IoUringFuseTransport::shouldRetrySubmitAndWaitError(-EINTR, true));
+
+  EXPECT_TRUE(
+      IoUringFuseTransport::shouldIgnoreSubmitAndWaitError(-EINTR, true));
+  EXPECT_TRUE(
+      IoUringFuseTransport::shouldIgnoreSubmitAndWaitError(-EAGAIN, true));
+  EXPECT_FALSE(
+      IoUringFuseTransport::shouldIgnoreSubmitAndWaitError(-EINTR, false));
+}
+
+TEST_F(FuseChannelTest, ioUringCqeErrorPolicy) {
+  EXPECT_TRUE(IoUringFuseTransport::shouldIgnoreCqeError(-EINTR));
+  EXPECT_TRUE(IoUringFuseTransport::shouldIgnoreCqeError(-EOPNOTSUPP));
+  EXPECT_TRUE(IoUringFuseTransport::shouldIgnoreCqeError(-EAGAIN));
+  EXPECT_TRUE(IoUringFuseTransport::shouldIgnoreCqeError(-ENOTCONN));
+  EXPECT_FALSE(IoUringFuseTransport::shouldIgnoreCqeError(-ECANCELED));
+  EXPECT_FALSE(IoUringFuseTransport::shouldIgnoreCqeError(-EIO));
+
+  EXPECT_TRUE(
+      IoUringFuseTransport::shouldIgnoreCqeErrorDuringShutdown(-ECANCELED));
+  EXPECT_FALSE(
+      IoUringFuseTransport::shouldIgnoreCqeErrorDuringShutdown(-EINTR));
+
+  EXPECT_FALSE(IoUringFuseTransport::shouldIgnoreCqeError(-ECANCELED, false));
+  EXPECT_TRUE(IoUringFuseTransport::shouldIgnoreCqeError(-ECANCELED, true));
+  EXPECT_TRUE(IoUringFuseTransport::shouldIgnoreCqeError(-EINTR, false));
+}
+#endif
 
 TEST_F(FuseChannelTest, testInitErrorClose) {
   // Close the FUSE device while the FuseChannel is waiting on the INIT request
@@ -410,4 +569,162 @@ TEST_F(FuseChannelTest, formatting_unknown) {
   // change the type back so the destructor doesn't throw
   entry.type = FuseChannel::InvalidationType::DIR_ENTRY;
 }
+
+#ifdef FUSE_MAX_PAGES
+TEST_F(FuseChannelTest, testMaxPagesNegotiation) {
+  constexpr uint32_t configuredMaxPages = 128;
+  auto channel =
+      createChannel(/*numThreads=*/2, /*fuseMaxPages=*/configuredMaxPages);
+
+  // The kernel must advertise FUSE_MAX_PAGES capability for EdenFS to set it
+  auto completeFuture = performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      /*maxReadahead=*/0,
+      /*flags=*/FUSE_MAX_PAGES);
+
+  channel->takeoverStop();
+
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  EXPECT_EQ(fuseStopData->reason, FuseChannel::StopReason::TAKEOVER);
+  EXPECT_TRUE(fuseStopData->fuseDevice);
+
+  // Verify FUSE_MAX_PAGES flag is set in the response
+  EXPECT_TRUE(fuseStopData->fuseSettings.flags & FUSE_MAX_PAGES)
+      << "FUSE_MAX_PAGES flag should be set when fuseMaxPages is configured";
+
+  // Verify max_pages matches the configured value
+  EXPECT_EQ(configuredMaxPages, fuseStopData->fuseSettings.max_pages);
+}
+
+TEST_F(FuseChannelTest, testMaxPagesDefaultDisabled) {
+  // Default fuseMaxPages=0 should NOT set FUSE_MAX_PAGES flag
+  auto channel = createChannel(/*numThreads=*/2, /*fuseMaxPages=*/0);
+
+  // Even if the kernel advertises FUSE_MAX_PAGES, EdenFS should not set it
+  // when fuseMaxPages is 0 (use kernel default)
+  auto completeFuture = performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      /*maxReadahead=*/0,
+      /*flags=*/FUSE_MAX_PAGES);
+
+  channel->takeoverStop();
+
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  EXPECT_EQ(fuseStopData->reason, FuseChannel::StopReason::TAKEOVER);
+  EXPECT_TRUE(fuseStopData->fuseDevice);
+
+  // Verify FUSE_MAX_PAGES flag is NOT set in the response
+  EXPECT_FALSE(fuseStopData->fuseSettings.flags & FUSE_MAX_PAGES)
+      << "FUSE_MAX_PAGES flag should not be set when fuseMaxPages is 0";
+
+  // max_pages should be 0 (kernel will use its default of 32)
+  EXPECT_EQ(0, fuseStopData->fuseSettings.max_pages);
+}
+
+TEST_F(FuseChannelTest, testMaxPagesClampedAt256) {
+  // Values above 256 should be capped at 256 (kernel maximum)
+  auto channel = createChannel(/*numThreads=*/2, /*fuseMaxPages=*/512);
+
+  auto completeFuture = performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      /*maxReadahead=*/0,
+      /*flags=*/FUSE_MAX_PAGES);
+
+  channel->takeoverStop();
+
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  EXPECT_EQ(fuseStopData->reason, FuseChannel::StopReason::TAKEOVER);
+  EXPECT_TRUE(fuseStopData->fuseDevice);
+
+  EXPECT_TRUE(fuseStopData->fuseSettings.flags & FUSE_MAX_PAGES);
+  EXPECT_EQ(256, fuseStopData->fuseSettings.max_pages);
+}
+
+TEST_F(FuseChannelTest, testMaxPagesKernelDoesNotSupport) {
+  // EdenFS wants max_pages but kernel doesn't advertise FUSE_MAX_PAGES
+  auto channel = createChannel(/*numThreads=*/2, /*fuseMaxPages=*/128);
+
+  // Send init with flags that do NOT include FUSE_MAX_PAGES
+  auto completeFuture = performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      /*maxReadahead=*/0,
+      /*flags=*/0);
+
+  channel->takeoverStop();
+
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  EXPECT_EQ(fuseStopData->reason, FuseChannel::StopReason::TAKEOVER);
+  EXPECT_TRUE(fuseStopData->fuseDevice);
+
+  // Kernel didn't advertise FUSE_MAX_PAGES, so EdenFS must not set it
+  EXPECT_FALSE(fuseStopData->fuseSettings.flags & FUSE_MAX_PAGES)
+      << "FUSE_MAX_PAGES should not be set when kernel doesn't support it";
+  EXPECT_EQ(0, fuseStopData->fuseSettings.max_pages);
+}
+#endif
+
+#ifdef FUSE_ALLOW_IDMAP
+TEST_F(FuseChannelTest, testAllowIdmapNegotiation) {
+  auto channel = createChannel();
+
+  // FUSE_ALLOW_IDMAP is bit 40, which lives in flags2 (bits 32..63 shifted
+  // down by 32). FUSE_INIT_EXT must be set in flags for the kernel to
+  // inspect flags2.
+  auto completeFuture = performInit(
+      channel.get(),
+      FUSE_KERNEL_VERSION,
+      FUSE_KERNEL_MINOR_VERSION,
+      /*maxReadahead=*/0,
+      /*flags=*/FUSE_INIT_EXT,
+      /*flags2=*/static_cast<uint32_t>(FUSE_ALLOW_IDMAP >> 32));
+
+  channel->takeoverStop();
+
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  EXPECT_EQ(fuseStopData->reason, FuseChannel::StopReason::TAKEOVER);
+  EXPECT_TRUE(fuseStopData->fuseDevice);
+
+#ifdef __linux__
+  EXPECT_TRUE(
+      fuseStopData->fuseSettings.flags2 &
+      static_cast<uint32_t>(FUSE_ALLOW_IDMAP >> 32))
+      << "FUSE_ALLOW_IDMAP should be set when kernel advertises it";
+#endif
+}
+
+TEST_F(FuseChannelTest, testAllowIdmapNotSetWhenKernelLacksSupport) {
+  auto channel = createChannel();
+
+  // Kernel does not advertise FUSE_ALLOW_IDMAP (flags2=0)
+  auto completeFuture = performInit(channel.get());
+
+  channel->takeoverStop();
+
+  auto stopData = std::move(completeFuture).get(kTimeout);
+  auto* fuseStopData = dynamic_cast<FuseChannel::StopData*>(stopData.get());
+  EXPECT_EQ(fuseStopData->reason, FuseChannel::StopReason::TAKEOVER);
+  EXPECT_TRUE(fuseStopData->fuseDevice);
+
+#ifdef __linux__
+  EXPECT_FALSE(
+      fuseStopData->fuseSettings.flags2 &
+      static_cast<uint32_t>(FUSE_ALLOW_IDMAP >> 32))
+      << "FUSE_ALLOW_IDMAP should not be set when kernel doesn't support it";
+#endif
+}
+#endif
+
 } // namespace facebook::eden

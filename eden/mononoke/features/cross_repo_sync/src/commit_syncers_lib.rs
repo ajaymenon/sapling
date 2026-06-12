@@ -384,7 +384,7 @@ where
     );
 
     // Killswitch to disable this logic altogether.
-    if let Ok(true) = justknobs::eval(
+    if justknobs::eval(
         "scm/mononoke:xrepo_disable_forward_sync_over_mapping_change",
         None,
         None,
@@ -414,10 +414,7 @@ where
     } else {
         log_debug(
             ctx,
-            format!(
-                "target bookmark version: none, parent version: {}",
-                parent_version,
-            ),
+            format!("target bookmark version: none, parent version: {parent_version}",),
         );
         // If we don't have a version for the target bookmark, we can't do anything.
         return Ok((parent_version, HashMap::new()));
@@ -425,8 +422,7 @@ where
     log_debug(
         ctx,
         format!(
-            "target bookmark version: {}, parent version: {}",
-            target_bookmark_version, parent_version,
+            "target bookmark version: {target_bookmark_version}, parent version: {parent_version}",
         ),
     );
 
@@ -486,7 +482,7 @@ where
             parent_mapping.insert(*target_parent_csid, target_bookmark_csid);
         }
     }
-    log_debug(ctx, format!("parent_mapping: {:?}", parent_mapping));
+    log_debug(ctx, format!("parent_mapping: {parent_mapping:?}"));
 
     if parent_mapping.is_empty() {
         // None of the parents are ancestors of current position of target_bookmark. Perhaps
@@ -500,8 +496,7 @@ where
         log_debug(
             ctx,
             format!(
-                "all validations passed, using target_bookmark_version: {}",
-                target_bookmark_version
+                "all validations passed, using target_bookmark_version: {target_bookmark_version}"
             ),
         );
         // There's exactly one parent that's ancestor of target_bookmark.
@@ -532,8 +527,7 @@ where
     log_warning(
         ctx,
         format!(
-            "Building parent override map without working copy validation to sync using synced_ancestors_versions {:#?}",
-            synced_ancestors_versions,
+            "Building parent override map without working copy validation to sync using synced_ancestors_versions {synced_ancestors_versions:#?}",
         ),
     );
 
@@ -566,7 +560,7 @@ where
             parent_mapping.insert(*target_parent_csid, target_bookmark_csid);
         }
     }
-    log_debug(ctx, format!("parent_mapping: {:?}", parent_mapping));
+    log_debug(ctx, format!("parent_mapping: {parent_mapping:?}"));
 
     if parent_mapping.is_empty() {
         // None of the parents are ancestors of current position of target_bookmark. Perhaps
@@ -853,8 +847,7 @@ pub async fn update_mapping_with_version<'a, R: Repo>(
     version_name: &CommitSyncConfigVersion,
 ) -> Result<(), Error> {
     let xrepo_sync_disable_all_syncs =
-        justknobs::eval("scm/mononoke:xrepo_sync_disable_all_syncs", None, None)
-            .unwrap_or_default();
+        justknobs::eval("scm/mononoke:xrepo_sync_disable_all_syncs", None, None);
     if xrepo_sync_disable_all_syncs {
         return Err(ErrorKind::XRepoSyncDisabled.into());
     }
@@ -984,11 +977,7 @@ where
             break;
         }
 
-        let leased = if justknobs::eval("scm/mononoke:xrepo_disable_commit_sync_lease", None, None)
-            .unwrap_or_default()
-        {
-            true
-        } else {
+        let leased = {
             let result = lease.try_add_put_lease(&lease_key).await;
             // In case of lease unavailability assume it's taken to not block the backsyncer
             result.unwrap_or(true)

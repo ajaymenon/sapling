@@ -20,7 +20,7 @@ export type FeatureFlagKey = keyof NonNullable<(typeof Internal)['featureFlags']
 export type SmartActionConfig = {
   id: string;
   label: string;
-  description?: string;
+  description?: string | ((context: ActionContext) => string);
   icon?: string;
   trackEventName: string;
   featureFlag?: FeatureFlagKey;
@@ -34,6 +34,8 @@ export type ActionContext = {
   commit?: CommitInfo;
   repoPath?: string;
   conflicts?: MergeConflicts;
+  userContext?: string;
+  featureFlags?: Record<string, boolean>;
 };
 
 export type ActionMenuItem = {

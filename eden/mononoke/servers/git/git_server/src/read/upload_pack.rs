@@ -13,12 +13,12 @@ use anyhow::Result;
 use async_stream::try_stream;
 use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_git_mapping::BonsaisOrGitShas;
-use buffered_weighted::WeightObserver;
 use bytes::Bytes;
 use either::Either;
 use futures::StreamExt;
 use futures::future::try_join4;
 use git_env::GitHost;
+use gotham::helpers::http::Body;
 use gotham::mime;
 use gotham::state::FromState;
 use gotham::state::State;
@@ -29,9 +29,8 @@ use gotham_ext::response::ResponseStream;
 use gotham_ext::response::ResponseTryStreamExt;
 use gotham_ext::response::StreamBody;
 use gotham_ext::response::TryIntoResponse;
+use http::Response;
 use http::StatusCode;
-use hyper::Body;
-use hyper::Response;
 use mononoke_macros::mononoke;
 use packetline::FLUSH_LINE;
 use packetline::encode::delim_to_write;
@@ -51,10 +50,14 @@ use protocol::mapping::ref_oid_mapping;
 use protocol::types::FetchResponse;
 use protocol::types::PackfileConcurrency;
 use protocol::types::ShallowInfoResponse;
+use protocol::validator::validate_shallow_fetch_without_deepen;
 use repo_identity::RepoIdentityRef;
 use rustc_hash::FxHashSet;
 use scuba_ext::MononokeScubaSampleBuilder;
+use sharding_observability::WeightTracker;
+use stats::prelude::*;
 use tokio::sync::mpsc;
+use weight_observer::WeightObserver;
 
 use crate::command::Command;
 use crate::command::FetchArgs;
@@ -66,11 +69,15 @@ use crate::model::RepositoryParams;
 use crate::model::RepositoryRequestContext;
 use crate::model::ResponseType;
 use crate::model::Service;
-use crate::model::WeightTracker;
 use crate::scuba::MononokeGitScubaHandler;
 use crate::scuba::MononokeGitScubaKey;
 use crate::util::empty_body;
 use crate::util::get_body;
+
+define_stats! {
+    prefix = "mononoke.git.request";
+    packfile_read_error: timeseries(Rate, Sum),
+}
 
 /// The header for the packfile section of the response
 const PACKFILE_HEADER: &[u8] = b"packfile";
@@ -84,8 +91,6 @@ const SHALLOW_INFO_HEADER: &[u8] = b"shallow-info";
 const ACK: &str = "ACK";
 /// Acknowledgement that the object sent by the client does not exist on the server
 const NAK: &[u8] = b"NAK";
-/// The default number of bytes to be buffered at the writer layer
-const DEFAULT_GIT_WRITER_BUFFER_BYTES: usize = 52_428_800; // 50 MB
 
 #[derive(Debug, Clone)]
 struct FetchResponseHeaders {
@@ -155,11 +160,23 @@ async fn acknowledgements(
     }
     Ok((Some(Bytes::from(output_buffer)), None))
 }
+
 async fn shallow_info(
     context: Arc<RepositoryRequestContext>,
     args: Arc<FetchArgs>,
 ) -> Result<(Option<Bytes>, Option<ShallowInfoResponse>), Error> {
     let request = args.into_shallow_request();
+
+    // Validate shallow fetch without deepen args to prevent broken repo state
+    let block_indirect_unshallow = justknobs::eval(
+        "scm/mononoke:git_block_indirect_unshallow_fetch",
+        None,
+        None,
+    );
+    if block_indirect_unshallow && !request.shallow.is_empty() && request.variant.is_none() {
+        validate_shallow_fetch_without_deepen(&context.ctx, &context.repo, &request).await?;
+    }
+
     // If the client did not request a shallow clone/fetch, then we can return early
     if !request.shallow_requested() {
         return Ok((None, None));
@@ -468,7 +485,7 @@ bundle.bundle_{}.creationtoken={}"#,
                     out.extend_from_slice(&blo[..])
                 }
                 Err(err) => {
-                    state.put(BundleUriOutcome::Error(format!("{:?}", err)));
+                    state.put(BundleUriOutcome::Error(format!("{err:?}")));
                 }
             }
         } else {
@@ -528,8 +545,7 @@ pub async fn fetch(
     } else {
         DeltaForm::RefAndOffset
     };
-    let max_buffer = justknobs::get_as::<usize>("scm/mononoke:git_writer_buffer_bytes", None)
-        .unwrap_or(DEFAULT_GIT_WRITER_BUFFER_BYTES);
+    let max_buffer = justknobs::get_as::<usize>("scm/mononoke:git_writer_buffer_bytes", None);
     // Some repos might be configured to display a message to users when they
     // run `git pull`.
     let mb_fetch_msg = git_fetch_message(request_context).await?;
@@ -580,16 +596,21 @@ pub async fn fetch(
         async move {
             // Track this request for memory-based scaling
             let repo_name = request_context.repo.repo_identity().name().to_string();
+            let main_client_id = request_context
+                .ctx
+                .metadata()
+                .client_info()
+                .and_then(|ci| ci.request_info.as_ref())
+                .and_then(|ri| ri.main_id.clone());
             let weight_tracker: Option<Arc<WeightTracker>> = if justknobs::eval(
                 "scm/mononoke:git_server_enable_memory_tracking",
                 None,
                 Some(&repo_name),
-            )
-            .unwrap_or(false)
-            {
+            ) {
                 Some(WeightTracker::new(
                     request_context.ctx.fb,
                     repo_name.clone(),
+                    main_client_id.as_deref(),
                 ))
             } else {
                 None
@@ -638,11 +659,12 @@ pub async fn fetch(
             match writer_future.await {
                 Ok(_) => anyhow::Ok(()),
                 Err(e) => {
-                    scuba.add(MononokeGitScubaKey::PackfileReadError, format!("{:?}", e));
+                    STATS::packfile_read_error.add_value(1);
+                    scuba.add(MononokeGitScubaKey::PackfileReadError, format!("{e:?}"));
                     scuba.add("log_tag", "Packfile Read Error");
                     scuba.unsampled();
                     scuba.log();
-                    error_writer.send(format!("{:?}", e)).await?;
+                    error_writer.send(format!("{e:?}")).await?;
                     Ok(())
                 }
             }
@@ -655,28 +677,15 @@ pub async fn fetch(
 
 /// Checks if there are any messages that should be displayed to the user when
 /// running `git pull` on this repo.
-async fn git_fetch_message(request_context: &RepositoryRequestContext) -> Result<Option<String>> {
-    let repo = &request_context.repo;
-    let repo_name = repo.repo_identity().name();
-
-    let should_display_message = justknobs::eval(
-        "scm/mononoke:display_repo_fetch_message_on_git_server",
-        None,
-        Some(repo_name),
-    )?;
-
-    if should_display_message {
-        Ok(repo.repo_config.git_configs.fetch_message.clone())
-    } else {
-        Ok(None)
-    }
+async fn git_fetch_message(_request_context: &RepositoryRequestContext) -> Result<Option<String>> {
+    Ok(None)
 }
 
 /// Generate packline encoded error response that Git client understands
 async fn git_error_message(
     error: &anyhow::Error,
 ) -> Result<impl TryIntoResponse + use<>, HttpError> {
-    let error_message = format!("{:?}", error);
+    let error_message = format!("{error:?}");
     let mut buf = Vec::with_capacity(error_message.len());
     write_error_channel(error_message.as_ref(), &mut buf)
         .await

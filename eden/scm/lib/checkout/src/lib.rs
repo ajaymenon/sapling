@@ -50,6 +50,7 @@ use treestate::dirstate;
 use treestate::filestate::FileStateV2;
 use treestate::filestate::StateFlags;
 use treestate::treestate::TreeState;
+use types::FetchCause;
 use types::FetchContext;
 use types::HgId;
 use types::Key;
@@ -178,7 +179,7 @@ impl Checkout {
     pub fn from_config(vfs: VFS, config: &dyn Config) -> Result<Self> {
         let concurrency = config
             .get_opt("nativecheckout", "concurrency")
-            .map_err(|e| format_err!("Failed to parse nativecheckout.concurrency: {}", e))?;
+            .map_err(|e| format_err!("Failed to parse nativecheckout.concurrency: {e}"))?;
         let concurrency = concurrency.unwrap_or(DEFAULT_CONCURRENCY);
         Ok(Self { vfs, concurrency })
     }
@@ -269,7 +270,10 @@ impl CheckoutPlan {
             .iter()
             .map(|(p, u)| Key::new(p.clone(), u.content_hgid.clone()))
             .collect();
-        let fetch_data_iter = store.get_content_iter(FetchContext::default(), keys)?;
+        let fetch_data_iter = store.get_content_iter(
+            FetchContext::new_with_cause(FetchCause::SaplingCheckout),
+            keys,
+        )?;
 
         const WORK_QUEUE_SIZE: usize = 10_000;
 
@@ -280,13 +284,16 @@ impl CheckoutPlan {
 
         let (progress_tx, progress_rx) = flume::unbounded();
 
-        let on_abort = AtExit::new(Box::new(move || {
-            if let Some(progress) = progress {
-                tracing::debug!("writing progress (on abort)");
-                let id_paths: Vec<_> = progress_rx.into_iter().collect();
-                progress.lock().record_writes(&id_paths);
-            }
-        }));
+        let on_abort = AtExit::new(
+            "checkout progress",
+            Box::new(move || {
+                if let Some(progress) = progress {
+                    tracing::debug!("writing progress (on abort)");
+                    let id_paths: Vec<_> = progress_rx.into_iter().collect();
+                    progress.lock().record_writes(&id_paths);
+                }
+            }),
+        );
 
         // Use vfs.batch() for parallel VFS writes.
         let n = self.vfs_worker_count(total);
@@ -327,7 +334,7 @@ impl CheckoutPlan {
 
             let action = actions
                 .get(&key.path)
-                .ok_or_else(|| format_err!("Storage returned unknown key {}", key))?;
+                .ok_or_else(|| format_err!("Storage returned unknown key {key}"))?;
             let flag = type_to_flag(&action.file_type);
 
             work_tx
@@ -414,7 +421,10 @@ impl CheckoutPlan {
         });
         let keys: Vec<_> = keys.collect();
         let (mut count, mut size) = (0, 0);
-        let iter = store.get_content_iter(FetchContext::default(), keys)?;
+        let iter = store.get_content_iter(
+            FetchContext::new_with_cause(FetchCause::SaplingCheckout),
+            keys,
+        )?;
         for result in iter {
             let (_key, data) = result?;
             count += 1;
@@ -523,10 +533,9 @@ impl CheckoutPlan {
                 let repo_path = file.as_repo_path();
                 let hgid = match manifest.get_file(repo_path)? {
                     Some(m) => m.hgid,
-                    None => bail!(
-                        "{} not found in manifest when checking for unknown files",
-                        repo_path
-                    ),
+                    None => {
+                        bail!("{repo_path} not found in manifest when checking for unknown files")
+                    }
                 };
                 let key = Key::new(file.clone(), hgid);
                 check_content.push(key);
@@ -543,7 +552,10 @@ impl CheckoutPlan {
         }
 
         let mut paths = Vec::new();
-        for entry in store.get_content_iter(FetchContext::default(), check_content)? {
+        for entry in store.get_content_iter(
+            FetchContext::new_with_cause(FetchCause::SaplingCheckout),
+            check_content,
+        )? {
             let (key, data) = entry?;
             if let Some(path) = Self::check_content(vfs, key, data.into_bytes()) {
                 paths.push(path);
@@ -622,6 +634,26 @@ impl CheckoutStats {
     }
 }
 
+fn display_path_prefixed_error(error: &Error) -> String {
+    let mut message = String::new();
+
+    for cause in error.chain() {
+        if !message.is_empty() {
+            message.push_str(": ");
+        }
+
+        match cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|err| util::path_error_details(err).map(|details| details.original_io_error))
+        {
+            Some(original) => message.push_str(&original.to_string()),
+            None => message.push_str(&cause.to_string()),
+        }
+    }
+
+    message
+}
+
 impl fmt::Display for CheckoutStats {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut printed_something = false;
@@ -635,7 +667,7 @@ impl fmt::Display for CheckoutStats {
                 truncated_error_list(
                     self.write_failed
                         .iter()
-                        .map(|(path, err)| format!("{path}: {err:#}")),
+                        .map(|(path, err)| format!("{path}: {}", display_path_prefixed_error(err))),
                     5
                 )
                 .join("\n "),
@@ -654,7 +686,7 @@ impl fmt::Display for CheckoutStats {
                 truncated_error_list(
                     self.set_exec_failed
                         .iter()
-                        .map(|(path, err)| format!("{path}: {err:#}")),
+                        .map(|(path, err)| format!("{path}: {}", display_path_prefixed_error(err))),
                     5
                 )
                 .join("\n "),
@@ -673,7 +705,7 @@ impl fmt::Display for CheckoutStats {
                 truncated_error_list(
                     self.remove_failed
                         .iter()
-                        .map(|(path, err)| format!("{path}: {err:#}")),
+                        .map(|(path, err)| format!("{path}: {}", display_path_prefixed_error(err))),
                     5
                 )
                 .join("\n "),
@@ -806,7 +838,7 @@ impl CheckoutProgress {
             let _ = (|| -> Result<()> {
                 let stat = self.vfs.metadata(path)?;
                 let time = stat
-                    .modified()?
+                    .mtime()
                     .duration_since(SystemTime::UNIX_EPOCH)?
                     .as_millis();
 
@@ -847,12 +879,9 @@ impl CheckoutProgress {
 
             if let Ok(stat) = self.vfs.metadata(path) {
                 let time_matches = stat
-                    .modified()
-                    .map(|t| {
-                        t.duration_since(SystemTime::UNIX_EPOCH)
-                            .map(|d| d.as_millis() == *time)
-                            .unwrap_or(false)
-                    })
+                    .mtime()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_millis() == *time)
                     .unwrap_or(false);
                 if time_matches && &stat.len() == size {
                     // Everything matches - clear out action indicating we don't need to check out the file.
@@ -896,7 +925,7 @@ impl AsRef<RepoPath> for UpdateMetaAction {
 impl fmt::Display for CheckoutPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for r in &self.remove {
-            writeln!(f, "rm {}", r)?;
+            writeln!(f, "rm {r}")?;
         }
         for (p, u) in &self.update_content {
             match u {
@@ -922,12 +951,9 @@ impl fmt::Display for CheckoutPlan {
 
 pub fn file_state(vfs: &VFS, path: &RepoPath) -> Result<FileStateV2> {
     let meta = vfs.metadata(path)?;
-    #[cfg(unix)]
-    let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions());
-    #[cfg(windows)]
-    let mode = if meta.is_symlink() { 0o120644 } else { 0o644 };
+    let mode = meta.mode();
     let mtime = meta
-        .modified()?
+        .mtime()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs();
     let mtime = truncate_u64("mtime", path, mtime);
@@ -1311,7 +1337,7 @@ pub fn filesystem_checkout(
 
     for (path, err) in apply_result.remove_failed {
         ctx.logger
-            .warn(format!("update failed to remove {}: {:#}!\n", path, err));
+            .warn(format!("update failed to remove {path}: {err:#}!\n"));
     }
 
     // 5. Update the treestate parents, dirstate
@@ -1652,21 +1678,21 @@ mod test {
         let cd = (rp("C/D"), FileMetadata::regular(hgid(1)));
 
         // update file
-        assert_checkout(&[a.clone()], &[a_2.clone()])?;
+        assert_checkout(std::slice::from_ref(&a), std::slice::from_ref(&a_2))?;
         // mv file
-        assert_checkout(&[a.clone()], &[b.clone()])?;
+        assert_checkout(std::slice::from_ref(&a), std::slice::from_ref(&b))?;
         // add / rm file
-        assert_checkout_symmetrical(&[a.clone()], &[a.clone(), b.clone()])?;
+        assert_checkout_symmetrical(std::slice::from_ref(&a), &[a.clone(), b.clone()])?;
         // regular<->exec
-        assert_checkout_symmetrical(&[a.clone()], &[a_e.clone()])?;
+        assert_checkout_symmetrical(std::slice::from_ref(&a), std::slice::from_ref(&a_e))?;
         // regular<->symlink
-        assert_checkout_symmetrical(&[a.clone()], &[a_s.clone()])?;
+        assert_checkout_symmetrical(std::slice::from_ref(&a), std::slice::from_ref(&a_s))?;
         // dir <-> file with the same name
-        assert_checkout_symmetrical(&[ab.clone()], &[a.clone()])?;
+        assert_checkout_symmetrical(std::slice::from_ref(&ab), std::slice::from_ref(&a))?;
         // create / rm dir
-        assert_checkout_symmetrical(&[ab.clone()], &[b.clone()])?;
+        assert_checkout_symmetrical(std::slice::from_ref(&ab), std::slice::from_ref(&b))?;
         // mv file between dirs
-        assert_checkout(&[ab.clone()], &[cd.clone()])?;
+        assert_checkout(std::slice::from_ref(&ab), std::slice::from_ref(&cd))?;
 
         Ok(())
     }
@@ -1793,7 +1819,7 @@ mod test {
 
     fn print_tree(t: &[(RepoPathBuf, FileMetadata)]) {
         for (path, meta) in t {
-            eprintln!("{} [{:?}]", path, meta);
+            eprintln!("{path} [{meta:?}]");
         }
     }
 
@@ -1820,7 +1846,7 @@ mod test {
             let expected_meta = if let Some(m) = expected.remove(&rel_path) {
                 m
             } else {
-                bail!("Checkout created unexpected file {}", rel_path);
+                bail!("Checkout created unexpected file {rel_path}");
             };
             assert_metadata(&expected_meta, &dir)?;
         }

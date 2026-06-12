@@ -5,16 +5,18 @@ oncall("sapling")
 rust_library(
     name = "revsets",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "lib": {"name": "revsets"},
-        "package": {
-            "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-            "homepage": "https://sapling-scm.com/",
-            "license": "MIT",
-            "name": "sapling-revsets",
-            "repository": "https://github.com/facebook/sapling",
+    autocargo = {
+        "cargo_toml_config": {
+            "lib": {"name": "revsets"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "MIT",
+                "name": "sapling-revsets",
+                "repository": "https://github.com/facebook/sapling",
+            },
         },
-    }},
+    },
     crate_root = "src/lib.rs",
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -24,7 +26,6 @@ rust_library(
         "//eden/scm/lib/dag:dag",
         "//eden/scm/lib/edenapi:edenapi",
         "//eden/scm/lib/metalog:metalog",
-        "//eden/scm/lib/treestate:treestate",
         "//eden/scm/lib/types:types",
         "//eden/scm/lib/util/hgplain:hgplain",
     ],

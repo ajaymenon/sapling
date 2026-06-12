@@ -13,10 +13,10 @@ license = "MIT"
 name = "treestate"
 
 [dependencies]
-anyhow = "1.0.98"
-bitflags = { version = "2.9", features = ["serde", "std"], default-features = false }
+anyhow = "1.0.102"
+bitflags = { version = "2.11.1", features = ["serde", "std"], default-features = false }
 byteorder = "1.5"
-fs-err = { version = "3", features = ["tokio"] }
+fs-err = { version = "3.3.0", features = ["tokio"] }
 sapling-atomicfile = { version = "0.1.0", path = "../atomicfile" }
 sapling-identity = { version = "0.1.0", path = "../identity" }
 sapling-repolock = { version = "0.1.0", path = "../repolock" }
@@ -27,12 +27,12 @@ sha2 = "0.10.6"
 thiserror = "2.0.18"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 twox-hash = "1.6.1"
-uuid = { version = "1.17", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
+uuid = { version = "1.23.3", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 
 [dev-dependencies]
 itertools = "0.14.0"
-pretty_assertions = { version = "1.2", features = ["alloc"], default-features = false }
-quickcheck = "1.0"
-rand = { version = "0.8", features = ["small_rng"] }
-rand_chacha = "0.3"
-tempfile = "3.22"
+pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
+quickcheck = "1.1"
+rand = "0.10.1"
+rand_chacha = "0.10"
+tempfile = "3.27.0"

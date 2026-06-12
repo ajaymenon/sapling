@@ -40,6 +40,7 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
+use gotham::helpers::http::Body;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham_derive::StateData;
@@ -48,7 +49,7 @@ use gotham_ext::error::HttpError;
 use gotham_ext::handler::SlapiCommitIdentityScheme;
 use gotham_ext::middleware::request_context::RequestContext;
 use gotham_ext::response::TryIntoResponse;
-use hyper::Body;
+use http_body_util::BodyExt as _;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgNodeHash;
 use mercurial_types::blobs::File;
@@ -85,6 +86,7 @@ const MAX_CONCURRENT_UPLOAD_FILENODES_PER_REQUEST: usize = 1000;
 define_stats! {
     prefix = "mononoke.files";
     files_served: timeseries(Rate, Sum),
+    files_batch_keys_requested: timeseries(Rate, Sum),
 }
 
 #[derive(Debug, Deserialize, StateData, StaticResponseExtender)]
@@ -109,7 +111,7 @@ impl SaplingRemoteApiHandler for Files2Handler {
     type Request = FileRequest;
     type Response = FileResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::Files2;
     const ENDPOINT: &'static str = "/files2";
 
@@ -123,6 +125,8 @@ impl SaplingRemoteApiHandler for Files2Handler {
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
         let ctx = repo.ctx().clone();
+
+        STATS::files_batch_keys_requested.add_value(request.reqs.len() as i64);
 
         let fetches = request.reqs.into_iter().map({
             let ctx = ctx.clone();
@@ -170,7 +174,7 @@ async fn fetch_file_response<R: MononokeRepo>(
 ) -> Result<FileResponse, Error> {
     let result = fetch_file(repo, key.clone(), attrs)
         .await
-        .map_err(|e| ServerError::generic(format!("{}", e)));
+        .map_err(|e| ServerError::generic(format!("{e}")));
     Ok(FileResponse { key, result })
 }
 
@@ -256,7 +260,7 @@ async fn fetch_git_object_as_file<R: MononokeRepo>(
         });
     Ok(FileResponse {
         key,
-        result: result.map_err(|e| ServerError::generic(format!("{}", e))),
+        result: result.map_err(|e| ServerError::generic(format!("{e}"))),
     })
 }
 
@@ -305,7 +309,9 @@ pub async fn upload_file(state: &mut State) -> Result<impl TryIntoResponse + use
     let id = AnyFileContentId::from_str(&format!("{}/{}", &params.idtype, &params.id))
         .map_err(HttpError::e400)?;
 
-    let body = Body::take_from(state).map_err(Error::from);
+    let body = Body::take_from(state)
+        .into_data_stream()
+        .map_err(Error::from);
     let content_size = query_string.content_size;
     let compression = query_string.compression;
 
@@ -318,8 +324,7 @@ pub async fn upload_file(state: &mut State) -> Result<impl TryIntoResponse + use
         }
         None => Ok((body.right_stream(), content_size)),
         Some(compression) => Err(HttpError::e400(anyhow!(
-            "Unsupported compression type: {:?}",
-            compression
+            "Unsupported compression type: {compression:?}"
         ))),
     }?;
 
@@ -402,8 +407,7 @@ async fn store_hg_filenode<R: MononokeRepo>(
         Some(_copy_from) => {
             ensure!(
                 p2.is_none(),
-                "Copy metadata is not valid for merged filenodes: {}",
-                filenode
+                "Copy metadata is not valid for merged filenodes: {filenode}"
             );
             repo.store_hg_filenode(filenode, None, p1, content_id, content_size, metadata)
                 .await?;
@@ -427,7 +431,7 @@ impl SaplingRemoteApiHandler for UploadHgFilenodesHandler {
     type Request = Batch<UploadHgFilenodeRequest>;
     type Response = UploadTokensResponse;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::UploadHgFilenodes;
     const ENDPOINT: &'static str = "/upload/filenodes";
 
@@ -454,7 +458,7 @@ impl SaplingRemoteApiHandler for DownloadFileHandler {
     type Request = UploadToken;
     type Response = Bytes;
 
-    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const HTTP_METHOD: http::Method = http::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::DownloadFile;
     const ENDPOINT: &'static str = "/download/file";
 

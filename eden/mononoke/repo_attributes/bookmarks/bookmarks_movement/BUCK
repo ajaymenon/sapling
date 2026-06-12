@@ -1,6 +1,6 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "bookmarks_movement",
@@ -15,6 +15,7 @@ rust_library(
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
         "//eden/mononoke/mononoke_types:mononoke_types-mocks",
         "//eden/mononoke/repo_attributes/filestore:filestore",
+        "//eden/mononoke/repo_attributes/git_source_of_truth:git_source_of_truth",
         "//eden/mononoke/repo_factory:test_repo_factory",
         "//eden/mononoke/tests/utils:tests_utils",
     ],
@@ -29,9 +30,9 @@ rust_library(
         "//common/rust/shed/cloned:cloned",
         "//common/rust/shed/futures_ext:futures_ext",
         "//common/rust/shed/futures_stats:futures_stats",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//eden/mononoke/blobstore:blobstore",
         "//eden/mononoke/common/permission_checker:permission_checker",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",
         "//eden/mononoke/derived_data:case_conflict_skeleton_manifest",
         "//eden/mononoke/derived_data:skeleton_manifest",
@@ -48,8 +49,9 @@ rust_library(
         "//eden/mononoke/repo_attributes/bonsai_hg_mapping:bonsai_hg_mapping",
         "//eden/mononoke/repo_attributes/bookmarks:bookmarks",
         "//eden/mononoke/repo_attributes/bookmarks/bookmarks_types:bookmarks_types",
+        "//eden/mononoke/repo_attributes/bookmarks/dbbookmarks:dbbookmarks",
         "//eden/mononoke/repo_attributes/commit_graph/commit_graph:commit_graph",
-        "//eden/mononoke/repo_attributes/git_source_of_truth:git_source_of_truth",
+        "//eden/mononoke/repo_attributes/filestore:filestore",
         "//eden/mononoke/repo_attributes/phases:phases",
         "//eden/mononoke/repo_attributes/pushrebase_mutation_mapping:pushrebase_mutation_mapping",
         "//eden/mononoke/repo_attributes/repo_blobstore:repo_blobstore",

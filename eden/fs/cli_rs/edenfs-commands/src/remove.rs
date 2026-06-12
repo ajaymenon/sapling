@@ -8,6 +8,7 @@
 //! edenfsctl remove
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -21,6 +22,7 @@ mod operations;
 mod types;
 mod utils;
 
+use operations::get_aux_processes_stop_timeout;
 use types::Messenger;
 use types::PathType;
 use types::RemoveContext;
@@ -29,7 +31,7 @@ use types::RemoveContext;
 #[clap(name = "remove", about = "Remove an EdenFS checkout")]
 pub struct RemoveCmd {
     #[clap(
-        multiple_values = true,
+        num_args = 1..,
         help = "The EdenFS checkout(s) to remove.",
         value_name = "PATH"
     )]
@@ -38,7 +40,7 @@ pub struct RemoveCmd {
     #[clap(
             short = 'y',
             long = "yes",
-            visible_aliases = &["--no-prompt"],
+            visible_aliases = &["no-prompt"],
             help = "Do not prompt for confirmation before removing the checkouts."
         )]
     skip_prompt: bool,
@@ -59,8 +61,15 @@ pub struct RemoveCmd {
     #[clap(long, hide = true)]
     preserve_mount_point: bool,
 
-    #[clap(long = "--no-force", hide = true)]
+    #[clap(long = "no-force", hide = true)]
     no_force: bool,
+
+    #[clap(
+        long = "timeout",
+        value_name = "SECONDS",
+        help = "Timeout in seconds for stopping auxiliary processes (e.g., redirections). Defaults to 60 seconds if not specified. Can also be set via environment variable EDENFS_AUX_PROCESSES_TIMEOUT_SECS."
+    )]
+    timeout: Option<u64>,
 }
 
 #[async_trait]
@@ -81,6 +90,8 @@ impl Subcommand for RemoveCmd {
             self.no,
         ));
 
+        let timeout = Duration::from_secs(get_aux_processes_stop_timeout(self.timeout));
+
         for path in &self.paths {
             let (canonicalized_path, path_type) = operations::classify_path(path).await?;
 
@@ -91,6 +102,7 @@ impl Subcommand for RemoveCmd {
                 self.preserve_mount_point,
                 self.no_force,
                 messenger.clone(),
+                timeout,
             );
             remove_contexts.push(context);
 
@@ -131,6 +143,7 @@ impl Subcommand for RemoveCmd {
             }
         }
 
+        // Remove each checkout (unmount redirections if applicable, unmount, destroy, cleanup)
         for context in remove_contexts {
             context.path_type.remove(&context).await?;
         }

@@ -28,6 +28,39 @@ use fs_err as fs;
 use crate::errors::IOContext;
 use crate::file::get_umask;
 
+/// Resolve a path to its canonical form, handling non-existent paths.
+///
+/// If the full path exists, behaves like `std::fs::canonicalize` (resolves
+/// all symlinks). If the path does not exist, canonicalizes the closest
+/// existing ancestor and appends the remaining (non-existent) components.
+///
+/// This is useful when you need a canonical absolute path for a target that
+/// hasn't been created yet (e.g., a destination directory for a clone). The
+/// standard `std::fs::canonicalize` fails on non-existent paths, but callers
+/// often still need symlinks in the existing prefix resolved for consistency.
+pub fn canonical_path_allow_missing(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = absolute(path)?;
+    if let Ok(p) = fs::canonicalize(&path) {
+        return Ok(p);
+    }
+    let mut existing = path.clone();
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                existing.pop();
+            }
+            None => return Ok(path),
+        }
+    }
+    let mut result = fs::canonicalize(&existing)?;
+    for component in tail.into_iter().rev() {
+        result.push(component);
+    }
+    Ok(result)
+}
+
 /// Pick a random file name `path.$RAND.atomic` as `real_path`. Write `data` to
 /// it.  Then modify the symlink `path` to point to `real_path`.  Attempt to
 /// delete files that are no longer referred.
@@ -141,9 +174,13 @@ pub fn symlink_dir(src: &Path, dst: &Path) -> io::Result<()> {
     symlink_file(src, dst)
 }
 
-/// Removes the UNC prefix `\\?\` on Windows. Does nothing on unices.
-pub fn strip_unc_prefix(path: &Path) -> &Path {
-    path.strip_prefix(r"\\?\").unwrap_or(path)
+/// Removes the extended-length path prefix `\\?\` on Windows.
+/// Returns the path unchanged on non-Windows or if no prefix is present.
+pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
+    path.to_string_lossy()
+        .strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or(path)
 }
 
 /// Return the absolute and normalized path without accessing the filesystem.
@@ -174,8 +211,7 @@ pub fn absolute(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 
     if !path.is_absolute() {
         return Err(io::Error::other(format!(
-            "cannot get absolute path from {:?}",
-            path
+            "cannot get absolute path from {path:?}"
         )));
     }
 
@@ -392,7 +428,7 @@ fn resolve_symlinks(path: &Path) -> anyhow::Result<PathBuf> {
     use anyhow::bail;
     fn inner(path: PathBuf, seen: &mut HashSet<PathBuf>) -> anyhow::Result<PathBuf> {
         if seen.contains(&path) {
-            bail!("symlink cycle containing {:?}", path);
+            bail!("symlink cycle containing {path:?}");
         }
 
         seen.insert(path.clone());
@@ -406,7 +442,7 @@ fn resolve_symlinks(path: &Path) -> anyhow::Result<PathBuf> {
 
             // Unexpected error reading file.
             Err(err) => add_stat_context(
-                Err(err).context(format!("statting {:?}", path)),
+                Err(err).context(format!("statting {path:?}")),
                 path.parent(),
             ),
         }
@@ -415,7 +451,7 @@ fn resolve_symlinks(path: &Path) -> anyhow::Result<PathBuf> {
     let mut seen = HashSet::new();
     let mut res = inner(path.to_path_buf(), &mut seen);
     if seen.len() > 1 {
-        res = res.with_context(|| format!("traversing symlinks from {:?}", path));
+        res = res.with_context(|| format!("traversing symlinks from {path:?}"));
     }
     res
 }
@@ -436,7 +472,7 @@ fn create_dir_with_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
     match path.metadata() {
         Ok(md) if md.is_file() => {
             return Err(anyhow!(io::Error::from(ErrorKind::AlreadyExists)))
-                .context(format!("path exists as a file: {:?}", path));
+                .context(format!("path exists as a file: {path:?}"));
         }
         Ok(md) => {
             // Symlinks were resolved above - assume is_dir.
@@ -450,7 +486,7 @@ fn create_dir_with_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => {
             return add_stat_context(
-                Err(err).context(format!("error statting {:?}", path)),
+                Err(err).context(format!("error statting {path:?}")),
                 path.parent(),
             );
         }
@@ -459,17 +495,17 @@ fn create_dir_with_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             ErrorKind::NotFound,
-            format!("`{:?}` does not have a parent directory", path),
+            format!("`{path:?}` does not have a parent directory"),
         )
     })?;
 
     let parent = resolve_symlinks(parent)?;
 
     let temp = add_stat_context(tempfile::TempDir::new_in(&parent), Some(&parent))
-        .with_context(|| format!("creating temp dir in {:?}", parent))?;
+        .with_context(|| format!("creating temp dir in {parent:?}"))?;
 
     fs::set_permissions(&temp, Permissions::from_mode(mode))
-        .with_context(|| format!("setting permissions on temp dir {:?}", temp))?;
+        .with_context(|| format!("setting permissions on temp dir {temp:?}"))?;
 
     let temp = temp.keep();
     if let Err(e) = fs::rename(&temp, &path) {
@@ -842,6 +878,7 @@ mod tests {
             Ok(())
         }
 
+        #[cfg(not(target_os = "macos"))]
         #[test]
         fn test_create_shared_dir() -> Result<()> {
             let tempdir = TempDir::new()?;
@@ -856,6 +893,7 @@ mod tests {
             Ok(())
         }
 
+        #[cfg(not(target_os = "macos"))]
         #[test]
         fn test_fixup_perms() -> Result<()> {
             let tempdir = TempDir::new()?;
@@ -888,7 +926,7 @@ mod tests {
             assert!(is_io_error_kind(&err, io::ErrorKind::PermissionDenied));
 
             // Make sure we give parent dir's info in error.
-            assert!(format!("{:?}", err).contains(&format!("stat({:?}) = ", path)));
+            assert!(format!("{err:?}").contains(&format!("stat({path:?}) = ")));
 
             Ok(())
         }
@@ -1063,6 +1101,7 @@ mod tests {
         assert_eq!(expand_path_impl(path, getenv, homedir), expected);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_create_shared_dir_all() -> Result<()> {
         test_create_dir_all_fn(&|path| create_shared_dir_all(path), 0o42775)
@@ -1176,5 +1215,66 @@ mod tests {
                 });
             }
         });
+    }
+
+    // --- strip_unc_prefix tests ---
+
+    #[test]
+    fn test_strip_unc_prefix_with_prefix() {
+        let path = PathBuf::from(r"\\?\C:\open\test1");
+        assert_eq!(strip_unc_prefix(path), PathBuf::from(r"C:\open\test1"));
+    }
+
+    #[test]
+    fn test_strip_unc_prefix_without_prefix() {
+        let path = PathBuf::from(r"C:\open\test1");
+        assert_eq!(strip_unc_prefix(path), PathBuf::from(r"C:\open\test1"));
+    }
+
+    #[test]
+    fn test_strip_unc_prefix_unix_path() {
+        let path = PathBuf::from("/home/user/repo");
+        assert_eq!(strip_unc_prefix(path), PathBuf::from("/home/user/repo"));
+    }
+
+    #[test]
+    fn test_strip_unc_prefix_unc_network_path() {
+        // UNC network paths (\\server\share) should NOT be stripped —
+        // only the extended-length prefix \\?\ should be removed.
+        let path = PathBuf::from(r"\\server\share\dir");
+        assert_eq!(strip_unc_prefix(path), PathBuf::from(r"\\server\share\dir"));
+    }
+
+    // --- canonical_path_allow_missing tests ---
+
+    #[test]
+    fn test_canonical_path_allow_missing_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        let result = canonical_path_allow_missing(dir.path()).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_canonical_path_allow_missing_nonexistent_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let non_existent = dir.path().join("does_not_exist");
+        let result = canonical_path_allow_missing(&non_existent).unwrap();
+        assert_eq!(result, canonical_dir.join("does_not_exist"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_canonical_path_allow_missing_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+
+        let result = canonical_path_allow_missing(&link).unwrap();
+        let expected = std::fs::canonicalize(&real_dir).unwrap();
+        assert_eq!(result, expected);
     }
 }

@@ -14,6 +14,7 @@ use anyhow::Result;
 use blobstore::Loadable;
 use changesets_creation::save_changesets;
 use commit_transformation::git_submodules::InMemoryRepo;
+use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
 use fbinit::FacebookInit;
@@ -23,6 +24,7 @@ use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::DateTime;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentityRef;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::test::git_submodules::git_submodules_test_utils::*;
@@ -43,20 +45,43 @@ async fn test_original_blobstore_and_changesets_are_the_same_after_validation(
 
     let orig_repo_commit = *orig_repo_cs_map.get("B_B").unwrap();
 
-    // Derive Fsnodes for a commit in the InMemoryRepo
-    in_memory_repo
-        .repo_derived_data()
-        .derive::<RootFsnodeId>(&ctx, orig_repo_commit, DerivationPriority::LOW)
-        .await?;
-
-    // Check that Fsnodes are not derived for that commit in the original repo
-    assert!(
-        orig_repo
-            .repo_derived_data()
-            .fetch_derived::<RootFsnodeId>(&ctx, orig_repo_commit)
-            .await?
-            .is_none()
+    let use_content_manifests = justknobs::eval(
+        "scm/mononoke:derived_data_use_content_manifests",
+        None,
+        Some(orig_repo.repo_identity().name()),
     );
+
+    if use_content_manifests {
+        // Derive ContentManifest for a commit in the InMemoryRepo
+        in_memory_repo
+            .repo_derived_data()
+            .derive::<RootContentManifestId>(&ctx, orig_repo_commit, DerivationPriority::LOW)
+            .await?;
+
+        // Check that ContentManifest is not derived for that commit in the original repo
+        assert!(
+            orig_repo
+                .repo_derived_data()
+                .fetch_derived::<RootContentManifestId>(&ctx, orig_repo_commit)
+                .await?
+                .is_none()
+        );
+    } else {
+        // Derive Fsnodes for a commit in the InMemoryRepo
+        in_memory_repo
+            .repo_derived_data()
+            .derive::<RootFsnodeId>(&ctx, orig_repo_commit, DerivationPriority::LOW)
+            .await?;
+
+        // Check that Fsnodes are not derived for that commit in the original repo
+        assert!(
+            orig_repo
+                .repo_derived_data()
+                .fetch_derived::<RootFsnodeId>(&ctx, orig_repo_commit)
+                .await?
+                .is_none()
+        );
+    }
 
     // ------------------ Test fallback repo ------------------
 
@@ -81,16 +106,12 @@ async fn test_original_blobstore_and_changesets_are_the_same_after_validation(
 
     // Fallback repo changeset can be loaded from in_memory repo
     let fallback_changeset_in_memory = cs_id.load(&ctx, &in_memory_repo.repo_blobstore()).await?;
-    println!(
-        "fallback_changeset_in_memory: {0:#?}",
-        fallback_changeset_in_memory
-    );
+    println!("fallback_changeset_in_memory: {fallback_changeset_in_memory:#?}");
 
     // Fallback repo bonsai can't be loaded from original repo
     let fallback_changeset_orig_repo = cs_id.load(&ctx, &orig_repo.repo_blobstore()).await;
     println!(
-        "Loading Fallback repo changeset from original repo: {0:#?}",
-        fallback_changeset_orig_repo
+        "Loading Fallback repo changeset from original repo: {fallback_changeset_orig_repo:#?}"
     );
     assert!(fallback_changeset_orig_repo.is_err_and(|e| {
         // Fails to find changeset blob

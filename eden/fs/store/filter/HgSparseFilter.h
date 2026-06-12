@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/container/F14Map.h>
+#include <folly/coro/safe/NowTask.h>
 #include <folly/logging/xlog.h>
 #include <rust/cxx.h>
 #include <memory>
@@ -35,6 +36,13 @@ class HgSparseFilter : public Filter {
    * Checks whether a path is filtered by the given filter.
    */
   ImmediateFuture<FilterCoverage> getFilterCoverageForPath(
+      RelativePathPiece path,
+      folly::StringPiece filterId) const override;
+
+  /*
+   * Coroutine version of getFilterCoverageForPath.
+   */
+  folly::coro::now_task<FilterCoverage> co_getFilterCoverageForPath(
       RelativePathPiece path,
       folly::StringPiece filterId) const override;
 

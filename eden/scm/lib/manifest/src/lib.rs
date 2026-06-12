@@ -26,6 +26,18 @@ use types::RepoPath;
 use types::RepoPathBuf;
 pub use types::tree::FileType;
 
+/// Options for [`Manifest::persist`].
+pub struct PersistOpts<'a, M> {
+    /// Parent manifests used to compute tree node IDs.
+    pub parents: &'a [&'a M],
+}
+
+impl<M> Default for PersistOpts<'_, M> {
+    fn default() -> Self {
+        Self { parents: &[] }
+    }
+}
+
 /// Manifest describes a mapping between file path ([`String`]) and file metadata ([`FileMetadata`]).
 /// Fundamentally it is just a Map<file_path, file_metadata>.
 ///
@@ -56,7 +68,7 @@ pub trait Manifest {
     /// * List::NotFound when the path is not present in the manifest
     /// * List::File when the path points to a file
     /// * List::Directory when the path points to a directory
-    ///    wraps the names of the files and directories in this directory
+    ///   wraps the names of the files and directories in this directory
     // TODO: add default implementation
     fn list(&self, path: &RepoPath) -> Result<List>;
 
@@ -70,7 +82,9 @@ pub trait Manifest {
 
     /// Persists the manifest so that it can be retrieved at a later time. Returns a note
     /// representing the identifier for saved manifest.
-    fn flush(&mut self) -> Result<HgId>;
+    fn persist(&mut self, opts: PersistOpts<'_, Self>) -> Result<HgId>
+    where
+        Self: Sized;
 
     /// Retrieve the FileMetadata associated with a path.
     /// Paths that were not set will return None.

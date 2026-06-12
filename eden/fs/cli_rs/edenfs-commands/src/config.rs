@@ -33,18 +33,18 @@ impl crate::Subcommand for CliConfigCmd {
         let config = match instance.get_config() {
             Ok(config) => config,
             Err(e) => {
-                eprintln!("{}", e);
+                eprintln!("{e}");
                 return Ok(1);
             }
         };
 
         match toml::to_string(&config) {
             Ok(st) => {
-                println!("{}", st);
+                println!("{st}");
                 Ok(0)
             }
             Err(e) => {
-                eprintln!("Error when serializing configurations: {:?}", e);
+                eprintln!("Error when serializing configurations: {e:?}");
                 Ok(1)
             }
         }
@@ -67,12 +67,12 @@ pub struct ReloadConfigCmd {
     )]
     local_telemetry: Option<PathBuf>,
 
-    #[clap(long, parse(from_str = expand_path), help = "Write filtered config file to custom location")]
+    #[clap(long, value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) }, help = "Write filtered config file to custom location")]
     out: Option<PathBuf>,
 
     #[clap(
         long,
-        parse(from_str = expand_path),
+        value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) },
         help = "Read and write location of the raw config which will be used if Configerator sends back an `edenfs_uptodate` response"
     )]
     raw_out: Option<PathBuf>,
@@ -87,14 +87,14 @@ pub struct ReloadConfigCmd {
     #[clap(
         short = 'c',
         long,
-        parse(from_str = expand_path),
+        value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) },
         help = "Load configs from the given local configerator repo instead of reading from remote. This is useful for testing changes locally without having to push them to production"
     )]
     local_cfgr_root: Option<PathBuf>,
 
     #[clap(
         long,
-        parse(from_str = expand_path),
+        value_parser = |s: &str| -> Result<PathBuf, std::convert::Infallible> { Ok(expand_path(s)) },
         help = "Load configs from the given host instead of reading from remote. The specified host must have ran `arc canary` on itself prior to execution. This is useful for testing changes locally without having to push them to production"
     )]
     canary_host: Option<PathBuf>,
@@ -233,13 +233,13 @@ impl crate::Subcommand for FsConfigCmd {
                 if current_section.is_some() {
                     println!();
                 }
-                println!("[{}]", section);
+                println!("[{section}]");
                 current_section = cs;
             }
 
             let str = format!("{} = \"{}\"", name, value.parsed_value);
             if value.source_path == PathBuf::new() {
-                println!("{}", str);
+                println!("{str}");
             } else {
                 const SOURCE_COLUMN: usize = 39;
                 let white = if str.len() >= SOURCE_COLUMN {

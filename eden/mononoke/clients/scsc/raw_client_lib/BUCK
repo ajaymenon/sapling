@@ -1,12 +1,23 @@
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
-oncall("scm_server_infra")
+oncall("scm_server_treehugger")
 
 rust_library(
     name = "scs_client_raw",
     srcs = glob(["src/**/*.rs"]),
     allow_oss_build = False,
     autocargo = {"ignore_rule": True},
+    # Not a public library.
+    # Use fbcode/scm/scmquery/client/src/lib.rs instead
+    visibility = [
+        "//eden/...",
+        "//scm/...",
+        # Allow only existing use cases
+        "//devai/config/loader_rs/...",
+        "//devai/devmate_client/...",
+        "//atlas/lib/rust/capabilities/...",
+        "//vscode_native/...",
+    ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:maplit",

@@ -288,7 +288,7 @@ async fn list_directory(
     cs_id: ChangesetId,
     path: &NonRootMPath,
 ) -> Result<Option<BTreeMap<NonRootMPath, ContentManifestFile>>, Error> {
-    let root_id: ContentManifestId = if let Ok(true) = justknobs::eval(
+    let root_id: ContentManifestId = if justknobs::eval(
         "scm/mononoke:derived_data_use_content_manifests",
         None,
         Some(repo.repo_identity().name()),
@@ -321,10 +321,7 @@ async fn list_directory(
             return Ok(None);
         }
         Some(Entry::Leaf(_)) => {
-            return Err(anyhow!(
-                "{} is a file, but expected to be a directory",
-                path
-            ));
+            return Err(anyhow!("{path} is a file, but expected to be a directory"));
         }
     };
 

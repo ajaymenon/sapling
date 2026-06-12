@@ -47,15 +47,13 @@ impl RendezVousConnection {
             changeset: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
-                    "bonsai_tag_mapping.changeset.{}",
-                    name,
+                    "bonsai_tag_mapping.changeset.{name}",
                 ))),
             ),
             tag_hash: RendezVous::new(
                 ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
-                    "bonsai_tag_mapping.tag_hash.{}",
-                    name,
+                    "bonsai_tag_mapping.tag_hash.{name}",
                 ))),
             ),
         }
@@ -315,7 +313,7 @@ async fn select_mapping_by_changeset(
         "scm/mononoke:rendezvous_bonsai_tag_mapping",
         ctx.client_correlator(),
         None,
-    )?;
+    );
 
     if use_rendezvous {
         select_mapping_by_changeset_rendezvous(ctx, connection, repo_id, changeset_ids).await
@@ -389,10 +387,7 @@ async fn select_mapping_by_changeset_non_rendezvous(
     )
     .await
     .with_context(|| {
-        format!(
-            "Failure in fetching entry for changesets {:?} in repo {}",
-            changeset_ids, repo_id
-        )
+        format!("Failure in fetching entry for changesets {changeset_ids:?} in repo {repo_id}")
     })?;
 
     let values = results
@@ -418,7 +413,7 @@ async fn select_mapping_by_tag_hash(
         "scm/mononoke:rendezvous_bonsai_tag_mapping",
         ctx.client_correlator(),
         None,
-    )?;
+    );
 
     if use_rendezvous {
         select_mapping_by_tag_hash_rendezvous(ctx, connection, repo_id, tag_hashes).await
@@ -491,10 +486,7 @@ async fn select_mapping_by_tag_hash_non_rendezvous(
     )
     .await
     .with_context(|| {
-        format!(
-            "Failure in fetching entry for tag hashes {:?} in repo {}",
-            tag_hashes, repo_id
-        )
+        format!("Failure in fetching entry for tag hashes {tag_hashes:?} in repo {repo_id}")
     })?;
 
     let values = results

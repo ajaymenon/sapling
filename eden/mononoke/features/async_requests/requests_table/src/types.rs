@@ -12,10 +12,19 @@ use sql::mysql;
 use sql::mysql_async::FromValueError;
 use sql::mysql_async::Value;
 use sql::mysql_async::from_value_opt;
-use sql::mysql_async::prelude::ConvIr;
 use sql::mysql_async::prelude::FromValue;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, mysql::OptTryFromRowField)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Ord,
+    PartialOrd,
+    mysql::OptTryFromRowField
+)]
 pub struct RowId(pub u64);
 
 impl From<RowId> for Value {
@@ -30,15 +39,10 @@ impl std::fmt::Display for RowId {
     }
 }
 
-impl ConvIr<RowId> for RowId {
-    fn new(v: Value) -> Result<Self, FromValueError> {
+impl TryFrom<Value> for RowId {
+    type Error = FromValueError;
+    fn try_from(v: Value) -> Result<Self, FromValueError> {
         Ok(RowId(from_value_opt(v)?))
-    }
-    fn commit(self) -> Self {
-        self
-    }
-    fn rollback(self) -> Value {
-        self.into()
     }
 }
 
@@ -63,8 +67,9 @@ macro_rules! mysql_string_newtype {
             }
         }
 
-        impl ConvIr<$ty> for $ty {
-            fn new(v: Value) -> Result<Self, FromValueError> {
+        impl TryFrom<Value> for $ty {
+            type Error = FromValueError;
+            fn try_from(v: Value) -> Result<Self, FromValueError> {
                 match v {
                     Value::Bytes(bytes) => match String::from_utf8(bytes) {
                         Ok(s) => Ok($ty(s)),
@@ -74,14 +79,6 @@ macro_rules! mysql_string_newtype {
                     },
                     v => Err(FromValueError(v)),
                 }
-            }
-
-            fn commit(self) -> $ty {
-                self
-            }
-
-            fn rollback(self) -> Value {
-                self.into()
             }
         }
 
@@ -120,6 +117,8 @@ pub struct LongRunningRequestEntry {
     pub claimed_by: Option<ClaimedBy>,
     pub num_retries: Option<u8>,
     pub failed_at: Option<Timestamp>,
+    pub root_request_id: Option<RowId>,
+    pub created_by: Option<String>,
 }
 
 impl std::fmt::Display for RequestStatus {
@@ -133,12 +132,13 @@ impl std::fmt::Display for RequestStatus {
             Polled => "polled",
             Failed => "failed",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
-impl ConvIr<RequestStatus> for RequestStatus {
-    fn new(v: Value) -> Result<Self, FromValueError> {
+impl TryFrom<Value> for RequestStatus {
+    type Error = FromValueError;
+    fn try_from(v: Value) -> Result<Self, FromValueError> {
         use RequestStatus::*;
 
         match v {
@@ -149,14 +149,6 @@ impl ConvIr<RequestStatus> for RequestStatus {
             Value::Bytes(ref b) if b == b"failed" => Ok(Failed),
             v => Err(FromValueError(v)),
         }
-    }
-
-    fn commit(self) -> RequestStatus {
-        self
-    }
-
-    fn rollback(self) -> Value {
-        self.into()
     }
 }
 
@@ -184,6 +176,27 @@ impl From<RequestStatus> for Value {
 ///       which request type you are talking about
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestId(pub RowId, pub RequestType);
+
+/// A row returned by `list_recent_backfills_with_repo_count`.
+///
+/// Includes both the root request's own status and aggregated per-status
+/// counts of its children, so callers can render a user-facing aggregate
+/// status without a follow-up query (the root reaches `Ready` once it
+/// finishes spawning children, even though the children may still be
+/// running).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentBackfillEntry {
+    pub id: RowId,
+    pub created_at: Timestamp,
+    pub root_status: RequestStatus,
+    pub repo_count: i64,
+    pub created_by: Option<String>,
+    pub args_blobstore_key: BlobstoreKey,
+    pub child_new_count: i64,
+    pub child_inprogress_count: i64,
+    pub child_ready_count: i64,
+    pub child_failed_count: i64,
+}
 
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub struct QueueStatsEntry {

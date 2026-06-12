@@ -21,35 +21,35 @@
   > A   # A/x/1=1
   > EOS
 
-  $ hg goto -q $C
+  $ sl goto -q $C
 
 # Log a directory:
 
-  $ hg log -T '{desc}\n' -f x
+  $ sl log -T '{desc}\n' -f x
   C
   A
 
 # From non-repo root:
 
   $ cd x
-  $ hg log -G -T '{desc}\n' -f .
+  $ sl log -G -T '{desc}\n' -f .
   @  C
   ╷
   o  A
 
 # Using the follow revset, which is related to repo root:
 
-  $ hg log -G -T '{desc}\n' -r 'follow("x")'
+  $ sl log -G -T '{desc}\n' -r 'follow("x")'
   @  C
   ╷
   o  A
-  $ hg log -G -T '{desc}\n' -r 'follow(".")'
+  $ sl log -G -T '{desc}\n' -r 'follow(".")'
   @  C
   │
   o  B
   │
   o  A
-  $ hg log -G -T '{desc}\n' -r 'follow("relpath:.")'
+  $ sl log -G -T '{desc}\n' -r 'follow("relpath:.")'
   @  C
   ╷
   o  A

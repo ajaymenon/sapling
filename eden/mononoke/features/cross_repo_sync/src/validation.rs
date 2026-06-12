@@ -30,10 +30,12 @@ use commit_transformation::git_submodules::get_git_hash_from_submodule_file;
 use commit_transformation::git_submodules::get_submodule_repo;
 use commit_transformation::git_submodules::get_x_repo_submodule_metadata_file_path;
 use commit_transformation::git_submodules::git_hash_from_submodule_metadata_file;
-use commit_transformation::git_submodules::root_fsnode_id_from_submodule_git_commit;
+use commit_transformation::git_submodules::root_manifest_id_from_submodule_git_commit;
 use commit_transformation::git_submodules::validate_working_copy_of_expansion_with_recursive_submodules;
+use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
+use either::Either;
 use fsnodes::RootFsnodeId;
 use futures::TryStreamExt;
 use futures::future;
@@ -42,6 +44,7 @@ use futures::stream;
 use futures::stream::StreamExt;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use manifest::Entry;
+use manifest::Manifest;
 use manifest::ManifestOps;
 use mercurial_types::FileType;
 use mercurial_types::MPath;
@@ -53,11 +56,9 @@ use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
+use mononoke_types::content_manifest::ContentManifest;
+use mononoke_types::content_manifest::compat;
 use mononoke_types::fsnode::Fsnode;
-use mononoke_types::fsnode::FsnodeDirectory;
-use mononoke_types::fsnode::FsnodeEntry;
-use mononoke_types::fsnode::FsnodeFile;
-use mononoke_types::typed_hash::FsnodeId;
 use movers::Mover;
 use regex::Regex;
 use sorted_vector_map::SortedVectorMap;
@@ -121,34 +122,12 @@ pub async fn verify_working_copy_with_version<'a, R: Repo>(
     let source_repo = commit_sync_data.get_source_repo();
     let target_repo = commit_sync_data.get_target_repo();
 
-    let source_root_fsnode_id = source_repo
-        .repo_derived_data()
-        .derive::<RootFsnodeId>(ctx, source_hash.0, DerivationPriority::LOW)
-        .await?
-        .into_fsnode_id();
-    let target_root_fsnode_id = target_repo
-        .repo_derived_data()
-        .derive::<RootFsnodeId>(ctx, target_hash.0, DerivationPriority::LOW)
-        .await?
-        .into_fsnode_id();
+    let direction = commit_sync_data.repos.get_direction();
+    let (small_repo, large_repo, commit_sync_data) = match direction {
+        CommitSyncDirection::Forward => (source_repo, target_repo, commit_sync_data.clone()),
+        CommitSyncDirection::Backwards => (target_repo, source_repo, commit_sync_data.reverse()),
+    };
 
-    let (small_repo, large_repo, small_root_fsnode_id, large_root_fsnode_id, commit_sync_data) =
-        match commit_sync_data.repos.get_direction() {
-            CommitSyncDirection::Forward => (
-                source_repo,
-                target_repo,
-                source_root_fsnode_id,
-                target_root_fsnode_id,
-                commit_sync_data.clone(),
-            ),
-            CommitSyncDirection::Backwards => (
-                target_repo,
-                source_repo,
-                target_root_fsnode_id,
-                source_root_fsnode_id,
-                commit_sync_data.reverse(),
-            ),
-        };
     let submodules_action = get_git_submodule_action_by_version(
         ctx,
         live_commit_sync_config.clone(),
@@ -157,6 +136,52 @@ pub async fn verify_working_copy_with_version<'a, R: Repo>(
         large_repo.repo_identity().id(),
     )
     .await?;
+
+    let use_content_manifests = justknobs::eval(
+        "scm/mononoke:derived_data_use_content_manifests",
+        None,
+        Some(source_repo.repo_identity().name()),
+    ) && justknobs::eval(
+        "scm/mononoke:derived_data_use_content_manifests",
+        None,
+        Some(target_repo.repo_identity().name()),
+    );
+
+    let (source_root_id, target_root_id): (compat::ContentManifestId, compat::ContentManifestId) =
+        if use_content_manifests {
+            let source_id = source_repo
+                .repo_derived_data()
+                .derive::<RootContentManifestId>(ctx, source_hash.0, DerivationPriority::LOW)
+                .await?
+                .into_content_manifest_id()
+                .into();
+            let target_id = target_repo
+                .repo_derived_data()
+                .derive::<RootContentManifestId>(ctx, target_hash.0, DerivationPriority::LOW)
+                .await?
+                .into_content_manifest_id()
+                .into();
+            (source_id, target_id)
+        } else {
+            let source_id = source_repo
+                .repo_derived_data()
+                .derive::<RootFsnodeId>(ctx, source_hash.0, DerivationPriority::LOW)
+                .await?
+                .into_fsnode_id()
+                .into();
+            let target_id = target_repo
+                .repo_derived_data()
+                .derive::<RootFsnodeId>(ctx, target_hash.0, DerivationPriority::LOW)
+                .await?
+                .into_fsnode_id()
+                .into();
+            (source_id, target_id)
+        };
+
+    let (small_root_id, large_root_id) = match direction {
+        CommitSyncDirection::Forward => (source_root_id, target_root_id),
+        CommitSyncDirection::Backwards => (target_root_id, source_root_id),
+    };
 
     let submodule_deps = commit_sync_data.get_submodule_deps();
     let (x_repo_submodule_metadata_file_prefix, dangling_submodule_pointers) =
@@ -204,14 +229,15 @@ pub async fn verify_working_copy_with_version<'a, R: Repo>(
         ctx,
         CommitSyncDirection::Backwards,
         Source(large_repo),
-        large_root_fsnode_id,
+        large_root_id,
         Target(small_repo),
-        small_root_fsnode_id,
+        small_root_id,
         movers.reverse_mover.as_ref(),
         large_repo_prefixes_to_visit.clone().into_iter().collect(),
         submodules_action,
         &sm_exp_data,
         &exp_and_metadata_paths,
+        use_content_manifests,
     )
     .await?;
 
@@ -233,14 +259,15 @@ pub async fn verify_working_copy_with_version<'a, R: Repo>(
         ctx,
         CommitSyncDirection::Forward,
         Source(small_repo),
-        small_root_fsnode_id,
+        small_root_id,
         Target(large_repo),
-        large_root_fsnode_id,
+        large_root_id,
         movers.mover.as_ref(),
         small_repo_prefixes_to_visit,
         submodules_action,
         &sm_exp_data,
         &exp_and_metadata_paths,
+        use_content_manifests,
     )
     .await?;
     info!("all is well!");
@@ -305,15 +332,7 @@ impl fmt::Display for PrintableValidationOutput {
                 } => {
                     writeln!(
                         f,
-                        "file differs between {} (path: {:?}, content_id: {:?}, type: {:?}) and {} (path: {:?}, content_id: {:?}, type: {:?})",
-                        source_name,
-                        source_path,
-                        source_id,
-                        source_type,
-                        target_name,
-                        target_path,
-                        target_id,
-                        target_type,
+                        "file differs between {source_name} (path: {source_path:?}, content_id: {source_id:?}, type: {source_type:?}) and {target_name} (path: {target_path:?}, content_id: {target_id:?}, type: {target_type:?})",
                     )?;
                 }
                 RewriteMismatch {
@@ -322,12 +341,11 @@ impl fmt::Display for PrintableValidationOutput {
                 } => {
                     writeln!(
                         f,
-                        "path differs between {} (path: {:?}) and {} (path: {:?})",
-                        source_name, source_path, target_name, target_path,
+                        "path differs between {source_name} (path: {source_path:?}) and {target_name} (path: {target_path:?})",
                     )?;
                 }
                 SubmoduleExpansionMismatch(msg) => {
-                    writeln!(f, "submodule expansion mismatch: {}", msg)?;
+                    writeln!(f, "submodule expansion mismatch: {msg}")?;
                 }
             }
         }
@@ -339,14 +357,15 @@ async fn verify_working_copy_inner<'a>(
     ctx: &'a CoreContext,
     direction: CommitSyncDirection,
     source_repo: Source<&'a impl Repo>,
-    source_root_fsnode_id: FsnodeId,
+    source_root_id: compat::ContentManifestId,
     target_repo: Target<&'a impl Repo>,
-    target_root_fsnode_id: FsnodeId,
+    target_root_id: compat::ContentManifestId,
     mover: &dyn Mover,
     prefixes_to_visit: Vec<Option<NonRootMPath>>,
     submodules_action: GitSubmodulesChangesAction,
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
     exp_and_metadata_paths: &ExpansionAndMetadataPaths,
+    use_content_manifests: bool,
 ) -> Result<(), Error> {
     let prefix_set: HashSet<_> = prefixes_to_visit
         .iter()
@@ -359,14 +378,15 @@ async fn verify_working_copy_inner<'a>(
             direction,
             source_repo,
             path,
-            source_root_fsnode_id.clone(),
+            source_root_id,
             target_repo,
-            target_root_fsnode_id.clone(),
+            target_root_id,
             mover,
             &prefix_set,
             submodules_action,
             sm_exp_data,
             exp_and_metadata_paths,
+            use_content_manifests,
         )
     }))
     .buffer_unordered(100)
@@ -386,10 +406,7 @@ async fn verify_working_copy_inner<'a>(
                 out
             ),
         );
-        return Err(format_err!(
-            "verification failed, found {} differences",
-            len
-        ));
+        return Err(format_err!("verification failed, found {len} differences"));
     }
     Ok(())
 }
@@ -444,26 +461,27 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
     mover: &dyn Mover,
     submodule_path: NonRootMPath,
-    submodule_fsnode_file_entry: FsnodeFile,
-    large_root_fsnode_id: FsnodeId,
+    submodule_file_entry: compat::ContentManifestFile,
+    large_root_id: compat::ContentManifestId,
+    use_content_manifests: bool,
 ) -> Result<Option<ValidationOutputElement>, Error> {
     // STEP 1: Assert that the submodule expansion data is available
     let sm_exp_data = sm_exp_data
         .as_ref()
         .ok_or(anyhow!("submodule expansion data needed for validation"))?;
-    // STEP 2: Compute the expansion path and find is fsnode in the large repo
+    // STEP 2: Compute the expansion path and find its entry in the large repo
     let expansion_path = mover
         .move_path(&submodule_path)?
         .ok_or(anyhow!("submodule path rewrites to nothing!"))?;
-    let expansion_fsnode_entry = large_root_fsnode_id
+    let expansion_entry = large_root_id
         .find_entry(
             ctx.clone(),
             large_repo.repo_blobstore_arc(),
             expansion_path.clone().into(),
         )
         .await?;
-    let expansion_fsnode_id = expansion_fsnode_entry
-        .ok_or(anyhow!("No submodule expansion fsnode entry in large repo"))?
+    let expansion_manifest_id = expansion_entry
+        .ok_or(anyhow!("No submodule expansion entry in large repo"))?
         .into_tree()
         .ok_or(anyhow!("submodule path doesn't rewrite to a directory"))?;
 
@@ -483,7 +501,7 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
         sm_exp_data.x_repo_submodule_metadata_file_prefix,
     )?;
 
-    let metadata_file_entry = large_root_fsnode_id
+    let metadata_file_entry = large_root_id
         .find_entry(
             ctx.clone(),
             large_repo.repo_blobstore_arc(),
@@ -497,8 +515,8 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
             )
         })?;
 
-    let metadata_file = match metadata_file_entry {
-        Entry::Leaf(file) => file,
+    let metadata_file: compat::ContentManifestFile = match metadata_file_entry {
+        Entry::Leaf(file) => file.into(),
         _ => {
             return Err(anyhow!(
                 "submodule metadata path doesn't represent a file: {:?}",
@@ -511,7 +529,7 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
     let exp_metadata_git_hash = match git_hash_from_submodule_metadata_file(
         ctx,
         &sm_exp_data.large_repo,
-        *metadata_file.content_id(),
+        metadata_file.content_id(),
     )
     .await
     {
@@ -521,27 +539,23 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
             return Ok(Some(SubmoduleExpansionMismatch(err.to_string())));
         }
     };
-    let git_hash = get_git_hash_from_submodule_file(
-        ctx,
-        small_repo.0,
-        *submodule_fsnode_file_entry.content_id(),
-    )
-    .await?;
+    let git_hash =
+        get_git_hash_from_submodule_file(ctx, small_repo.0, submodule_file_entry.content_id())
+            .await?;
 
     if git_hash != exp_metadata_git_hash {
         return Err(anyhow!(
-            "submodule metadata file git hash {:?} doesn't match the hash in metadata file {:?}",
-            git_hash,
-            exp_metadata_git_hash,
+            "submodule metadata file git hash {git_hash:?} doesn't match the hash in metadata file {exp_metadata_git_hash:?}",
         ));
     }
 
-    // STEP 7: Load submodule fsnode id in submodule repo
-    let submodule_fsnode_id = root_fsnode_id_from_submodule_git_commit(
+    // STEP 7: Load submodule manifest id in submodule repo
+    let submodule_manifest_id = root_manifest_id_from_submodule_git_commit(
         ctx,
         submodule_repo,
         git_hash,
         &sm_exp_data.dangling_submodule_pointers,
+        use_content_manifests,
     )
     .await?;
 
@@ -552,8 +566,9 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
         sm_exp_data.clone(),
         adjusted_submodule_deps,
         submodule_repo,
-        expansion_fsnode_id,
-        submodule_fsnode_id,
+        expansion_manifest_id,
+        submodule_manifest_id,
+        use_content_manifests,
     )
     .await
     {
@@ -571,30 +586,31 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
     small_repo: Target<&'a impl Repo>,
     mover: &dyn Mover,
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
-    small_root_fsnode_id: FsnodeId,
+    small_root_id: compat::ContentManifestId,
     expansion_path: NonRootMPath,
-    expansion_fsnode_dir_entry: FsnodeDirectory,
-    expansion_metadata_file: FsnodeFile,
+    expansion_dir_id: compat::ContentManifestId,
+    expansion_metadata_file: compat::ContentManifestFile,
+    use_content_manifests: bool,
 ) -> Result<Option<ValidationOutputElement>, Error> {
     // STEP 1: Assert that the submodule expansion data is available
     let sm_exp_data = sm_exp_data
         .as_ref()
         .ok_or(anyhow!("submodule expansion data needed for validation"))?;
 
-    // STEP 2: Compute the submodule path and find is fsnode in the small repo
+    // STEP 2: Compute the submodule path and find its entry in the small repo
     let submodule_path = if let Some(submodule_path) = mover.move_path(&expansion_path)? {
         submodule_path
     } else {
         return Err(anyhow!("expansion path rewrites to nothing in small repo!"));
     };
-    let submodule_fsnode_entry = small_root_fsnode_id
+    let submodule_entry = small_root_id
         .find_entry(
             ctx.clone(),
             small_repo.repo_blobstore_arc(),
             submodule_path.clone().into(),
         )
         .await?;
-    let submodule_fsnode_file = submodule_fsnode_entry
+    let submodule_file_leaf: compat::ContentManifestFile = submodule_entry
         .ok_or(anyhow!(
             "No manifest entry in small repo for submodule path {}",
             &submodule_path
@@ -603,9 +619,10 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
         .ok_or(anyhow!(
             "Small repo manifest entry for submodule path {} is not a leaf",
             &submodule_path
-        ))?;
+        ))?
+        .into();
 
-    if *submodule_fsnode_file.file_type() != FileType::GitSubmodule {
+    if submodule_file_leaf.file_type() != FileType::GitSubmodule {
         return Err(anyhow!(
             "submodule path is not a git submodule: {}!",
             &submodule_path,
@@ -626,7 +643,7 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
     let exp_metadata_git_hash = match git_hash_from_submodule_metadata_file(
         ctx,
         &sm_exp_data.large_repo,
-        *expansion_metadata_file.content_id(),
+        expansion_metadata_file.content_id(),
     )
     .await
     {
@@ -637,23 +654,22 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
         }
     };
     let git_hash =
-        get_git_hash_from_submodule_file(ctx, small_repo.0, *submodule_fsnode_file.content_id())
+        get_git_hash_from_submodule_file(ctx, small_repo.0, submodule_file_leaf.content_id())
             .await?;
 
     if git_hash != exp_metadata_git_hash {
         return Err(anyhow!(
-            "submodule metadata file git hash {:?} doesn't match the hash in metadata file {:?}",
-            git_hash,
-            exp_metadata_git_hash,
+            "submodule metadata file git hash {git_hash:?} doesn't match the hash in metadata file {exp_metadata_git_hash:?}",
         ));
     }
 
-    // STEP 6: Load submodule fsnode id in submodule repo
-    let submodule_fsnode_id = root_fsnode_id_from_submodule_git_commit(
+    // STEP 6: Load submodule manifest id in submodule repo
+    let submodule_manifest_id = root_manifest_id_from_submodule_git_commit(
         ctx,
         submodule_repo,
         git_hash,
         &sm_exp_data.dangling_submodule_pointers,
+        use_content_manifests,
     )
     .await?;
 
@@ -664,8 +680,9 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
         sm_exp_data.clone(),
         adjusted_submodule_deps,
         submodule_repo,
-        *expansion_fsnode_dir_entry.id(),
-        submodule_fsnode_id,
+        expansion_dir_id,
+        submodule_manifest_id,
+        use_content_manifests,
     )
     .await
     {
@@ -726,8 +743,8 @@ fn list_possible_expansion_and_metadata_paths<'a>(
 // submodule expansion directory and its metadata file.
 struct SubmoduleExpansionDirectoryAndMetadata {
     expansion_path: NonRootMPath,
-    expansion_fsnode_dir_entry: FsnodeDirectory,
-    expansion_metadata_file: FsnodeFile,
+    expansion_dir_id: compat::ContentManifestId,
+    expansion_metadata_file: compat::ContentManifestFile,
 }
 
 enum ElemAction {
@@ -743,15 +760,18 @@ enum ElemAction {
 fn find_submodule_expansion(
     exp_and_metadata_paths: &ExpansionAndMetadataPaths,
     source_dir_path: &MPath,
-    source_dir_map: &SortedVectorMap<MPathElement, FsnodeEntry>,
+    source_dir_map: &HashMap<
+        MPathElement,
+        Entry<compat::ContentManifestId, compat::ContentManifestFile>,
+    >,
     elem: &MPathElement,
-    entry: &FsnodeEntry,
+    entry: Entry<compat::ContentManifestId, compat::ContentManifestFile>,
 ) -> Result<ElemAction, Error> {
     // validation errors
-    if let FsnodeEntry::File(fsnode_fileentry) = entry {
+    if let Entry::Leaf(leaf) = entry.clone() {
         // if submodule expansion is ON then the submodules have no business to exist in
         // the large repo
-        if *fsnode_fileentry.file_type() == FileType::GitSubmodule {
+        if leaf.file_type() == FileType::GitSubmodule {
             return Ok(ElemAction::Skip(Some(SubmoduleExpansionMismatch(
                 "git submodules not allowed in large to small sync".to_string(),
             ))));
@@ -763,28 +783,26 @@ fn find_submodule_expansion(
         .metadata_path_to_expansion
         .get(&source_elem_path)
     {
-        let expansion_metadata_file = if let FsnodeEntry::File(fsnode_fileentry) = entry {
-            if *fsnode_fileentry.file_type() != FileType::Regular {
+        let expansion_metadata_file = if let Entry::Leaf(leaf) = entry {
+            if leaf.file_type() != FileType::Regular {
                 return Ok(ElemAction::Skip(Some(SubmoduleExpansionMismatch(format!(
                     "git submodule expansion metadata file {} has to be a regular file",
                     &source_elem_path,
                 )))));
             }
-            fsnode_fileentry
+            leaf.clone()
         } else {
             return Ok(ElemAction::Skip(Some(SubmoduleExpansionMismatch(format!(
                 "git submodule expansion metadata path {} has to be a file",
                 &source_elem_path,
             )))));
         };
-        if let Some(FsnodeEntry::Directory(expansion_fsnode_dir_entry)) =
-            source_dir_map.get(expansion_path.basename())
-        {
+        if let Some(Entry::Tree(expansion_dir_id)) = source_dir_map.get(expansion_path.basename()) {
             return Ok(ElemAction::VerifyExpansion(
                 SubmoduleExpansionDirectoryAndMetadata {
                     expansion_path: expansion_path.clone(),
-                    expansion_fsnode_dir_entry: expansion_fsnode_dir_entry.clone(),
-                    expansion_metadata_file: expansion_metadata_file.clone(),
+                    expansion_dir_id: *expansion_dir_id,
+                    expansion_metadata_file,
                 },
             ));
         } else {
@@ -807,7 +825,7 @@ fn find_submodule_expansion(
     Ok(ElemAction::Keep)
 }
 
-/// Given a source and target directories fsnodes and a mover, verify that for all submodule
+/// Given source and target directory manifests and a mover, verify that for all submodule
 /// expansions (or submodules) in the source repo the expansion was done correctly. Also filter
 /// those out so the rest of validation process will ignore them.
 async fn verify_and_filter_out_submodule_changes<'a>(
@@ -815,26 +833,48 @@ async fn verify_and_filter_out_submodule_changes<'a>(
     direction: CommitSyncDirection,
     source_repo: Source<&'a impl Repo>,
     source_path: &MPath,
-    source_dir: Fsnode,
+    source_dir: Either<ContentManifest, Fsnode>,
     target_repo: Target<&'a impl Repo>,
-    target_root_fsnode_id: FsnodeId,
+    target_root_id: compat::ContentManifestId,
     mover: &dyn Mover,
     submodules_action: GitSubmodulesChangesAction,
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
     exp_and_metadata_paths: &ExpansionAndMetadataPaths,
+    use_content_manifests: bool,
 ) -> Result<
     (
         Vec<ValidationOutputElement>,
-        Vec<(NonRootMPath, FsnodeEntry)>,
+        Vec<(
+            NonRootMPath,
+            Entry<compat::ContentManifestId, compat::ContentManifestFile>,
+        )>,
     ),
     Error,
 > {
-    // the filtered directory entries that will be returned
+    let source_blobstore = source_repo.0.repo_blobstore_arc();
+
+    // Materialize entries once, analogous to the original Fsnode::into_subentries().
+    // For Fsnode this is in-memory; for ContentManifest it streams from the blobstore.
+    let source_subentries: Vec<(
+        MPathElement,
+        Entry<compat::ContentManifestId, compat::ContentManifestFile>,
+    )> = source_dir
+        .list(ctx, &source_blobstore)
+        .await?
+        .map_ok(|(elem, entry)| {
+            let entry = match entry {
+                Entry::Tree(id) => Entry::Tree(id),
+                Entry::Leaf(leaf) => Entry::Leaf(leaf.into()),
+            };
+            (elem, entry)
+        })
+        .try_collect()
+        .await?;
+
     let mut filtered_directory_entries = Vec::new();
-    // validation errors
     let mut output_elements = vec![];
-    // futures for submodule verification, we buffer them in this vector so we can run them in parallel
     let mut verification_futures = vec![];
+
     match direction {
         // large to small: find all expansions and their metadata files and call the
         // appropriate validation function
@@ -845,32 +885,31 @@ async fn verify_and_filter_out_submodule_changes<'a>(
                 GitSubmodulesChangesAction::Keep | GitSubmodulesChangesAction::Strip => {
                     return Ok((
                         vec![],
-                        source_dir
-                            .into_subentries()
+                        source_subentries
                             .into_iter()
                             .map(|(elem, entry)| {
                                 (source_path.join_into_non_root_mpath(&elem), entry)
                             })
-                            .collect::<Vec<_>>(),
+                            .collect(),
                     ));
                 }
-                // rest of this block cares only about expand scenario
-                // we're using match here rather than "if let" so the person adding
-                // new variants of submodule changes action will get a compile time error
                 GitSubmodulesChangesAction::Expand => (),
-            };
-            // this map will contain only the entries that are not submodule expansions or metadata files
-            let source_dir_map = source_dir.clone().into_subentries();
-            for (elem, entry) in source_dir.into_subentries() {
+            }
+
+            let source_dir_map: HashMap<MPathElement, _> =
+                source_subentries.iter().cloned().collect();
+            for (elem, entry) in &source_subentries {
                 let elem_action = find_submodule_expansion(
                     exp_and_metadata_paths,
                     source_path,
                     &source_dir_map,
-                    &elem,
-                    &entry,
+                    elem,
+                    entry.clone(),
                 )?;
                 match elem_action {
-                    ElemAction::Keep => filtered_directory_entries.push((elem, entry)),
+                    ElemAction::Keep => {
+                        filtered_directory_entries.push((elem.clone(), entry.clone()))
+                    }
                     ElemAction::Skip(Some(output_elem)) => output_elements.push(output_elem),
                     ElemAction::Skip(None) => (),
                     ElemAction::VerifyExpansion(exp_and_metadata) => {
@@ -879,21 +918,22 @@ async fn verify_and_filter_out_submodule_changes<'a>(
                             target_repo,
                             mover,
                             sm_exp_data,
-                            target_root_fsnode_id,
+                            target_root_id,
                             exp_and_metadata.expansion_path,
-                            exp_and_metadata.expansion_fsnode_dir_entry,
+                            exp_and_metadata.expansion_dir_id,
                             exp_and_metadata.expansion_metadata_file,
+                            use_content_manifests,
                         );
                         verification_futures.push(verification_fut.boxed());
                     }
                 }
             }
         }
-        // small to large is simpler: ws need to call validation for each submodule
+        // small to large: call validation for each submodule
         CommitSyncDirection::Forward => {
-            for (elem, entry) in source_dir.into_subentries() {
-                if let FsnodeEntry::File(fsnode_fileentry) = entry {
-                    if *fsnode_fileentry.file_type() == FileType::GitSubmodule {
+            for (elem, entry) in source_subentries {
+                if let Entry::Leaf(ref leaf) = entry {
+                    if leaf.file_type() == FileType::GitSubmodule {
                         match submodules_action {
                             // when keeping submodules don't filter them out - we need a matching
                             // submodule on both sides of sync
@@ -914,8 +954,9 @@ async fn verify_and_filter_out_submodule_changes<'a>(
                                         sm_exp_data,
                                         mover,
                                         submodule_path,
-                                        fsnode_fileentry,
-                                        target_root_fsnode_id,
+                                        leaf.clone(),
+                                        target_root_id,
+                                        use_content_manifests,
                                     )
                                     .boxed(),
                                 );
@@ -928,6 +969,7 @@ async fn verify_and_filter_out_submodule_changes<'a>(
             }
         }
     }
+
     let downstream_verification_output: Vec<ValidationOutputElement> =
         stream::iter(verification_futures)
             .buffered(10)
@@ -948,18 +990,19 @@ async fn verify_dir<'a>(
     direction: CommitSyncDirection,
     source_repo: Source<&'a impl Repo>,
     source_path: Option<NonRootMPath>,
-    source_root_fsnode_id: FsnodeId,
+    source_root_id: compat::ContentManifestId,
     target_repo: Target<&'a impl Repo>,
-    target_root_fsnode_id: FsnodeId,
+    target_root_id: compat::ContentManifestId,
     mover: &dyn Mover,
     prefixes_to_visit: &HashSet<NonRootMPath>,
     submodules_action: GitSubmodulesChangesAction,
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
     exp_and_metadata_paths: &ExpansionAndMetadataPaths,
+    use_content_manifests: bool,
 ) -> Result<ValidationOutput, Error> {
     let source_blobstore = source_repo.repo_blobstore_arc();
     let target_blobstore = target_repo.repo_blobstore_arc();
-    let maybe_source_manifest_entry = source_root_fsnode_id
+    let maybe_source_manifest_entry = source_root_id
         .find_entry(
             ctx.clone(),
             source_blobstore.clone(),
@@ -973,11 +1016,11 @@ async fn verify_dir<'a>(
             Entry::Leaf(source_leaf) => {
                 vec![(
                     source_path.clone().expect("leaf path can't be empty!"),
-                    FsnodeEntry::File(source_leaf),
+                    Entry::Leaf(source_leaf.into()),
                 )]
             }
-            Entry::Tree(source_dir_fsnode_id) => {
-                let source_dir = source_dir_fsnode_id.load(ctx, &source_blobstore).await?;
+            Entry::Tree(source_dir_id) => {
+                let source_dir = source_dir_id.load(ctx, &source_blobstore).await?;
                 let (validation_errors, filtered_source_dir) =
                     verify_and_filter_out_submodule_changes(
                         ctx,
@@ -986,11 +1029,12 @@ async fn verify_dir<'a>(
                         &source_path.clone().into(),
                         source_dir,
                         target_repo,
-                        target_root_fsnode_id,
+                        target_root_id,
                         mover,
                         submodules_action,
                         sm_exp_data,
                         exp_and_metadata_paths,
+                        use_content_manifests,
                     )
                     .await?;
                 outs.extend(validation_errors);
@@ -1006,7 +1050,10 @@ async fn verify_dir<'a>(
         let out = bounded_traversal::bounded_traversal(
             256,
             init,
-            move |(source_path, source_entry)| {
+            move |(source_path, source_entry): (
+                NonRootMPath,
+                Entry<compat::ContentManifestId, compat::ContentManifestFile>,
+            )| {
                 cloned!(start_source_path, source_blobstore, target_blobstore);
                 Box::pin(async move {
                     let target_path = wrap_mover_result(mover, &Some(source_path.clone()))?;
@@ -1023,7 +1070,7 @@ async fn verify_dir<'a>(
                         return Ok((vec![], vec![]));
                     };
 
-                    let target_fsnode = target_root_fsnode_id
+                    let target_entry = target_root_id
                         .find_entry(
                             ctx.clone(),
                             target_blobstore.clone(),
@@ -1031,13 +1078,11 @@ async fn verify_dir<'a>(
                         )
                         .await?;
 
-                    if let (
-                        FsnodeEntry::Directory(source_dir),
-                        Some(Entry::Tree(target_dir_fsnode_id)),
-                    ) = (&source_entry, target_fsnode)
+                    if let (Entry::Tree(source_dir_id), Some(Entry::Tree(target_dir_id))) =
+                        (&source_entry, &target_entry)
                     {
-                        if *source_dir.id() != target_dir_fsnode_id {
-                            let source_dir = source_dir.id().load(ctx, &source_blobstore).await?;
+                        if source_dir_id != target_dir_id {
+                            let source_dir = source_dir_id.load(ctx, &source_blobstore).await?;
                             let (validation_errors, recurse) =
                                 verify_and_filter_out_submodule_changes(
                                     ctx,
@@ -1046,11 +1091,12 @@ async fn verify_dir<'a>(
                                     &source_path.clone().into(),
                                     source_dir,
                                     target_repo,
-                                    target_root_fsnode_id,
+                                    target_root_id,
                                     mover,
                                     submodules_action,
                                     sm_exp_data,
                                     exp_and_metadata_paths,
+                                    use_content_manifests,
                                 )
                                 .await?;
                             return Ok((validation_errors, recurse));
@@ -1059,10 +1105,8 @@ async fn verify_dir<'a>(
                         };
                     }
                     // The dir might not to map to the other side but if all subdirs map then we're good.
-                    if let (FsnodeEntry::Directory(source_dir), None) =
-                        (&source_entry, target_fsnode)
-                    {
-                        let source_dir = source_dir.id().load(ctx, &source_blobstore).await?;
+                    if let (Entry::Tree(source_dir_id), None) = (&source_entry, &target_entry) {
+                        let source_dir = source_dir_id.load(ctx, &source_blobstore).await?;
                         let (validation_errors, recurse) = verify_and_filter_out_submodule_changes(
                             ctx,
                             direction,
@@ -1070,29 +1114,33 @@ async fn verify_dir<'a>(
                             &source_path.clone().into(),
                             source_dir,
                             target_repo,
-                            target_root_fsnode_id,
+                            target_root_id,
                             mover,
                             submodules_action,
                             sm_exp_data,
                             exp_and_metadata_paths,
+                            use_content_manifests,
                         )
                         .await?;
                         return Ok((validation_errors, recurse));
                     }
 
                     let source_elem = match source_entry {
-                        FsnodeEntry::File(source_file) => RewriteMismatchElement::File((
-                            source_file.content_id().clone(),
-                            source_file.file_type().clone(),
+                        Entry::Leaf(source_leaf) => RewriteMismatchElement::File((
+                            source_leaf.content_id(),
+                            source_leaf.file_type(),
                         )),
-                        FsnodeEntry::Directory(_dir) => RewriteMismatchElement::Directory,
+                        Entry::Tree(_) => RewriteMismatchElement::Directory,
                     };
 
-                    let target_elem = match target_fsnode {
-                        Some(Entry::Leaf(target_file)) => RewriteMismatchElement::File((
-                            target_file.content_id().clone(),
-                            target_file.file_type().clone(),
-                        )),
+                    let target_elem = match target_entry {
+                        Some(Entry::Leaf(target_leaf)) => {
+                            let target_file: compat::ContentManifestFile = target_leaf.into();
+                            RewriteMismatchElement::File((
+                                target_file.content_id(),
+                                target_file.file_type(),
+                            ))
+                        }
                         Some(Entry::Tree(_id)) => RewriteMismatchElement::Directory,
                         None => RewriteMismatchElement::Nothing,
                     };
@@ -1119,7 +1167,7 @@ async fn verify_dir<'a>(
             },
         )
         .await?;
-        outs.extend(out.into_iter());
+        outs.extend(out);
     }
 
     Ok(outs)
@@ -1138,11 +1186,7 @@ async fn get_large_repo_prefixes_to_visit<'a, R: Repo>(
         .await?;
 
     let small_repo_config = config.small_repos.get(&small_repo_id).ok_or_else(|| {
-        format_err!(
-            "cannot find small repo id {} in commit sync config for {}",
-            small_repo_id,
-            version
-        )
+        format_err!("cannot find small repo id {small_repo_id} in commit sync config for {version}")
     })?;
 
     // Gets a list of large repo paths that small repo paths can map to.
@@ -1304,11 +1348,11 @@ async fn get_synced_commit<R: Repo>(
 ) -> Result<(ChangesetId, CommitSyncConfigVersion), Error> {
     let maybe_sync_outcome = commit_sync_data.get_commit_sync_outcome(&ctx, hash).await?;
     let sync_outcome = maybe_sync_outcome
-        .ok_or_else(|| format_err!("No sync outcome for {} in {:?}", hash, commit_sync_data))?;
+        .ok_or_else(|| format_err!("No sync outcome for {hash} in {commit_sync_data:?}"))?;
 
     use crate::commit_sync_outcome::CommitSyncOutcome::*;
     match sync_outcome {
-        NotSyncCandidate(_) => Err(format_err!("{} does not remap in small repo", hash)),
+        NotSyncCandidate(_) => Err(format_err!("{hash} does not remap in small repo")),
         RewrittenAs(cs_id, mapping_version)
         | EquivalentWorkingCopyAncestor(cs_id, mapping_version) => Ok((cs_id, mapping_version)),
     }
@@ -1375,7 +1419,7 @@ async fn rename_and_remap_bookmarks<R: Repo>(
                         Some(RewrittenAs(cs_id, _))
                         | Some(EquivalentWorkingCopyAncestor(cs_id, _)) => Some(cs_id),
                         Some(NotSyncCandidate(_)) => {
-                            return Err(format_err!("{} is not a sync candidate", cs_id));
+                            return Err(format_err!("{cs_id} is not a sync candidate"));
                         }
                         None => None,
                     };
@@ -1564,7 +1608,7 @@ pub async fn update_large_repo_bookmarks<'a, R: Repo>(
                     .get_plural_commit_sync_outcome(ctx, *target_cs_id)
                     .await?
                     .with_context(|| {
-                        format!("Missing outcome for {} from small repo", target_cs_id)
+                        format!("Missing outcome for {target_cs_id} from small repo")
                     })?;
 
                 use crate::commit_sync_outcome::PluralCommitSyncOutcome::*;
@@ -1606,7 +1650,7 @@ pub async fn update_large_repo_bookmarks<'a, R: Repo>(
                     let reason = BookmarkUpdateReason::XRepoSync;
                     let large_bookmark =
                         bookmark_renamer(target_bookmark).await?.ok_or_else(|| {
-                            format_err!("small bookmark {} remaps to nothing", target_bookmark)
+                            format_err!("small bookmark {target_bookmark} remaps to nothing")
                         })?;
 
                     info!("setting {} {}", large_bookmark, large_cs_id);
@@ -1623,7 +1667,7 @@ pub async fn update_large_repo_bookmarks<'a, R: Repo>(
                     target_bookmark,
                 );
                 let large_bookmark = bookmark_renamer(target_bookmark).await?.ok_or_else(|| {
-                    format_err!("small bookmark {} remaps to nothing", target_bookmark)
+                    format_err!("small bookmark {target_bookmark} remaps to nothing")
                 })?;
                 let reason = BookmarkUpdateReason::XRepoSync;
                 info!("deleting {}", large_bookmark);
@@ -2005,7 +2049,7 @@ mod test {
 
         println!("checking root commit");
         for version in &["first_version", "second_version"] {
-            println!("version: {}", version);
+            println!("version: {version}");
             verify_working_copy_with_version(
                 &ctx,
                 &commit_sync_data,
@@ -2019,7 +2063,7 @@ mod test {
 
         println!("checking first commit");
         for version in &["first_version", "second_version"] {
-            println!("version: {}", version);
+            println!("version: {version}");
             verify_working_copy_with_version(
                 &ctx,
                 &commit_sync_data,
@@ -2032,7 +2076,7 @@ mod test {
         }
 
         let version = "second_version";
-        println!("checking second commit, version: {}", version);
+        println!("checking second commit, version: {version}");
         verify_working_copy_with_version(
             &ctx,
             &commit_sync_data,
@@ -2044,7 +2088,7 @@ mod test {
         .await?;
 
         let version = "first_version";
-        println!("checking second commit, version: {}", version);
+        println!("checking second commit, version: {version}");
         let res = verify_working_copy_with_version(
             &ctx,
             &commit_sync_data,
@@ -2057,7 +2101,7 @@ mod test {
         assert!(res.is_err());
 
         let version = "second_version";
-        println!("checking first and second commit, version: {}", version);
+        println!("checking first and second commit, version: {version}");
         let res = verify_working_copy_with_version(
             &ctx,
             &commit_sync_data,

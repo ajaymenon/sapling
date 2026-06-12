@@ -8,6 +8,9 @@
 #include "eden/fs/testharness/FakeBackingStore.h"
 
 #include <folly/Varint.h>
+#include <folly/coro/BlockingWait.h>
+#include <folly/coro/GtestHelpers.h>
+#include <folly/coro/Task.h>
 #include <folly/executors/ManualExecutor.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
@@ -23,9 +26,14 @@
 #include "eden/fs/model/TestOps.h"
 #include "eden/fs/store/BackingStoreLogger.h"
 #include "eden/fs/store/FilteredBackingStore.h"
+#include "eden/fs/store/ObjectStore.h"
+#include "eden/fs/store/TreeCache.h"
 #include "eden/fs/store/filter/HgSparseFilter.h"
 #include "eden/fs/store/sl/SaplingBackingStore.h"
 #include "eden/fs/store/sl/SaplingBackingStoreOptions.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
+#include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/testharness/FakeFilter.h"
 #include "eden/fs/testharness/HgRepo.h"
 #include "eden/fs/testharness/TestUtil.h"
@@ -55,6 +63,7 @@ const char kTestFilter8[] = "V1:this/filter/is/very/nested";
 struct TestRepo {
   folly::test::TemporaryDirectory testDir{"eden_filtered_backing_store_test"};
   AbsolutePath testPath = canonicalPath(testDir.path().string());
+  AbsolutePath clientPath = testPath + "client"_pc;
   HgRepo repo{testPath + "repo"_pc};
   RootId commit1;
   Hash20 manifest1;
@@ -147,16 +156,24 @@ struct SaplingFilteredBackingStoreTest : FilteredBackingStoreTestBase {
 
   folly::InlineExecutor executor_ = folly::InlineExecutor::instance();
 
+  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+
   std::shared_ptr<SaplingBackingStore> wrappedStore_{
       std::make_shared<SaplingBackingStore>(
           repo.path(),
           repo.path(),
+          clientPath,
           kPathMapDefaultCaseSensitive,
           stats.copy(),
           &executor_,
           edenConfig,
           std::move(runtimeOptions),
-          std::make_shared<NullStructuredLogger>(),
+          std::make_shared<EdenFsEventsLogger>(
+              std::make_shared<NullStructuredLogger>(),
+              /*xplatLogger=*/nullptr,
+              edenConfig,
+              stats.copy()),
+          /*errorLogger=*/noopErrorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector)};
 };
@@ -198,6 +215,37 @@ TEST_F(FakeSubstringFilteredBackingStoreTest, getNonExistent) {
           ObjectFetchContext::getNullContext()),
       std::domain_error,
       "tree 0.*1 not found");
+}
+
+TEST_F(
+    FakeSubstringFilteredBackingStoreTest,
+    checkPermissionUnwrapsFilteredTreeId) {
+  testEdenConfig->restrictedTreeTtlSeconds.setValue(
+      0, ConfigSourceType::UserConfig, true);
+  auto stats = makeRefPtr<EdenStats>();
+  auto objectStore = ObjectStore::create(
+      filteredStore_,
+      TreeCache::create(edenConfig, stats.copy()),
+      stats.copy(),
+      nullptr,
+      nullptr,
+      edenConfig,
+      CaseSensitivity::Sensitive);
+
+  auto rawManifestId = makeTestId("1");
+  auto filteredTreeId = ObjectId{FilteredObjectId{
+      RelativePathPiece{"src/restricted"}, kTestFilter1, rawManifestId}
+                                     .getValue()};
+  wrappedStore_->setCheckPermissionResult(rawManifestId, false);
+
+  auto hasAccess = objectStore
+                       ->checkPermissionIfExpired(
+                           filteredTreeId, std::chrono::steady_clock::now())
+                       .get(0ms);
+
+  EXPECT_FALSE(hasAccess);
+  EXPECT_EQ(1, wrappedStore_->getCheckPermissionCount(rawManifestId));
+  EXPECT_EQ(0, wrappedStore_->getCheckPermissionCount(filteredTreeId));
 }
 
 TEST_F(FakeSubstringFilteredBackingStoreTest, getBlob) {
@@ -281,6 +329,23 @@ TEST_F(FakeSubstringFilteredBackingStoreTest, getBlob) {
   executor.drain();
   ASSERT_TRUE(future6.isReady());
   EXPECT_EQ("foobar", blobContents(*std::move(future6).get(0ms).blob));
+}
+
+CO_TEST_F(FakeSubstringFilteredBackingStoreTest, co_getBlobAuxData) {
+  auto id = makeTestId("1");
+  auto filteredId = ObjectId{
+      FilteredObjectId{id, FilteredObjectIdType::OBJECT_TYPE_BLOB}.getValue()};
+  auto* storedBlob = wrappedStore_->putBlob(id, "foobar");
+  storedBlob->setReady();
+
+  auto result = co_await filteredStore_->co_getBlobAuxData(
+      filteredId, ObjectFetchContext::getNullContext());
+
+  EXPECT_NE(result.blobAux, nullptr);
+  EXPECT_EQ(result.blobAux->size, 6);
+  EXPECT_EQ(
+      result.blobAux->sha1,
+      Hash20::sha1(folly::ByteRange{folly::StringPiece{"foobar"}}));
 }
 
 TEST_F(FakeSubstringFilteredBackingStoreTest, getTree) {
@@ -939,6 +1004,85 @@ TEST_F(FakeSubstringFilteredBackingStoreTest, getGlobFiles) {
   EXPECT_EQ(filteredFutRes5.globFiles[3], "this/filter/is/very");
 }
 
+CO_TEST_F(FakeSubstringFilteredBackingStoreTest, co_getGlobFiles) {
+  // Same setup as getGlobFiles test
+  RootId rootId =
+      RootId{FilteredBackingStore::createFilteredRootId("1", kTestFilter1)};
+  RootId rootId2 =
+      RootId{FilteredBackingStore::createFilteredRootId("2", kTestFilter2)};
+  RootId rootId3 = RootId{
+      FilteredBackingStore::createFilteredRootId("3", kTestFilter4Legacy)};
+  RootId rootId4 =
+      RootId{FilteredBackingStore::createFilteredRootId("4", kTestFilter7)};
+  RootId rootId5 =
+      RootId{FilteredBackingStore::createFilteredRootId("5", kTestFilter8)};
+  wrappedStore_->putGlob(
+      std::pair<RootId, std::string>{RootId{"1"}, "foo"},
+      std::vector<std::string>{"football2", "football3", "foo/bar/baz.cpp"});
+  wrappedStore_->putGlob(
+      std::pair<RootId, std::string>{RootId{"2"}, "foo"},
+      std::vector<std::string>{"football2", "football3", "foo/tball2/baz.cpp"});
+  wrappedStore_->putGlob(
+      std::pair<RootId, std::string>{RootId{"3"}, "foo"},
+      std::vector<std::string>{"football2", "football3", "foo/bar/baz.cpp"});
+  wrappedStore_->putGlob(
+      std::pair<RootId, std::string>{RootId{"4"}, "foo"},
+      std::vector<std::string>{
+          "football2",
+          "football3",
+          "foo/bar/baz.cpp",
+          "dir2/foo.txt",
+          "dir2/foo/README",
+          "dir2/README",
+          "dir2/README.txt",
+          "dir2/README2/read.txt",
+      });
+  wrappedStore_->putGlob(
+      std::pair<RootId, std::string>{RootId{"5"}, "foo"},
+      std::vector<std::string>{
+          "this",
+          "this/filter",
+          "this/filter/is",
+          "this/filter/is/very",
+          "this/filter/is/very/nested",
+      });
+
+  auto res1 = co_await filteredStore_->co_getGlobFiles(
+      rootId, std::vector<std::string>{"foo"}, std::vector<std::string>{});
+  auto res2 = co_await filteredStore_->co_getGlobFiles(
+      rootId2, std::vector<std::string>{"foo"}, std::vector<std::string>{});
+  auto res3 = co_await filteredStore_->co_getGlobFiles(
+      rootId3, std::vector<std::string>{"foo"}, std::vector<std::string>{});
+  auto res4 = co_await filteredStore_->co_getGlobFiles(
+      rootId4, std::vector<std::string>{"foo"}, std::vector<std::string>{});
+  auto res5 = co_await filteredStore_->co_getGlobFiles(
+      rootId5, std::vector<std::string>{"foo"}, std::vector<std::string>{});
+
+  EXPECT_EQ(res1.globFiles.size(), 0);
+  EXPECT_EQ(res2.globFiles.size(), 2);
+  EXPECT_EQ(res3.globFiles.size(), 3);
+  EXPECT_EQ(res4.globFiles.size(), 5);
+  EXPECT_EQ(res5.globFiles.size(), 4);
+
+  EXPECT_EQ(res2.globFiles[0], "football3");
+  EXPECT_EQ(res2.globFiles[1], "foo/tball2/baz.cpp");
+
+  EXPECT_EQ(res3.globFiles[0], "football2");
+  EXPECT_EQ(res3.globFiles[1], "football3");
+  EXPECT_EQ(res3.globFiles[2], "foo/bar/baz.cpp");
+
+  EXPECT_EQ(res4.globFiles[0], "football2");
+  EXPECT_EQ(res4.globFiles[1], "football3");
+  EXPECT_EQ(res4.globFiles[2], "foo/bar/baz.cpp");
+  EXPECT_EQ(res4.globFiles[3], "dir2/foo.txt");
+  EXPECT_EQ(res4.globFiles[4], "dir2/foo/README");
+
+  EXPECT_EQ(res5.globFiles[0], "this");
+  EXPECT_EQ(res5.globFiles[1], "this/filter");
+  EXPECT_EQ(res5.globFiles[2], "this/filter/is");
+  EXPECT_EQ(res5.globFiles[3], "this/filter/is/very");
+}
+
 TEST_F(FakePrefixFilteredBackingStoreTest, testCompareSimilarTreeObjectsById) {
   // The code that this test is testing only works when the
   // getFilterCoverageForPath check is immediately ready. See:
@@ -1143,4 +1287,75 @@ TEST_F(FakeSubstringFilteredBackingStoreTest, testCompareRootsById) {
       filteredStore_->compareRootsById(rootId1V1, rootId3),
       ObjectComparison::Different);
 }
+
+TEST_F(FakeSubstringFilteredBackingStoreTest, parseObjectIdRawHex) {
+  // A raw 40-char hex string without a colon should be delegated to the
+  // underlying backing store instead of throwing.
+  auto rawHex = "a8767dadf91caaaabfb7c95597df28f77f13516e";
+  auto result = filteredStore_->parseObjectId(rawHex);
+  EXPECT_EQ(rawHex, result.asString());
+}
+
+TEST_F(FakeSubstringFilteredBackingStoreTest, parseObjectIdHashColonPath) {
+  // A SaplingBackingStore rendered ID in "hash:path" format has the colon at
+  // position 40, which is too far to be a FilteredObjectId type prefix.
+  // It should be delegated to the underlying backing store.
+  auto hashColonPath =
+      "f22e7e2b0624e5d287f24bab7021f1af5e71fc73:fbcode/eden/fs/service/Foo.h";
+  auto result = filteredStore_->parseObjectId(hashColonPath);
+  EXPECT_EQ(hashColonPath, result.asString());
+}
+
+TEST_F(FakeSubstringFilteredBackingStoreTest, parseObjectIdFilteredFormat) {
+  auto rawHex = "a8767dadf91caaaabfb7c95597df28f77f13516e";
+  auto filteredStr = std::string("16:") + rawHex;
+  auto result = filteredStore_->parseObjectId(filteredStr);
+  auto foid = FilteredObjectId::fromObjectId(result);
+  EXPECT_EQ(FilteredObjectIdType::OBJECT_TYPE_BLOB, foid.objectType());
+}
+
+TEST_F(
+    FakeSubstringFilteredBackingStoreTest,
+    restrictedTreePreservedAfterFiltering) {
+  auto [file, file_id] = wrappedStore_->putBlob("content");
+
+  // Test 1: Non-restricted tree preserves isRestricted=false
+  auto normalRootId = makeTestId("1001");
+  auto* normalRootDir = wrappedStore_->putTree(
+      normalRootId,
+      {
+          {"normal_dir", wrappedStore_->putTree({{"a.txt", file_id}})},
+          {"another_dir", wrappedStore_->putTree({{"b.txt", file_id}})},
+      });
+  EXPECT_FALSE(normalRootDir->get().isRestricted());
+
+  auto normalTreeId =
+      FilteredObjectId(RelativePath{""}, kTestFilter1, normalRootId);
+  auto normalTreeOID = ObjectId{normalTreeId.getValue()};
+  auto normalFuture = filteredStore_->getTree(
+      normalTreeOID, ObjectFetchContext::getNullContext());
+  normalRootDir->trigger();
+  auto normalTree = std::move(normalFuture).get(0ms).tree;
+  EXPECT_FALSE(normalTree->isRestricted());
+  EXPECT_NE(normalTree->find("normal_dir"_pc), normalTree->cend());
+
+  // Test 2: Restricted tree preserves isRestricted=true
+  auto restrictedRootId = makeTestId("2002");
+  auto* restrictedRootDir = wrappedStore_->putRestrictedTree(
+      restrictedRootId,
+      {
+          {"secret_dir", wrappedStore_->putTree({{"s.txt", file_id}})},
+      });
+  EXPECT_TRUE(restrictedRootDir->get().isRestricted());
+
+  auto restrictedTreeId =
+      FilteredObjectId(RelativePath{""}, kTestFilter1, restrictedRootId);
+  auto restrictedTreeOID = ObjectId{restrictedTreeId.getValue()};
+  auto restrictedFuture = filteredStore_->getTree(
+      restrictedTreeOID, ObjectFetchContext::getNullContext());
+  restrictedRootDir->trigger();
+  auto restrictedTree = std::move(restrictedFuture).get(0ms).tree;
+  EXPECT_TRUE(restrictedTree->isRestricted());
+}
+
 } // namespace facebook::eden

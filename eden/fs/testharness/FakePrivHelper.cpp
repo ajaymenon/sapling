@@ -155,6 +155,13 @@ Future<Unit> FakePrivHelper::setMemoryPriorityForProcess(
       "FakePrivHelper::setMemoryPriorityForProcess() not implemented"));
 }
 
+Future<Unit> FakePrivHelper::setFuseReadAhead(
+    folly::StringPiece /* mountPath */,
+    uint32_t /* readAheadKb */) {
+  return makeFuture<Unit>(
+      runtime_error("FakePrivHelper::setFuseReadAhead() not implemented"));
+}
+
 int FakePrivHelper::stop() {
   return 0;
 }
@@ -182,6 +189,12 @@ folly::Future<folly::Unit> FakePrivHelper::setUseEdenFs(bool /* useEdenFs */) {
 
 folly::Future<pid_t> FakePrivHelper::getServerPid() {
   return -1;
+}
+
+folly::Future<NamespaceInfo> FakePrivHelper::getNamespaceInfo(
+    pid_t /* daemonPid */) {
+  return makeFuture<NamespaceInfo>(
+      runtime_error("FakePrivHelper::getNamespaceInfo() not implemented"));
 }
 
 folly::Future<pid_t> FakePrivHelper::startFam(

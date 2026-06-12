@@ -14,12 +14,13 @@ license = "MIT"
 name = "util"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.102"
+bitflags = { version = "2.11.1", features = ["serde", "std"], default-features = false }
 dirs = "6.0"
 fn-error-context = "0.2"
-fs-err = { version = "3", features = ["tokio"] }
-once_cell = "1.21"
-rand = { version = "0.9", features = ["small_rng"] }
+fs-err = { version = "3.3.0", features = ["tokio"] }
+once_cell = "1.21.4"
+rand = "0.10.1"
 sapling-atomicfile = { version = "0.1.0", path = "../atomicfile" }
 sapling-lazystr = { version = "0.1.0", path = "../lazystr" }
 sapling-metrics = { version = "0.1.0", path = "../metrics" }
@@ -29,22 +30,23 @@ thiserror = "2.0.18"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-memmap2 = "0.9.5"
-tempfile = "3.22"
+memmap2 = "0.9.10"
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.139"
+libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
-tempfile = "3.22"
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2.139"
+libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
-tempfile = "3.22"
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-widestring = "1.0.2"
-winapi = { version = "0.3", features = ["fileapi", "handleapi", "winbase", "winerror", "winnt"] }
+ntapi = "0.4.3"
+widestring = "1.2.1"
+winapi = { version = "0.3", features = ["everything", "std"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
-tempfile = "3.22"
+tempfile = "3.27.0"

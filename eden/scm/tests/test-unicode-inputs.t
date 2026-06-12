@@ -10,15 +10,15 @@
   $ eagerepo
   $ setmodernconfig
 
-  $ hg init repo
+  $ sl init repo
   $ cd repo
   $ echo xxx > file
   $ echo yyy > Æ
-  $ hg add file
-  $ hg add Æ
-  $ hg commit -m 'Æ'
+  $ sl add file
+  $ sl add Æ
+  $ sl commit -m 'Æ'
 
-  $ hg log -v
+  $ sl log -v
   commit:      * (glob)
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000

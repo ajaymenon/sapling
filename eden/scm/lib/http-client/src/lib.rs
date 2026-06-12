@@ -25,9 +25,9 @@
 //
 // Other types:
 // - `HttpClient`: Configured HTTP client. Uses at least one libcurl
-//   `Multi` to handle multiple requests in a single loop/thread. However,
-//   the `send_async` uses `spawn_blocking` which defeats the benefit
-//   of O(1) thread provided by `Multi`.
+//   `Multi` to handle multiple requests in a single loop/thread. Async
+//   requests use a small pool of long-lived dispatcher threads by
+//   default, with a config escape hatch back to `spawn_blocking`.
 // - `Request` / `StreamRequest`: Similar but duplicated implementation
 //   to send requests.
 // - `CborStream`: Turn a stream of bytes into a stream of CBOR decoded
@@ -38,8 +38,12 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
 mod claimer;
 mod client;
+mod dispatcher;
 mod driver;
 mod errors;
 mod event_listeners;
@@ -80,6 +84,37 @@ pub use response::AsyncResponse;
 pub use response::Response;
 pub use stats::Stats;
 pub use stream::CborStream;
+
+// Set during Sapling atexit so late cleanup paths do not start new curl work.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+pub fn init() {
+    // Sapling can run multiple commands in one process, so a new HTTP client
+    // marks the HTTP layer usable again after a previous command's atexit.
+    SHUTTING_DOWN.store(false, Ordering::Release);
+    init_openssl();
+}
+
+pub fn shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::Release);
+}
+
+pub(crate) fn init_openssl() {
+    // Force openssl to initialize to to work around openssl bug
+    // https://github.com/openssl/openssl/issues/6214. Initializing openssl explicitly
+    // causes openssl to use OPENSSL_INIT_NO_ATEXIT which avoids shutdown race conditions
+    // (but not shutting down openssl). If we don't explicitly innitialize, curl
+    // initializes openssl without OPENSSL_INIT_NO_ATEXIT and we get the race conditions.
+    openssl::init();
+}
+
+pub(crate) fn check_not_shutting_down() -> Result<(), HttpClientError> {
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        Err(anyhow::anyhow!("http client is shutting down").into())
+    } else {
+        Ok(())
+    }
+}
 
 /// The only Easy2 type used by this crate.
 pub(crate) type Easy2H = Easy2<Box<dyn HandlerExt>>;

@@ -75,6 +75,7 @@ pub use crate::blame::BlameLineRange;
 pub use crate::blame::BlameRequest;
 pub use crate::blame::BlameResult;
 pub use crate::bookmark::BookmarkEntry;
+pub use crate::bookmark::BookmarkKind;
 pub use crate::bookmark::BookmarkRequest;
 pub use crate::bookmark::BookmarkResult;
 pub use crate::bookmark::ListBookmarkPatternsRequest;
@@ -210,6 +211,10 @@ pub use crate::token::UploadToken;
 pub use crate::token::UploadTokenData;
 pub use crate::token::UploadTokenMetadata;
 pub use crate::token::UploadTokenSignature;
+pub use crate::tree::CheckManifestPermissionRequest;
+pub use crate::tree::CheckManifestPermissionResponse;
+pub use crate::tree::CheckPathPermissionRequest;
+pub use crate::tree::CheckPathPermissionResponse;
 pub use crate::tree::TreeAttributes;
 pub use crate::tree::TreeAuxData;
 pub use crate::tree::TreeChildDirectoryEntry;
@@ -245,21 +250,21 @@ pub struct SaplingRemoteApiServerError {
 impl SaplingRemoteApiServerError {
     pub fn new(err: impl std::fmt::Debug) -> SaplingRemoteApiServerError {
         SaplingRemoteApiServerError {
-            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{:?}", err)),
+            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{err:?}")),
             key: None,
         }
     }
 
     pub fn with_key(key: Key, err: impl std::fmt::Debug) -> SaplingRemoteApiServerError {
         SaplingRemoteApiServerError {
-            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{:?}", err)),
+            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{err:?}")),
             key: Some(key),
         }
     }
 
     pub fn with_path(path: RepoPathBuf, err: impl std::fmt::Debug) -> SaplingRemoteApiServerError {
         SaplingRemoteApiServerError {
-            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{:?}", err)),
+            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{err:?}")),
             key: Some(Key {
                 path,
                 hgid: *HgId::null_id(),
@@ -269,7 +274,7 @@ impl SaplingRemoteApiServerError {
 
     pub fn with_hgid(hgid: HgId, err: impl std::fmt::Debug) -> SaplingRemoteApiServerError {
         SaplingRemoteApiServerError {
-            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{:?}", err)),
+            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{err:?}")),
             key: Some(Key {
                 hgid,
                 path: RepoPathBuf::new(),
@@ -283,4 +288,13 @@ impl SaplingRemoteApiServerError {
 pub enum SaplingRemoteApiServerErrorKind {
     #[error("SaplingRemoteAPI server returned an error with message: {0}")]
     OpaqueError(String),
+    #[error(
+        "Unauthorized access to manifest under restricted path: {tree_id}. Request access via ACL {request_acl}."
+    )]
+    PermissionDenied {
+        /// ID of the tree to which the user does not have access.
+        tree_id: HgId,
+        /// ACL to direct users for access requests.
+        request_acl: String,
+    },
 }

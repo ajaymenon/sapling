@@ -59,6 +59,7 @@ use http_client::TlsErrorKind;
 use http_client::curl;
 use indexedlog::DefaultOpenOptions;
 use indexedlog::Repair;
+use indexedlog::log::ExtendWrite;
 use indexedlog::log::IndexOutput;
 use indexedlog::rotate;
 use indexedlog::rotate::ConsistentReadGuard;
@@ -73,8 +74,6 @@ use mincode::deserialize;
 use mincode::serialize;
 use mincode::serialize_into;
 use minibytes::Bytes;
-use rand::Rng;
-use rand::thread_rng;
 use redacted::is_redacted;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
@@ -91,6 +90,7 @@ use types::FetchContext;
 use types::HgId;
 use types::Key;
 use types::RepoPath;
+use types::RepoPathBuf;
 use types::Sha256;
 use url::Url;
 use util::path::create_dir;
@@ -292,7 +292,8 @@ impl LfsPointersStore {
     }
 
     fn add(&self, entry: LfsPointersEntry) -> Result<()> {
-        self.0.append(serialize(&entry)?)
+        self.0
+            .append(|buf: &mut dyn ExtendWrite| -> Result<()> { Ok(serialize_into(buf, &entry)?) })
     }
 }
 
@@ -444,7 +445,7 @@ impl LfsIndexedLogBlobsStore {
         // Verify content integrity at write time to allow avoiding read time check.
         let apparent_hash = &ContentHash::sha256(&data).unwrap_sha256();
         if apparent_hash != hash {
-            bail!("content hash mismatch: {} != {}", hash, apparent_hash);
+            bail!("content hash mismatch: {hash} != {apparent_hash}");
         }
 
         let chunks = LfsIndexedLogBlobsStore::chunk(data, self.chunk_size);
@@ -455,11 +456,17 @@ impl LfsIndexedLogBlobsStore {
         });
 
         for entry in chunks {
-            let serialized = serialize(&entry)?;
-            self.inner.append(serialized)?;
+            self.inner
+                .append(|buf: &mut dyn ExtendWrite| -> Result<()> {
+                    Ok(serialize_into(buf, &entry)?)
+                })?;
         }
 
         Ok(())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.inner.is_dirty()
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -581,13 +588,21 @@ impl LfsBlobsStore {
         match self {
             LfsBlobsStore::Loose(path, _) => {
                 let path = LfsBlobsStore::path(path, hash);
-                remove_file(path).with_context(|| format!("Cannot remove LFS blob {}", hash))?;
+                remove_file(path).with_context(|| format!("Cannot remove LFS blob {hash}"))?;
             }
 
             _ => {}
         }
 
         Ok(())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        match self {
+            LfsBlobsStore::IndexedLog(log) => log.is_dirty(),
+            LfsBlobsStore::Union(first, _) => first.is_dirty(),
+            _ => false,
+        }
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -675,7 +690,9 @@ impl StreamingState {
                     };
                     store
                         .inner
-                        .append_direct(|buf| Ok(serialize_into(buf, &entry)?))?;
+                        .append(|buf: &mut dyn ExtendWrite| -> Result<()> {
+                            Ok(serialize_into(buf, &entry)?)
+                        })?;
                     *len += data_len;
 
                     if took_chunk {
@@ -854,6 +871,12 @@ impl LfsStore {
         Ok(repair_str)
     }
 
+    /// Check if a pointer exists for the given HgId.
+    pub fn contains_pointer(&self, id: &HgId) -> Result<bool> {
+        let key = StoreKey::HgId(Key::new(RepoPathBuf::new(), *id));
+        Ok(self.pointers.entry(&key)?.is_some())
+    }
+
     fn blob_impl(&self, key: StoreKey) -> Result<StoreResult<(LfsPointersEntry, Bytes)>> {
         let pointer = self.pointers.entry(&key)?;
 
@@ -955,6 +978,10 @@ impl LfsStore {
 
     pub(crate) fn add_pointer(&self, pointer_entry: LfsPointersEntry) -> Result<()> {
         self.pointers.add(pointer_entry)
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.blobs.is_dirty() || self.pointers.0.is_dirty()
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -1083,7 +1110,7 @@ impl LfsPointersEntry {
             } else if let Some(suffix) = line.strip_prefix(LFS_POINTER_X_IS_BINARY) {
                 is_binary = suffix.parse::<u8>()? == 1;
             } else {
-                bail!("unknown metadata: {}", line);
+                bail!("unknown metadata: {line}");
             }
         }
 
@@ -1173,7 +1200,7 @@ impl LfsRemote {
             Ok(Self::File(file))
         } else {
             if !["http", "https"].contains(&url.scheme()) {
-                bail!("Unsupported url: {}", url);
+                bail!("Unsupported url: {url}");
             }
 
             let user_agent = config.get_or("experimental", "lfs.user-agent", || {
@@ -1214,7 +1241,7 @@ impl LfsRemote {
                         HttpVersion::V2
                     }
                 }
-                x => bail!("Unsupported http_version: {}", x),
+                x => bail!("Unsupported http_version: {x}"),
             };
 
             let low_speed_grace_period =
@@ -1427,11 +1454,11 @@ impl LfsRemote {
                         for code in seen_error_codes {
                             // Record that we saw this error code, but it went away on retry.
                             hg_metrics::increment_counter(
-                                format!("lfs.transient_error.{}.{}", method, code),
+                                format!("lfs.transient_error.{method}.{code}"),
                                 1,
                             );
                         }
-                        hg_metrics::increment_counter(format!("lfs.success.{}", method), 1);
+                        hg_metrics::increment_counter(format!("lfs.success.{method}"), 1);
                         return Ok(res);
                     }
                     Err(error) => error,
@@ -1461,7 +1488,7 @@ impl LfsRemote {
                 if let Some(backoff_time) = backoff_time {
                     if backoff_time > 0.0 {
                         let sleep_time =
-                            Duration::from_secs_f32(thread_rng().gen_range(0.0..backoff_time));
+                            Duration::from_secs_f32(rand::random_range(0.0..backoff_time));
                         tracing::debug!(
                             sleep_time = ?sleep_time,
                             retry_strategy = ?retry_strategy,
@@ -1473,15 +1500,12 @@ impl LfsRemote {
                 }
 
                 if seen_error_codes.is_empty() {
-                    hg_metrics::increment_counter(format!("lfs.fatal_error.{}.other", method), 1);
+                    hg_metrics::increment_counter(format!("lfs.fatal_error.{method}.other"), 1);
                 }
 
                 for code in seen_error_codes {
                     // Record that we saw this error code and ended up failing.
-                    hg_metrics::increment_counter(
-                        format!("lfs.fatal_error.{}.{}", method, code),
-                        1,
-                    );
+                    hg_metrics::increment_counter(format!("lfs.fatal_error.{method}.{code}"), 1);
                 }
 
                 return Err(LfsFetchError { url, method, error });
@@ -1590,7 +1614,7 @@ impl LfsRemote {
 
         while chunk_start < file_end {
             let chunk_end = std::cmp::min(file_end, chunk_start + chunk_increment);
-            let range = format!("bytes={}-{}", chunk_start, chunk_end);
+            let range = format!("bytes={chunk_start}-{chunk_end}");
 
             let chunk_res = LfsRemote::send_with_retry(
                 fctx.clone(),
@@ -1917,6 +1941,10 @@ impl LfsClient {
         c
     }
 
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.local.as_ref().is_some_and(|l| l.is_dirty()) || self.shared.is_dirty()
+    }
+
     pub(crate) fn flush(&self) -> Result<()> {
         let mut res = Ok(());
 
@@ -1946,7 +1974,7 @@ fn move_blob(hash: &Sha256, size: u64, from: &LfsStore, to: &LfsStore) -> Result
         let blob = from
             .blobs
             .get(hash, size)?
-            .ok_or_else(|| format_err!("Cannot find blob for {}", hash))?;
+            .ok_or_else(|| format_err!("Cannot find blob for {hash}"))?;
 
         to.blobs.add(hash, blob.into_bytes())?;
         from.blobs.remove(hash)?;
@@ -1958,9 +1986,9 @@ fn move_blob(hash: &Sha256, size: u64, from: &LfsStore, to: &LfsStore) -> Result
             }
             Ok(())
         })()
-        .with_context(|| format!("Cannot move pointer for {}", hash))
+        .with_context(|| format!("Cannot move pointer for {hash}"))
     })()
-    .with_context(|| format!("Cannot move blob {}", hash))
+    .with_context(|| format!("Cannot move blob {hash}"))
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -3013,7 +3041,7 @@ mod tests {
             &config,
         )?);
         let k = StoreKey::hgid(k1.clone());
-        remote.upload(&[k.clone()])?;
+        remote.upload(std::slice::from_ref(&k))?;
 
         let contentk = StoreKey::Content(ContentHash::sha256(&data), Some(k1));
 

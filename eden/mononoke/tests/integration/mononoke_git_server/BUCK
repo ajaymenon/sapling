@@ -6,26 +6,96 @@ load(
 
 oncall("scm_server_treehugger")
 
-# Tests that require features not available in OSS builds (e.g., jemalloc profiling)
+# Tests that require features not available in OSS builds
 OSS_EXCLUDED_TESTS = [
     "test-mononoke-git-server-flamegraph.t",
+    "test-mononoke-git-server-multi-repo-land-push.t",
+    "test-mononoke-git-server-shadow-traffic.t",
+    "test-mononoke-git-server-with-gclone.t",
+]
+
+# Tests that require network access for inter-service communication
+NETWORK_EXCLUDED_TESTS = [
+    "test-mononoke-git-server-multi-repo-land-push.t",
+    "test-mononoke-git-server-shadow-traffic.t",
+    "test-mononoke-git-server-with-gclone.t",
+]
+
+# Tests that use the Meta-built git client (separate target to avoid
+# adding the git binary build dep to all other tests)
+META_GIT_CLIENT_TESTS = [
+    "test-mononoke-git-server-push-predecessor-amend.t",
+    "test-mononoke-git-server-push-predecessor-cherry-pick.t",
+    "test-mononoke-git-server-push-predecessor-combined.t",
+    "test-mononoke-git-server-push-predecessor-rebase.t",
 ]
 
 dott_test(
     name = "mononoke-git-server",
     # These tests have been vetted to run well without network access. Please investigate any failure thoroughly before disabling.
     disable_all_network_access_target = True,
-    dott_files =
-        glob(
-            ["*.t"],
-            exclude = OSS_EXCLUDED_TESTS if rust_oss.is_oss_build() else [],
-        ),
+    dott_files = glob(
+        ["*.t"],
+        exclude = (OSS_EXCLUDED_TESTS if rust_oss.is_oss_build() else NETWORK_EXCLUDED_TESTS) + META_GIT_CLIENT_TESTS,
+    ),
     deps = [
         "//eden/mononoke:mononoke",
         "//eden/mononoke/features/commit_rewriting/mononoke_x_repo_sync_job:mononoke_x_repo_sync_job",
         "//eden/mononoke/git/gitimport:gitimport",
         "//eden/mononoke/servers/git/git_server:git_server",
         "//eden/mononoke/servers/lfs/lfs_server:lfs_server",
+        "//eden/mononoke/tools/admin:admin",
+        "//eden/mononoke/tools/testtool:testtool",
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "//eden/mononoke/clients/facebook/multi_repo_land_service_client:multi_repo_land_service_client_cli",
+            "//eden/mononoke/clients/scsc:scsc",
+            "//eden/mononoke/facebook/mock_rl_land_service:mock_rl_land_service",
+            "//eden/mononoke/facebook/multi_repo_land_service:multi_repo_land_service",
+            "//eden/mononoke/servers/scs/scs_server:scs_server",
+        ]
+    ),
+)
+
+# Tests that require network access for inter-service communication
+dott_test(
+    name = "mononoke-git-server-needs-network",
+    dott_files = NETWORK_EXCLUDED_TESTS,
+    rust_allow_oss_build = False,
+    deps = [
+        "//eden/mononoke:mononoke",
+        "//eden/mononoke/clients/facebook/multi_repo_land_service_client:multi_repo_land_service_client_cli",
+        "//eden/mononoke/clients/scsc:scsc",
+        "//eden/mononoke/facebook/mock_rl_land_service:mock_rl_land_service",
+        "//eden/mononoke/facebook/multi_repo_land_service:multi_repo_land_service",
+        "//eden/mononoke/features/commit_rewriting/mononoke_x_repo_sync_job:mononoke_x_repo_sync_job",
+        "//eden/mononoke/git/gitimport:gitimport",
+        "//eden/mononoke/servers/git/git_server:git_server",
+        "//eden/mononoke/servers/lfs/lfs_server:lfs_server",
+        "//eden/mononoke/servers/scs/scs_server:scs_server",
+        "//eden/mononoke/tools/admin:admin",
+        "//eden/mononoke/tools/testtool:testtool",
+        "//scm/gclone:gclone",
+    ],
+)
+
+# Tests that use the Meta-built git client (fb-git-client) for predecessor
+# tracking. Separate target to avoid adding the git binary build dep to
+# all other git server tests.
+dott_test(
+    name = "mononoke-git-server-meta-git-client",
+    dott_files = META_GIT_CLIENT_TESTS,
+    rust_allow_oss_build = False,
+    deps = [
+        "fbsource//third-party/git/v2.53.0:git",
+        "//eden/mononoke:mononoke",
+        "//eden/mononoke/clients/scsc:scsc",
+        "//eden/mononoke/git/gitimport:gitimport",
+        "//eden/mononoke/servers/git/git_server:git_server",
+        "//eden/mononoke/servers/scs/scs_server:scs_server",
         "//eden/mononoke/tools/admin:admin",
         "//eden/mononoke/tools/testtool:testtool",
     ],

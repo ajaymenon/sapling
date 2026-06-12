@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use async_runtime::block_on;
 use configloader::Config;
 use configloader::config::Options;
@@ -25,14 +26,13 @@ use parking_lot::RwLock;
 use pathmatcher::DynMatcher;
 use repourl::RepoUrl;
 use revisionstore::trait_impls::ArcFileStore;
-use revsets::errors::RevsetLookupError;
+use revsets::utils::ResolveResult;
 use revsets::utils::remote_hash_prefix_lookup;
 use sparse::Root;
 use storemodel::FileStore;
 use storemodel::StoreInfo;
 use storemodel::TreeStore;
 use types::HgId;
-use workingcopy::sparse::build_matcher;
 
 use crate::scmstore::build_scm_file_store;
 use crate::scmstore::build_scm_tree_store;
@@ -121,7 +121,7 @@ impl SlapiRepo {
                 .downcast_ref::<ArcFileStore>()
                 .map(|fs| fs.0.clone())
         });
-        let ts = build_scm_tree_store(self, fs)?;
+        let ts = build_scm_tree_store(self, fs, None)?;
         let ts: Arc<dyn TreeStore> = ts;
         let _ = self.tree_store.set(ts.clone());
 
@@ -141,7 +141,8 @@ impl SlapiRepo {
 
     /// Resolve a commit identifier to an HgId.
     /// Supports hex commit hash prefixes and bookmark names.
-    pub fn resolve_commit(&self, id: &str) -> Result<HgId> {
+    /// Note: Since SlapiRepo has no local dag, all successful lookups are RemoteOnly.
+    pub fn resolve_commit(&self, id: &str) -> Result<ResolveResult> {
         let slapi = self.eden_api()?;
 
         // Check if this looks like a hex commit hash prefix.
@@ -151,7 +152,7 @@ impl SlapiRepo {
         {
             if !id.is_empty() && id.len() <= 40 {
                 if let Some(hgid) = remote_hash_prefix_lookup(slapi.as_ref(), id)? {
-                    return Ok(hgid);
+                    return Ok(ResolveResult::RemoteOnly(id.to_string(), hgid));
                 }
             }
         }
@@ -160,9 +161,24 @@ impl SlapiRepo {
         let mut bms = block_on(slapi.bookmarks(vec![id.to_string()], None))?;
 
         match bms.pop().and_then(|bm| bm.hgid) {
-            None => Err(RevsetLookupError::RevsetNotFound(id.to_owned()).into()),
-            Some(hgid) => Ok(hgid),
+            None => Ok(ResolveResult::NotFound(id.to_string())),
+            Some(hgid) => Ok(ResolveResult::RemoteOnly(id.to_string(), hgid)),
         }
+    }
+
+    /// Resolve a change identifier to a TreeManifest.
+    ///
+    /// Resolves the commit and fetches its TreeManifest.
+    /// Note: "wdir" is not supported for SlapiRepo.
+    ///
+    /// Returns the commit HgId and the TreeManifest.
+    pub fn resolve_manifest(&self, change_id: &str) -> Result<(HgId, TreeManifest)> {
+        if change_id == "wdir" {
+            bail!("repoless does not support 'wdir' revset");
+        }
+        let commit_id = self.resolve_commit(change_id)?.any()?;
+        let tree_resolver = self.tree_resolver()?;
+        Ok((commit_id, tree_resolver.get(&commit_id)?))
     }
 
     /// Get sparse matcher for code tenting.
@@ -170,6 +186,7 @@ impl SlapiRepo {
     /// Checks for a code-tenting sparse profile in the config and builds a matcher from
     /// it if present.
     pub fn sparse_matcher(&self, manifest: &TreeManifest) -> Result<Option<DynMatcher>> {
+        #[cfg(feature = "wdir")]
         match filters::util::filter_paths_from_config(self.config()) {
             // {""} is a special case that means "null filter" - match eveything.
             Some(paths) if !paths.iter().all(|p| p.is_empty()) => {
@@ -181,12 +198,21 @@ impl SlapiRepo {
                         .join(""),
                     "SlapiRepo".to_string(),
                 )?;
-                let (sparse_matcher, _) =
-                    build_matcher(&sparse_root, manifest, self.file_store()?, &HashMap::new())?;
+                let (sparse_matcher, _) = workingcopy::sparse::build_matcher(
+                    &sparse_root,
+                    manifest,
+                    self.file_store()?,
+                    &HashMap::new(),
+                )?;
 
                 Ok(Some(Arc::new(sparse_matcher)))
             }
             _ => Ok(None),
+        }
+        #[cfg(not(feature = "wdir"))]
+        {
+            let _ = manifest;
+            Ok(None)
         }
     }
 }
@@ -379,19 +405,28 @@ mod tests {
 
         // Test 1: Resolve by full commit hash.
         let resolved = slapi_repo.resolve_commit(&commit_id.to_hex()).unwrap();
-        assert_eq!(resolved, commit_id);
+        assert_eq!(
+            resolved,
+            ResolveResult::RemoteOnly(commit_id.to_hex(), commit_id)
+        );
 
         // Test 2: Resolve by hash prefix.
         let prefix = &commit_id.to_hex()[..12];
         let resolved = slapi_repo.resolve_commit(prefix).unwrap();
-        assert_eq!(resolved, commit_id);
+        assert_eq!(
+            resolved,
+            ResolveResult::RemoteOnly(prefix.to_string(), commit_id)
+        );
 
         // Test 3: Resolve by bookmark name.
         let resolved = slapi_repo.resolve_commit("main").unwrap();
-        assert_eq!(resolved, commit_id);
+        assert_eq!(
+            resolved,
+            ResolveResult::RemoteOnly("main".to_string(), commit_id)
+        );
 
         // Test 4: Not found case.
-        let err = slapi_repo.resolve_commit("nonexistent").unwrap_err();
-        assert!(err.downcast_ref::<RevsetLookupError>().is_some());
+        let resolved = slapi_repo.resolve_commit("nonexistent").unwrap();
+        assert_eq!(resolved, ResolveResult::NotFound("nonexistent".to_string()));
     }
 }

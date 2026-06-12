@@ -8,17 +8,15 @@
 //! Provides the c-bindings for `crate::backingstore`.
 
 use std::collections::HashMap;
-use std::ffi::CStr;
-use std::os::raw::c_char;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Error;
-use anyhow::Result;
 use anyhow::anyhow;
-use cxx::CxxString;
 use cxx::SharedPtr;
 use cxx::UniquePtr;
+use cxxerror::Result;
 use edenapi::types::DirectoryMetadata;
 use storemodel::FileAuxData as ScmStoreFileAuxData;
 use storemodel::FileType;
@@ -129,6 +127,7 @@ pub(crate) mod ffi {
         Network,
         IO,
         DataCorruption,
+        PermissionDenied,
     }
 
     unsafe extern "C++" {
@@ -206,6 +205,7 @@ pub(crate) mod ffi {
             name: &str,
             hg_node: &[u8; 20],
             ttype: TreeEntryType,
+            is_restricted: bool,
         );
 
         fn add_entry_with_aux_data(
@@ -216,6 +216,7 @@ pub(crate) mod ffi {
             size: u64,
             sha1: &[u8; 20],
             blake3: &[u8; 32],
+            is_restricted: bool,
         );
 
         fn mark_missing(self: Pin<&mut TreeBuilder>);
@@ -253,16 +254,22 @@ pub(crate) mod ffi {
         error: UniquePtr<SaplingBackingStoreError>,
     }
 
+    pub struct CheckPermissionResult {
+        has_access: bool,
+        error: UniquePtr<SaplingBackingStoreError>,
+    }
+
     extern "Rust" {
         type BackingStore;
 
-        pub unsafe fn sapling_backingstore_new(
-            repository: &[c_char],
-            mount: &[c_char],
-            walk_mode: &CxxString,
+        pub fn sapling_backingstore_new(
+            repository: &str,
+            mount: &str,
+            eden_client_dir: &str,
+            walk_mode: &str,
         ) -> Result<Box<BackingStore>>;
 
-        pub unsafe fn sapling_backingstore_get_name(store: &BackingStore) -> Result<String>;
+        pub fn sapling_backingstore_get_name(store: &BackingStore) -> Result<String>;
 
         pub fn sapling_backingstore_get_manifest(
             store: &BackingStore,
@@ -333,6 +340,11 @@ pub(crate) mod ffi {
             suffixes: Vec<String>,
             prefixes: Vec<String>,
         ) -> GetGlobFilesResult;
+
+        pub fn sapling_backingstore_check_permission(
+            store: &BackingStore,
+            manifest_id: &[u8],
+        ) -> CheckPermissionResult;
 
         pub fn sapling_backingstore_witness_file_read(
             store: &BackingStore,
@@ -446,37 +458,37 @@ macro_rules! resolve_result {
     };
 }
 
-pub unsafe fn sapling_backingstore_new(
-    repository: &[c_char],
-    mount: &[c_char],
-    walk_mode: &CxxString,
+pub fn sapling_backingstore_new(
+    repository: &str,
+    mount: &str,
+    eden_client_dir: &str,
+    walk_mode: &str,
 ) -> Result<Box<BackingStore>> {
-    unsafe {
-        super::init::backingstore_global_init();
+    super::init::backingstore_global_init();
 
-        let repo = CStr::from_ptr(repository.as_ptr()).to_str()?;
-        let mount = CStr::from_ptr(mount.as_ptr()).to_str()?;
+    let mut extra_sapling_configs = Vec::new();
 
-        let mut extra_sapling_configs = Vec::new();
-
-        // Allow configuring walk mode optionally via eden config.
-        if let v @ ("off" | "monitor" | "prefetch") = walk_mode.to_str()? {
-            tracing::debug!("setting backingstore.walk-mode={v} via eden config");
-            extra_sapling_configs.push(format!("backingstore.walk-mode={v}"));
-        }
-
-        let store = BackingStore::new_with_config(repo, mount, &extra_sapling_configs)
-            .map_err(|err| anyhow!("{:?}", err))?;
-        Ok(Box::new(store))
+    // Allow configuring walk mode optionally via eden config.
+    if let v @ ("off" | "monitor" | "prefetch") = walk_mode {
+        tracing::debug!("setting backingstore.walk-mode={v} via eden config");
+        extra_sapling_configs.push(format!("backingstore.walk-mode={v}"));
     }
+
+    let store = BackingStore::new_with_config_and_client_dir(
+        repository,
+        mount,
+        eden_client_dir,
+        &extra_sapling_configs,
+    )?;
+    Ok(Box::new(store))
 }
 
-pub unsafe fn sapling_backingstore_get_name(store: &BackingStore) -> Result<String> {
-    store.name()
+pub fn sapling_backingstore_get_name(store: &BackingStore) -> Result<String> {
+    store.name().map_err(Into::into)
 }
 
 pub fn sapling_backingstore_get_manifest(store: &BackingStore, node: &[u8]) -> Result<[u8; 20]> {
-    store.get_manifest(node)
+    store.get_manifest(node).map_err(Into::into)
 }
 
 pub fn sapling_backingstore_get_tree(
@@ -487,7 +499,7 @@ pub fn sapling_backingstore_get_tree(
 ) -> ffi::GetTreeResult {
     // the cause is not propagated for this API
     let res = store.get_tree(
-        FetchContext::new_with_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
+        FetchContext::new_with_mode_and_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
         node,
     );
     let error = resolve_result!(
@@ -498,15 +510,48 @@ pub fn sapling_backingstore_get_tree(
     ffi::GetTreeResult { error }
 }
 
+/// Build a set of restricted child directory HgIds from the tree's
+/// permission_denied_children(). Fail-open: if the initial call or
+/// individual entries error, log a warning and treat as unrestricted.
+fn build_restricted_set(tree: &dyn TreeEntry) -> HashSet<HgId> {
+    let iter = match tree.permission_denied_children() {
+        Ok(iter) => iter,
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "error calling permission_denied_children; treating all children as unrestricted (fail-open)"
+            );
+            return HashSet::new();
+        }
+    };
+    iter.filter_map(|r| match r {
+        Ok((_, hgid, _)) => Some(hgid),
+        Err(e) => {
+            tracing::warn!(?e, "error checking permission_denied_children");
+            None
+        }
+    })
+    .collect()
+}
+
 // Convert the `TreeEntry` trait object into an EdenFS Tree by adding each entry to the TreeBuilder
 // object.
 fn add_tree_to_builder(
     mut builder: Pin<&mut ffi::TreeBuilder>,
     tree: Arc<dyn TreeEntry>,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     // TODO: Make the aux data available in `TreeEntry::iter()` so we don't have to do this HashMap business.
     let aux_map: HashMap<HgId, ScmStoreFileAuxData> =
-        tree.file_aux_iter()?.collect::<Result<_>>()?;
+        tree.file_aux_iter()?.collect::<anyhow::Result<_>>()?;
+
+    // Build a set of child directory IDs that the server denied access to
+    // (path ACL restriction). These are directories containing .slacl files.
+    //
+    // Naming mapping (B2): The Sapling layer uses "has_acl" / "permission_denied"
+    // to describe directories with access restrictions. EdenFS translates this
+    // to "is_restricted" / "isRestricted" to describe the access-denied behavior
+    // from the user's perspective.
+    let restricted_set: HashSet<HgId> = build_restricted_set(tree.as_ref());
 
     // Pre-allocate the per-entry storage.
     if let Some(hint) = tree.size_hint() {
@@ -528,6 +573,9 @@ fn add_tree_to_builder(
             }
         };
 
+        let is_restricted =
+            matches!(flag, TreeItemFlag::Directory) && restricted_set.contains(&node);
+
         if let Some(aux) = aux_map.get(&node) {
             builder.as_mut().add_entry_with_aux_data(
                 name.as_str(),
@@ -536,11 +584,12 @@ fn add_tree_to_builder(
                 aux.total_size,
                 aux.sha1.as_byte_array(),
                 aux.blake3.as_byte_array(),
+                is_restricted,
             );
         } else {
             builder
                 .as_mut()
-                .add_entry(name.as_str(), node.as_byte_array(), ttype);
+                .add_entry(name.as_str(), node.as_byte_array(), ttype, is_restricted);
         }
     }
 
@@ -567,7 +616,7 @@ pub fn sapling_backingstore_get_tree_batch(
     let fetch_mode = FetchMode::from(fetch_mode);
 
     store.get_tree_batch(
-        FetchContext::new_with_cause(fetch_mode, cause),
+        FetchContext::new_with_mode_and_cause(fetch_mode, cause),
         keys,
         |idx, result| {
             let req = &requests[idx];
@@ -624,7 +673,7 @@ pub fn sapling_backingstore_get_tree_aux(
 ) -> ffi::GetTreeAuxResult {
     // the cause is not propagated for this API
     let res = store.get_tree_aux(
-        FetchContext::new_with_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
+        FetchContext::new_with_mode_and_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
         node,
     );
     let (data, error) = resolve_result!(res, transform_some: |aux: DirectoryMetadata| SharedPtr::new(aux.into()), replace_none: SharedPtr::null());
@@ -641,7 +690,7 @@ pub fn sapling_backingstore_get_tree_aux_batch(
     let cause = select_cause(requests.iter().map(|req| req.cause)).0;
 
     store.get_tree_aux_batch(
-        FetchContext::new_with_cause(FetchMode::from(fetch_mode), cause),
+        FetchContext::new_with_mode_and_cause(FetchMode::from(fetch_mode), cause),
         keys,
         |idx, result| {
             let result = result.and_then(|opt| opt.ok_or_else(|| Error::msg("no aux data found")));
@@ -664,7 +713,7 @@ pub fn sapling_backingstore_get_blob(
 ) -> ffi::GetBlobResult {
     // the cause is not propagated for this API
     let res = store.get_blob(
-        FetchContext::new_with_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
+        FetchContext::new_with_mode_and_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
         node,
     );
     let (data, error) = resolve_result!(res, transform_some: |blob: blob::Blob| blob.into_iobuf().into(), replace_none: UniquePtr::null());
@@ -689,7 +738,7 @@ pub fn sapling_backingstore_get_blob_batch(
     }
 
     store.get_blob_batch(
-        FetchContext::new_with_cause(fetch_mode, cause),
+        FetchContext::new_with_mode_and_cause(fetch_mode, cause),
         keys,
         |idx, result| {
             let resolver = resolver.clone();
@@ -725,7 +774,7 @@ pub fn sapling_backingstore_get_file_aux(
 ) -> ffi::GetFileAuxResult {
     // the cause is not propagated for this API
     let res = store.get_file_aux(
-        FetchContext::new_with_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
+        FetchContext::new_with_mode_and_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
         node,
     );
 
@@ -743,10 +792,10 @@ pub fn sapling_backingstore_get_file_aux_batch(
     let cause = select_cause(requests.iter().map(|req| req.cause)).0;
 
     store.get_file_aux_batch(
-        FetchContext::new_with_cause(FetchMode::from(fetch_mode), cause),
+        FetchContext::new_with_mode_and_cause(FetchMode::from(fetch_mode), cause),
         keys,
         |idx, result| {
-            let result: Result<ScmStoreFileAuxData> =
+            let result: anyhow::Result<ScmStoreFileAuxData> =
                 result.and_then(|opt| opt.ok_or_else(|| Error::msg("no file aux data found")));
             let resolver = resolver.clone();
             let (error, aux) = match result {
@@ -761,7 +810,7 @@ pub fn sapling_backingstore_get_file_aux_batch(
 }
 
 pub fn sapling_dogfooding_host(store: &BackingStore) -> Result<bool> {
-    store.dogfooding_host()
+    store.dogfooding_host().map_err(Into::into)
 }
 
 pub fn sapling_backingstore_set_parent_hint(store: &BackingStore, parent_id: &str) {
@@ -770,7 +819,7 @@ pub fn sapling_backingstore_set_parent_hint(store: &BackingStore, parent_id: &st
 
 pub fn sapling_backingstore_flush(store: &BackingStore) {
     store.flush();
-    store.refresh();
+    store.sync();
 }
 
 pub fn sapling_backingstore_get_glob_files(
@@ -788,6 +837,23 @@ pub fn sapling_backingstore_get_glob_files(
         files
     }), replace_none: SharedPtr::null());
     ffi::GetGlobFilesResult { data, error }
+}
+
+pub fn sapling_backingstore_check_permission(
+    store: &BackingStore,
+    manifest_id: &[u8],
+) -> ffi::CheckPermissionResult {
+    let res = store.check_permission(manifest_id);
+    match res {
+        Ok(has_access) => ffi::CheckPermissionResult {
+            has_access,
+            error: UniquePtr::null(),
+        },
+        Err(e) => ffi::CheckPermissionResult {
+            has_access: false,
+            error: into_backingstore_err(e),
+        },
+    }
 }
 
 pub fn sapling_backingstore_witness_file_read(

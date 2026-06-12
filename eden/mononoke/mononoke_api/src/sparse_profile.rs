@@ -23,10 +23,12 @@ use futures::stream;
 use futures::try_join;
 use futures_ext::FbStreamExt;
 use futures_watchdog::WatchdogExt;
+use manifest::Entry;
+use manifest::Manifest;
 use maplit::btreeset;
 use metaconfig_types::SparseProfilesConfig;
 use mononoke_types::NonRootMPath;
-use mononoke_types::fsnode::FsnodeEntry;
+use mononoke_types::content_manifest::compat;
 use mononoke_types::path::MPath;
 use pathmatcher::DirectoryMatch;
 use pathmatcher::Matcher;
@@ -73,8 +75,7 @@ impl SparseProfileMonitoring {
     ) -> Result<Self, MononokeError> {
         let sparse_config = maybe_sparse_config.ok_or_else(|| {
             MononokeError::from(anyhow!(
-                "There isn't sparse profiles monitoring config in repo {}",
-                repo_name
+                "There isn't sparse profiles monitoring config in repo {repo_name}"
             ))
         })?;
         let rules: Vec<_> = vec![format!("{}/**", sparse_config.sparse_profiles_location)]
@@ -88,16 +89,16 @@ impl SparseProfileMonitoring {
             .collect();
         let profiles_location_with_excludes_matcher =
             pathmatcher::TreeMatcher::from_rules(rules.iter(), true).context(format!(
-                "Couldn't create profiles config matcher for repo {} from rules {:?}",
-                repo_name, rules,
+                "Couldn't create profiles config matcher for repo {repo_name} from rules {rules:?}",
             ))?;
         let exact_profiles_matcher = match monitoring_profiles {
-            MonitoringProfiles::Exact { ref profiles } => {
-                pathmatcher::TreeMatcher::from_rules(profiles.iter(), true).context(format!(
-                    "Couldn't create exact profiles matcher for repo {} from rules {:?}",
-                    repo_name, rules,
-                ))?
-            }
+            MonitoringProfiles::Exact { ref profiles } => pathmatcher::TreeMatcher::from_rules(
+                profiles.iter(),
+                true,
+            )
+            .context(format!(
+                "Couldn't create exact profiles matcher for repo {repo_name} from rules {rules:?}",
+            ))?,
             // In that case exact_proifles_matcher will not be used, however making it Option
             // brings in some unnecessary complexity, so I just cloned existing matcher.
             MonitoringProfiles::All => profiles_location_with_excludes_matcher.clone(),
@@ -146,7 +147,7 @@ impl SparseProfileMonitoring {
                         let matcher = self
                             .monitoring_profiles_only_matcher
                             .as_ref()
-                            .map_or_else(|| &self.profiles_location_with_excludes_matcher, |m| m);
+                            .unwrap_or(&self.profiles_location_with_excludes_matcher);
                         Ok(match matcher.matches(path.to_string().as_str()) {
                             // Since None in MPath is a root repo directory
                             // and we are returning list of profiles
@@ -248,7 +249,7 @@ pub(crate) async fn fetch<R: MononokeRepo>(
         .file()
         .watched()
         .await?
-        .ok_or_else(|| anyhow!("Sparse profile {} not found", path))?;
+        .ok_or_else(|| anyhow!("Sparse profile {path} not found"))?;
     file_ctx
         .content_concat()
         .watched()
@@ -294,39 +295,60 @@ async fn calculate_size<'a, R: MononokeRepo>(
     changeset: &'a ChangesetContext<R>,
     matchers: HashMap<String, Arc<dyn Matcher + Send + Sync>>,
 ) -> Result<Out, MononokeError> {
-    let root_fsnode_id = changeset.root_fsnode_id().await?;
+    let root_id = changeset.root_content_manifest_id().await?;
     let root = MPath::ROOT;
     bounded_traversal::bounded_traversal(
         256,
-        (root, *root_fsnode_id.fsnode_id(), matchers),
-        |(path, fsnode_id, matchers)| {
+        (root, root_id, matchers),
+        |(path, manifest_id, matchers)| {
             cloned!(ctx, matchers);
             let blobstore = changeset.repo_ctx().repo().repo_blobstore();
             async move {
                 let mut sizes: Out = HashMap::new();
                 let mut next: HashMap<_, HashMap<_, _>> = HashMap::new();
-                let fsnode = fsnode_id.load(&ctx, blobstore).await?;
-                for (base_name, entry) in fsnode.list() {
-                    let path = path.join_element(Some(base_name));
+                let manifest = manifest_id.load(&ctx, blobstore).await?;
+                let entries: Vec<_> = manifest.list(&ctx, blobstore).await?.try_collect().await?;
+                for (base_name, entry) in entries {
+                    let path = path.join_element(Some(&base_name));
                     let path_vec = path.to_vec();
                     let repo_path = RepoPath::from_utf8(&path_vec)?;
                     match entry {
-                        FsnodeEntry::File(leaf) => {
+                        Entry::Leaf(file) => {
+                            let file: compat::ContentManifestFile = file.into();
                             for (source, matcher) in &matchers {
                                 if matcher.matches_file(repo_path)? {
-                                    *sizes.entry(source.to_string()).or_insert(0) += leaf.size();
+                                    *sizes.entry(source.to_string()).or_insert(0) += file.size();
                                 }
                             }
                         }
-                        FsnodeEntry::Directory(tree) => {
+                        Entry::Tree(dir_id) => {
+                            let mut total_size = None;
                             for (source, matcher) in &matchers {
                                 match matcher.matches_directory(repo_path)? {
                                     DirectoryMatch::Everything => {
-                                        *sizes.entry(source.to_string()).or_insert(0) +=
-                                            tree.summary().descendant_files_total_size;
+                                        let size = match total_size {
+                                            Some(s) => s,
+                                            None => {
+                                                let dir = dir_id.load(&ctx, blobstore).await?;
+                                                let s = match &dir {
+                                                    either::Either::Left(cm) => {
+                                                        cm.subentries
+                                                            .rollup_data()
+                                                            .descendant_counts
+                                                            .files_total_size
+                                                    }
+                                                    either::Either::Right(fsnode) => {
+                                                        fsnode.summary().descendant_files_total_size
+                                                    }
+                                                };
+                                                total_size = Some(s);
+                                                s
+                                            }
+                                        };
+                                        *sizes.entry(source.to_string()).or_insert(0) += size;
                                     }
                                     DirectoryMatch::ShouldTraverse => {
-                                        next.entry((path.clone(), *tree.id()))
+                                        next.entry((path.clone(), dir_id))
                                             .or_default()
                                             .insert(source.clone(), matcher.clone());
                                     }
@@ -340,7 +362,7 @@ async fn calculate_size<'a, R: MononokeRepo>(
                 anyhow::Ok((
                     sizes,
                     next.into_iter()
-                        .map(|((path, fsnode_id), matchers)| (path, fsnode_id, matchers)),
+                        .map(|((path, manifest_id), matchers)| (path, manifest_id, matchers)),
                 ))
             }
             .boxed()
@@ -371,8 +393,7 @@ async fn get_entry_size<R: MononokeRepo>(
     match content.entry().await? {
         PathEntry::File(file, _) => Ok(file.metadata().await?.total_size),
         PathEntry::Tree(_) => Err(MononokeError::from(anyhow!(
-            "Got Tree entry for the diff, while requested Files only. Path {}",
-            path
+            "Got Tree entry for the diff, while requested Files only. Path {path}"
         ))),
         PathEntry::NotPresent => Ok(0),
     }
@@ -440,7 +461,7 @@ async fn get_bonsai_size_change<R: MononokeRepo>(
                         size_change,
                     }])
                 }
-                _ => Err(anyhow!("Encountered invalid diff item: {:?}", diff)),
+                _ => Err(anyhow!("Encountered invalid diff item: {diff:?}")),
             }
         })
         .buffered(100)
@@ -499,7 +520,7 @@ pub async fn calculate_delta_size<'a, R: MononokeRepo>(
         .collect();
     let profile_configs_change =
         calculate_profile_config_change(ctx, monitor, current, other, sparse_config_change).await?;
-    sizes.extend(profile_configs_change.into_iter());
+    sizes.extend(profile_configs_change);
     Ok(sizes
         .into_iter()
         .filter(|(_, size)| {

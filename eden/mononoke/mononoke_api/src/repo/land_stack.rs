@@ -49,9 +49,7 @@ impl<R: MononokeRepo> RepoContext<R> {
             .await?
         {
             None => anyhow::bail!(
-                "Bookmark: unexpected absence of CommitSyncOutcome for {} in {:?}",
-                large_cs_id,
-                syncer
+                "Bookmark: unexpected absence of CommitSyncOutcome for {large_cs_id} in {syncer:?}"
             ),
             // EquivalentWorkingCopyAncestor is fine because the bookmark commit in the
             // large repo might not have come from the small repo
@@ -60,10 +58,7 @@ impl<R: MononokeRepo> RepoContext<R> {
                 Ok(Small(Some(small_cs_id)))
             }
             Some(outcome) => anyhow::bail!(
-                "Bookmark: unexpected CommitSyncOutcome for {} in {:?}: {:?}",
-                large_cs_id,
-                syncer,
-                outcome
+                "Bookmark: unexpected CommitSyncOutcome for {large_cs_id} in {syncer:?}: {outcome:?}"
             ),
         }
     }
@@ -81,6 +76,8 @@ impl<R: MononokeRepo> RepoContext<R> {
             rebased_changesets,
             pushrebase_distance,
             log_id,
+            merge_resolved_paths,
+            merge_summary,
         }) = outcome;
         redirector.ensure_backsynced(ctx, log_id).await?;
 
@@ -98,10 +95,18 @@ impl<R: MononokeRepo> RepoContext<R> {
             rebased_changesets,
             pushrebase_distance,
             log_id,
+            merge_resolved_paths,
+            merge_summary,
         }))
     }
 
     /// Land a stack of commits to a bookmark via pushrebase.
+    ///
+    /// The `MERGE_RESOLUTION_OVERRIDE` pushvar (if present) is parsed
+    /// from `pushvars` here and forwarded to `normal_pushrebase`. Absent
+    /// → defer to the `pushrebase_enable_merge_resolution` JK; `"true"` /
+    /// `"1"` → `ForceOn`; `"false"` / `"0"` → `ForceOff`. Callers don't
+    /// need to interpret the pushvar themselves.
     pub async fn land_stack(
         &self,
         bookmark: impl AsRef<str>,
@@ -126,8 +131,7 @@ impl<R: MononokeRepo> RepoContext<R> {
             .await?
         {
             return Err(MononokeError::InvalidRequest(format!(
-                "Not a stack: base commit {} is not an ancestor of head commit {}",
-                base, head,
+                "Not a stack: base commit {base} is not an ancestor of head commit {head}",
             )));
         }
 
@@ -155,7 +159,8 @@ impl<R: MononokeRepo> RepoContext<R> {
             .try_collect()
             .await?;
 
-        let outcome = if let Some(redirector) = self.push_redirector.as_ref() {
+        let push_redirector = self.push_redirector().await?;
+        let outcome = if let Some(redirector) = push_redirector.as_ref() {
             // run hooks on small repo
             bookmarks_movement::run_changeset_hooks(
                 ctx,

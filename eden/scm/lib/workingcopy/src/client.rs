@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use anyhow::bail;
+use configmodel::Config;
 use gitcompat::GitCmd;
 use gitcompat::rungit::RepoGit;
 use types::HgId;
@@ -47,6 +48,7 @@ pub trait WorkingCopyClient: Send + Sync {
     /// Checkout. Set parents and update working copy content.
     fn checkout(
         &self,
+        config: &dyn Config,
         node: HgId,
         tree_node: HgId,
         mode: CheckoutMode,
@@ -74,12 +76,13 @@ impl WorkingCopyClient for edenfs_client::EdenFsClient {
 
     fn checkout(
         &self,
+        config: &dyn Config,
         node: HgId,
         tree_node: HgId,
         mode: edenfs_client::CheckoutMode,
     ) -> Result<Vec<CheckoutConflict>> {
         tracing::debug!(p1=?node, p1_tree=?tree_node, mode=?mode, "checkout");
-        edenfs_client::EdenFsClient::checkout(self, node, tree_node, mode)
+        edenfs_client::EdenFsClient::checkout(self, config, node, tree_node, mode)
     }
 
     fn checkout_progress(&self) -> Result<Option<ProgressInfo>> {
@@ -154,8 +157,12 @@ impl WorkingCopyClient for RepoGit {
                 if p1_tree.is_null() {
                     p1_tree = GIT_EMPTY_TREE_ID;
                 }
-                let p1_tree_hex = p1_tree.to_hex();
-                self.call("read-tree", &["--no-recurse-submodules", &p1_tree_hex])?;
+                if self.index_fast_path {
+                    self.update_diff_index(p1_tree)?;
+                } else {
+                    let p1_tree_hex = p1_tree.to_hex();
+                    self.call("read-tree", &["--no-recurse-submodules", &p1_tree_hex])?;
+                }
             }
         }
         Ok(())
@@ -163,6 +170,7 @@ impl WorkingCopyClient for RepoGit {
 
     fn checkout(
         &self,
+        _config: &dyn Config,
         node: HgId,
         tree_node: HgId,
         mode: CheckoutMode,

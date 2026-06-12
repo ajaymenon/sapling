@@ -115,11 +115,62 @@ via-profile = "bind"
                 await client.addBindMount(
                     self.mount.encode("utf-8"), rel_mount, dir_to_mount_bytes
                 )
-                self.assertIn(
-                    "PathComponent must not be . or ..",
-                    str(ctx.exception),
-                    msg="Can't mount outside the repo via relative path",
-                )
+            self.assertIn(
+                "PathComponent must not be",
+                str(ctx.exception),
+                msg="Can't mount outside the repo via relative path",
+            )
+
+    def test_bind_redirection_mount(self) -> None:
+        if sys.platform != "linux":
+            self.skipTest("Linux-specific privhelper bind mount validation")
+
+        repo_path = os.path.join("a", "fd-mount")
+        redirection_path = os.path.join(self.mount, repo_path)
+
+        output = self.eden.run_cmd(
+            "redirect", "add", "--mount", self.mount, repo_path, "bind"
+        )
+        self.assertEqual(output, "", msg="we believe we set up a bind mount")
+        self.assertNotEqual(
+            os.stat(self.mount).st_dev,
+            os.stat(redirection_path).st_dev,
+            msg="redirection is mounted on a different device",
+        )
+
+    def test_bind_redirection_unmount(self) -> None:
+        if sys.platform != "linux":
+            self.skipTest("Linux-specific privhelper bind unmount validation")
+
+        repo_path = os.path.join("a", "fd-unmount")
+        redirection_path = os.path.join(self.mount, repo_path)
+
+        output = self.eden.run_cmd(
+            "redirect", "add", "--mount", self.mount, repo_path, "bind"
+        )
+        self.assertEqual(output, "", msg="we believe we set up a bind mount")
+        self.assertNotEqual(
+            os.stat(self.mount).st_dev,
+            os.stat(redirection_path).st_dev,
+            msg="redirection is mounted on a different device",
+        )
+
+        output = self.eden.run_cmd("redirect", "unmount", "--mount", self.mount)
+        self.assertEqual(output, "", msg="we believe we unmounted redirections")
+
+        output = self.eden.run_cmd("redirect", "list", "--json", "--mount", self.mount)
+        self.assertIn(
+            {
+                "repo_path": repo_path,
+                "type": "bind",
+                "target": scratch_path(
+                    self.mount, os.path.join("edenfs", "redirections", repo_path)
+                ),
+                "source": ".eden/client/config.toml:redirections",
+                "state": "not-mounted",
+            },
+            json.loads(output),
+        )
 
     def test_list_with_cli(self) -> None:
         # Redirection via profile

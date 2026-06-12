@@ -20,11 +20,8 @@ use commit_graph_types::edges::Parents;
 use commit_graph_types::storage::CommitGraphStorage;
 use commit_graph_types::storage::Prefetch;
 use context::CoreContext;
-use futures::FutureExt;
+use futures::stream::TryStreamExt;
 use in_memory_commit_graph_storage::InMemoryCommitGraphStorage;
-use justknobs::test_helpers::JustKnobsInMemory;
-use justknobs::test_helpers::KnobVal;
-use justknobs::test_helpers::with_just_knobs_async;
 use maplit::hashmap;
 use maplit::hashset;
 use mononoke_types::ChangesetIdPrefix;
@@ -54,6 +51,7 @@ macro_rules! impl_commit_graph_tests {
             test_storage_store_and_fetch,
             test_is_ancestor_exact_prefetching,
             test_is_ancestor_skew_ancestors_prefetching,
+            test_filter_ancestors,
             test_is_linear_stack,
             test_skip_tree,
             test_p1_linear_tree,
@@ -215,7 +213,7 @@ pub async fn test_storage_store_and_fetch(
             .maybe_fetch_edges(&ctx, name_cs_id("A"))
             .await?
             .unwrap()
-            .merge_ancestor::<Parents>(),
+            .merge_ancestor_or_root::<Parents>(),
         None
     );
     assert_eq!(
@@ -223,7 +221,7 @@ pub async fn test_storage_store_and_fetch(
             .maybe_fetch_edges(&ctx, name_cs_id("C"))
             .await?
             .unwrap()
-            .merge_ancestor::<Parents>(),
+            .merge_ancestor_or_root::<Parents>(),
         Some(&name_cs_node("A", 1, 0, 0))
     );
     assert_eq!(
@@ -231,7 +229,7 @@ pub async fn test_storage_store_and_fetch(
             .maybe_fetch_edges(&ctx, name_cs_id("I"))
             .await?
             .unwrap()
-            .merge_ancestor::<Parents>(),
+            .merge_ancestor_or_root::<Parents>(),
         Some(&name_cs_node("G", 5, 1, 4))
     );
 
@@ -292,26 +290,14 @@ pub async fn test_is_ancestor_exact_prefetching(
     ctx: CoreContext,
     storage: Arc<dyn CommitGraphStorageTest>,
 ) -> Result<()> {
-    with_just_knobs_async(
-        JustKnobsInMemory::new(hashmap![
-            "scm/mononoke:commit_graph_use_skip_tree_exact_prefetching".to_string() => KnobVal::Bool(true)
-        ]),
-        test_is_ancestor_impl(ctx, storage).boxed(),
-    )
-    .await
+    test_is_ancestor_impl(ctx, storage).await
 }
 
 pub async fn test_is_ancestor_skew_ancestors_prefetching(
     ctx: CoreContext,
     storage: Arc<dyn CommitGraphStorageTest>,
 ) -> Result<()> {
-    with_just_knobs_async(
-        JustKnobsInMemory::new(hashmap![
-            "scm/mononoke:commit_graph_use_skip_tree_exact_prefetching".to_string() => KnobVal::Bool(false)
-        ]),
-        test_is_ancestor_impl(ctx, storage).boxed(),
-    )
-    .await
+    test_is_ancestor_impl(ctx, storage).await
 }
 
 async fn test_is_ancestor_impl(
@@ -430,6 +416,93 @@ async fn test_is_ancestor_impl(
             )
             .await?
     );
+
+    Ok(())
+}
+
+pub async fn test_filter_ancestors(
+    ctx: CoreContext,
+    storage: Arc<dyn CommitGraphStorageTest>,
+) -> Result<()> {
+    let graph = from_dag(
+        &ctx,
+        r"
+             A-B-C-D-G-H-I
+              \     /
+               E---F
+         ",
+        storage.clone(),
+    )
+    .await?;
+    storage.flush();
+
+    let all_names = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+
+    // Test 1: All of A,B,C,D,E,F,G,H should be ancestors of I
+    let candidates: Vec<_> = vec!["A", "B", "C", "D", "E", "F", "G", "H"]
+        .into_iter()
+        .map(name_cs_id)
+        .collect();
+    let result: HashSet<_> = graph
+        .filter_ancestors(&ctx, name_cs_id("I"), candidates.clone())
+        .await?
+        .into_iter()
+        .collect();
+    let expected: HashSet<_> = candidates.into_iter().collect();
+    assert_eq!(result, expected);
+
+    // Test 2: Only A,B,C should be ancestors of D (not E,F)
+    let candidates: Vec<_> = vec!["A", "B", "C", "E", "F"]
+        .into_iter()
+        .map(name_cs_id)
+        .collect();
+    let result: HashSet<_> = graph
+        .filter_ancestors(&ctx, name_cs_id("D"), candidates)
+        .await?
+        .into_iter()
+        .collect();
+    let expected: HashSet<_> = vec!["A", "B", "C"].into_iter().map(name_cs_id).collect();
+    assert_eq!(result, expected);
+
+    // Test 3: Empty candidates -> empty result
+    let result = graph
+        .filter_ancestors(&ctx, name_cs_id("I"), vec![])
+        .await?;
+    assert!(result.is_empty());
+
+    // Test 4: Self-ancestry — D is ancestor of D
+    let result: HashSet<_> = graph
+        .filter_ancestors(&ctx, name_cs_id("D"), vec![name_cs_id("D")])
+        .await?
+        .into_iter()
+        .collect();
+    assert_eq!(result, hashset! { name_cs_id("D") });
+
+    // Test 5: No candidates are ancestors of A (I and H are not)
+    let result = graph
+        .filter_ancestors(
+            &ctx,
+            name_cs_id("A"),
+            vec![name_cs_id("I"), name_cs_id("H")],
+        )
+        .await?;
+    assert!(result.is_empty());
+
+    // Test 6: Verify equivalence with individual is_ancestor calls for all commits against G
+    let descendant = name_cs_id("G");
+    let candidates: Vec<_> = all_names.iter().map(|n| name_cs_id(n)).collect();
+    let batch_result: HashSet<_> = graph
+        .filter_ancestors(&ctx, descendant, candidates.clone())
+        .await?
+        .into_iter()
+        .collect();
+    let mut individual_result: HashSet<_> = HashSet::new();
+    for candidate in &candidates {
+        if graph.is_ancestor(&ctx, *candidate, descendant).await? {
+            individual_result.insert(*candidate);
+        }
+    }
+    assert_eq!(batch_result, individual_result);
 
     Ok(())
 }
@@ -698,6 +771,26 @@ pub async fn test_parents_and_subtree_sources_tree(
     assert_parents_and_subtree_sources_common_base(&graph, &ctx, "K", "P", vec!["P"]).await?;
     assert_parents_and_subtree_sources_common_base(&graph, &ctx, "V", "J", vec!["G"]).await?;
     assert_parents_and_subtree_sources_common_base(&graph, &ctx, "F", "U", vec!["Q"]).await?;
+
+    // Test ancestors_within_distance on the parents-and-subtree-sources graph.
+    // G has parent B and subtree source Q. In the parents-and-subtree-sources
+    // view, both are treated as parents, so ancestors_within_distance([G], 1)
+    // should include G (distance 0), B (distance 1), and Q (distance 1).
+    let ancestors_within_distance: HashSet<_> = graph
+        .parents_and_subtree_sources_graph()
+        .ancestors_within_distance_stream(&ctx, vec![name_cs_id("G")], 1)
+        .await?
+        .try_collect()
+        .await?;
+    assert_eq!(
+        ancestors_within_distance,
+        hashset! {
+            (name_cs_id("G"), 0),
+            (name_cs_id("B"), 1),
+            (name_cs_id("Q"), 1),
+        },
+    );
+
     Ok(())
 }
 
@@ -754,6 +847,50 @@ pub async fn test_ancestors_difference_segment_slices(
             &["I"],
             &["J", "K"],
         ],
+    )
+    .await?;
+
+    // No common ancestors → no external parents.
+    assert_ancestors_difference_segment_slices_with_external_parents(
+        &graph,
+        &ctx,
+        &["K"],
+        &[],
+        3,
+        &[
+            &["A", "B", "C"],
+            &["D"],
+            &["E", "F"],
+            &["G", "H", "I"],
+            &["J", "K"],
+        ],
+        &[],
+    )
+    .await?;
+
+    // With common ancestors → external parents are segment parents
+    // that fall outside all segments (i.e. in the common set).
+    // DAG: G has parents D and F, so with common=["D"], both B
+    // (parent of E) and D (parent of G) are external parents.
+    assert_ancestors_difference_segment_slices_with_external_parents(
+        &graph,
+        &ctx,
+        &["K"],
+        &["D"],
+        3,
+        &[&["E", "F"], &["G"], &["H", "I"], &["J"], &["K"]],
+        &["B", "D"],
+    )
+    .await?;
+
+    assert_ancestors_difference_segment_slices_with_external_parents(
+        &graph,
+        &ctx,
+        &["K"],
+        &["H"],
+        3,
+        &[&["I"], &["J", "K"]],
+        &["H"],
     )
     .await?;
 

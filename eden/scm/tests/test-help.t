@@ -1,17 +1,17 @@
 #chg-compatible
-#require no-fsmonitor
-#debugruntest-incompatible
+#inprocess-hg-incompatible
+#require no-fsmonitor no-eden
 
   $ setconfig alias.ssl:doc="show a graph of your commits and associated Diff information"
 Short help:
 
-  $ hg
+  $ sl
   Sapling SCM
   
-  hg COMMAND [OPTIONS]
+  sl COMMAND [OPTIONS]
   
-  These are some common Sapling commands.  Use 'hg help commands' to list all
-  commands, and 'hg help COMMAND' to get help on a specific command.
+  These are some common Sapling commands.  Use 'sl help commands' to list all
+  commands, and 'sl help COMMAND' to get help on a specific command.
   
   Get the latest commits from the server:
   
@@ -39,20 +39,32 @@ Short help:
   Commit changes and modify commits:
   
    commit        save all pending changes or specified files in a new commit
+   amend         meld pending changes into the current commit
+   metaedit      edit commit message and other metadata
   
   Rearrange commits:
   
    graft         copy commits from a different location
+   hide          hide commits and their descendants
+   unhide        unhide commits and their ancestors
+  
+  Work with stacks of commits:
+  
+   previous      check out an ancestor commit
+   next          check out a descendant commit
+   split         split a commit into smaller commits
+   fold          combine multiple commits into a single commit
   
   Undo changes:
   
    uncommit      uncommit part or all of the current commit
+   unamend       undo the last amend operation on the current commit
   
   Other commands:
   
    config        show config settings
    doctor        attempt to check and fix issues
-   grep          search for a pattern in tracked files in the working directory
+   grep          search for a pattern in tracked files
    web           launch Sapling Web GUI on localhost
   
   Additional help topics:
@@ -63,13 +75,13 @@ Short help:
    revisions     specifying commits
    templating    customizing output with templates
 
-  $ hg -q
+  $ sl -q
   Sapling SCM
   
-  hg COMMAND [OPTIONS]
+  sl COMMAND [OPTIONS]
   
-  These are some common Sapling commands.  Use 'hg help commands' to list all
-  commands, and 'hg help COMMAND' to get help on a specific command.
+  These are some common Sapling commands.  Use 'sl help commands' to list all
+  commands, and 'sl help COMMAND' to get help on a specific command.
   
   Get the latest commits from the server:
   
@@ -97,20 +109,32 @@ Short help:
   Commit changes and modify commits:
   
    commit        save all pending changes or specified files in a new commit
+   amend         meld pending changes into the current commit
+   metaedit      edit commit message and other metadata
   
   Rearrange commits:
   
    graft         copy commits from a different location
+   hide          hide commits and their descendants
+   unhide        unhide commits and their ancestors
+  
+  Work with stacks of commits:
+  
+   previous      check out an ancestor commit
+   next          check out a descendant commit
+   split         split a commit into smaller commits
+   fold          combine multiple commits into a single commit
   
   Undo changes:
   
    uncommit      uncommit part or all of the current commit
+   unamend       undo the last amend operation on the current commit
   
   Other commands:
   
    config        show config settings
    doctor        attempt to check and fix issues
-   grep          search for a pattern in tracked files in the working directory
+   grep          search for a pattern in tracked files
    web           launch Sapling Web GUI on localhost
   
   Additional help topics:
@@ -121,13 +145,13 @@ Short help:
    revisions     specifying commits
    templating    customizing output with templates
 
-  $ hg help
+  $ sl help
   Sapling SCM
   
-  hg COMMAND [OPTIONS]
+  sl COMMAND [OPTIONS]
   
-  These are some common Sapling commands.  Use 'hg help commands' to list all
-  commands, and 'hg help COMMAND' to get help on a specific command.
+  These are some common Sapling commands.  Use 'sl help commands' to list all
+  commands, and 'sl help COMMAND' to get help on a specific command.
   
   Get the latest commits from the server:
   
@@ -155,20 +179,32 @@ Short help:
   Commit changes and modify commits:
   
    commit        save all pending changes or specified files in a new commit
+   amend         meld pending changes into the current commit
+   metaedit      edit commit message and other metadata
   
   Rearrange commits:
   
    graft         copy commits from a different location
+   hide          hide commits and their descendants
+   unhide        unhide commits and their ancestors
+  
+  Work with stacks of commits:
+  
+   previous      check out an ancestor commit
+   next          check out a descendant commit
+   split         split a commit into smaller commits
+   fold          combine multiple commits into a single commit
   
   Undo changes:
   
    uncommit      uncommit part or all of the current commit
+   unamend       undo the last amend operation on the current commit
   
   Other commands:
   
    config        show config settings
    doctor        attempt to check and fix issues
-   grep          search for a pattern in tracked files in the working directory
+   grep          search for a pattern in tracked files
    web           launch Sapling Web GUI on localhost
   
   Additional help topics:
@@ -179,13 +215,13 @@ Short help:
    revisions     specifying commits
    templating    customizing output with templates
 
-  $ hg -q help
+  $ sl -q help
   Sapling SCM
   
-  hg COMMAND [OPTIONS]
+  sl COMMAND [OPTIONS]
   
-  These are some common Sapling commands.  Use 'hg help commands' to list all
-  commands, and 'hg help COMMAND' to get help on a specific command.
+  These are some common Sapling commands.  Use 'sl help commands' to list all
+  commands, and 'sl help COMMAND' to get help on a specific command.
   
   Get the latest commits from the server:
   
@@ -213,20 +249,32 @@ Short help:
   Commit changes and modify commits:
   
    commit        save all pending changes or specified files in a new commit
+   amend         meld pending changes into the current commit
+   metaedit      edit commit message and other metadata
   
   Rearrange commits:
   
    graft         copy commits from a different location
+   hide          hide commits and their descendants
+   unhide        unhide commits and their ancestors
+  
+  Work with stacks of commits:
+  
+   previous      check out an ancestor commit
+   next          check out a descendant commit
+   split         split a commit into smaller commits
+   fold          combine multiple commits into a single commit
   
   Undo changes:
   
    uncommit      uncommit part or all of the current commit
+   unamend       undo the last amend operation on the current commit
   
   Other commands:
   
    config        show config settings
    doctor        attempt to check and fix issues
-   grep          search for a pattern in tracked files in the working directory
+   grep          search for a pattern in tracked files
    web           launch Sapling Web GUI on localhost
   
   Additional help topics:
@@ -238,7 +286,7 @@ Short help:
    templating    customizing output with templates
 
 Test extension help:
-  $ hg help extensions --config extensions.rebase= --config extensions.children=
+  $ sl help extensions --config extensions.rebase= --config extensions.children=
   Using Additional Features
   """""""""""""""""""""""""
   
@@ -258,7 +306,7 @@ Test extension help:
         [extensions]
         myfeature = ~/.ext/myfeature.py
   
-      See 'hg help config' for more information on configuration files.
+      See 'sl help config' for more information on configuration files.
   
       Extensions are not loaded by default for a variety of reasons: they can
       increase startup overhead; they may be meant for advanced usage only; they
@@ -278,8 +326,10 @@ Test extension help:
   
       Enabled extensions:
   
+       amend         extends the existing commit amend functionality
+       commitcloud   back up and sync changesets via the cloud
        conflictinfo
-       eden          accelerated hg functionality in Eden checkouts (eden !)
+       eden          accelerated sl functionality in Eden checkouts (eden !)
        debugshell    a python shell with repo, changelog & manifest objects
        errorredirect
                      redirect error message
@@ -300,16 +350,12 @@ Test extension help:
       Disabled extensions:
   
        absorb        apply working directory changes to changesets
-       amend         extends the existing commit amend functionality
        arcdiff       (no help text available)
        blackbox      log repository events to a blackbox for debugging
-       checkserverbookmark
-                     (no help text available)
        chistedit
        clienttelemetry
                      provide information about the client in server telemetry
        clonebundles  advertise pre-generated bundles to seed clones
-       commitcloud   back up and sync changesets via the cloud
        crdump        (no help text available)
        debugnetwork  test network connections to the server
        dialect       replace terms with more widely used equivalents
@@ -356,25 +402,40 @@ Test extension help:
 
 Only show documented aliases:
 
-  $ hg help goto | grep '^aliases:'
-  aliases: goto, go
+  $ sl help goto | grep '^aliases:'
+  aliases: go
+
+Rust-only commands expose Rust aliases in help:
+
+  $ sl debuglfsreceive --help | grep '^aliases:'
+  aliases: debuglfsrecv
+
+Commands implemented in both Rust and Python keep Python aliases in help:
+
+  $ sl config --help | grep '^aliases:'
+  aliases: conf
+
+  $ sl showconfig --help
+  unknown command 'showconfig'
+  (use 'sl help' to get help)
+  [255]
 
 Verify that extension keywords appear in help templates
 
-  $ hg help --config extensions.fbcodereview= templating|grep phabdiff > /dev/null
+  $ sl help --config extensions.fbcodereview= templating|grep phabdiff > /dev/null
 
 Normal help for add
 
-  $ hg add -h
-  hg add [OPTION]... [FILE]...
+  $ sl add -h
+  sl add [OPTION]... [FILE]...
   
   start tracking the specified files
   
       Specify files to be tracked by Sapling. The files will be added to the
       repository at the next commit.
   
-      To undo an add before files have been committed, use 'hg forget'. To undo
-      an add after files have been committed, use 'hg rm'.
+      To undo an add before files have been committed, use 'sl forget'. To undo
+      an add after files have been committed, use 'sl rm'.
   
       If no names are given, add all files to the repository (except files
       matching ".gitignore").
@@ -391,42 +452,42 @@ Normal help for add
 
 Verbose help for add
 
-  $ hg add -hv
-  hg add [OPTION]... [FILE]...
+  $ sl add -hv
+  sl add [OPTION]... [FILE]...
   
   start tracking the specified files
   
       Specify files to be tracked by Sapling. The files will be added to the
       repository at the next commit.
   
-      To undo an add before files have been committed, use 'hg forget'. To undo
-      an add after files have been committed, use 'hg rm'.
+      To undo an add before files have been committed, use 'sl forget'. To undo
+      an add after files have been committed, use 'sl rm'.
   
       If no names are given, add all files to the repository (except files
       matching ".gitignore").
   
       Examples:
   
-        - New (unknown) files are added automatically by 'hg add':
+        - New (unknown) files are added automatically by 'sl add':
   
             $ ls
             foo.c
-            $ hg status
+            $ sl status
             ? foo.c
-            $ hg add
+            $ sl add
             adding foo.c
-            $ hg status
+            $ sl status
             A foo.c
   
         - Add specific files:
   
             $ ls
             bar.c  foo.c
-            $ hg status
+            $ sl status
             ? bar.c
             ? foo.c
-            $ hg add bar.c
-            $ hg status
+            $ sl add bar.c
+            $ sl status
             A bar.c
             ? foo.c
   
@@ -472,8 +533,8 @@ Verbose help for add
 
 Test the textwidth config option
 
-  $ hg root -h  --config ui.textwidth=50
-  hg root
+  $ sl root -h  --config ui.textwidth=50
+  sl root
   
   print the repository's root (top) of the current
   working directory
@@ -484,7 +545,7 @@ Test the textwidth config option
       Frequently useful in shells scripts and
       automation to run commands like:
   
-        $ $(hg root)/bin/script.py
+        $ $(sl root)/bin/script.py
   
       Returns 0 on success.
   
@@ -496,10 +557,10 @@ Test the textwidth config option
   complete help)
 Test help on a self-referencing alias that is a rust command
 
-  $ hg --config "alias.root=root --shared" help root
+  $ sl --config "alias.root=root --shared" help root
   alias for: root --shared
   
-  hg root
+  sl root
   
   print the repository's root (top) of the current working directory
   
@@ -507,7 +568,7 @@ Test help on a self-referencing alias that is a rust command
   
       Frequently useful in shells scripts and automation to run commands like:
   
-        $ $(hg root)/bin/script.py
+        $ $(sl root)/bin/script.py
   
       Returns 0 on success.
   
@@ -516,10 +577,10 @@ Test help on a self-referencing alias that is a rust command
     --shared show root of the shared repo
   
   (some details hidden, use --verbose to show complete help)
-  $ hg --config "alias.root=root --shared" root -h
+  $ sl --config "alias.root=root --shared" root -h
   alias for: root --shared
   
-  hg root
+  sl root
   
   print the repository's root (top) of the current working directory
   
@@ -527,7 +588,7 @@ Test help on a self-referencing alias that is a rust command
   
       Frequently useful in shells scripts and automation to run commands like:
   
-        $ $(hg root)/bin/script.py
+        $ $(sl root)/bin/script.py
   
       Returns 0 on success.
   
@@ -539,15 +600,15 @@ Test help on a self-referencing alias that is a rust command
 
 Test ambiguous command help
 
-  $ hg help ad
+  $ sl help ad
   abort: no such help topic: ad
-  (try 'hg help --keyword ad')
+  (try 'sl help --keyword ad')
   [255]
 
 Test command without options
 
-  $ hg help verify
-  hg verify
+  $ sl help verify
+  sl verify
   
   verify the integrity of the repository
   
@@ -559,8 +620,8 @@ Test command without options
   
   (some details hidden, use --verbose to show complete help)
 
-  $ hg help diff
-  hg diff [OPTION]... ([-c REV] | [-r REV1 [-r REV2]]) [FILE]...
+  $ sl help diff
+  sl diff [OPTION]... ([-c REV] | [-r REV1 [-r REV2]]) [FILE]...
   
   aliases: d
   
@@ -578,14 +639,14 @@ Test command without options
   
       By default, diffs are shown using the unified diff format. Specify "-g" to
       generate diffs in the git extended diff format. For more information, see
-      'hg help diffs'.
+      'sl help diffs'.
   
       "--from-path" and "--to-path" allow diffing between directories. Files
-      outside "--from-path" in the left side are ignored. See 'hg help
+      outside "--from-path" in the left side are ignored. See 'sl help
       directorybranching' for more information.
   
       Note:
-         'hg diff' might generate unexpected results during merges because it
+         'sl diff' might generate unexpected results during merges because it
          defaults to comparing against your working copy's first parent commit
          if no commits are specified.
   
@@ -616,8 +677,8 @@ Test command without options
   
   (some details hidden, use --verbose to show complete help)
 
-  $ hg help status
-  hg status [OPTION]... [FILE]...
+  $ sl help status
+  sl status [OPTION]... [FILE]...
   
   aliases: st
   
@@ -630,7 +691,7 @@ Test command without options
         A = added
         R = removed
         C = clean
-        ! = missing (deleted by a non-hg command, but still tracked)
+        ! = missing (deleted by a non-sl command, but still tracked)
         ? = not tracked
         I = ignored
           = origin of the previous file (with --copies)
@@ -653,9 +714,13 @@ Test command without options
       the changed files of a revision from its first parent.
   
       Note:
-         'hg status' might appear to disagree with 'hg diff' if permissions have
+         "-A/--all", "-c/--clean" can be extremely slow in large repositories
+         because they scan all tracked files.
+  
+      Note:
+         'sl status' might appear to disagree with 'sl diff' if permissions have
          changed or a merge has occurred, because the standard diff format does
-         not report permission changes and 'hg diff' only reports changes
+         not report permission changes and 'sl diff' only reports changes
          relative to one merge parent.
   
       Returns 0 on success.
@@ -681,55 +746,55 @@ Test command without options
   
   (some details hidden, use --verbose to show complete help)
 
-  $ hg -q help status
-  hg status [OPTION]... [FILE]...
+  $ sl -q help status
+  sl status [OPTION]... [FILE]...
   
   list files with pending changes
 
-  $ hg help foo
+  $ sl help foo
   abort: no such help topic: foo
-  (try 'hg help --keyword foo')
+  (try 'sl help --keyword foo')
   [255]
 
-  $ hg skjdfks
+  $ sl skjdfks
   unknown command 'skjdfks'
-  (use 'hg help' to get help)
+  (use 'sl help' to get help)
   [255]
 
 Typoed command gives suggestion
-  $ hg puls
+  $ sl puls
   unknown command 'puls'
-  (use 'hg help' to get help)
+  (use 'sl help' to get help)
   [255]
 
 Not enabled extension gets suggested
 
-  $ hg rebase
+  $ sl rebase
   unknown command 'rebase'
-  (use 'hg help' to get help)
+  (use 'sl help' to get help)
   [255]
 
 Disabled extension gets suggested
-  $ hg --config extensions.rebase=! rebase
+  $ sl --config extensions.rebase=! rebase
   unknown command 'rebase'
-  (use 'hg help' to get help)
+  (use 'sl help' to get help)
   [255]
 
 Make sure that we don't run afoul of the help system thinking that
 this is a section and erroring out weirdly.
 
-  $ hg .log
+  $ sl .log
   unknown command '.log'
-  (use 'hg help' to get help)
+  (use 'sl help' to get help)
   [255]
 
-  $ hg log.
+  $ sl log.
   unknown command 'log.'
-  (use 'hg help' to get help)
+  (use 'sl help' to get help)
   [255]
-  $ hg pu.lh
+  $ sl pu.lh
   unknown command 'pu.lh'
-  (use 'hg help' to get help)
+  (use 'sl help' to get help)
   [255]
 
   $ cat > helpext.py <<EOF
@@ -743,7 +808,7 @@ this is a section and erroring out weirdly.
   >     [('', 'longdesc', 3, 'x'*90),
   >     ('n', '', None, 'normal desc'),
   >     ('', 'newline', '', 'line1\nline2')],
-  >     'hg nohelp',
+  >     'sl nohelp',
   >     norepo=True)
   > @command('debugoptADV', [('', 'aopt', None, 'option is (ADVANCED)')])
   > @command('debugoptDEP', [('', 'dopt', None, 'option is (DEPRECATED)')])
@@ -761,10 +826,10 @@ this is a section and erroring out weirdly.
 
 Test for aliases
 
-  $ hg help hgalias
+  $ sl help hgalias
   alias for: summary
   
-  hg summary [--remote]
+  sl summary [--remote]
   
   aliases: su
   
@@ -784,10 +849,10 @@ Test for aliases
   
   (some details hidden, use --verbose to show complete help)
 
-  $ hg help shellalias
+  $ sl help shellalias
   alias for: debugrunshell --cmd=echo hi
   
-  hg debugrunshell
+  sl debugrunshell
   
   run a shell command
   
@@ -799,8 +864,8 @@ Test for aliases
 
 Test command with no help text
 
-  $ hg help nohelp
-  hg nohelp
+  $ sl help nohelp
+  sl nohelp
   
   (no help text available)
   
@@ -813,10 +878,10 @@ Test command with no help text
   
   (some details hidden, use --verbose to show complete help)
 
-  $ hg help -k nohelp
+  $ sl help -k nohelp
   Commands:
   
-   nohelp hg nohelp
+   nohelp sl nohelp
   
   Extension Commands:
   
@@ -825,22 +890,22 @@ Test command with no help text
 Commands in disabled extensions gets suggested even if there is no help text
 for the module itself.
 
-  $ hg help --config 'extensions.helpext=!'`pwd`/helpext.py nohelp
+  $ sl help --config 'extensions.helpext=!'`pwd`/helpext.py nohelp
   'nohelp' is provided by the following extension:
   
       helpext       (no help text available)
   
-  (use 'hg help extensions' for information on enabling extensions)
+  (use 'sl help extensions' for information on enabling extensions)
 
 Test that default list of commands omits extension commands
 
-  $ hg help
+  $ sl help
   Sapling SCM
   
-  hg COMMAND [OPTIONS]
+  sl COMMAND [OPTIONS]
   
-  These are some common Sapling commands.  Use 'hg help commands' to list all
-  commands, and 'hg help COMMAND' to get help on a specific command.
+  These are some common Sapling commands.  Use 'sl help commands' to list all
+  commands, and 'sl help COMMAND' to get help on a specific command.
   
   Get the latest commits from the server:
   
@@ -868,20 +933,32 @@ Test that default list of commands omits extension commands
   Commit changes and modify commits:
   
    commit        save all pending changes or specified files in a new commit
+   amend         meld pending changes into the current commit
+   metaedit      edit commit message and other metadata
   
   Rearrange commits:
   
    graft         copy commits from a different location
+   hide          hide commits and their descendants
+   unhide        unhide commits and their ancestors
+  
+  Work with stacks of commits:
+  
+   previous      check out an ancestor commit
+   next          check out a descendant commit
+   split         split a commit into smaller commits
+   fold          combine multiple commits into a single commit
   
   Undo changes:
   
    uncommit      uncommit part or all of the current commit
+   unamend       undo the last amend operation on the current commit
   
   Other commands:
   
    config        show config settings
    doctor        attempt to check and fix issues
-   grep          search for a pattern in tracked files in the working directory
+   grep          search for a pattern in tracked files
    web           launch Sapling Web GUI on localhost
   
   Additional help topics:
@@ -895,14 +972,14 @@ Test that default list of commands omits extension commands
 
 Test list of internal help commands
 
-  $ hg help debug | grep -E 'Debug|debugshell|debugapi'
+  $ sl help debug | grep -E 'Debug|debugshell|debugapi'
   Debug commands (internal and unsupported):
    debugapi      send an SaplingRemoteAPI request and print its output
    debugshell    launch an interactive Python shell or execute Python code
 
 Test list of commands with command with no help text
 
-  $ hg help helpext
+  $ sl help helpext
   helpext extension - no help text available
   
   Commands:
@@ -911,48 +988,48 @@ Test list of commands with command with no help text
 
 
 test advanced, deprecated and experimental options are hidden in command help
-  $ hg help debugoptADV
-  hg debugoptADV
+  $ sl help debugoptADV
+  sl debugoptADV
   
   (no help text available)
   
   (some details hidden, use --verbose to show complete help)
-  $ hg help debugoptDEP
-  hg debugoptDEP
+  $ sl help debugoptDEP
+  sl debugoptDEP
   
   (no help text available)
   
   (some details hidden, use --verbose to show complete help)
 
-  $ hg help debugoptEXP
-  hg debugoptEXP
+  $ sl help debugoptEXP
+  sl debugoptEXP
   
   (no help text available)
   
   (some details hidden, use --verbose to show complete help)
 
 test advanced, deprecated and experimental options are shown with -v
-  $ hg help -v debugoptADV | grep aopt
+  $ sl help -v debugoptADV | grep aopt
     --aopt option is (ADVANCED)
-  $ hg help -v debugoptDEP | grep dopt
+  $ sl help -v debugoptDEP | grep dopt
     --dopt option is (DEPRECATED)
-  $ hg help -v debugoptEXP | grep eopt
+  $ sl help -v debugoptEXP | grep eopt
     --eopt option is (EXPERIMENTAL)
 
 Test commands that collide with topics (issue4240)
 
-  $ hg config -hq
-  hg config [OPTION]... [NAME]...
+  $ sl config -hq
+  sl config [OPTION]... [NAME]...
   
   show config settings
-  $ hg showconfig -hq
-  hg config [OPTION]... [NAME]...
-  
-  show config settings
+  $ sl showconfig -hq
+  unknown command 'showconfig'
+  (use 'sl help' to get help)
+  [255]
 
 Test a help topic
 
-  $ hg help dates
+  $ sl help dates
   Date Formats
   """"""""""""
   
@@ -998,7 +1075,7 @@ Test a help topic
 
 Test repeated config section name
 
-  $ hg help config.host
+  $ sl help config.host
       "http_proxy.host"
           Host name and (optional) port of the proxy server, for example
           "myproxy:8000".
@@ -1008,22 +1085,30 @@ Test repeated config section name
   
 Test capitalized section name
 
-  $ hg help scripting.HGPLAIN > /dev/null
+  $ sl help scripting.HGPLAIN > /dev/null
 
 Help subsection:
 
-  $ hg help config.charsets |grep "Email example:" > /dev/null
+  $ sl help config.charsets |grep "Email example:" > /dev/null
   [1]
 
 Show nested definitions
-("profiling.type"[break]"ls"[break]"stat"[break])
 
-  $ hg help config.type | grep -E '^$'|wc -l
-  \s*3 (re)
-
+  $ sl help config.ui.quiet
+      "ui.quiet"
+          Reduce the amount of output printed. (default: False)
+  
 Separate sections from subsections
 
-  $ hg help config.format | grep -E '^    ("|-)|^\s*$' | uniq
+  >>> import os, re, subprocess
+  >>> hg = os.environ["HGEXECUTABLEPATH"]
+  >>> out = subprocess.check_output([hg, "help", "config.format"], text=True)
+  >>> previous = None
+  >>> for line in out.splitlines():
+  ...     if re.match(r'    ("|-)|^\s*$', line):
+  ...         if line != previous:
+  ...             print(line)
+  ...         previous = line
       "format"
       --------
   
@@ -1048,18 +1133,18 @@ Separate sections from subsections
 
 Last item in help config.*:
 
-  $ hg help config.`hg help config|grep '^    "'| \
+  $ sl help config.`sl help config|grep '^    "'| \
   >       tail -1|sed 's![ "]*!!g'`| \
-  >   grep 'hg help -c config' > /dev/null
+  >   grep 'sl help -c config' > /dev/null
   [1]
 
-note to use help -c for general hg help config:
+note to use help -c for general sl help config:
 
-  $ hg help config |grep 'hg help -c config' > /dev/null
+  $ sl help config |grep 'sl help -c config' > /dev/null
 
 Test templating help
 
-  $ hg help templating | grep -E '(desc|diffstat|firstline|nonempty)  '
+  $ sl help templating | grep -E '(desc|diffstat|firstline|nonempty)  '
       desc          String. The text of the changeset description.
       diffstat      String. Statistics of changes with the following format:
       firstline     Any text. Returns the first line of text.
@@ -1067,9 +1152,9 @@ Test templating help
 
 Test deprecated items
 
-  $ hg help -v templating | grep currentbookmark
+  $ sl help -v templating | grep currentbookmark
       currentbookmark
-  $ hg help templating | (grep currentbookmark || true)
+  $ sl help templating | (grep currentbookmark || true)
 
 Test help hooks
 
@@ -1094,55 +1179,55 @@ Test help hooks
   $ echo '[extensions]' >> $HGRCPATH
   $ echo "helphook1 = `pwd`/helphook1.py" >> $HGRCPATH
   $ echo "helphook2 = `pwd`/helphook2.py" >> $HGRCPATH
-  $ hg help revsets | grep helphook
+  $ sl help revsets | grep helphook
       helphook1
       helphook2
 
 help -c should only show debug --debug
 
-  $ hg help -c --debug|grep -E debug|wc -l|grep -E '^\s*0\s*$'
+  $ sl help -c --debug|grep -E debug|wc -l|grep -E '^\s*0\s*$'
   [1]
 
 help -c should only show deprecated for -v
 
-  $ hg help -c -v|grep -E DEPRECATED|wc -l|grep -E '^\s*0\s*$'
+  $ sl help -c -v|grep -E DEPRECATED|wc -l|grep -E '^\s*0\s*$'
   [1]
 
 Test -s / --system
 
-  $ hg help config.files -s windows |grep 'etc/mercurial' | \
+  $ sl help config.files -s windows |grep 'etc/mercurial' | \
   > wc -l | sed -e 's/ //g'
   0
-  $ hg help config.files --system unix | grep 'USER' | \
+  $ sl help config.files --system unix | grep 'USER' | \
   > wc -l | sed -e 's/ //g'
   0
 
 Test -e / -c / -k combinations
 
-  $ hg help -c|grep -E '^[A-Z].*:|^ debug'
+  $ sl help -c|grep -E '^[A-Z].*:|^ debug'
   Commands:
-  $ hg help -e|grep -E '^[A-Z].*:|^ debug'
+  $ sl help -e|grep -E '^[A-Z].*:|^ debug'
   Extensions:
-   debugnetwork        test network connections to the server
-   debugshell          a python shell with repo, changelog & manifest objects
-  $ hg help -k|grep -E '^[A-Z].*:|^ debug'
+   debugnetwork    test network connections to the server
+   debugshell      a python shell with repo, changelog & manifest objects
+  $ sl help -k|grep -E '^[A-Z].*:|^ debug'
   Topics:
   Commands:
   Extensions:
-   debugnetwork        test network connections to the server
-   debugshell          a python shell with repo, changelog & manifest objects
+   debugnetwork    test network connections to the server
+   debugshell      a python shell with repo, changelog & manifest objects
   Extension Commands:
-  $ hg help -c -k dates |grep -E '^(Topics|Extensions|Commands):'
+  $ sl help -c -k dates |grep -E '^(Topics|Extensions|Commands):'
   Commands:
-  $ hg help -e -k a |grep -E '^(Topics|Extensions|Commands):'
+  $ sl help -e -k a |grep -E '^(Topics|Extensions|Commands):'
   Extensions:
-  $ hg help -e -c -k date |grep -E '^(Topics|Extensions|Commands):'
+  $ sl help -e -c -k date |grep -E '^(Topics|Extensions|Commands):'
   Commands:
-  $ hg help -c commit > /dev/null
-  $ hg help -e -c commit > /dev/null
-  $ hg help -e commit > /dev/null
+  $ sl help -c commit > /dev/null
+  $ sl help -e -c commit > /dev/null
+  $ sl help -e commit > /dev/null
   abort: no such help topic: commit
-  (try 'hg help --keyword commit')
+  (try 'sl help --keyword commit')
   [255]
 
 Test keyword search help
@@ -1153,7 +1238,7 @@ Test keyword search help
   > EOF
   $ echo '[extensions]' >> $HGRCPATH
   $ echo "dot.dot.prefixedname = `pwd`/prefixedname.py" >> $HGRCPATH
-  $ hg help -k clone
+  $ sl help -k clone
   Topics:
   
    config     Configuration Files
@@ -1174,16 +1259,16 @@ Test keyword search help
 
 Test unfound topic
 
-  $ hg help nonexistingtopicthatwillneverexisteverever
+  $ sl help nonexistingtopicthatwillneverexisteverever
   abort: no such help topic: nonexistingtopicthatwillneverexisteverever
-  (try 'hg help --keyword nonexistingtopicthatwillneverexisteverever')
+  (try 'sl help --keyword nonexistingtopicthatwillneverexisteverever')
   [255]
 
 Test unfound keyword
 
-  $ hg help --keyword nonexistingwordthatwillneverexisteverever
+  $ sl help --keyword nonexistingwordthatwillneverexisteverever
   abort: no matches
-  (try 'hg help' for a list of topics)
+  (try 'sl help' for a list of topics)
   [255]
 
 Test omit indicating for help
@@ -1218,7 +1303,7 @@ Test omit indicating for help
   > EOF
   $ echo '[extensions]' >> $HGRCPATH
   $ echo "addverboseitems = `pwd`/addverboseitems.py" >> $HGRCPATH
-  $ hg help addverboseitems
+  $ sl help addverboseitems
   addverboseitems extension - extension to test omit indicating.
   
   This paragraph is never omitted (for extension)
@@ -1228,18 +1313,18 @@ Test omit indicating for help
   (some details hidden, use --verbose to show complete help)
   
   no commands defined
-  $ hg help -v addverboseitems
+  $ sl help -v addverboseitems
   addverboseitems extension - extension to test omit indicating.
   
   This paragraph is never omitted (for extension)
   
-  This paragraph is omitted, if 'hg help' is invoked without "-v" (for
+  This paragraph is omitted, if 'sl help' is invoked without "-v" (for
   extension)
   
   This paragraph is never omitted, too (for extension)
   
   no commands defined
-  $ hg help topic-containing-verbose
+  $ sl help topic-containing-verbose
   This is the topic to test omit indicating.
   """"""""""""""""""""""""""""""""""""""""""
   
@@ -1248,34 +1333,34 @@ Test omit indicating for help
       This paragraph is never omitted, too (for topic)
   
   (some details hidden, use --verbose to show complete help)
-  $ hg help -v topic-containing-verbose
+  $ sl help -v topic-containing-verbose
   This is the topic to test omit indicating.
   """"""""""""""""""""""""""""""""""""""""""
   
       This paragraph is never omitted (for topic).
   
-      This paragraph is omitted, if 'hg help' is invoked without "-v" (for
+      This paragraph is omitted, if 'sl help' is invoked without "-v" (for
       topic)
   
       This paragraph is never omitted, too (for topic)
 
 Test section lookup
 
-  $ hg help revset.merge
+  $ sl help revset.merge
       "merge()"
         Changeset is a merge changeset.
   
-  $ hg help glossary.dag
+  $ sl help glossary.dag
       DAG
           The repository of changesets of a distributed version control system
           (DVCS) can be described as a directed acyclic graph (DAG), consisting
           of nodes and edges, where nodes correspond to changesets and edges
           imply a parent -> child relation. This graph can be visualized by
-          graphical tools such as 'hg log --graph'. In Sapling, the DAG is
+          graphical tools such as 'sl log --graph'. In Sapling, the DAG is
           limited by the requirement for children to have at most two parents.
   
 
-  $ hg help hgrc.paths
+  $ sl help hgrc.paths
       "paths"
       -------
   
@@ -1289,7 +1374,7 @@ Test section lookup
         local_path = /home/me/repo
   
       These symbolic names can be used from the command line. To pull from
-      "my_server": 'hg pull my_server'. To push to "local_path": 'hg push
+      "my_server": 'sl pull my_server'. To push to "local_path": 'sl push
       local_path'.
   
       Options containing colons (":") denote sub-options that can influence
@@ -1308,7 +1393,7 @@ Test section lookup
       "pushrev"
          A revset defining which revisions to push by default.
   
-         When 'hg push' is executed without a "-r" argument, the revset defined
+         When 'sl push' is executed without a "-r" argument, the revset defined
          by this sub-option is evaluated to determine what to push.
   
          For example, a value of "." will push the working directory's revision
@@ -1322,27 +1407,27 @@ Test section lookup
       "default"
          The URL or directory to use when no source or remote is specified.
   
-         'hg clone' will automatically define this path to the location the
+         'sl clone' will automatically define this path to the location the
          repository was cloned from.
   
       "default-push"
-         (deprecated) The URL or directory for the default 'hg push' location.
+         (deprecated) The URL or directory for the default 'sl push' location.
          "default:pushurl" should be used instead.
   
-  $ hg help glossary.mcguffin
+  $ sl help glossary.mcguffin
   abort: help section not found: glossary.mcguffin
   [255]
 
-  $ hg help glossary.mc.guffin
+  $ sl help glossary.mc.guffin
   abort: help section not found: glossary.mc.guffin
   [255]
 
-  $ hg help template.files
+  $ sl help template.files
       files         List of strings. All files modified, added, or removed by
                     this changeset.
       files(pattern)
                     All files of the current changeset matching the pattern. See
-                    'hg help patterns'.
+                    'sl help patterns'.
 
 Test section lookup by translated message
 
@@ -1381,7 +1466,7 @@ such str.lower().
   > subsequent section
   > ------------------
   > 
-  > This should be hidden at 'hg help ambiguous' with section name.
+  > This should be hidden at 'sl help ambiguous' with section name.
   > '''
   > """ % (escape(upper), escape(lower)))
   > EOF
@@ -1392,13 +1477,13 @@ Show help content of disabled extensions
   > [extensions]
   > ambiguous = !./ambiguous.py
   > EOF
-  $ hg help -e ambiguous
+  $ sl help -e ambiguous
   ambiguous extension - (no help text available)
   
-  (use 'hg help extensions' for information on enabling extensions)
+  (use 'sl help extensions' for information on enabling extensions)
 
 Test dynamic list of merge tools only shows up once
-  $ hg help merge-tools
+  $ sl help merge-tools
   Merge Tools
   """""""""""
   
@@ -1409,7 +1494,7 @@ Test dynamic list of merge tools only shows up once
       the two file versions, so they can determine the changes made on both
       branches.
   
-      Merge tools are used both for 'hg resolve', 'hg merge', 'hg goto', 'hg
+      Merge tools are used both for 'sl resolve', 'sl merge', 'sl goto', 'sl
       backout' and in several extensions.
   
       Usually, the merge tool tries to automatically reconcile the files by
@@ -1424,7 +1509,7 @@ Test dynamic list of merge tools only shows up once
       =====================
   
       External merge tools and their properties are configured in the merge-
-      tools configuration section - see 'hg help config.merge-tools' - but they
+      tools configuration section - see 'sl help config.merge-tools' - but they
       can often just be named by their executable.
   
       A merge tool is generally usable if its executable can be found on the
@@ -1544,12 +1629,12 @@ Test dynamic list of merge tools only shows up once
          first can be controlled by the premerge setting of the merge tool.
          Premerge is enabled by default unless the file is binary or a symlink.
   
-      See the merge-tools and ui sections of 'hg help config' for details on the
+      See the merge-tools and ui sections of 'sl help config' for details on the
       configuration of merge tools.
 
-Compression engines listed in `hg help bundlespec`
+Compression engines listed in `sl help bundlespec`
 
-  $ hg help bundlespec | grep gzip
+  $ sl help bundlespec | grep gzip
           "v1" bundles can only use the "gzip", "bzip2", and "none" compression
         An algorithm that produces smaller bundles than "gzip".
         This engine will likely produce smaller bundles than "gzip" but will be
@@ -1560,5 +1645,6 @@ Compression engines listed in `hg help bundlespec`
 Test usage of section marks in help documents
 
   $ cd "$TESTDIR"/../doc
-  $ hg debugpython -- check-seclevel.py
+  warning: no longer inside TESTTMP (?)
+  $ sl debugpython -- check-seclevel.py
 #endif

@@ -64,6 +64,36 @@ mononoke_queries! {
         none,
         "INSERT INTO mononoke_queries_test_v3 (x, a, b, c, d, e, repo_id) VALUES {values}"
     }
+
+    // >tuple_list queries for testing WHERE (col1, col2) IN ((v1, v2), ...)
+    write TupleListInsert(values: (repo_id: RepositoryId, x: i64)) {
+        none,
+        "INSERT INTO tuple_list_test (repo_id, x) VALUES {values}"
+    }
+
+    write TupleListDeleteAll() {
+        none,
+        "DELETE FROM tuple_list_test WHERE 1=1"
+    }
+
+    read TupleListQuery(
+        >tuple_list pairs: (repo_id: RepositoryId, x: i64)
+    ) -> (RepositoryId, i64) {
+        "SELECT repo_id, x FROM tuple_list_test WHERE (repo_id, x) IN {pairs}"
+    }
+
+    read TupleListQueryWithScalar(
+        min_x: i64,
+        >tuple_list pairs: (repo_id: RepositoryId, x: i64)
+    ) -> (RepositoryId, i64) {
+        "SELECT repo_id, x FROM tuple_list_test WHERE x > {min_x} AND (repo_id, x) IN {pairs}"
+    }
+
+    read TupleListQuerySingleCol(
+        >tuple_list pairs: (x: i64, repo_id: RepositoryId)
+    ) -> (i64, RepositoryId) {
+        "SELECT x, repo_id FROM tuple_list_test WHERE (x, repo_id) IN {pairs}"
+    }
 }
 
 #[cfg(fbcode_build)]
@@ -118,6 +148,7 @@ mod facebook {
         query_name: Option<String>,
         transaction_query_names: Vec<String>,
         shard_name: String,
+        attempt: Option<i64>,
     }
 
     #[mononoke::fbinit_test]
@@ -190,6 +221,7 @@ mod facebook {
 
         // Columns expected in some samples, but not necessarily all.
         let expected_in_some: HashSet<String> = hashset! {
+            "attempt",
             "query_name",
             "read_tables",
             "signal_time_ENQUEUE",
@@ -209,7 +241,7 @@ mod facebook {
         let columns = extract_all_scuba_columns(&content, expected_in_all, expected_values);
 
         // For debugging purposes. By default will only print if test fails.
-        println!("All columns logged in scuba samples: {:#?}", columns);
+        println!("All columns logged in scuba samples: {columns:#?}");
 
         assert!(
             expected_in_some.is_subset(&columns),
@@ -246,15 +278,17 @@ mod facebook {
         txn.commit().await?;
 
         // Verify logs from Scuba file
-        let scuba_file_logs = deserialize_scuba_log_file(&temp_path)?;
+        let mut scuba_file_logs = deserialize_scuba_log_file(&temp_path)?;
+        clear_instance_type(&mut scuba_file_logs);
 
-        println!("scuba_file_logs: {:#?}", scuba_file_logs);
+        println!("scuba_file_logs: {scuba_file_logs:#?}");
 
         // Verify logs from mock transport
-        let mock_transport_logs =
+        let mut mock_transport_logs =
             parse_captured_logs(&mock_transport).context("Parsing logger samples")?;
+        clear_instance_type(&mut mock_transport_logs);
 
-        println!("mock_transport_logs: {:#?}", mock_transport_logs);
+        println!("mock_transport_logs: {mock_transport_logs:#?}");
 
         // Expected logs
         let expected_logs = vec![
@@ -267,10 +301,10 @@ mod facebook {
                 mysql_telemetry: MysqlQueryTelemetry {
                     read_tables: hashset! {},
                     write_tables: hashset! {"mononoke_queries_test_v3".to_string()},
-                    instance_type: Some("PRIMARY".to_string()),
                     ..Default::default()
                 },
                 transaction_query_names: vec![],
+                attempt: Some(1),
             },
             ScubaTelemetryLogSample {
                 success: true,
@@ -281,10 +315,10 @@ mod facebook {
                 mysql_telemetry: MysqlQueryTelemetry {
                     read_tables: hashset! {"mononoke_queries_test_v3".to_string()},
                     write_tables: hashset! {},
-                    instance_type: Some("PRIMARY".to_string()),
                     ..Default::default()
                 },
                 transaction_query_names: vec![],
+                attempt: Some(1),
             },
             ScubaTelemetryLogSample {
                 success: true,
@@ -295,10 +329,10 @@ mod facebook {
                 mysql_telemetry: MysqlQueryTelemetry {
                     read_tables: hashset! {"mononoke_queries_test_v3".to_string()},
                     write_tables: hashset! {},
-                    instance_type: Some("PRIMARY".to_string()),
                     ..Default::default()
                 },
                 transaction_query_names: vec![],
+                attempt: Some(1),
             },
             // TODO(T223577767): test transaction-level metadata, e.g. run multiple queries
             // for different repos and ensure they are all logged together.
@@ -319,15 +353,20 @@ mod facebook {
                     .map(String::from)
                     .sorted()
                     .collect::<Vec<String>>(),
+                attempt: Some(1),
             },
         ];
 
         // Assert both Scuba file and mock transport have the same expected logs
-        pretty_assertions::assert_eq!(expected_logs, scuba_file_logs, "Raw scuba logs don't match");
         pretty_assertions::assert_eq!(
             expected_logs,
             scuba_file_logs,
-            "Schematized logger logs don't match"
+            "Scuba file logs don't match"
+        );
+        pretty_assertions::assert_eq!(
+            expected_logs,
+            mock_transport_logs,
+            "Mock transport logs don't match"
         );
 
         Ok(())
@@ -392,15 +431,17 @@ mod facebook {
         .await?;
 
         // Verify logs from Scuba file
-        let scuba_file_logs = deserialize_scuba_log_file(&temp_path)?;
+        let mut scuba_file_logs = deserialize_scuba_log_file(&temp_path)?;
+        clear_instance_type(&mut scuba_file_logs);
 
-        println!("scuba_file_logs: {:#?}", scuba_file_logs);
+        println!("scuba_file_logs: {scuba_file_logs:#?}");
 
         // Verify logs from mock transport
-        let mock_transport_logs =
+        let mut mock_transport_logs =
             parse_captured_logs(&mock_transport).context("Parsing logger samples")?;
+        clear_instance_type(&mut mock_transport_logs);
 
-        println!("mock_transport_logs: {:#?}", mock_transport_logs);
+        println!("mock_transport_logs: {mock_transport_logs:#?}");
 
         // Expected logs
         let expected_logs = vec![
@@ -413,10 +454,10 @@ mod facebook {
                 mysql_telemetry: MysqlQueryTelemetry {
                     read_tables: hashset! {},
                     write_tables: hashset! {"mononoke_queries_test_v3".to_string()},
-                    instance_type: Some("PRIMARY".to_string()),
                     ..Default::default()
                 },
                 transaction_query_names: vec![],
+                attempt: Some(1),
             },
             ScubaTelemetryLogSample {
                 success: true,
@@ -427,19 +468,23 @@ mod facebook {
                 mysql_telemetry: MysqlQueryTelemetry {
                     read_tables: hashset! {},
                     write_tables: hashset! {"mononoke_queries_test_v3".to_string()},
-                    instance_type: Some("PRIMARY".to_string()),
                     ..Default::default()
                 },
                 transaction_query_names: vec![],
+                attempt: Some(1),
             },
         ];
 
         // Assert both Scuba file and mock transport have the same expected logs
-        pretty_assertions::assert_eq!(expected_logs, scuba_file_logs, "Raw scuba logs don't match");
         pretty_assertions::assert_eq!(
             expected_logs,
             scuba_file_logs,
-            "Schematized logger logs don't match"
+            "Scuba file logs don't match"
+        );
+        pretty_assertions::assert_eq!(
+            expected_logs,
+            mock_transport_logs,
+            "Mock transport logs don't match"
         );
 
         Ok(())
@@ -494,15 +539,17 @@ mod facebook {
         };
 
         // Verify logs from Scuba file
-        let scuba_file_logs = deserialize_scuba_log_file(&temp_path)?;
+        let mut scuba_file_logs = deserialize_scuba_log_file(&temp_path)?;
+        clear_instance_type(&mut scuba_file_logs);
 
-        println!("scuba_file_logs: {:#?}", scuba_file_logs);
+        println!("scuba_file_logs: {scuba_file_logs:#?}");
 
         // Verify logs from mock transport
-        let mock_transport_logs =
+        let mut mock_transport_logs =
             parse_captured_logs(&mock_transport).context("Parsing logger samples")?;
+        clear_instance_type(&mut mock_transport_logs);
 
-        println!("mock_transport_logs: {:#?}", mock_transport_logs);
+        println!("mock_transport_logs: {mock_transport_logs:#?}");
 
         let expected_log_for_each_attempt = ScubaTelemetryLogSample {
             success: true,
@@ -516,22 +563,49 @@ mod facebook {
                 ..Default::default()
             },
             transaction_query_names: vec![],
+            attempt: Some(1),
         };
 
-        let expected_logs = vec![
-            // All attempts generate the exact same log
-            expected_log_for_each_attempt.clone(),
-            expected_log_for_each_attempt.clone(),
-            expected_log_for_each_attempt,
-        ];
+        let scuba_query_logs: Vec<_> = scuba_file_logs
+            .iter()
+            .filter(|log| log.granularity == TelemetryGranularity::ConsistentReadQuery)
+            .collect();
 
-        // Assert both Scuba file and mock transport have the same expected logs
-        pretty_assertions::assert_eq!(expected_logs, scuba_file_logs, "Raw scuba logs don't match");
-        pretty_assertions::assert_eq!(
-            expected_logs,
-            scuba_file_logs,
-            "Schematized logger logs don't match"
+        let mock_transport_query_logs: Vec<_> = mock_transport_logs
+            .iter()
+            .filter(|log| log.granularity == TelemetryGranularity::ConsistentReadQuery)
+            .collect();
+
+        // We expect exactly 3 query attempts (max_attempts: 3)
+        assert_eq!(
+            scuba_query_logs.len(),
+            3,
+            "Expected 3 ConsistentReadQuery logs from Scuba file, got {}",
+            scuba_query_logs.len()
         );
+        assert_eq!(
+            mock_transport_query_logs.len(),
+            3,
+            "Expected 3 ConsistentReadQuery logs from mock transport, got {}",
+            mock_transport_query_logs.len()
+        );
+
+        // Verify each query log matches expected format
+        for log in &scuba_query_logs {
+            pretty_assertions::assert_eq!(
+                &expected_log_for_each_attempt,
+                *log,
+                "Scuba file query log doesn't match expectation"
+            );
+        }
+
+        for log in &mock_transport_query_logs {
+            pretty_assertions::assert_eq!(
+                &expected_log_for_each_attempt,
+                *log,
+                "Mock transport query log doesn't match expectation"
+            );
+        }
 
         Ok(())
     }
@@ -579,15 +653,17 @@ mod facebook {
         assert_eq!(res.len(), 10, "query should return 10 rows");
 
         // Verify logs from Scuba file
-        let scuba_file_logs = deserialize_scuba_log_file(&temp_path)?;
+        let mut scuba_file_logs = deserialize_scuba_log_file(&temp_path)?;
+        clear_instance_type(&mut scuba_file_logs);
 
-        println!("scuba_file_logs: {:#?}", scuba_file_logs);
+        println!("scuba_file_logs: {scuba_file_logs:#?}");
 
         // Verify logs from mock transport
-        let mock_transport_logs =
+        let mut mock_transport_logs =
             parse_captured_logs(&mock_transport).context("Parsing logger samples")?;
+        clear_instance_type(&mut mock_transport_logs);
 
-        println!("mock_transport_logs: {:#?}", mock_transport_logs);
+        println!("mock_transport_logs: {mock_transport_logs:#?}");
 
         let expected_logs = vec![
             // Single log for the one and only query that ran
@@ -603,6 +679,7 @@ mod facebook {
                     ..Default::default()
                 },
                 transaction_query_names: vec![],
+                attempt: Some(1),
             },
             ScubaTelemetryLogSample {
                 success: true,
@@ -616,6 +693,7 @@ mod facebook {
                     ..Default::default()
                 },
                 transaction_query_names: vec![],
+                attempt: Some(1),
             },
         ];
 
@@ -683,14 +761,16 @@ mod facebook {
 
         // Verify logs from Scuba file
         let mut scuba_file_logs = deserialize_scuba_log_file(&temp_path)?;
+        clear_instance_type(&mut scuba_file_logs);
 
-        println!("scuba_file_logs: {:#?}", scuba_file_logs);
+        println!("scuba_file_logs: {scuba_file_logs:#?}");
 
         // Verify logs from mock transport
         let mut mock_transport_logs =
             parse_captured_logs(&mock_transport).context("Parsing logger samples")?;
+        clear_instance_type(&mut mock_transport_logs);
 
-        println!("mock_transport_logs: {:#?}", mock_transport_logs);
+        println!("mock_transport_logs: {mock_transport_logs:#?}");
 
         assert!(
             scuba_file_logs.len() > 1,
@@ -722,7 +802,19 @@ mod facebook {
                 ..Default::default()
             },
             transaction_query_names: vec![],
+            attempt: Some(1),
         };
+
+        // Pop the last log for ConsistentRead granularity from both sources
+        let scuba_file_cons_read_log = scuba_file_logs
+            .pop()
+            .ok_or(anyhow!("Expected ConsistentRead log from Scuba file"))?;
+
+        let mock_transport_cons_read_log = mock_transport_logs
+            .pop()
+            .ok_or(anyhow!("Expected ConsistentRead log from mock transport"))?;
+
+        let expected_final_attempt = scuba_file_logs.len();
 
         let expected_cons_read_log = ScubaTelemetryLogSample {
             success: true,
@@ -736,16 +828,8 @@ mod facebook {
                 ..Default::default()
             },
             transaction_query_names: vec![],
+            attempt: Some(expected_final_attempt as i64),
         };
-
-        // Pop the last log for ConsistentRead granularity from both sources
-        let scuba_file_cons_read_log = scuba_file_logs
-            .pop()
-            .ok_or(anyhow!("Expected ConsistentRead log from Scuba file"))?;
-
-        let mock_transport_cons_read_log = mock_transport_logs
-            .pop()
-            .ok_or(anyhow!("Expected ConsistentRead log from mock transport"))?;
 
         // Check all the query logs from both sources
         scuba_file_logs
@@ -768,6 +852,130 @@ mod facebook {
             mock_transport_cons_read_log,
             "Mock transport ConsistentRead log doesn't match expectation"
         );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_tuple_list_query(fb: FacebookInit) -> Result<()> {
+        let master_sql_connection: sql::Connection = setup_mysql_test_connection(
+            fb,
+            Some(
+                "CREATE TABLE IF NOT EXISTS tuple_list_test(
+                     id INT AUTO_INCREMENT PRIMARY KEY,
+                     repo_id INT UNSIGNED NOT NULL,
+                     x INT NOT NULL
+                 )",
+            ),
+            InstanceRequirement::Master,
+        )
+        .await?;
+
+        let connection = Connection {
+            inner: master_sql_connection,
+            shard_name: TEST_XDB_NAME.to_string(),
+        };
+
+        let sql_query_tel = SqlQueryTelemetry::new(fb, Metadata::default());
+
+        // Clean up any leftover data from previous test runs.
+        TupleListDeleteAll::query(&connection, sql_query_tel.clone()).await?;
+
+        // Insert test data: (repo_id=1, x=10), (repo_id=1, x=20), (repo_id=2, x=30), (repo_id=3, x=40)
+        TupleListInsert::query(
+            &connection,
+            sql_query_tel.clone(),
+            &[
+                (&RepositoryId::new(1), &10i64),
+                (&RepositoryId::new(1), &20i64),
+                (&RepositoryId::new(2), &30i64),
+                (&RepositoryId::new(3), &40i64),
+            ],
+        )
+        .await?;
+
+        // Test 1: Query matching two specific (repo_id, x) pairs
+        let results = TupleListQuery::query(
+            &connection,
+            sql_query_tel.clone(),
+            &[(RepositoryId::new(1), 10i64), (RepositoryId::new(2), 30i64)],
+        )
+        .await?;
+
+        assert_eq!(results.len(), 2, "Should match exactly 2 rows");
+        let result_set: HashSet<(i32, i64)> = results
+            .iter()
+            .map(|(repo_id, x)| (repo_id.id(), *x))
+            .collect();
+        assert!(
+            result_set.contains(&(1, 10)),
+            "Should contain (repo_id=1, x=10)"
+        );
+        assert!(
+            result_set.contains(&(2, 30)),
+            "Should contain (repo_id=2, x=30)"
+        );
+
+        // Test 2: Query with a pair that doesn't exist — no cross-product false positives
+        let results = TupleListQuery::query(
+            &connection,
+            sql_query_tel.clone(),
+            &[(RepositoryId::new(1), 30i64)], // repo_id=1 exists, x=30 exists, but not together
+        )
+        .await?;
+
+        assert_eq!(
+            results.len(),
+            0,
+            "Should not match any rows (no cross-product)"
+        );
+
+        // Test 3: Query all inserted pairs
+        let results = TupleListQuery::query(
+            &connection,
+            sql_query_tel.clone(),
+            &[
+                (RepositoryId::new(1), 10i64),
+                (RepositoryId::new(1), 20i64),
+                (RepositoryId::new(2), 30i64),
+                (RepositoryId::new(3), 40i64),
+            ],
+        )
+        .await?;
+
+        assert_eq!(results.len(), 4, "Should match all 4 rows");
+
+        // Test 4: TupleListQueryWithScalar — combine scalar param with tuple_list
+        let results = TupleListQueryWithScalar::query(
+            &connection,
+            sql_query_tel.clone(),
+            &15i64, // min_x > 15
+            &[
+                (RepositoryId::new(1), 10i64), // x=10 < 15, should be filtered out
+                (RepositoryId::new(1), 20i64), // x=20 > 15, should match
+                (RepositoryId::new(2), 30i64), // x=30 > 15, should match
+            ],
+        )
+        .await?;
+
+        assert_eq!(results.len(), 2, "Scalar filter should exclude x=10");
+        let result_set: HashSet<(i32, i64)> = results
+            .iter()
+            .map(|(repo_id, x)| (repo_id.id(), *x))
+            .collect();
+        assert!(
+            result_set.contains(&(1, 20)),
+            "Should contain (repo_id=1, x=20)"
+        );
+        assert!(
+            result_set.contains(&(2, 30)),
+            "Should contain (repo_id=2, x=30)"
+        );
+
+        // Test 5: Empty tuple_list should return empty results
+        let results = TupleListQuery::query(&connection, sql_query_tel.clone(), &[]).await?;
+
+        assert_eq!(results.len(), 0, "Empty tuple_list should return no rows");
 
         Ok(())
     }
@@ -848,6 +1056,16 @@ mod facebook {
         })
     }
 
+    /// Clears the `instance_type` field from all samples.
+    /// Whether the test XDB tier returns `instance_type` in MySQL response
+    /// attributes depends on infra configuration that has historically been
+    /// unstable (see T223577767), so we normalize it away before comparing.
+    fn clear_instance_type(logs: &mut [ScubaTelemetryLogSample]) {
+        for log in logs.iter_mut() {
+            log.mysql_telemetry.instance_type = None;
+        }
+    }
+
     /// Parse MononokeXdbTelemetryWrappedLoggerScubaStruct samples from mock transport
     /// into ScubaTelemetryLogSample objects.
     fn parse_captured_logs(
@@ -876,7 +1094,7 @@ mod facebook {
                     .granularity_thrift_safe
                     .ok_or_else(|| anyhow!("granularity field missing"))
                     .and_then(|g| {
-                        serde_json::from_str::<TelemetryGranularity>(&format!("\"{}\"", g))
+                        serde_json::from_str::<TelemetryGranularity>(&format!("\"{g}\""))
                             .context("Failed to parse granularity")
                     })?;
 
@@ -926,6 +1144,8 @@ mod facebook {
                     ..Default::default()
                 };
 
+                let attempt = sample.attempt_thrift_safe;
+
                 Ok(ScubaTelemetryLogSample {
                     mysql_telemetry,
                     success,
@@ -934,6 +1154,7 @@ mod facebook {
                     query_name,
                     transaction_query_names,
                     shard_name,
+                    attempt,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -1080,6 +1301,8 @@ mod facebook {
                                 })
                                 .unwrap_or_default();
 
+                        let attempt: Option<i64> = flattened_log["attempt"].as_i64();
+
                         // Now deserialize that into a MysqlQueryTelemetry object
                         let mysql_tel =
                             serde_json::from_value::<MysqlQueryTelemetry>(flattened_log)
@@ -1093,6 +1316,7 @@ mod facebook {
                             query_name,
                             transaction_query_names,
                             shard_name,
+                            attempt,
                         })
                     })
             })

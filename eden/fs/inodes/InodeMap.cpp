@@ -23,6 +23,7 @@
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/ParentInodeInfo.h"
 #include "eden/fs/inodes/TreeInode.h"
+#include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/NotImplemented.h"
@@ -105,11 +106,11 @@ InodeMap::InodeMap(
     EdenMount* mount,
     std::shared_ptr<ReloadableConfig> config,
     EdenStatsPtr stats,
-    std::shared_ptr<StructuredLogger> logger)
+    std::shared_ptr<EdenFsEventsLogger> logger)
     : mount_{mount},
       config_{std::move(config)},
       stats_{std::move(stats)},
-      structuredLogger_{std::move(logger)},
+      edenFsEventsLogger_{std::move(logger)},
       lazyInodePersistence_{
           config_->getEdenConfig()->lazyInodePersistence.getValue()} {}
 
@@ -140,6 +141,40 @@ inline void InodeMap::insertLoadedInode(
   } else {
     ++data->numFileInodes_;
   }
+  totalInodeCount_.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void InodeMap::eraseLoadedInode(
+    const folly::Synchronized<Members>::LockedPtr& data,
+    InodeBase* inode) {
+  auto numErased = data->loadedInodes_.erase(inode->getNodeId());
+  XCHECK_EQ(numErased, 1u) << "inconsistent loaded inodes data: "
+                           << inode->getLogPath();
+  if (inode->getType() == dtype_t::Dir) {
+    --data->numTreeInodes_;
+  } else {
+    --data->numFileInodes_;
+  }
+  totalInodeCount_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+inline InodeMap::UnloadedInode& InodeMap::insertUnloadedInode(
+    const folly::Synchronized<Members>::LockedPtr& data,
+    InodeNumber ino,
+    UnloadedInode&& unloadedInode) {
+  auto ret = data->unloadedInodes_.emplace(ino, std::move(unloadedInode));
+  XCHECK(ret.second) << fmt::format(
+      "failed to emplace inode number {}; is it already present in the InodeMap?",
+      ino);
+  totalInodeCount_.fetch_add(1, std::memory_order_relaxed);
+  return ret.first->second;
+}
+
+inline void InodeMap::eraseUnloadedInode(
+    const folly::Synchronized<Members>::LockedPtr& data,
+    std::unordered_map<InodeNumber, UnloadedInode>::iterator iter) {
+  data->unloadedInodes_.erase(iter);
+  totalInodeCount_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void InodeMap::initializeRoot(
@@ -167,15 +202,8 @@ void InodeMap::initializeUnloadedInode(
     InodeNumber parentIno,
     InodeNumber ino,
     Args&&... args) {
-  auto unloadedEntry = UnloadedInode(parentIno, std::forward<Args>(args)...);
-  auto result = data->unloadedInodes_.emplace(ino, std::move(unloadedEntry));
-  if (!result.second) {
-    auto message = fmt::format(
-        "failed to emplace inode number {}; is it already present in the InodeMap?",
-        ino);
-    XLOG(ERR, message);
-    throw std::runtime_error(message);
-  }
+  insertUnloadedInode(
+      data, ino, UnloadedInode(parentIno, std::forward<Args>(args)...));
 }
 
 void InodeMap::initializeFromTakeover(
@@ -300,7 +328,7 @@ ImmediateFuture<InodePtr> InodeMap::lookupInode(InodeNumber number) {
       // windows does not have ESTALE. We need some other error to turn into the
       // nfs stale error. For now let's just let it throw.
 #ifndef _WIN32
-      structuredLogger_->logEvent(NFSStaleError{number.getRawValue()});
+      edenFsEventsLogger_->logEvent(NFSStaleError{number.getRawValue()});
       return ImmediateFuture<InodePtr>{folly::Try<InodePtr>{
           std::system_error{std::error_code{ESTALE, std::system_category()}}}};
 #endif
@@ -508,7 +536,7 @@ InodeMap::PromiseVector InodeMap::inodeLoadComplete(InodeBase* inode) {
           InodeEventType::LOAD,
           InodeEventProgress::END,
           it->second.name);
-      data->unloadedInodes_.erase(it);
+      eraseUnloadedInode(data, it);
     }
     mount_->publishInodeTraceEvent(std::move(endLoadEvent.value()));
     stats_->increment(
@@ -547,7 +575,7 @@ void InodeMap::inodeLoadFailed(
 
   // Temporarily log every inode load failure and associated error string.
   // This data will help us understand the impact of X2P errors on EdenFS.
-  structuredLogger_->logEvent(
+  edenFsEventsLogger_->logEvent(
       InodeLoadingFailed{errStr.toStdString(), number.getRawValue()});
   stats_->increment(&InodeMapStats::lookupInodeError, promises.size());
 }
@@ -570,7 +598,7 @@ std::optional<InodeTraceEvent> InodeMap::createInodeLoadFailEvent(
     InodeNumber number) {
   auto data = data_.rlock();
   auto it = data->unloadedInodes_.find(number);
-  if (it != data->unloadedInodes_.end()) {
+  if (it == data->unloadedInodes_.end()) {
     XLOGF(
         ERR,
         "failed to find unloaded inode data when finishing load of inode {}",
@@ -754,7 +782,7 @@ InodePtr InodeMap::decFsRefcountHelper(
         number,
         unloadedEntry.parent,
         unloadedEntry.name);
-    data->unloadedInodes_.erase(unloadedIter);
+    eraseUnloadedInode(data, unloadedIter);
   }
   return nullptr;
 }
@@ -907,7 +935,7 @@ Future<SerializedInodeMap> InodeMap::shutdown(
   // Walk from the root of the tree down, finding all unreferenced inodes,
   // and immediately destroy them.
   //
-  // Hold the the mountpoint-wide rename lock in shared mode while doing the
+  // Hold the mountpoint-wide rename lock in shared mode while doing the
   // walk.  We want to make sure that we walk *all* children.  While doing the
   // walk we want to make sure that an Inode that hasn't been processed yet
   // cannot be moved from the unprocessed part of the tree into a processed
@@ -1012,10 +1040,7 @@ void InodeMap::shutdownComplete(
   // reference count again when the pointer is destroyed. Note: we don't add
   // the root to unloadedInodes here as it has been freed and we don't want to
   // serialize the freed root during graceful shutdown for takeover.
-  auto numErased = data->loadedInodes_.erase(kRootNodeId);
-  XCHECK_EQ(numErased, 1u) << fmt::format(
-      "inconsistent loaded inodes data: {}", kRootNodeId);
-  --data->numTreeInodes_;
+  eraseLoadedInode(data, root_.get());
   delete root_.get();
   root_.resetNoDecRef();
 
@@ -1145,19 +1170,11 @@ void InodeMap::unloadInode(
     // Insert the unloaded entry
     XLOGF(
         DBG7, "inserting unloaded map entry for inode {}", inode->getNodeId());
-    auto ret = data->unloadedInodes_.emplace(
-        inode->getNodeId(), std::move(unloadedEntry.value()));
-    XCHECK(ret.second);
+    insertUnloadedInode(
+        data, inode->getNodeId(), std::move(unloadedEntry.value()));
   }
 
-  auto numErased = data->loadedInodes_.erase(inode->getNodeId());
-  XCHECK_EQ(numErased, 1u) << "inconsistent loaded inodes data: "
-                           << inode->getLogPath();
-  if (inode->getType() == dtype_t::Dir) {
-    --data->numTreeInodes_;
-  } else {
-    --data->numFileInodes_;
-  }
+  eraseLoadedInode(data, inode);
 }
 
 optional<InodeMap::UnloadedInode> InodeMap::updateOverlayForUnload(
@@ -1210,7 +1227,8 @@ optional<InodeMap::UnloadedInode> InodeMap::updateOverlayForUnload(
           asTree->getLogPath());
       overlay->saveOverlayDir(
           asTree->getNodeId(),
-          asTree->getContents().unsafeGetUnlocked().entries);
+          asTree->getContentsUnchecked().unsafeGetUnlocked().entries,
+          /*isMaterialized=*/false);
     }
   }
 
@@ -1244,7 +1262,7 @@ optional<InodeMap::UnloadedInode> InodeMap::updateOverlayForUnload(
     // is being unloaded, nobody else can reference it right now, so the lock is
     // guaranteed not held. Therefore, it's not necessary to synchronize, and
     // the contents can be directly accessed here.
-    auto& treeContents = asTree->getContents().unsafeGetUnlocked();
+    auto& treeContents = asTree->getContentsUnchecked().unsafeGetUnlocked();
 
     // If the fs refcount is non-zero we have to remember this inode.
     if (fsCount > 0) {
@@ -1258,7 +1276,7 @@ optional<InodeMap::UnloadedInode> InodeMap::updateOverlayForUnload(
           parent, name, isUnlinked, treeContents.treeId, fsCount);
     }
 
-    // If any of this inode's childrens are in unloadedInodes_, then this
+    // If any of this inode's children are in unloadedInodes_, then this
     // inode, as its parent, must not be forgotten.
     for (const auto& pair : treeContents.entries) {
       const auto& childName = pair.first;
@@ -1315,10 +1333,8 @@ bool InodeMap::startLoadingChildIfNotLoading(
       // example, isUnlinked, id, and numFsReferences are set to default
       // values
       auto newUnloadedData = UnloadedInode(parentNumber, name, mode);
-      auto ret =
-          data->unloadedInodes_.emplace(childInode, std::move(newUnloadedData));
-      XDCHECK(ret.second);
-      unloadedData = &ret.first->second;
+      unloadedData =
+          &insertUnloadedInode(data, childInode, std::move(newUnloadedData));
     } else {
       unloadedData = &iter->second;
     }

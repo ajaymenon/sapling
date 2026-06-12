@@ -71,7 +71,6 @@ impl BonsaiDerivable for MappedGitCommitId {
     const VARIANT: DerivableType = DerivableType::GitCommits;
 
     type Dependencies = dependencies![];
-    type PredecessorDependencies = dependencies![];
 
     /// Derives a Git commit for a given Bonsai changeset. The mapping is recorded in bonsai_git_mapping and as a result
     /// imported Mononoke commits from Git repos will by default be marked as having their Git commits derived. This method
@@ -182,6 +181,22 @@ impl BonsaiDerivable for MappedGitCommitId {
         Ok(())
     }
 
+    async fn store_mapping_batch(
+        ctx: &CoreContext,
+        derivation_ctx: &DerivationContext,
+        derived: Vec<(ChangesetId, Self)>,
+    ) -> Result<()> {
+        let entries: Vec<_> = derived
+            .into_iter()
+            .map(|(bcs_id, derived)| BonsaiGitMappingEntry::new(derived.oid().clone(), bcs_id))
+            .collect();
+        derivation_ctx
+            .bonsai_git_mapping()?
+            .bulk_add(ctx, &entries)
+            .await?;
+        Ok(())
+    }
+
     async fn fetch(
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
@@ -284,7 +299,7 @@ mod test {
             .with_parsed_as_commit(|commit| {
                 // In this case, the original commit was created from a Bonsai, so we are
                 // shielded from non-roundtripping behaviours coming from original uses of Git
-                commit.to_owned().into_owned()
+                commit.to_owned().into_owned().unwrap()
             })
             .ok_or_else(|| anyhow::anyhow!("Expected {git_hash} to be a commit, but it isn't"))?;
         // Validate that the parents match

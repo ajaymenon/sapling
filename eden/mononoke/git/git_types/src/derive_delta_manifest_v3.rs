@@ -21,6 +21,7 @@ use cloned::cloned;
 use context::CoreContext;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
+use derived_data_manager::DerivableUntopologically;
 use derived_data_manager::DerivationContext;
 use derived_data_manager::dependencies;
 use derived_data_service_if as thrift;
@@ -38,6 +39,7 @@ use metaconfig_types::GitDeltaManifestV3Config;
 use mononoke_macros::mononoke;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableUntopologicallyVariant;
 use mononoke_types::ThriftConvert;
 use mononoke_types::path::MPath;
 
@@ -61,7 +63,7 @@ pub struct RootGitDeltaManifestV3Id;
 pub fn format_key(derivation_ctx: &DerivationContext, changeset_id: ChangesetId) -> String {
     let root_prefix = "derived_root_gdm3.";
     let key_prefix = derivation_ctx.mapping_key_prefix::<RootGitDeltaManifestV3Id>();
-    format!("{}{}{}", root_prefix, key_prefix, changeset_id)
+    format!("{root_prefix}{key_prefix}{changeset_id}")
 }
 
 pub fn format_manifest_key(
@@ -70,7 +72,7 @@ pub fn format_manifest_key(
 ) -> String {
     let manifest_prefix = "gdm3.";
     let key_prefix = derivation_ctx.mapping_key_prefix::<RootGitDeltaManifestV3Id>();
-    format!("{}{}{}", manifest_prefix, key_prefix, changeset_id)
+    format!("{manifest_prefix}{key_prefix}{changeset_id}")
 }
 
 async fn derive_single(
@@ -381,7 +383,6 @@ impl BonsaiDerivable for RootGitDeltaManifestV3Id {
     const VARIANT: DerivableType = DerivableType::GitDeltaManifestsV3;
 
     type Dependencies = dependencies![MappedGitCommitId];
-    type PredecessorDependencies = dependencies![];
     type Value = GitDeltaManifestV3;
 
     async fn derive_single(
@@ -419,14 +420,6 @@ impl BonsaiDerivable for RootGitDeltaManifestV3Id {
             .try_collect::<Vec<_>>()
             .await?;
         Ok(output.into_iter().collect())
-    }
-
-    async fn derive_from_predecessor(
-        ctx: &CoreContext,
-        derivation_ctx: &DerivationContext,
-        bonsai: BonsaiChangeset,
-    ) -> Result<Self> {
-        derive_single(ctx, derivation_ctx, bonsai).await
     }
 
     async fn store_mapping(
@@ -486,6 +479,21 @@ impl BonsaiDerivable for RootGitDeltaManifestV3Id {
                 ..Default::default()
             },
         ))
+    }
+}
+
+#[async_trait]
+impl DerivableUntopologically for RootGitDeltaManifestV3Id {
+    const DERIVABLE_UNTOPOLOGICALLY_VARIANT: DerivableUntopologicallyVariant =
+        DerivableUntopologicallyVariant::GitDeltaManifestsV3;
+    type PredecessorDependencies = dependencies![];
+
+    async fn unsafe_derive_untopologically(
+        ctx: &CoreContext,
+        derivation_ctx: &DerivationContext,
+        bonsai: BonsaiChangeset,
+    ) -> Result<Self> {
+        derive_single(ctx, derivation_ctx, bonsai).await
     }
 }
 
@@ -559,10 +567,7 @@ mod tests {
             .fetch_derived_direct::<RootGitDeltaManifestV3Id>(ctx, cs_id)
             .await?
             .ok_or_else(|| {
-                format_err!(
-                    "GitDeltaManifestV3 should be present for changeset {}",
-                    cs_id
-                )
+                format_err!("GitDeltaManifestV3 should be present for changeset {cs_id}")
             })?;
         // Validate the derivation of all the commits in this repo succeeds
         let all_cs_ids = repo

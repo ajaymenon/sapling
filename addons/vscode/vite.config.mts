@@ -5,17 +5,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {Plugin, PluginOption} from 'vite';
+import type {PluginOption} from 'vite';
 
+// import babel from '@rolldown/plugin-babel';
 import react from '@vitejs/plugin-react';
-import fs, {existsSync} from 'node:fs';
+import {existsSync} from 'node:fs';
 import path from 'node:path';
 import {defineConfig} from 'vite';
-import styleX from 'vite-plugin-stylex';
-import viteTsconfigPaths from 'vite-tsconfig-paths';
 
 // Normalize `c:\foo\index.html` to `c:/foo/index.html`.
-// This affects Rollup's `facadeModuleId` (which expects the `c:/foo/bar` format),
+// This affects Rolldown's `facadeModuleId` (which expects the `c:/foo/bar` format),
 // and is important for Vite to replace the script tags in HTML files.
 // See https://github.com/vitejs/vite/blob/7440191715b07a50992fcf8c90d07600dffc375e/packages/vite/src/node/plugins/html.ts#L804
 // Without this, building on Windows might produce HTML entry points with
@@ -32,38 +31,10 @@ if (isInternal) {
   input.push(normalizeInputPath('inlineCommentWebview.html'));
   input.push(normalizeInputPath('DiffCommentPanelWebview.html'));
   input.push(normalizeInputPath('InlineCommentPanelWebview.html'));
+  input.push(normalizeInputPath('diffSignalWebview.html'));
 }
 
 console.log(isInternal ? 'Building internal version' : 'Building OSS version');
-
-// vite-plugin-stylex doesn't support renaming the output CSS file, so we have to do that ourselves.
-function moveStylexFilenamePlugin(): Plugin {
-  return {
-    name: 'move-stylex-filename',
-    writeBundle(options, bundle) {
-      for (const name in bundle) {
-        const chunk = bundle[name];
-        // Check if this is the stylex output cssfile
-        if (chunk.type === 'asset' && /assets[/\\]stylex\.[a-f0-9]+\.css/.test(chunk.fileName)) {
-          // Rename the file, move it from "assets" to "res" where the rest of our assets are
-          const newName = 'res/stylex.css';
-          if (options.dir == null) {
-            this.error('Could not replace StyleX output, dir must be set');
-          }
-          const dir = options.dir as string;
-          const oldPath = path.resolve(dir, chunk.fileName);
-          const newPath = path.resolve(dir, newName);
-          this.info(`Replacing StyleX output file ${chunk.fileName} with ${newName}`);
-          fs.renameSync(oldPath, newPath);
-          // Update the bundle object
-          chunk.fileName = newName;
-          bundle[newName] = chunk;
-          delete bundle[name];
-        }
-      }
-    },
-  };
-}
 
 const replaceFiles = (
   replacements?: Array<{
@@ -73,8 +44,8 @@ const replaceFiles = (
 ): PluginOption => {
   const projectRoot = process.cwd();
   replacements = replacements?.map(x => ({
-    file: path.join(projectRoot, x.file),
-    replacement: path.join(projectRoot, x.replacement),
+    file: path.join(projectRoot, x.file).replace(/\\/g, '/'),
+    replacement: path.join(projectRoot, x.replacement).replace(/\\/g, '/'),
   }));
 
   return {
@@ -102,6 +73,9 @@ const replaceFiles = (
 
 export default defineConfig(({mode}) => ({
   base: '',
+  resolve: {
+    tsconfigPaths: true,
+  },
   plugins: [
     replaceFiles([
       {
@@ -109,30 +83,27 @@ export default defineConfig(({mode}) => ({
         replacement: './webview/vscodeWebviewPlatform.tsx',
       },
     ]),
-    react({
-      babel: {
-        plugins: [
-          [
-            'jotai/babel/plugin-debug-label',
-            {
-              customAtomNames: [
-                'atomFamilyWeak',
-                'atomLoadableWithRefresh',
-                'atomWithOnChange',
-                'atomWithRefresh',
-                'configBackedAtom',
-                'jotaiAtom',
-                'lazyAtom',
-                'localStorageBackedAtom',
-              ],
-            },
-          ],
-        ],
-      },
-    }),
-    styleX(),
-    viteTsconfigPaths(),
-    moveStylexFilenamePlugin(),
+
+    react(),
+    // babel({
+    //   plugins: [
+    //     [
+    //       'jotai/babel/plugin-debug-label',
+    //       {
+    //         customAtomNames: [
+    //           'atomFamilyWeak',
+    //           'atomLoadableWithRefresh',
+    //           'atomWithOnChange',
+    //           'atomWithRefresh',
+    //           'configBackedAtom',
+    //           'jotaiAtom',
+    //           'lazyAtom',
+    //           'localStorageBackedAtom',
+    //         ],
+    //       },
+    //     ],
+    //   ],
+    // }),
   ],
   build: {
     outDir: 'dist/webview',
@@ -142,7 +113,7 @@ export default defineConfig(({mode}) => ({
     // Ideally, we'd load all the relevant css files in the webview, but our current approach
     // with our own manual copy of html in htmlForWebview does not support this.
     cssCodeSplit: false,
-    rollupOptions: {
+    rolldownOptions: {
       input,
       output: {
         // Don't use hashed names, so ISL webview panel can pre-define what filename to load
@@ -156,7 +127,7 @@ export default defineConfig(({mode}) => ({
     sourcemap: mode === 'development',
   },
   worker: {
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         // Don't use hashed names, so ISL webview panel can pre-define what filename to load
         entryFileNames: 'worker/[name].js',

@@ -14,7 +14,6 @@ use context::CoreContext;
 use context::PerfCounters;
 use derived_data_constants::*;
 use futures_stats::FutureStats;
-use metadata::Metadata;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -36,12 +35,18 @@ pub(super) struct DerivedDataScuba<Derivable> {
 }
 
 impl DerivedDataManager {
-    pub(super) fn derived_data_scuba<Derivable>(&self) -> DerivedDataScuba<Derivable>
+    pub(super) fn derived_data_scuba<Derivable>(
+        &self,
+        ctx: &CoreContext,
+    ) -> DerivedDataScuba<Derivable>
     where
         Derivable: BonsaiDerivable,
     {
         let mut scuba = self.inner.scuba.clone();
         scuba.add("derived_data", Derivable::NAME);
+        // Attach request metadata (session id, client identities, client_correlator, ...)
+        // up front so every row this builder emits carries it.
+        scuba.add_metadata(ctx.metadata());
         DerivedDataScuba {
             scuba,
             description: None,
@@ -51,6 +56,16 @@ impl DerivedDataManager {
 }
 
 impl<Derivable: BonsaiDerivable> DerivedDataScuba<Derivable> {
+    pub(super) fn add_stage_id(&mut self, stage_id: &str) {
+        self.scuba.add("stage_id", stage_id.to_string());
+    }
+
+    /// Add the duration of the pre-derivation setup phase (loading bonsais,
+    /// fetching parent/dependency stage outputs, building dependency map).
+    pub(super) fn add_setup_duration(&mut self, duration: Duration) {
+        self.scuba.add("setup_time_us", duration.as_micros() as u64);
+    }
+
     /// Description of this operation to log (derived data type and affected
     /// changesets).
     fn description(&self) -> String {
@@ -94,11 +109,6 @@ impl<Derivable: BonsaiDerivable> DerivedDataScuba<Derivable> {
         self.scuba.add("changed_files_count", changed_files_count);
     }
 
-    /// Add metadata to the logger
-    pub fn add_metadata(&mut self, metadata: &Metadata) {
-        self.scuba.add_metadata(metadata);
-    }
-
     /// Log the start of derivation to both the request and derived data scuba
     /// tables.
     pub(super) fn log_derivation_start(&mut self, ctx: &CoreContext) {
@@ -118,7 +128,7 @@ impl<Derivable: BonsaiDerivable> DerivedDataScuba<Derivable> {
     ) {
         let (tag, error_str) = match error {
             None => (DERIVATION_END, None),
-            Some(error) => (FAILED_DERIVATION, Some(format!("{:#}", error))),
+            Some(error) => (FAILED_DERIVATION, Some(format!("{error:#}"))),
         };
 
         let mut ctx_scuba = ctx.scuba().clone();
@@ -152,7 +162,7 @@ impl<Derivable: BonsaiDerivable> DerivedDataScuba<Derivable> {
     ) {
         let (tag, error_str) = match error {
             None => (DERIVATION_END_BATCH, None),
-            Some(error) => (FAILED_DERIVATION_BATCH, Some(format!("{:#}", error))),
+            Some(error) => (FAILED_DERIVATION_BATCH, Some(format!("{error:#}"))),
         };
 
         let mut ctx_scuba = ctx.scuba().clone();
@@ -203,14 +213,14 @@ impl<Derivable: BonsaiDerivable> DerivedDataScuba<Derivable> {
     ) {
         let (tag, error_str) = match error {
             None => (INSERTED_MAPPING, None),
-            Some(error) => (FAILED_INSERTING_MAPPING, Some(format!("{:#}", error))),
+            Some(error) => (FAILED_INSERTING_MAPPING, Some(format!("{error:#}"))),
         };
 
         ctx.perf_counters().insert_perf_counters(&mut self.scuba);
 
         if let Some(value) = value {
             // Limit how much we log to scuba.
-            let value = format!("{:1000?}", value);
+            let value = format!("{value:1000?}");
             self.scuba.add("mapping_value", value);
         }
 
@@ -222,13 +232,10 @@ impl<Derivable: BonsaiDerivable> DerivedDataScuba<Derivable> {
 
 impl DerivedDataManager {
     fn should_log_slow_derivation(&self, duration: Duration) -> bool {
-        const FALLBACK_THRESHOLD_SECS: u64 = 15;
-
         let threshold: u64 = justknobs::get_as::<u64>(
             "scm/mononoke_timeouts:derived_data_slow_derivation_threshold_secs",
             None,
-        )
-        .unwrap_or(FALLBACK_THRESHOLD_SECS);
+        );
 
         duration > Duration::from_secs(threshold)
     }

@@ -10,6 +10,7 @@ import binascii
 import json
 import os
 import subprocess
+import sys
 import typing
 from pathlib import Path
 from typing import BinaryIO, Dict, List, Optional, Tuple
@@ -153,9 +154,10 @@ def setup_hg_dir(
         except FileExistsError:
             raise Exception(f"{checkout_hg_dir} symlink already exists")
 
-    # hgrc
+    # repo config file (hgrc for .hg, config for .sl)
     hgrc_data = get_hgrc_data(checkout)
-    (checkout_hg_dir / "hgrc").write_text(hgrc_data)
+    config_name = config_file_for_dot_dir(checkout_hg_dir.name)
+    (checkout_hg_dir / config_name).write_text(hgrc_data)
 
     # requires
     requires_data = get_requires_data(checkout)
@@ -214,11 +216,12 @@ def get_hgrc_data(checkout: EdenCheckout) -> str:
     if extra_hgrc and extra_hgrc[-1] != "\n":
         extra_hgrc += "\n"
 
+    config_name = config_file_for_dot_dir(backing_hg_dir.name)
     try:
-        orig_hgrc = (backing_hg_dir / "hgrc").read_text()
+        orig_hgrc = (backing_hg_dir / config_name).read_text()
     except FileNotFoundError:
-        # Repositories aren't required to have an .hgrc file
-        # Make sure the .hg directory itself exists though, to confirm
+        # Repositories aren't required to have a config file.
+        # Make sure the .hg/.sl directory itself exists though, to confirm
         # we weren't called with incorrect arguments.
         if not backing_hg_dir.is_dir():
             raise Exception(f"backing repository does not exist: {backing_hg_dir}")
@@ -245,7 +248,7 @@ def get_requires_data(checkout: EdenCheckout) -> str:
     requires.discard("windowssymlinks")
     requires.discard("edensparse")
 
-    if checkout.get_config().enable_windows_symlinks:
+    if sys.platform == "win32":
         requires.add("windowssymlinks")
 
     if checkout.get_config().scm_type == "filteredhg":
@@ -256,13 +259,26 @@ def get_requires_data(checkout: EdenCheckout) -> str:
 
 _possible_dot_dirs = (".hg", ".sl")
 
+# Map from dot dir name to the config file name inside it.
+_dot_dir_config_file = {".hg": "hgrc", ".sl": "config"}
+
+
+def config_file_for_dot_dir(dot_dir: str) -> str:
+    return _dot_dir_config_file.get(dot_dir, "hgrc")
+
 
 def sniff_dot_dir(repo_root: Path) -> str:
     for dot_dir in _possible_dot_dirs:
         if (repo_root / dot_dir).exists():
             return dot_dir
 
-    env_ident = os.environ.get("HGIDENTITY", os.environ.get("SLIDENTITY", None))
+    # SL_REPO_IDENTITY/HGREPO_IDENTITY specifically controls the repo format
+    # (dot dir flavor), so check it first.
+    repo_ident = os.environ.get("SL_REPO_IDENTITY") or os.environ.get("HGREPO_IDENTITY")
+    if repo_ident in {"hg", "sl"}:
+        return "." + repo_ident
+
+    env_ident = os.environ.get("HGIDENTITY") or os.environ.get("SL_IDENTITY")
     if env_ident in {"hg", "sl"}:
         return "." + env_ident
 

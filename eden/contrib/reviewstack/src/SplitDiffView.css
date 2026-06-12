@@ -27,6 +27,11 @@
   padding-left: 10px;
   padding-right: 10px;
   text-align: right;
+  white-space: nowrap;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
 }
 
 .SplitDiffView-hunk-table td.separator {
@@ -34,6 +39,12 @@
   padding-top: 0;
   padding-bottom: 0;
   text-align: center;
+}
+
+.split-diff-view-file-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 
 .file-header-copyable-path {

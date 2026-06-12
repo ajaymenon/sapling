@@ -80,12 +80,10 @@ impl RemoteCache {
     }
 
     fn create_key_gen(backing_store_name: &str, backing_store_params: &str) -> Result<KeyGen> {
-        let key_prefix = format!(
-            "scm.mononoke.filenodes.{}.{}",
-            backing_store_name, backing_store_params,
-        );
+        let key_prefix =
+            format!("scm.mononoke.filenodes.{backing_store_name}.{backing_store_params}",);
 
-        let sitever = justknobs::get_as::<u32>("scm/mononoke_memcache_sitevers:filenodes", None)?;
+        let sitever = justknobs::get_as::<u32>("scm/mononoke_memcache_sitevers:filenodes", None);
 
         Ok(KeyGen::new(key_prefix, thrift::MC_CODEVER as u32, sitever))
     }
@@ -339,23 +337,19 @@ async fn fill_history(
             .chunks(MEMCACHE_VALUE_MAX_SIZE)
             .map(Vec::from) // takes ownership
             .zip(PointersIter::new())
-            .map({
-                move |(chunk, pointer)| {
-                    async move {
-                        let chunk_key = get_mc_key_for_filenodes_list_chunk(keygen, key, pointer);
+            .map(move |(chunk, pointer)| async move {
+                let chunk_key = get_mc_key_for_filenodes_list_chunk(keygen, key, pointer);
 
-                        // give chunks non-random max TTL_SEC_RAND so that they always live
-                        // longer than the pointer
-                        let chunk_ttl = Duration::from_secs(TTL_SEC + TTL_SEC_RAND);
+                // give chunks non-random max TTL_SEC_RAND so that they always live
+                // longer than the pointer
+                let chunk_ttl = Duration::from_secs(TTL_SEC + TTL_SEC_RAND);
 
-                        memcache
-                            .set_with_ttl(chunk_key, chunk, chunk_ttl)
-                            .await
-                            .map_err(drop)?;
+                memcache
+                    .set_with_ttl(chunk_key, chunk, chunk_ttl)
+                    .await
+                    .map_err(drop)?;
 
-                        Ok(pointer)
-                    }
-                }
+                Ok::<i64, ()>(pointer)
             })
             .collect::<Vec<_>>();
 

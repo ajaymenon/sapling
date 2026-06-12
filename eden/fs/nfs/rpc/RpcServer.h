@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <optional>
 #include <vector>
 
 #include <folly/SocketAddress.h>
@@ -26,7 +28,7 @@ class Executor;
 
 namespace facebook::eden {
 
-class StructuredLogger;
+class EdenFsEventsLogger;
 
 enum class RpcStopReason {
   /**
@@ -65,6 +67,21 @@ struct RpcStopData final : FsStopData {
   folly::File socketToKernel;
 };
 
+/**
+ * Timeline of an RPC request's journey through the RPC server pipeline.
+ * Each phase boundary is stamped as a time_point for per-phase duration
+ * metrics (accept, queue_wait, processing, write_wait).
+ */
+struct RpcRequestTimeline {
+  using TimePoint = std::optional<std::chrono::steady_clock::time_point>;
+  TimePoint requestReceived;
+  TimePoint dispatched;
+  TimePoint handlerStart;
+  TimePoint handlerDone;
+  TimePoint responseSent;
+  uint32_t procNumber{0};
+};
+
 class RpcServerProcessor {
  public:
   virtual ~RpcServerProcessor() = default;
@@ -78,6 +95,62 @@ class RpcServerProcessor {
       uint32_t procNumber);
   virtual void clientConnected();
   virtual void onShutdown(RpcStopData stopData);
+
+  /**
+   * Return true to enable fast-path handling of certain RPCs directly on
+   * the EventBase thread, bypassing the thread pool. When enabled:
+   *   - null RPCs (proc=0) get an inline SUCCESS reply
+   *   - unimplemented procs (per isUnimplementedProc) get PROC_UNAVAIL
+   */
+  virtual bool shouldFastPathRPCs() const {
+    return false;
+  }
+
+  /**
+   * Return true for procedures that are unimplemented and should be
+   * fast-pathed as PROC_UNAVAIL directly on the EventBase thread.
+   */
+  virtual bool isUnimplementedProc(uint32_t /*proc*/) const {
+    return false;
+  }
+
+  /**
+   * Result of an inline rejection check on the EventBase thread.
+   * Three valid states:
+   *   - rejected=true, permit=nullptr: request was rejected, response
+   * serialized
+   *   - rejected=false, permit!=nullptr: permit acquired, proceed to thread
+   * pool
+   *   - rejected=false, permit=nullptr: rate limiting not configured, proceed
+   */
+  struct InlineRejectResult {
+    bool rejected = false;
+    std::unique_ptr<RequestPermit> permit;
+  };
+
+  /**
+   * Called on the EventBase thread to check whether rate limiting denies
+   * this request. Default: no rejection.
+   */
+  virtual InlineRejectResult tryInlineReject() {
+    return {};
+  }
+
+  /**
+   * Serialize the rejection response into ser. Only called after
+   * tryInlineReject returned rejected=true.
+   */
+  virtual void serializeInlineReject(
+      uint32_t /*proc*/,
+      uint32_t /*xid*/,
+      folly::io::QueueAppender& /*ser*/) {}
+
+  /**
+   * Called after a request completes and the response has been written.
+   * Subclasses implement this to record timing metrics and log anomalies.
+   * Called on the EventBase thread from the socket write callback.
+   */
+  virtual void onRequestComplete(const RpcRequestTimeline& /*timeline*/) {}
 };
 
 class RpcServer;
@@ -121,12 +194,17 @@ class RpcConnectionHandler : public folly::DelayedDestruction,
    */
   folly::SemiFuture<folly::Unit> takeoverStop();
 
+  /**
+   * Record per-phase timing metrics from the request timeline.
+   */
+  void recordPhaseTimings(const RpcRequestTimeline& timeline) noexcept;
+
  private:
   RpcConnectionHandler(
       std::shared_ptr<RpcServerProcessor> proc,
       folly::AsyncSocket::UniquePtr&& socket,
       std::shared_ptr<folly::Executor> threadPool,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       std::weak_ptr<RpcServer> owningServer,
       size_t maximumInFlightRequests,
       std::chrono::nanoseconds highNfsRequestsLogInterval);
@@ -161,6 +239,14 @@ class RpcConnectionHandler : public folly::DelayedDestruction,
   void tryConsumeReadBuffer() noexcept;
 
   /**
+   * Serialize and send an inline RPC reply on the EventBase thread.
+   * The body serializer is called with a QueueAppender positioned after
+   * the fragment header placeholder.
+   */
+  template <typename F>
+  void writeInlineReply(F&& serializeBody);
+
+  /**
    * Delete the reader, called when the socket is closed or on takeover.
    *
    * This must be called on the main event base of the socket. This is
@@ -183,7 +269,9 @@ class RpcConnectionHandler : public folly::DelayedDestruction,
    */
   void dispatchAndReply(
       std::unique_ptr<folly::IOBuf> input,
-      DestructorGuard guard);
+      DestructorGuard guard,
+      std::unique_ptr<RequestPermit> permit,
+      RpcRequestTimeline timeline);
 
   /**
    * Reply to an rpc call with an error.
@@ -227,7 +315,7 @@ class RpcConnectionHandler : public folly::DelayedDestruction,
    * are exported off the machine this EdenFS instance is running on. This is
    * where you log anomalous things that you want to monitor across the fleet.
    */
-  std::shared_ptr<StructuredLogger> errorLogger_;
+  std::shared_ptr<EdenFsEventsLogger> errorLogger_;
 
   folly::IOBufQueue readBuf_{folly::IOBufQueue::cacheChainLength()};
 
@@ -296,7 +384,7 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
       std::shared_ptr<RpcServerProcessor> proc,
       folly::EventBase* evb,
       std::shared_ptr<folly::Executor> threadPool,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       size_t maximumInFlightRequests,
       std::chrono::nanoseconds highNfsRequestsLogInterval);
 
@@ -321,6 +409,12 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
    * Initialize this server from an existing server socket.
    */
   void initializeServerSocket(folly::File socket);
+
+  /**
+   * Resume accepting on an existing server socket after takeoverStop() paused
+   * the accept callback.
+   */
+  void resumeAccepting();
 
   /**
    * Stop reading new requests, wait for pending requests, and detach and return
@@ -363,7 +457,7 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
       std::shared_ptr<RpcServerProcessor> proc,
       folly::EventBase* evb,
       std::shared_ptr<folly::Executor> threadPool,
-      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       size_t maximumInFlightRequests,
       std::chrono::nanoseconds highNfsRequestsLogInterval);
 
@@ -390,7 +484,7 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
   std::shared_ptr<folly::Executor> threadPool_;
 
   // Logger for logging anomalous things to Scuba
-  std::shared_ptr<StructuredLogger> structuredLogger_;
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
 
   // listening socket for this server.
   folly::AsyncServerSocket::UniquePtr serverSocket_;

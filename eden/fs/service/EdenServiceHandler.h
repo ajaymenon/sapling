@@ -10,6 +10,7 @@
 #include <fb303/BaseService.h>
 #include <folly/CancellationToken.h>
 #include <folly/coro/Task.h>
+#include <folly/coro/safe/NowTask.h>
 #include <optional>
 #include "eden/common/os/ProcessId.h"
 #include "eden/common/telemetry/TraceBus.h"
@@ -171,6 +172,25 @@ class EdenServiceHandler
       CheckoutMode checkoutMode,
       std::unique_ptr<CheckOutRevisionParams> params) override;
 
+  folly::SemiFuture<std::unique_ptr<std::vector<CheckoutConflict>>>
+  semifuture_checkOutRevisionImpl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::string> hash,
+      CheckoutMode checkoutMode,
+      std::unique_ptr<CheckOutRevisionParams> params);
+
+  /**
+   * Coroutine implementation of `checkOutRevision`. Selected by
+   * `EdenConfig::enableCoroutinesPhase7`.
+   */
+  folly::coro::now_task<std::unique_ptr<std::vector<CheckoutConflict>>>
+  co_checkOutRevisionImpl(
+      apache::thrift::Cpp2RequestContext* requestContext,
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::string> hash,
+      CheckoutMode checkoutMode,
+      std::unique_ptr<CheckOutRevisionParams> params);
+
   folly::SemiFuture<folly::Unit> semifuture_resetParentCommits(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<WorkingDirectoryParents> parents,
@@ -198,11 +218,37 @@ class EdenServiceHandler
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync) override;
 
+  // DEPRECATED: Use co_getSHA1Impl instead.
+  folly::SemiFuture<std::unique_ptr<std::vector<SHA1Result>>>
+  semifuture_getSHA1Impl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
+
+  folly::coro::now_task<std::unique_ptr<std::vector<SHA1Result>>>
+  co_getSHA1Impl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
+
   folly::SemiFuture<std::unique_ptr<std::vector<Blake3Result>>>
   semifuture_getBlake3(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync) override;
+
+  // DEPRECATED. Use co_getBlake3Impl instead.
+  folly::SemiFuture<std::unique_ptr<std::vector<Blake3Result>>>
+  semifuture_getBlake3Impl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
+
+  folly::coro::now_task<std::unique_ptr<std::vector<Blake3Result>>>
+  co_getBlake3Impl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
 
   folly::SemiFuture<std::unique_ptr<std::vector<DigestHashResult>>>
   semifuture_getDigestHash(
@@ -210,9 +256,25 @@ class EdenServiceHandler
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync) override;
 
+  folly::SemiFuture<std::unique_ptr<std::vector<DigestHashResult>>>
+  semifuture_getDigestHashImpl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
+
+  folly::coro::now_task<std::unique_ptr<std::vector<DigestHashResult>>>
+  co_getDigestHashImpl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
+
   void getCurrentJournalPosition(
       JournalPosition& out,
       std::unique_ptr<std::string> mountPoint) override;
+
+  void peekCurrentJournalPosition(
+      PeekCurrentJournalPositionResponse& out,
+      std::unique_ptr<PeekCurrentJournalPositionRequest> params) override;
 
   void getFilesChangedSince(
       FileDelta& out,
@@ -238,11 +300,35 @@ class EdenServiceHandler
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync) override;
 
+  folly::SemiFuture<std::unique_ptr<std::vector<EntryInformationOrError>>>
+  semifuture_getEntryInformationImpl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
+
+  folly::coro::now_task<std::unique_ptr<std::vector<EntryInformationOrError>>>
+  co_getEntryInformationImpl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
+
   folly::SemiFuture<std::unique_ptr<std::vector<FileInformationOrError>>>
   semifuture_getFileInformation(
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<std::vector<std::string>> paths,
       std::unique_ptr<SyncBehavior> sync) override;
+
+  folly::SemiFuture<std::unique_ptr<std::vector<FileInformationOrError>>>
+  semifuture_getFileInformationImpl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
+
+  folly::coro::now_task<std::unique_ptr<std::vector<FileInformationOrError>>>
+  co_getFileInformationImpl(
+      std::unique_ptr<std::string> mountPoint,
+      std::unique_ptr<std::vector<std::string>> paths,
+      std::unique_ptr<SyncBehavior> sync);
 
   folly::SemiFuture<std::unique_ptr<GetAttributesFromFilesResultV2>>
   semifuture_getAttributesFromFilesV2(
@@ -254,14 +340,29 @@ class EdenServiceHandler
   folly::SemiFuture<std::unique_ptr<Glob>> semifuture_globFiles(
       std::unique_ptr<GlobParams> params) override;
 
+  folly::SemiFuture<std::unique_ptr<Glob>> semifuture_globFilesImpl(
+      std::unique_ptr<GlobParams> params);
+
+  folly::coro::now_task<std::unique_ptr<Glob>> co_globFilesImpl(
+      std::unique_ptr<GlobParams> params);
+
   folly::SemiFuture<folly::Unit> semifuture_prefetchFiles(
       std::unique_ptr<PrefetchParams> params) override;
 
   folly::SemiFuture<std::unique_ptr<PrefetchResult>> semifuture_prefetchFilesV2(
       std::unique_ptr<PrefetchParams> params) override;
 
+  folly::SemiFuture<std::unique_ptr<PrefetchResult>>
+  semifuture_prefetchFilesV2Impl(std::unique_ptr<PrefetchParams> params);
+
+  folly::coro::now_task<std::unique_ptr<PrefetchResult>> co_prefetchFilesV2Impl(
+      std::unique_ptr<PrefetchParams> params);
+
   folly::SemiFuture<std::unique_ptr<Glob>> semifuture_predictiveGlobFiles(
       std::unique_ptr<GlobParams> params) override;
+
+  folly::coro::now_task<std::unique_ptr<Glob>> co_predictiveGlobFilesImpl(
+      std::unique_ptr<GlobParams> params);
 
   folly::SemiFuture<folly::Unit> semifuture_chown(
       std::unique_ptr<std::string> mountPoint,
@@ -367,6 +468,8 @@ class EdenServiceHandler
 
   void debugOutstandingThriftRequests(
       std::vector<ThriftRequestMetadata>& outstandingCalls) override;
+
+  bool debugLogError() override;
 
   void debugOutstandingHgEvents(
       std::vector<HgEvent>& outstandingEvents,
@@ -522,9 +625,12 @@ class EdenServiceHandler
       ListRedirectionsResponse& response,
       std::unique_ptr<ListRedirectionsRequest> request) override;
 
-  folly::SemiFuture<std::unique_ptr<GetFileContentResponse>>
-  semifuture_getFileContent(
+  folly::coro::Task<std::unique_ptr<GetFileContentResponse>> co_getFileContent(
+      apache::thrift::RequestParams params,
       std::unique_ptr<GetFileContentRequest> request) override;
+
+  folly::coro::now_task<std::unique_ptr<ReaddirResult>> co_readdirImpl(
+      std::unique_ptr<ReaddirParams> params);
 
   folly::coro::Task<std::unique_ptr<::facebook::eden::CancelRequestsResponse>>
   co_cancelRequests(

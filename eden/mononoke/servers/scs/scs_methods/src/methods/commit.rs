@@ -18,19 +18,16 @@ use context::CoreContext;
 use futures::pin_mut;
 use futures::stream;
 use futures::stream::BoxStream;
-use futures::stream::FuturesOrdered;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
 use futures_watchdog::WatchdogExt;
-use hooks::HookExecution;
 use hooks::HookOutcome;
+use hooks::HookResult;
 use itertools::Either;
-use itertools::Itertools;
-use maplit::btreeset;
+use mononoke_api::BookmarkKey;
 use mononoke_api::CandidateSelectionHintArgs;
 use mononoke_api::ChangesetContext;
-use mononoke_api::ChangesetDiffItem;
 use mononoke_api::ChangesetFileOrdering;
 use mononoke_api::ChangesetHistoryOptions;
 use mononoke_api::ChangesetId;
@@ -39,11 +36,12 @@ use mononoke_api::ChangesetPathContentContext;
 use mononoke_api::ChangesetPathDiffContext;
 use mononoke_api::ChangesetSpecifier;
 use mononoke_api::CopyInfo;
+use mononoke_api::FingerprintVersion;
 use mononoke_api::MetadataDiff;
 use mononoke_api::MononokeError;
 use mononoke_api::MononokeRepo;
+use mononoke_api::RateLimitOutcome;
 use mononoke_api::Repo;
-use mononoke_api::RepoContext;
 use mononoke_api::UnifiedDiff;
 use mononoke_api::UnifiedDiffMode;
 use mononoke_api::XRepoLookupExactBehaviour;
@@ -52,126 +50,23 @@ use mononoke_api_hg::RepoContextHgExt;
 use mononoke_macros::mononoke;
 use mononoke_types::path::MPath;
 use phases::PhasesRef;
-use restricted_paths::RestrictedPathsArc;
 use scs_errors::ServiceErrorResultExt;
 use source_control as thrift;
 
 use super::commit_restricted_paths;
 use crate::commit_id::map_commit_identities;
 use crate::commit_id::map_commit_identity;
+use crate::diff::RemoteDiffError;
 use crate::from_request::FromRequest;
 use crate::from_request::check_range_and_convert;
 use crate::from_request::validate_timestamp;
 use crate::history::collect_history;
-use crate::into_response::AsyncIntoResponse;
 use crate::into_response::AsyncIntoResponseWith;
 use crate::into_response::IntoResponse;
 use crate::source_control_impl::SourceControlServiceImpl;
 
 // Magic number used when we want to limit concurrency with buffer_unordered.
 const CONCURRENCY_LIMIT: usize = 100;
-
-enum CommitComparePath {
-    File(thrift::CommitCompareFile),
-    Tree(thrift::CommitCompareTree),
-}
-
-impl CommitComparePath {
-    /// The main path that this comparison applies to.
-    fn path(&self) -> Result<&str, scs_errors::ServiceError> {
-        // Use the base path where available.  If it is not available, then
-        // this is a deletion and the other path should be used.
-        match self {
-            CommitComparePath::File(file) => file
-                .base_file
-                .as_ref()
-                .or(file.other_file.as_ref())
-                .map(|file| file.path.as_str())
-                .ok_or_else(|| {
-                    scs_errors::internal_error("programming error, file entry has no file").into()
-                }),
-
-            CommitComparePath::Tree(tree) => tree
-                .base_tree
-                .as_ref()
-                .or(tree.other_tree.as_ref())
-                .map(|tree| tree.path.as_str())
-                .ok_or_else(|| {
-                    scs_errors::internal_error("programming error, tree entry has no tree").into()
-                }),
-        }
-    }
-
-    async fn from_path_diff(
-        path_diff: ChangesetPathDiffContext<Repo>,
-        schemes: &BTreeSet<thrift::CommitIdentityScheme>,
-    ) -> Result<Self, scs_errors::ServiceError> {
-        if path_diff.is_file() {
-            let (base_file, other_file): (_, Option<thrift::FilePathInfo>) = try_join!(
-                path_diff.get_new_content().into_response(),
-                path_diff.get_old_content().into_response()
-            )?;
-            let copy_info = path_diff.copy_info().into_response();
-            let (other_file, subtree_source) = match (
-                path_diff.get_old_content(),
-                path_diff.subtree_copy_dest_path(),
-                other_file,
-            ) {
-                (Some(other), Some(replacement_path), Some(mut other_file)) => {
-                    let source_commit_ids = map_commit_identity(other.changeset(), schemes).await?;
-                    let source_path =
-                        std::mem::replace(&mut other_file.path, replacement_path.to_string());
-                    (
-                        Some(other_file),
-                        Some(thrift::CommitCompareSubtreeSource {
-                            source_commit_ids,
-                            source_path,
-                            ..Default::default()
-                        }),
-                    )
-                }
-                (_, _, other_file) => (other_file, None),
-            };
-            Ok(CommitComparePath::File(thrift::CommitCompareFile {
-                base_file,
-                other_file,
-                copy_info,
-                subtree_source,
-                ..Default::default()
-            }))
-        } else {
-            let (base_tree, other_tree) = try_join!(
-                path_diff.get_new_content().into_response(),
-                path_diff.get_old_content().into_response()
-            )?;
-            Ok(CommitComparePath::Tree(thrift::CommitCompareTree {
-                base_tree,
-                other_tree,
-                ..Default::default()
-            }))
-        }
-    }
-}
-
-/// Helper for commit_compare to add mutable rename information if appropriate
-async fn add_mutable_renames(
-    base_changeset: &mut ChangesetContext<Repo>,
-    params: &thrift::CommitCompareParams,
-) -> Result<(), scs_errors::ServiceError> {
-    if params.follow_mutable_file_history.unwrap_or(false) {
-        if let Some(paths) = &params.paths {
-            let paths: Vec<_> = paths
-                .iter()
-                .map(MPath::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| MononokeError::InvalidRequest(error.to_string()))?;
-            base_changeset
-                .add_mutable_renames(paths.into_iter())
-                .await?;
-        }
-    }
-    Ok(())
-}
 
 struct CommitFileDiffsItem {
     path_diff_context: ChangesetPathDiffContext<Repo>,
@@ -231,11 +126,9 @@ impl CommitFileDiffsItem {
             thrift::DiffFormat::METADATA_DIFF => {
                 self.metadata_diff(ctx, repo_name, diff_router).await
             }
-            unknown => Err(scs_errors::invalid_request(format!(
-                "invalid diff format: {:?}",
-                unknown
-            ))
-            .into()),
+            unknown => {
+                Err(scs_errors::invalid_request(format!("invalid diff format: {unknown:?}")).into())
+            }
         }
     }
 
@@ -628,8 +521,7 @@ impl SourceControlServiceImpl {
                         Some(base_path) => {
                             Some(base_path_contexts.get(base_path).ok_or_else(|| {
                                 scs_errors::invalid_request(format!(
-                                    "{} not found in {:?}",
-                                    base_path, commit
+                                    "{base_path} not found in {commit:?}"
                                 ))
                             })?)
                         }
@@ -647,8 +539,7 @@ impl SourceControlServiceImpl {
                         (None, Some(other_path)) => {
                             Some(other_path_contexts.get(other_path).ok_or_else(|| {
                                 scs_errors::invalid_request(format!(
-                                    "{} not found in {:?}",
-                                    other_path, other_commit
+                                    "{other_path} not found in {other_commit:?}"
                                 ))
                             })?)
                         }
@@ -765,6 +656,33 @@ impl SourceControlServiceImpl {
         Ok(changeset.generation().await?.value() as i64)
     }
 
+    /// Get the content fingerprint of a commit.
+    pub(crate) async fn commit_fingerprint(
+        &self,
+        ctx: CoreContext,
+        commit: thrift::CommitSpecifier,
+        params: thrift::CommitFingerprintParams,
+    ) -> Result<thrift::CommitFingerprintResponse, scs_errors::ServiceError> {
+        let version = match params.version {
+            thrift::CommitFingerprintVersion::V1 => FingerprintVersion::V1,
+            thrift::CommitFingerprintVersion::V2 => FingerprintVersion::V2,
+            other => {
+                return Err(scs_errors::ServiceError::from(
+                    MononokeError::InvalidRequest(format!(
+                        "unsupported fingerprint version: {other:?}"
+                    )),
+                ));
+            }
+        };
+        let (_repo, changeset) = self.repo_changeset(ctx, &commit).await?;
+        let fingerprint = changeset.content_fingerprint(version).await?;
+        Ok(thrift::CommitFingerprintResponse {
+            fingerprint,
+            version: params.version,
+            ..Default::default()
+        })
+    }
+
     /// Returns `true` if this commit is an ancestor of `other_commit`.
     pub(crate) async fn commit_is_ancestor_of(
         &self,
@@ -779,6 +697,67 @@ impl SourceControlServiceImpl {
         Ok(is_ancestor_of)
     }
 
+    /// Filter a list of candidate commits to only those that are ancestors
+    /// of the target commit. Uses progressive frontier lowering for efficiency.
+    pub(crate) async fn commit_filter_ancestors(
+        &self,
+        ctx: CoreContext,
+        commit: thrift::CommitSpecifier,
+        params: thrift::CommitFilterAncestorsParams,
+    ) -> Result<thrift::CommitFilterAncestorsResponse, scs_errors::ServiceError> {
+        let num_candidates = params.candidate_ancestor_ids.len();
+        if num_candidates as i64 > thrift::consts::COMMIT_FILTER_ANCESTORS_MAX_CANDIDATES {
+            return Err(scs_errors::invalid_request(format!(
+                "too many candidates ({}), limit is {}",
+                num_candidates,
+                thrift::consts::COMMIT_FILTER_ANCESTORS_MAX_CANDIDATES,
+            ))
+            .into());
+        }
+
+        let (repo, changeset) = self.repo_changeset(ctx, &commit).await?;
+
+        // Resolve all candidate commit IDs to ChangesetIds concurrently
+        let candidate_cs_ids: Vec<ChangesetId> = stream::iter(params.candidate_ancestor_ids)
+            .map(|candidate_id| {
+                borrowed!(repo);
+                async move {
+                    let cs_ctx = repo
+                        .changeset(ChangesetSpecifier::from_request(&candidate_id)?)
+                        .await?
+                        .ok_or_else(|| scs_errors::commit_not_found(format!("{candidate_id:?}")))?;
+                    Ok::<_, scs_errors::ServiceError>(cs_ctx.id())
+                }
+            })
+            .buffered(CONCURRENCY_LIMIT)
+            .try_collect()
+            .await?;
+
+        // Use the batch filter_ancestors method on the commit graph
+        let ancestor_cs_ids = repo
+            .commit_graph()
+            .filter_ancestors(changeset.ctx(), changeset.id(), candidate_cs_ids)
+            .watched()
+            .await
+            .map_err(MononokeError::from)?;
+
+        // Map to requested identity schemes
+        let id_mapping =
+            map_commit_identities(&repo, ancestor_cs_ids.clone(), &params.identity_schemes)
+                .watched()
+                .await?;
+
+        let ancestors = ancestor_cs_ids
+            .into_iter()
+            .map(|cs_id| id_mapping.get(&cs_id).cloned().unwrap_or_default())
+            .collect();
+
+        Ok(thrift::CommitFilterAncestorsResponse {
+            ancestors,
+            ..Default::default()
+        })
+    }
+
     /// Returns `true` if this commit is public
     pub(crate) async fn commit_is_public(
         &self,
@@ -790,58 +769,11 @@ impl SourceControlServiceImpl {
         let public = repo_ctx
             .repo()
             .phases()
-            .get_public(
-                &ctx,
-                vec![changeset.id()],
-                false, /* ephemeral_derive */
-            )
+            .get_cached_public(&ctx, vec![changeset.id()])
             .await
             .map_err(|_| scs_errors::internal_error("failed to query commit phase"))?;
 
         Ok(!public.is_empty())
-    }
-
-    /// Given a base changeset, find the "other" changeset from parent information
-    /// including mutable history if appropriate
-    ///
-    /// This is entirely a heuristic to guess the "right" thing if the client
-    /// doesn't provide an "other" changeset - errors would normally be fed back
-    /// to a human and not handled automatically.
-    async fn find_commit_compare_parent(
-        &self,
-        repo: &RepoContext<Repo>,
-        base_changeset: &mut ChangesetContext<Repo>,
-        params: &thrift::CommitCompareParams,
-    ) -> Result<Option<ChangesetContext<Repo>>, scs_errors::ServiceError> {
-        let commit_parents = base_changeset.parents().await?;
-        let mut other_changeset_id = commit_parents.first().copied();
-
-        if params.follow_mutable_file_history.unwrap_or(false) {
-            let mutable_parents = base_changeset.mutable_parents();
-
-            // If there are multiple choices to make, then bail - the user needs to be
-            // clear to avoid the ambiguity
-            if mutable_parents.len() > 1 {
-                return Err(scs_errors::invalid_request(
-                    "multiple different mutable parents in supplied paths",
-                )
-                .into());
-            }
-            if let Some(Some(parent)) = mutable_parents.into_iter().next() {
-                other_changeset_id = Some(parent);
-            }
-        }
-
-        match other_changeset_id {
-            None => Ok(None),
-            Some(other_changeset_id) => {
-                let other_changeset = repo
-                    .changeset(ChangesetSpecifier::Bonsai(other_changeset_id))
-                    .await?
-                    .ok_or_else(|| scs_errors::internal_error("other changeset is missing"))?;
-                Ok(Some(other_changeset))
-            }
-        }
     }
 
     /// Diff two commits
@@ -851,198 +783,58 @@ impl SourceControlServiceImpl {
         commit: thrift::CommitSpecifier,
         params: thrift::CommitCompareParams,
     ) -> Result<thrift::CommitCompareResponse, scs_errors::ServiceError> {
-        let (base_changeset, other_changeset) = match &params.other_commit_id {
-            Some(id) => {
-                let (mut base_changeset, other_changeset) = self
-                    .repo_changeset_pair(ctx.clone(), &commit, id)
-                    .watched()
-                    .await?;
-                add_mutable_renames(&mut base_changeset, &params)
-                    .watched()
-                    .await?;
-                (base_changeset, Some(other_changeset))
+        // Check if we should route to the remote diff_service
+        let repo_name = &commit.repo.name;
+        let remote_diff_config = self
+            .configs
+            .repo_configs()
+            .repos
+            .get(repo_name)
+            .and_then(|config| config.remote_diff_config.clone());
+        let diff_router = self.diff_router(remote_diff_config.as_ref());
+        if diff_router.should_use_remote_commit_compare(repo_name) {
+            let remote_params = params.clone();
+            match diff_router
+                .remote_commit_compare(&ctx, repo_name, commit.id.clone(), remote_params)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(RemoteDiffError::RequestError(e)) => return Err(e),
+                Err(RemoteDiffError::InfraError(reason)) => {
+                    let mut scuba = ctx.scuba().clone();
+                    scuba.add("diff_fallback", reason);
+                    scuba.add("diff_fallback_method", "commit_compare");
+                    scuba.log_with_msg("Diff service fallback to local", None);
+                }
             }
-            None => {
-                let (repo, mut base_changeset) =
-                    self.repo_changeset(ctx.clone(), &commit).watched().await?;
-                add_mutable_renames(&mut base_changeset, &params)
-                    .watched()
-                    .await?;
-                let other_changeset = self
-                    .find_commit_compare_parent(&repo, &mut base_changeset, &params)
-                    .watched()
-                    .await?;
-                (base_changeset, other_changeset)
-            }
-        };
-
-        // Log the generation difference to drill down on clients making
-        // expensive `commit_compare` requests
-        let base_generation = base_changeset.generation().watched().await?.value();
-        let other_generation = match other_changeset {
-            Some(ref cs) => cs.generation().watched().await?.value(),
-            // If there isn't another commit, let's use the same generation
-            // to have a difference of 0.
-            None => base_generation,
-        };
-
-        let generation_diff = base_generation.abs_diff(other_generation);
-        let mut scuba = ctx.scuba().clone();
-        scuba.log_with_msg(
-            "Commit compare generation difference",
-            format!("{generation_diff}"),
-        );
-
-        let mut last_path = None;
-        let mut diff_items: BTreeSet<_> = params
-            .compare_items
-            .into_iter()
-            .filter_map(|item| match item {
-                thrift::CommitCompareItem::FILES => Some(ChangesetDiffItem::FILES),
-                thrift::CommitCompareItem::TREES => Some(ChangesetDiffItem::TREES),
-                _ => None,
-            })
-            .collect();
-
-        if diff_items.is_empty() {
-            diff_items = btreeset! { ChangesetDiffItem::FILES };
         }
 
-        let paths: Option<Vec<MPath>> = match params.paths {
-            None => None,
-            Some(paths) => Some(
-                paths
-                    .iter()
-                    .map(MPath::try_from)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| MononokeError::InvalidRequest(error.to_string()))?,
-            ),
-        };
-        let (diff_files, diff_trees) = match params.ordered_params {
-            None => {
-                let diff = match other_changeset {
-                    Some(ref other_changeset) => {
-                        base_changeset
-                            .diff_unordered(
-                                other_changeset,
-                                !params.skip_copies_renames,
-                                params.compare_with_subtree_copy_sources.unwrap_or_default(),
-                                paths,
-                                diff_items,
-                            )
-                            .watched()
-                            .await?
-                    }
-                    None => {
-                        base_changeset
-                            .diff_root_unordered(paths, diff_items)
-                            .watched()
-                            .await?
-                    }
-                };
-                stream::iter(diff)
-                    .map(|diff| CommitComparePath::from_path_diff(diff, &params.identity_schemes))
-                    // Use `buffered` instead of `buffer_unordered` to maintain deterministic
-                    // ordering of results. While `buffer_unordered` can yield results sooner,
-                    // it produces non-deterministic ordering based on which futures complete first.
-                    .buffered(CONCURRENCY_LIMIT)
-                    .try_collect::<Vec<_>>()
-                    .watched()
-                    .await?
-                    .into_iter()
-                    .partition_map(|diff| match diff {
-                        CommitComparePath::File(entry) => Either::Left(entry),
-                        CommitComparePath::Tree(entry) => Either::Right(entry),
-                    })
+        let (repo, base_changeset, other_changeset) = match &params.other_commit_id {
+            Some(id) => {
+                let (base, other) = self.repo_changeset_pair(ctx.clone(), &commit, id).await?;
+                let repo = base.repo_ctx().clone();
+                (repo, base, Some(other))
             }
-            Some(ordered_params) => {
-                let limit: usize = check_range_and_convert(
-                    "limit",
-                    ordered_params.limit,
-                    0..=source_control::COMMIT_COMPARE_ORDERED_MAX_LIMIT,
-                )?;
-                let after = ordered_params
-                    .after_path
-                    .map(|after| {
-                        MPath::try_from(&after).map_err(|e| {
-                            scs_errors::invalid_request(format!(
-                                "invalid continuation path '{}': {}",
-                                after, e
-                            ))
-                        })
-                    })
-                    .transpose()?;
-                let diff = match other_changeset {
-                    Some(ref other_changeset) => {
-                        base_changeset
-                            .diff(
-                                other_changeset,
-                                !params.skip_copies_renames,
-                                params.compare_with_subtree_copy_sources.unwrap_or_default(),
-                                paths,
-                                diff_items,
-                                ChangesetFileOrdering::Ordered { after },
-                                Some(limit),
-                            )
-                            .watched()
-                            .await?
-                    }
-                    None => {
-                        base_changeset
-                            .diff_root(
-                                paths,
-                                diff_items,
-                                ChangesetFileOrdering::Ordered { after },
-                                Some(limit),
-                            )
-                            .watched()
-                            .await?
-                    }
-                };
-                let diff_items = diff
-                    .into_iter()
-                    .map(|diff| CommitComparePath::from_path_diff(diff, &params.identity_schemes))
-                    .collect::<FuturesOrdered<_>>()
-                    .try_collect::<Vec<_>>()
-                    .watched()
-                    .await?;
-                if diff_items.len() >= limit {
-                    if let Some(item) = diff_items.last() {
-                        last_path = Some(item.path()?.to_string());
-                    }
-                }
-                diff_items.into_iter().partition_map(|diff| match diff {
-                    CommitComparePath::File(entry) => Either::Left(entry),
-                    CommitComparePath::Tree(entry) => Either::Right(entry),
-                })
+            None => {
+                let (repo, base) = self.repo_changeset(ctx.clone(), &commit).await?;
+                (repo, base, None)
             }
         };
 
-        let other_commit_ids = match other_changeset {
-            None => None,
-            Some(other_changeset) => {
-                // Snapshots currently only support Bonsai, so missing the remaining ones
-                // is not an error.
-                let is_snaptshot = other_changeset.bonsai_changeset().await?.is_snapshot();
-                let schemes = if is_snaptshot {
-                    BTreeSet::from([thrift::CommitIdentityScheme::BONSAI])
-                } else {
-                    params.identity_schemes
-                };
-                Some(
-                    map_commit_identity(&other_changeset, &schemes)
-                        .watched()
-                        .await?,
-                )
-            }
-        };
-        Ok(thrift::CommitCompareResponse {
-            diff_files,
-            diff_trees,
-            other_commit_ids,
-            last_path,
-            ..Default::default()
-        })
+        let result = commit_compare::operations::commit_compare(
+            &ctx,
+            &repo,
+            base_changeset,
+            other_changeset,
+            &params,
+        )
+        .await
+        .map_err(|e| match e.downcast::<MononokeError>() {
+            Ok(mononoke_err) => scs_errors::ServiceError::from(mononoke_err),
+            Err(e) => scs_errors::internal_error(format!("{e:#}")).into(),
+        })?;
+
+        Ok(result.response)
     }
 
     /// Returns files that match the criteria
@@ -1064,10 +856,7 @@ impl SourceControlServiceImpl {
                     .into_iter()
                     .map(|prefix| {
                         MPath::try_from(&prefix).map_err(|e| {
-                            scs_errors::invalid_request(format!(
-                                "invalid prefix '{}': {}",
-                                prefix, e
-                            ))
+                            scs_errors::invalid_request(format!("invalid prefix '{prefix}': {e}"))
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -1077,10 +866,7 @@ impl SourceControlServiceImpl {
         let ordering = match &params.after {
             Some(after) => {
                 let after = Some(MPath::try_from(after).map_err(|e| {
-                    scs_errors::invalid_request(format!(
-                        "invalid continuation path '{}': {}",
-                        after, e
-                    ))
+                    scs_errors::invalid_request(format!("invalid continuation path '{after}': {e}"))
                 })?);
                 ChangesetFileOrdering::Ordered { after }
             }
@@ -1127,10 +913,7 @@ impl SourceControlServiceImpl {
                     .iter()
                     .map(|prefix| {
                         MPath::try_from(prefix).map_err(|e| {
-                            scs_errors::invalid_request(format!(
-                                "invalid prefix '{}': {}",
-                                prefix, e
-                            ))
+                            scs_errors::invalid_request(format!("invalid prefix '{prefix}': {e}"))
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -1140,10 +923,7 @@ impl SourceControlServiceImpl {
         let ordering = match &params.after {
             Some(after) => {
                 let after = Some(MPath::try_from(after).map_err(|e| {
-                    scs_errors::invalid_request(format!(
-                        "invalid continuation path '{}': {}",
-                        after, e
-                    ))
+                    scs_errors::invalid_request(format!("invalid continuation path '{after}': {e}"))
                 })?);
                 ChangesetFileOrdering::Ordered { after }
             }
@@ -1214,7 +994,23 @@ impl SourceControlServiceImpl {
             }
         )?;
 
-        let limit: usize = check_range_and_convert("limit", params.limit, 0..)?;
+        // Cap `limit` at COMMIT_HISTORY_MAX_LIMIT for most clients, but allow a
+        // JustKnob switchval-based allowlist of clients to bypass the cap. Some
+        // clients pass i32::MAX as a sentinel for "unlimited"; this gives them
+        // a glide path to migrate without breakage. Shared knob across history
+        // methods (commit_history, commit_path_history).
+        let client_id = ctx.metadata().upstream_client_id();
+        let enforce_limit =
+            justknobs::eval("scm/mononoke:scs_history_enforce_limit", None, client_id);
+        let limit: usize = if enforce_limit {
+            check_range_and_convert(
+                "limit",
+                params.limit,
+                0..=source_control::COMMIT_HISTORY_MAX_LIMIT,
+            )?
+        } else {
+            check_range_and_convert("limit", params.limit, 0..)?
+        };
         let skip: usize = check_range_and_convert("skip", params.skip, 0..)?;
 
         // Time filter equal to zero might be mistaken by users for an unset, like None.
@@ -1233,8 +1029,7 @@ impl SourceControlServiceImpl {
         if let (Some(ats), Some(bts)) = (after_timestamp, before_timestamp) {
             if bts < ats {
                 return Err(scs_errors::invalid_request(format!(
-                    "after_timestamp ({}) cannot be greater than before_timestamp ({})",
-                    ats, bts,
+                    "after_timestamp ({ats}) cannot be greater than before_timestamp ({bts})",
                 ))
                 .into());
             }
@@ -1242,8 +1037,7 @@ impl SourceControlServiceImpl {
         if let (Some(ats), Some(bts)) = (after_committer_timestamp, before_committer_timestamp) {
             if bts < ats {
                 return Err(scs_errors::invalid_request(format!(
-                    "after_committer_timestamp ({}) cannot be greater than before_committer_timestamp ({})",
-                    ats, bts,
+                    "after_committer_timestamp ({ats}) cannot be greater than before_committer_timestamp ({bts})",
                 ))
                 .into());
             }
@@ -1277,6 +1071,7 @@ impl SourceControlServiceImpl {
             after_timestamp,
             before_committer_timestamp,
             after_committer_timestamp,
+            params.author,
             params.format,
             &params.identity_schemes,
         )
@@ -1319,7 +1114,11 @@ impl SourceControlServiceImpl {
             }
         )?;
 
-        let limit: usize = check_range_and_convert("limit", params.limit, 0..)?;
+        let limit: usize = check_range_and_convert(
+            "limit",
+            params.limit,
+            0..=source_control::COMMIT_LINEAR_HISTORY_MAX_LIMIT,
+        )?;
         let skip: u64 = check_range_and_convert("skip", params.skip, 0..)?;
 
         let history_stream = changeset
@@ -1338,6 +1137,7 @@ impl SourceControlServiceImpl {
             None,
             None,
             None,
+            params.author,
             params.format,
             &params.identity_schemes,
         )
@@ -1458,15 +1258,15 @@ impl SourceControlServiceImpl {
                 HookOutcome::ChangesetHook(id, exec) => (id.hook_name, exec),
             };
 
-            match execution {
-                HookExecution::Accepted => {
+            match execution.result {
+                HookResult::Accepted => {
                     outcomes_map.entry(name).or_insert_with(|| {
                         thrift::HookOutcome::accepted(thrift::HookOutcomeAccepted {
                             ..Default::default()
                         })
                     });
                 }
-                HookExecution::Rejected(rej) => {
+                HookResult::Rejected(rej) => {
                     let rejection = thrift::HookOutcomeRejected {
                         description: rej.description.to_string(),
                         long_description: rej.long_description,
@@ -1486,6 +1286,67 @@ impl SourceControlServiceImpl {
 
         Ok(thrift::CommitRunHooksResponse {
             outcomes: outcomes_map,
+            ..Default::default()
+        })
+    }
+
+    pub(crate) async fn commit_rate_limit_check(
+        &self,
+        ctx: CoreContext,
+        commit: thrift::CommitSpecifier,
+        params: thrift::CommitRateLimitCheckParams,
+    ) -> Result<thrift::CommitRateLimitCheckResponse, scs_errors::ServiceError> {
+        let (_repo, changeset) = self.repo_changeset(ctx, &commit).await?;
+        let bookmark = BookmarkKey::new(&params.bookmark)
+            .map_err(|e| scs_errors::invalid_request(format!("Invalid bookmark: {e}")))?;
+
+        let result = changeset.commit_rate_limit_check(&bookmark).await?;
+
+        let rule_results = result
+            .rule_results
+            .into_iter()
+            .map(|r| {
+                let outcome = match r.outcome {
+                    // `Skipped` (rule not applicable) is reported as `allowed`
+                    // on the SCS API.
+                    RateLimitOutcome::Allowed | RateLimitOutcome::Skipped => {
+                        thrift::CommitRateLimitRuleOutcome::allowed(
+                            thrift::CommitRateLimitAllowed {
+                                ..Default::default()
+                            },
+                        )
+                    }
+                    RateLimitOutcome::Exceeded {
+                        total,
+                        window_secs,
+                        max_commits,
+                    } => thrift::CommitRateLimitRuleOutcome::exceeded(
+                        thrift::CommitRateLimitExceeded {
+                            current_count: total as i64,
+                            max_commits: max_commits as i64,
+                            window_secs: window_secs as i64,
+                            ..Default::default()
+                        },
+                    ),
+                };
+                let directories = if r.directories.is_empty() {
+                    None
+                } else {
+                    Some(r.directories)
+                };
+                thrift::CommitRateLimitRuleResult {
+                    rule_name: r.rule_name,
+                    outcome,
+                    user_filter: r.user_filter,
+                    directories,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        Ok(thrift::CommitRateLimitCheckResponse {
+            passed: result.passed,
+            rule_results,
             ..Default::default()
         })
     }
@@ -1615,8 +1476,7 @@ impl SourceControlServiceImpl {
             }
             unknown => {
                 return Err(scs_errors::invalid_request(format!(
-                    "invalid mutation history format: {:?}",
-                    unknown
+                    "invalid mutation history format: {unknown:?}"
                 ))
                 .into());
             }
@@ -1624,6 +1484,95 @@ impl SourceControlServiceImpl {
 
         Ok(thrift::CommitHgMutationHistoryResponse {
             hg_mutation_history,
+            ..Default::default()
+        })
+    }
+
+    /// Returns the git mutation history of a commit, extracted from
+    /// predecessor/predecessor-op extra headers on the commit object.
+    /// Walks the full predecessor chain by loading each predecessor commit
+    /// and reading its headers, similar to how commit_hg_mutation_history
+    /// walks the SQL mutation store.
+    pub(crate) async fn commit_git_mutation_history(
+        &self,
+        ctx: CoreContext,
+        commit: thrift::CommitSpecifier,
+        params: thrift::CommitGitMutationHistoryParams,
+    ) -> Result<thrift::CommitGitMutationHistoryResponse, scs_errors::ServiceError> {
+        let (repo, changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
+
+        // Walk the predecessor chain by following headers hop-by-hop.
+        // Depth limit prevents infinite loops from circular references.
+        const MAX_CHAIN_DEPTH: usize = 100;
+        let mut mutations = Vec::new();
+        let mut all_predecessor_ids = Vec::new();
+        let mut current_changeset = changeset;
+
+        for _ in 0..MAX_CHAIN_DEPTH {
+            let git_extra_headers = current_changeset.git_extra_headers().await?;
+            let mutation_entry = git_extra_headers
+                .as_ref()
+                .and_then(|headers| git_types::mutation::extract_mutation_from_headers(headers));
+
+            let Some(entry) = mutation_entry else {
+                break;
+            };
+
+            let successor_id = current_changeset
+                .git_sha1()
+                .await?
+                .map(|sha1| thrift::CommitId::git(sha1.as_ref().to_vec()))
+                .unwrap_or_else(|| {
+                    thrift::CommitId::bonsai(current_changeset.id().as_ref().to_vec())
+                });
+
+            let predecessor_ids: Vec<thrift::CommitId> = entry
+                .predecessor_bytes()
+                .into_iter()
+                .map(thrift::CommitId::git)
+                .collect();
+
+            all_predecessor_ids.extend(predecessor_ids.clone());
+
+            let next_sha1 = entry.predecessors.first().cloned();
+
+            mutations.push(thrift::GitMutation {
+                successor: successor_id,
+                predecessors: predecessor_ids,
+                op: entry.op,
+                ..Default::default()
+            });
+
+            // Follow the chain: load the predecessor commit
+            match next_sha1 {
+                Some(sha1) => {
+                    let specifier = mononoke_api::ChangesetSpecifier::GitSha1(sha1);
+                    match repo.changeset(specifier).await? {
+                        Some(cs) => current_changeset = cs,
+                        None => break, // Predecessor not on server
+                    }
+                }
+                None => break,
+            }
+        }
+
+        let git_mutation_history = match params.format {
+            thrift::MutationHistoryFormat::COMMIT_ID => {
+                thrift::GitMutationHistory::commit_ids(all_predecessor_ids)
+            }
+            thrift::MutationHistoryFormat::GIT_MUTATION => {
+                thrift::GitMutationHistory::git_mutations(mutations)
+            }
+            unknown => {
+                return Err(scs_errors::invalid_request(format!(
+                    "invalid mutation history format: {unknown:?}"
+                ))
+                .into());
+            }
+        };
+
+        Ok(thrift::CommitGitMutationHistoryResponse {
+            git_mutation_history,
             ..Default::default()
         })
     }
@@ -1710,8 +1659,8 @@ impl SourceControlServiceImpl {
         commit: thrift::CommitSpecifier,
         params: thrift::CommitRestrictedPathsAccessParams,
     ) -> Result<thrift::CommitRestrictedPathsAccessResponse, scs_errors::ServiceError> {
-        let (repo, _changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
-        if commit_restricted_paths::use_mock_api(repo.name()) {
+        let (repo, changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
+        if commit_restricted_paths::use_mock_api(repo.name())? {
             return Err(scs_errors::not_implemented(
                 "commit_restricted_paths_access is not mocked yet".to_string(),
             )
@@ -1719,9 +1668,7 @@ impl SourceControlServiceImpl {
         }
         let paths: BTreeSet<String> = params.paths.into_iter().collect();
         commit_restricted_paths::restricted_paths_access_impl(
-            repo.ctx(),
-            &repo,
-            &self.acl_provider,
+            &changeset,
             paths,
             params.check_permissions,
         )
@@ -1744,21 +1691,25 @@ impl SourceControlServiceImpl {
         ),
         scs_errors::ServiceError,
     > {
-        let (repo, _changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
-        if commit_restricted_paths::use_mock_api(repo.name()) {
+        let (repo, changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
+        if commit_restricted_paths::use_mock_api(repo.name())? {
             return Err(scs_errors::not_implemented(
                 "commit_find_restricted_paths is not mocked yet".to_string(),
             )
             .into());
         }
 
-        let restricted_paths_facet = repo.repo().restricted_paths_arc().clone();
         let filter_roots: BTreeSet<String> = params.roots.into_iter().collect();
+        let check_permissions = params.check_permissions.unwrap_or(false);
+        let return_only_accessible = params.return_only_accessible.unwrap_or(false);
 
-        let stream = commit_restricted_paths::find_nested_restricted_roots_stream(
-            restricted_paths_facet,
+        let stream = commit_restricted_paths::find_nested_restricted_roots(
+            &changeset,
             filter_roots,
-        );
+            check_permissions,
+            return_only_accessible,
+        )
+        .await?;
 
         Ok((
             thrift::CommitFindRestrictedPathsStreamResponse::default(),
@@ -1774,7 +1725,7 @@ impl SourceControlServiceImpl {
         _params: thrift::CommitRestrictedPathsChangesParams,
     ) -> Result<thrift::CommitRestrictedPathsChangesResponse, scs_errors::ServiceError> {
         let (repo, changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
-        if commit_restricted_paths::use_mock_api(repo.name()) {
+        if commit_restricted_paths::use_mock_api(repo.name())? {
             return Err(scs_errors::not_implemented(
                 "commit_restricted_paths_changes is not mocked yet".to_string(),
             )
@@ -1790,9 +1741,7 @@ impl SourceControlServiceImpl {
             .collect();
 
         let access_response = commit_restricted_paths::restricted_paths_access_impl(
-            repo.ctx(),
-            &repo,
-            &self.acl_provider,
+            &changeset,
             changed_paths.clone(),
             true, // Always check permissions for changes endpoint
         )

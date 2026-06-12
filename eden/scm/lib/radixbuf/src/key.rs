@@ -51,10 +51,10 @@ macro_rules! impl_convert {
             }
         }
 
-        impl Into<$T> for KeyId {
+        impl From<KeyId> for $T {
             #[inline]
-            fn into(self) -> $T {
-                self.0 as $T
+            fn from(val: KeyId) -> Self {
+                val.0 as $T
             }
         }
     };
@@ -133,8 +133,8 @@ impl VariantKey {
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
-    use rand::RngCore;
+    use rand::Rng as _;
+    use rand::RngExt as _;
     use rand::distr::Alphanumeric;
     use rand::rng;
 

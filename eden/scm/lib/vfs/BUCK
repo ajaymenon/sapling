@@ -5,49 +5,27 @@ oncall("sapling")
 rust_library(
     name = "vfs",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "dependencies_override": {"target": {
-            "'cfg(target_os = \"linux\")'": {"dependencies": {
-                "libc": {"version": "0.2.139"},
-            }},
-            "'cfg(target_os = \"macos\")'": {"dependencies": {
-                "libc": {"version": "0.2.139"},
-            }},
-        }},
-        "extra_buck_dependencies": {"dependencies": [
-            "fbsource//third-party/rust:anyhow",
-            "fbsource//third-party/rust:dashmap",
-            "fbsource//third-party/rust:flume",
-            "fbsource//third-party/rust:fs-err",
-            "fbsource//third-party/rust:once_cell",
-            "fbsource//third-party/rust:thiserror",
-            "fbsource//third-party/rust:tokio",
-            "fbsource//third-party/rust:tracing",
-            "//eden/scm/lib/blob:blob",
-            "//eden/scm/lib/fsinfo:fsinfo",
-            "//eden/scm/lib/identity:identity",
-            "//eden/scm/lib/minibytes:minibytes",
-            "//eden/scm/lib/types:types",
-            "//eden/scm/lib/util:util",
-        ]},
-        "lib": {"name": "vfs"},
-        "package": {
-            "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
-            "homepage": "https://sapling-scm.com/",
-            "license": "MIT",
-            "name": "sapling-vfs",
-            "repository": "https://github.com/facebook/sapling",
+    autocargo = {
+        "cargo_toml_config": {
+            "lib": {"name": "vfs"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "MIT",
+                "name": "sapling-vfs",
+                "repository": "https://github.com/facebook/sapling",
+            },
         },
-    }},
+    },
     crate_root = "src/lib.rs",
     test_deps = [
         "fbsource//third-party/rust:tempfile",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:bitflags",
         "fbsource//third-party/rust:dashmap",
         "fbsource//third-party/rust:flume",
-        "fbsource//third-party/rust:fs-err",
         "fbsource//third-party/rust:once_cell",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
@@ -58,13 +36,5 @@ rust_library(
         "//eden/scm/lib/minibytes:minibytes",
         "//eden/scm/lib/types:types",
         "//eden/scm/lib/util:util",
-    ] + select({
-        "DEFAULT": [],
-        "ovr_config//os:linux": [
-            "fbsource//third-party/rust:libc",
-        ],
-        "ovr_config//os:macos": [
-            "fbsource//third-party/rust:libc",
-        ],
-    }),
+    ],
 )
